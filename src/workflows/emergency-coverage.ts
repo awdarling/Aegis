@@ -651,7 +651,7 @@ function managerReplyTarget(outreach: ActiveOutreach): { contact: VerifiedContac
 
 // Send outreach SMS to one employee and store their outreach record.
 // Returns { sent: true } or { sent: false, reason: string }.
-async function dispatchOutreach(params: {
+export async function dispatchOutreach(params: {
   employee: Employee;
   session: CoverageSession;
   aegisSmsNumber: string;

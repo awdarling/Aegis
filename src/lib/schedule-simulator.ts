@@ -1,0 +1,360 @@
+import { supabase } from '../db/client';
+import { getSpecialNotesForRange } from '../workflows/special-notes';
+import type {
+  Employee,
+  Availability,
+  TimeOffRequest,
+  ShiftRequirement,
+  Policy,
+  Event,
+} from '../db/types';
+
+// ── Public types ──────────────────────────────────────────────────────────────
+
+export interface SimulationInput {
+  company_id: string;
+  period_start: string;
+  period_end: string;
+  new_time_off?: {
+    employee_id: string;
+    start_date: string;
+    end_date: string;
+  };
+}
+
+export interface AffectedShift {
+  date: string;
+  shift_name: string;
+  role: string;
+  required_count: number;
+  covered_without: number;
+  covered_with: number;
+  shift_start: string;
+  shift_end: string;
+}
+
+export interface CoverageGap {
+  date: string;
+  shift_name: string;
+  role: string;
+  shortfall: number;
+}
+
+export interface AlternateEmployee {
+  employee_id: string;
+  name: string;
+  qualified_roles: string[];
+  available_dates: string[];
+}
+
+export interface SimulationResult {
+  overall_feasible: boolean;
+  affected_shifts: AffectedShift[];
+  coverage_gaps: CoverageGap[];
+  available_alternates: AlternateEmployee[];
+  coverage_rate_before: number;
+  coverage_rate_after: number;
+  period_start: string;
+  period_end: string;
+  special_notes_affecting_period: Event[];
+}
+
+// ── Internal types ────────────────────────────────────────────────────────────
+
+interface SimData {
+  employees: Employee[];
+  availabilityByEmployee: Map<string, Availability[]>;
+  shiftRequirements: ShiftRequirement[];
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+export function getDatesInRange(start: string, end: string): string[] {
+  const dates: string[] = [];
+  const cur = new Date(start + 'T12:00:00Z');
+  const last = new Date(end + 'T12:00:00Z');
+  while (cur <= last) {
+    dates.push(cur.toISOString().slice(0, 10));
+    cur.setUTCDate(cur.getUTCDate() + 1);
+  }
+  return dates;
+}
+
+// Returns the Sunday-through-Saturday week(s) that fully contain the given dates.
+export function getWeekBounds(
+  startDate: string,
+  endDate: string
+): { weekStart: string; weekEnd: string } {
+  const start = new Date(startDate + 'T12:00:00Z');
+  const end = new Date(endDate + 'T12:00:00Z');
+  const weekStart = new Date(start);
+  weekStart.setUTCDate(start.getUTCDate() - start.getUTCDay()); // back to Sunday
+  const weekEnd = new Date(end);
+  weekEnd.setUTCDate(end.getUTCDate() + (6 - end.getUTCDay())); // forward to Saturday
+  return {
+    weekStart: weekStart.toISOString().slice(0, 10),
+    weekEnd: weekEnd.toISOString().slice(0, 10),
+  };
+}
+
+// Normalize time strings to HH:MM so "09:00" and "09:00:00" compare correctly.
+function normalizeTime(t: string): string {
+  return t.slice(0, 5);
+}
+
+function isEmployeeAvailableForShift(
+  empId: string,
+  dayOfWeek: number,
+  shiftStart: string,
+  shiftEnd: string,
+  availabilityByEmployee: Map<string, Availability[]>
+): boolean {
+  const records = availabilityByEmployee.get(empId) ?? [];
+  const ns = normalizeTime(shiftStart);
+  const ne = normalizeTime(shiftEnd);
+  return records.some(
+    a =>
+      a.day_of_week === dayOfWeek &&
+      normalizeTime(a.start_time) <= ns &&
+      normalizeTime(a.end_time) >= ne
+  );
+}
+
+function buildTimeOffSet(dates: string[], requests: TimeOffRequest[]): Set<string> {
+  const set = new Set<string>();
+  for (const tor of requests) {
+    for (const date of dates) {
+      if (date >= tor.start_date && date <= tor.end_date) {
+        set.add(`${tor.employee_id}:${date}`);
+      }
+    }
+  }
+  return set;
+}
+
+// ── Data loading ──────────────────────────────────────────────────────────────
+
+async function loadSimData(companyId: string): Promise<SimData> {
+  const [empRes, availRes, reqRes] = await Promise.all([
+    supabase.from('employees').select('*').eq('company_id', companyId).eq('active', true),
+    supabase.from('availability').select('*').eq('company_id', companyId),
+    supabase.from('shift_requirements').select('*').eq('company_id', companyId),
+  ]);
+
+  const employees = (empRes.data ?? []) as Employee[];
+  const availability = (availRes.data ?? []) as Availability[];
+  const shiftRequirements = (reqRes.data ?? []) as ShiftRequirement[];
+
+  const availabilityByEmployee = new Map<string, Availability[]>();
+  for (const avail of availability) {
+    if (!availabilityByEmployee.has(avail.employee_id)) {
+      availabilityByEmployee.set(avail.employee_id, []);
+    }
+    availabilityByEmployee.get(avail.employee_id)!.push(avail);
+  }
+
+  return { employees, availabilityByEmployee, shiftRequirements };
+}
+
+async function loadApprovedTimeOff(
+  companyId: string,
+  periodStart: string,
+  periodEnd: string
+): Promise<TimeOffRequest[]> {
+  const { data } = await supabase
+    .from('time_off_requests')
+    .select('*')
+    .eq('company_id', companyId)
+    .eq('status', 'approved')
+    .lte('start_date', periodEnd)
+    .gte('end_date', periodStart);
+  return (data ?? []) as TimeOffRequest[];
+}
+
+// ── Core simulation ───────────────────────────────────────────────────────────
+
+// Runs both scenarios (with and without the new TO) in a single pass.
+// Returns all structural results without touching the database.
+function runBothScenarios(
+  dates: string[],
+  data: SimData,
+  baselineSet: Set<string>,
+  withNewSet: Set<string>,
+  newEmployeeId: string | undefined
+): {
+  affected_shifts: AffectedShift[];
+  coverage_gaps: CoverageGap[];
+  available_alternates: AlternateEmployee[];
+  coverage_rate_before: number;
+  coverage_rate_after: number;
+} {
+  const alternateMap = new Map<string, AlternateEmployee>();
+  const affectedShifts: AffectedShift[] = [];
+  const coverageGaps: CoverageGap[] = [];
+
+  let baselineTotalReq = 0;
+  let baselineTotalCov = 0;
+  let withNewTotalReq = 0;
+  let withNewTotalCov = 0;
+
+  for (const date of dates) {
+    const dayOfWeek = new Date(date + 'T12:00:00Z').getUTCDay(); // 0 = Sunday
+
+    for (const req of data.shiftRequirements) {
+      if (!req.days_active.includes(dayOfWeek)) continue;
+
+      let baselineCovered = 0;
+      let withNewCovered = 0;
+
+      for (const emp of data.employees) {
+        if (!emp.qualified_roles.includes(req.role)) continue;
+        if (
+          !isEmployeeAvailableForShift(
+            emp.id,
+            dayOfWeek,
+            req.start_time,
+            req.end_time,
+            data.availabilityByEmployee
+          )
+        )
+          continue;
+        if (!baselineSet.has(`${emp.id}:${date}`)) baselineCovered++;
+        if (!withNewSet.has(`${emp.id}:${date}`)) withNewCovered++;
+      }
+
+      baselineTotalReq += req.required_count;
+      baselineTotalCov += Math.min(baselineCovered, req.required_count);
+      withNewTotalReq += req.required_count;
+      withNewTotalCov += Math.min(withNewCovered, req.required_count);
+
+      // Coverage gap: with the new TO we fall below the requirement
+      if (withNewCovered < req.required_count) {
+        coverageGaps.push({
+          date,
+          shift_name: req.shift_name,
+          role: req.role,
+          shortfall: req.required_count - withNewCovered,
+        });
+      }
+
+      // Affected shift: coverage changes between baseline and new scenario
+      if (withNewCovered < baselineCovered) {
+        affectedShifts.push({
+          date,
+          shift_name: req.shift_name,
+          role: req.role,
+          required_count: req.required_count,
+          covered_without: Math.min(baselineCovered, req.required_count),
+          covered_with: Math.min(withNewCovered, req.required_count),
+          shift_start: req.start_time,
+          shift_end: req.end_time,
+        });
+
+        // Find employees who could cover this affected slot
+        for (const emp of data.employees) {
+          if (emp.id === newEmployeeId) continue;
+          if (!emp.qualified_roles.includes(req.role)) continue;
+          if (withNewSet.has(`${emp.id}:${date}`)) continue;
+          if (
+            !isEmployeeAvailableForShift(
+              emp.id,
+              dayOfWeek,
+              req.start_time,
+              req.end_time,
+              data.availabilityByEmployee
+            )
+          )
+            continue;
+
+          if (!alternateMap.has(emp.id)) {
+            alternateMap.set(emp.id, {
+              employee_id: emp.id,
+              name: emp.name,
+              qualified_roles: emp.qualified_roles,
+              available_dates: [],
+            });
+          }
+          const alt = alternateMap.get(emp.id)!;
+          if (!alt.available_dates.includes(date)) alt.available_dates.push(date);
+        }
+      }
+    }
+  }
+
+  return {
+    affected_shifts: affectedShifts,
+    coverage_gaps: coverageGaps,
+    available_alternates: Array.from(alternateMap.values()),
+    coverage_rate_before:
+      baselineTotalReq > 0 ? (baselineTotalCov / baselineTotalReq) * 100 : 100,
+    coverage_rate_after:
+      withNewTotalReq > 0 ? (withNewTotalCov / withNewTotalReq) * 100 : 100,
+  };
+}
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// Returns a structured simulation result. Never writes to the database.
+// Throws 'NO_SHIFT_REQUIREMENTS' if no shift requirements are configured.
+export async function runSimulation(input: SimulationInput): Promise<SimulationResult> {
+  const [simData, baselineTO, specialNotes] = await Promise.all([
+    loadSimData(input.company_id),
+    loadApprovedTimeOff(input.company_id, input.period_start, input.period_end),
+    getSpecialNotesForRange(input.company_id, input.period_start, input.period_end),
+  ]);
+
+  if (simData.shiftRequirements.length === 0) {
+    throw new Error('NO_SHIFT_REQUIREMENTS');
+  }
+
+  const dates = getDatesInRange(input.period_start, input.period_end);
+
+  // Add the proposed TO as a synthetic "approved" request for simulation only
+  const withNewTO: TimeOffRequest[] = input.new_time_off
+    ? [
+        ...baselineTO,
+        {
+          id: '__simulated__',
+          company_id: input.company_id,
+          employee_id: input.new_time_off.employee_id,
+          start_date: input.new_time_off.start_date,
+          end_date: input.new_time_off.end_date,
+          status: 'approved' as const,
+          reason: null,
+          requested_at: new Date().toISOString(),
+          decided_at: null,
+          decided_by: null,
+        },
+      ]
+    : baselineTO;
+
+  const baselineSet = buildTimeOffSet(dates, baselineTO);
+  const withNewSet = buildTimeOffSet(dates, withNewTO);
+
+  const scenarios = runBothScenarios(
+    dates,
+    simData,
+    baselineSet,
+    withNewSet,
+    input.new_time_off?.employee_id
+  );
+
+  return {
+    ...scenarios,
+    overall_feasible: scenarios.coverage_gaps.length === 0,
+    period_start: input.period_start,
+    period_end: input.period_end,
+    special_notes_affecting_period: specialNotes,
+  };
+}
+
+// Convenience: load time_off and coverage policies for a company.
+// Used by the time-off workflow when building the manager email.
+export async function loadTimeOffPolicies(companyId: string): Promise<Policy[]> {
+  const { data } = await supabase
+    .from('policies')
+    .select('*')
+    .eq('company_id', companyId)
+    .in('policy_type', ['time_off', 'coverage']);
+  return (data ?? []) as Policy[];
+}

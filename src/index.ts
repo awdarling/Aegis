@@ -3,6 +3,7 @@ import express from 'express';
 import { env } from './config/env';
 import { emailWebhook } from './webhooks/email';
 import { smsWebhook } from './webhooks/sms';
+import { decisionWebhook } from './webhooks/decision';
 
 const app = express();
 
@@ -15,6 +16,9 @@ app.use(
 
 // SendGrid sends multipart/form-data — handled inside emailWebhook with multer
 app.use('/webhooks/email', emailWebhook);
+
+// Manager approve/deny clicks from time-off notification emails
+app.use('/webhooks/decision', decisionWebhook);
 
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', service: 'aegis' });

@@ -22,6 +22,9 @@ const envSchema = z.object({
 
   // Anthropic
   ANTHROPIC_API_KEY: z.string().min(1),
+
+  // Public base URL for this service (used in email decision links)
+  BASE_URL: z.string().url().default('http://localhost:3000'),
 });
 
 const parsed = envSchema.safeParse(process.env);

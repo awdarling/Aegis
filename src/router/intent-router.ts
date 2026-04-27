@@ -1,12 +1,17 @@
 import { classifyIntent } from '../ai/claude';
 import { logActivity } from '../logger/activity-log';
-import { sendSms } from '../messaging/sms';
-import { sendEmail } from '../messaging/email';
+import { reply } from '../messaging/reply';
 import { supabase } from '../db/client';
 import type { InboundMessage, VerifiedContact } from '../security/types';
 
 // Workflow handlers — stubs until each phase is built
-import { handleSubmitTimeOff, handleApproveTimeOff, handleDenyTimeOff } from '../workflows/time-off';
+import {
+  handleSubmitTimeOff,
+  handleApproveTimeOff,
+  handleDenyTimeOff,
+  handlePendingTimeOffConfirmation,
+  getPendingTimeOff,
+} from '../workflows/time-off';
 import { handleBuildSchedule } from '../workflows/schedule-build';
 import { handleInitiateSwap, handleRespondSwap, handleApproveSwap, handleDenySwap } from '../workflows/shift-swap';
 import { handleEmergencyCoverage } from '../workflows/emergency-coverage';
@@ -26,6 +31,16 @@ export async function routeIntent(
   message: InboundMessage,
   contact: VerifiedContact
 ): Promise<void> {
+  // Pre-classification: check for a pending time-off confirmation from this employee.
+  // The employee's "yes/no" reply won't classify as submit_time_off, so we intercept it here.
+  if (contact.role === 'employee' && contact.employee_id) {
+    const pending = await getPendingTimeOff(contact.company_id, contact.employee_id);
+    if (pending) {
+      await handlePendingTimeOffConfirmation(message, contact, pending);
+      return;
+    }
+  }
+
   // Load company profile for context injection into the classifier
   const companyContext = await loadCompanyContext(contact.company_id);
 
@@ -167,28 +182,5 @@ async function logSecurityUnauthorized(
   });
 }
 
-// Send a reply back through the same channel the message arrived on
-export async function reply(
-  contact: VerifiedContact,
-  originalMessage: InboundMessage,
-  text: string
-): Promise<void> {
-  if (originalMessage.channel === 'sms') {
-    await sendSms({
-      to: originalMessage.sender,
-      from: originalMessage.recipient,
-      body: text,
-      company_id: contact.company_id,
-    });
-  } else {
-    await sendEmail({
-      to: originalMessage.sender,
-      subject: originalMessage.raw_subject
-        ? `Re: ${originalMessage.raw_subject}`
-        : 'Re: Your message to Aegis',
-      text,
-      company_id: contact.company_id,
-      thread_id: originalMessage.thread_id,
-    });
-  }
-}
+// Re-export reply for any callers that imported it from here
+export { reply };

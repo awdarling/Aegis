@@ -14,7 +14,13 @@ import {
 } from '../workflows/time-off';
 import { handleBuildSchedule } from '../workflows/schedule-build';
 import { handleInitiateSwap, handleRespondSwap, handleApproveSwap, handleDenySwap } from '../workflows/shift-swap';
-import { handleEmergencyCoverage } from '../workflows/emergency-coverage';
+import {
+  handleEmergencyCoverage,
+  handleManagerCoverageReply,
+  handleEmployeeCoverageResponse,
+  getActiveCoverageSession,
+  getActiveOutreach,
+} from '../workflows/emergency-coverage';
 
 // Intents that require manager role — employee attempting these is an unauthorized_action
 const MANAGER_ONLY_INTENTS = new Set([
@@ -31,12 +37,26 @@ export async function routeIntent(
   message: InboundMessage,
   contact: VerifiedContact
 ): Promise<void> {
-  // Pre-classification: check for a pending time-off confirmation from this employee.
-  // The employee's "yes/no" reply won't classify as submit_time_off, so we intercept it here.
+  // Pre-classification: employee checks (TO confirmation, active outreach)
   if (contact.role === 'employee' && contact.employee_id) {
-    const pending = await getPendingTimeOff(contact.company_id, contact.employee_id);
-    if (pending) {
-      await handlePendingTimeOffConfirmation(message, contact, pending);
+    const pendingTO = await getPendingTimeOff(contact.company_id, contact.employee_id);
+    if (pendingTO) {
+      await handlePendingTimeOffConfirmation(message, contact, pendingTO);
+      return;
+    }
+
+    const activeOutreach = await getActiveOutreach(contact.company_id, contact.employee_id);
+    if (activeOutreach) {
+      await handleEmployeeCoverageResponse(message, contact, activeOutreach);
+      return;
+    }
+  }
+
+  // Pre-classification: manager check — coverage session awaiting name reply
+  if (contact.role === 'manager') {
+    const session = await getActiveCoverageSession(contact.company_id, contact.matched_identifier);
+    if (session && session.state === 'awaiting_names') {
+      await handleManagerCoverageReply(message, contact, session);
       return;
     }
   }

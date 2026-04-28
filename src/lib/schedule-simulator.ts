@@ -358,3 +358,85 @@ export async function loadTimeOffPolicies(companyId: string): Promise<Policy[]> 
     .in('policy_type', ['time_off', 'coverage']);
   return (data ?? []) as Policy[];
 }
+
+// ── Wage estimation ───────────────────────────────────────────────────────────
+
+export interface WageLineItem {
+  employee_id: string;
+  employee_name: string;
+  hours: number;
+  hourly_rate: number;
+  estimated_pay: number;
+}
+
+export interface WageEstimate {
+  total_estimated: number;
+  by_employee: WageLineItem[];
+}
+
+// Computes estimated wages for a set of shifts.
+// Uses individual_wage from employees table first, falls back to role wage_rate.
+// Never writes to the database.
+export async function computeWageEstimate(
+  companyId: string,
+  shifts: Array<{
+    employee_id: string;
+    employee_name: string;
+    role: string;
+    start_time: string;
+    end_time: string;
+    hours?: number;
+  }>
+): Promise<WageEstimate> {
+  const [empRes, ratesRes] = await Promise.all([
+    supabase.from('employees').select('id, individual_wage').eq('company_id', companyId),
+    supabase.from('wage_rates').select('role, hourly_rate').eq('company_id', companyId),
+  ]);
+
+  const individualWages = new Map<string, number>();
+  for (const emp of (empRes.data ?? []) as { id: string; individual_wage: number | null }[]) {
+    if (emp.individual_wage != null) individualWages.set(emp.id, emp.individual_wage);
+  }
+
+  const roleRates = new Map<string, number>();
+  for (const rate of (ratesRes.data ?? []) as { role: string; hourly_rate: number }[]) {
+    roleRates.set(rate.role, rate.hourly_rate);
+  }
+
+  const byEmployee = new Map<string, WageLineItem>();
+
+  for (const shift of shifts) {
+    const hours = shift.hours ?? wageShiftHours(shift.start_time, shift.end_time);
+    const rate = individualWages.get(shift.employee_id) ?? roleRates.get(shift.role) ?? 0;
+    const pay = Math.round(hours * rate * 100) / 100;
+
+    if (!byEmployee.has(shift.employee_id)) {
+      byEmployee.set(shift.employee_id, {
+        employee_id: shift.employee_id,
+        employee_name: shift.employee_name,
+        hours: 0,
+        hourly_rate: rate,
+        estimated_pay: 0,
+      });
+    }
+    const entry = byEmployee.get(shift.employee_id)!;
+    entry.hours = Math.round((entry.hours + hours) * 10) / 10;
+    entry.estimated_pay = Math.round((entry.estimated_pay + pay) * 100) / 100;
+  }
+
+  const items = Array.from(byEmployee.values());
+  return {
+    total_estimated: Math.round(items.reduce((s, e) => s + e.estimated_pay, 0) * 100) / 100,
+    by_employee: items,
+  };
+}
+
+function wageShiftHours(startTime: string, endTime: string): number {
+  const toMins = (t: string) => {
+    const [h, m] = t.slice(0, 5).split(':').map(Number);
+    return h * 60 + m;
+  };
+  let mins = toMins(endTime) - toMins(startTime);
+  if (mins < 0) mins += 24 * 60;
+  return Math.round((mins / 60) * 10) / 10;
+}

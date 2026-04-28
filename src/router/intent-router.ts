@@ -13,7 +13,16 @@ import {
   getPendingTimeOff,
 } from '../workflows/time-off';
 import { handleBuildSchedule } from '../workflows/schedule-build';
-import { handleInitiateSwap, handleRespondSwap, handleApproveSwap, handleDenySwap } from '../workflows/shift-swap';
+import {
+  handleInitiateSwap,
+  handleRespondSwap,
+  handleApproveSwap,
+  handleDenySwap,
+  handleSwapConfirmation,
+  handleSwapOutreachResponse,
+  getPendingSwap,
+  getActiveSwapOutreach,
+} from '../workflows/shift-swap';
 import {
   handleEmergencyCoverage,
   handleManagerCoverageReply,
@@ -48,6 +57,20 @@ export async function routeIntent(
     const activeOutreach = await getActiveOutreach(contact.company_id, contact.employee_id);
     if (activeOutreach) {
       await handleEmployeeCoverageResponse(message, contact, activeOutreach);
+      return;
+    }
+
+    // Check for active swap outreach (employee being asked to take a shift)
+    const swapOutreach = await getActiveSwapOutreach(contact.company_id, contact.employee_id);
+    if (swapOutreach) {
+      await handleSwapOutreachResponse(message, contact, swapOutreach);
+      return;
+    }
+
+    // Check for pending swap confirmation (employee confirming their own request)
+    const pendingSwap = await getPendingSwap(contact.company_id, contact.employee_id);
+    if (pendingSwap) {
+      await handleSwapConfirmation(message, contact, pendingSwap);
       return;
     }
   }

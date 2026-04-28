@@ -3,13 +3,17 @@ import { supabase } from '../db/client';
 import { logActivity } from '../logger/activity-log';
 import { sendEmail } from '../messaging/email';
 import { sendSms } from '../messaging/sms';
+import { executeScheduleSwap } from '../workflows/shift-swap';
+import { computeWageEstimate } from '../lib/schedule-simulator';
 import type { Employee } from '../db/types';
 
 export const decisionWebhook = Router();
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
-interface DecisionToken {
+// Time-off token — decision_type is always normalised to 'time_off' on parse
+interface TimeOffDecisionToken {
+  decision_type: 'time_off';
   action: 'approve' | 'deny';
   request_id: string;
   company_id: string;
@@ -20,6 +24,27 @@ interface DecisionToken {
   aegis_sms_channel: string | null;
   expires_at: string;
 }
+
+// Swap token
+interface SwapDecisionToken {
+  decision_type: 'swap';
+  action: 'approve' | 'deny';
+  request_id: string;
+  company_id: string;
+  requester_id: string;
+  requester_name: string;
+  requester_channel: 'sms' | 'email';
+  requester_contact: string;
+  aegis_sms_channel: string | null;
+  receiver_id: string;
+  receiver_name: string;
+  shift_date: string;
+  shift_name: string;
+  role: string;
+  expires_at: string;
+}
+
+type DecisionToken = TimeOffDecisionToken | SwapDecisionToken;
 
 // ── HTML response helpers ─────────────────────────────────────────────────────
 
@@ -72,10 +97,10 @@ function errorPage(message: string): string {
 </html>`;
 }
 
-// ── Employee notification ─────────────────────────────────────────────────────
+// ── Time-off notification ─────────────────────────────────────────────────────
 
 async function notifyEmployee(
-  token: DecisionToken,
+  token: TimeOffDecisionToken,
   employee: Employee,
   action: 'approve' | 'deny'
 ): Promise<void> {
@@ -100,6 +125,118 @@ async function notifyEmployee(
       company_id: token.company_id,
     });
   }
+}
+
+// ── Swap decision handler ─────────────────────────────────────────────────────
+
+async function handleSwapDecision(
+  res: import('express').Response,
+  requestId: string,
+  action: 'approve' | 'deny',
+  token: SwapDecisionToken
+): Promise<void> {
+  // Load swap request
+  const { data: swapRow, error: swapError } = await supabase
+    .from('swap_requests')
+    .select('*')
+    .eq('id', requestId)
+    .eq('company_id', token.company_id)
+    .single();
+
+  if (swapError || !swapRow) {
+    res.status(404).send(errorPage('Swap request not found. It may have already been processed.'));
+    return;
+  }
+
+  const swap = swapRow as {
+    id: string; status: string; requesting_employee_id: string; receiving_employee_id: string | null;
+    shift_date: string; shift_name: string; role: string;
+  };
+
+  if (swap.status !== 'pending_manager') {
+    res.status(409).send(errorPage(`This swap has already been ${swap.status}. No further action is needed.`));
+    return;
+  }
+
+  // Load both employee records
+  const [requesterRes, receiverRes] = await Promise.all([
+    supabase.from('employees').select('*').eq('id', token.requester_id).single(),
+    supabase.from('employees').select('*').eq('id', token.receiver_id).single(),
+  ]);
+
+  const requester = requesterRes.data as Employee | null;
+  const receiver = receiverRes.data as Employee | null;
+
+  // Update swap_request status
+  await supabase.from('swap_requests').update({
+    status: action === 'approve' ? 'approved' : 'denied',
+    decided_at: new Date().toISOString(),
+    decided_by: 'manager',
+  }).eq('id', requestId);
+
+  // Consume both sibling tokens
+  await consumeSwapTokens(token.company_id, requestId);
+
+  if (action === 'approve') {
+    // Find the schedule covering this shift date
+    const { data: schedRow } = await supabase.from('schedules').select('id, data')
+      .eq('company_id', token.company_id).eq('status', 'published')
+      .lte('week_start', token.shift_date).gte('week_end', token.shift_date)
+      .order('generated_at', { ascending: false }).limit(1).maybeSingle();
+
+    if (schedRow && receiver) {
+      const row = schedRow as { id: string; data: { shifts: unknown[] } };
+      await executeScheduleSwap(
+        token.company_id, row.id, token.shift_date, token.shift_name,
+        token.requester_id, token.receiver_id, token.receiver_name
+      );
+    }
+
+    // Notify both employees
+    const approvedMsg = (name: string, role: string) =>
+      `Your shift swap has been approved! ${name} will cover the ${token.shift_name} (${role}) shift on ${new Date(token.shift_date + 'T12:00:00Z').toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' })}.`;
+
+    if (requester?.contact_phone && token.aegis_sms_channel) {
+      await sendSms({ to: requester.contact_phone, from: token.aegis_sms_channel, body: approvedMsg(token.receiver_name, token.role), company_id: token.company_id });
+    } else if (requester?.contact_email) {
+      await sendEmail({ to: requester.contact_email, subject: 'Swap approved', text: approvedMsg(token.receiver_name, token.role), company_id: token.company_id });
+    }
+    if (receiver?.contact_phone && token.aegis_sms_channel) {
+      await sendSms({ to: receiver.contact_phone, from: token.aegis_sms_channel, body: approvedMsg(token.requester_name, token.role), company_id: token.company_id });
+    }
+  } else {
+    // Denied — notify both
+    const deniedMsg = `Your shift swap request for the ${token.shift_name} shift on ${new Date(token.shift_date + 'T12:00:00Z').toLocaleDateString('en-US', { month: 'long', day: 'numeric' })} has been denied by your manager. Please contact them if you have questions.`;
+    if (requester?.contact_phone && token.aegis_sms_channel) {
+      await sendSms({ to: requester.contact_phone, from: token.aegis_sms_channel, body: deniedMsg, company_id: token.company_id });
+    } else if (requester?.contact_email) {
+      await sendEmail({ to: requester.contact_email, subject: 'Swap denied', text: deniedMsg, company_id: token.company_id });
+    }
+    if (receiver?.contact_phone && token.aegis_sms_channel) {
+      await sendSms({ to: receiver.contact_phone, from: token.aegis_sms_channel, body: deniedMsg, company_id: token.company_id });
+    }
+  }
+
+  await logActivity({
+    company_id: token.company_id,
+    action: `swap_${action}d`,
+    entity_type: 'swap_request',
+    entity_id: requestId,
+    summary: `Swap between ${token.requester_name} and ${token.receiver_name} ${action}d by manager via email`,
+    metadata: { requester_id: token.requester_id, receiver_id: token.receiver_id, shift_date: token.shift_date, shift_name: token.shift_name },
+  });
+
+  res.send(confirmationPage(`${token.requester_name} & ${token.receiver_name}`, action));
+}
+
+async function consumeSwapTokens(companyId: string, requestId: string): Promise<void> {
+  const { data: rows } = await supabase.from('aegis_memory').select('id, content')
+    .eq('company_id', companyId).like('source', 'decision_token:%');
+  if (!rows) return;
+  const ids = (rows as { id: string; content: string }[])
+    .filter(r => { try { return (JSON.parse(r.content) as { request_id?: string }).request_id === requestId; } catch { return false; } })
+    .map(r => r.id);
+  if (ids.length > 0) await supabase.from('aegis_memory').delete().in('id', ids);
 }
 
 // ── Route handler ─────────────────────────────────────────────────────────────
@@ -139,7 +276,9 @@ decisionWebhook.get('/', async (req, res) => {
   let decisionToken: DecisionToken;
   try {
     const row = tokenData as { id: string; content: string };
-    decisionToken = JSON.parse(row.content) as DecisionToken;
+    // Normalise: tokens stored before swap support have no decision_type — default to 'time_off'
+    const raw = JSON.parse(row.content) as Record<string, unknown>;
+    decisionToken = { decision_type: 'time_off', ...raw } as DecisionToken;
   } catch {
     res.status(500).send(errorPage('An internal error occurred. Please try again.'));
     return;
@@ -164,6 +303,12 @@ decisionWebhook.get('/', async (req, res) => {
   // Verify action matches token (each token has a fixed action)
   if (decisionToken.action !== action) {
     res.status(400).send(errorPage('Action mismatch. Please use the correct Approve or Deny button from your email.'));
+    return;
+  }
+
+  // Branch: swap vs time-off
+  if (decisionToken.decision_type === 'swap') {
+    await handleSwapDecision(res, requestId, action as 'approve' | 'deny', decisionToken);
     return;
   }
 

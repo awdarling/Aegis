@@ -12,7 +12,8 @@ import {
   handlePendingTimeOffConfirmation,
   getPendingTimeOff,
 } from '../workflows/time-off';
-import { handleBuildSchedule } from '../workflows/schedule-build';
+import { handleBuildSchedule, handleDistributeSchedule } from '../workflows/schedule-build';
+import { handleOperationalQuery, handleHomebaseEdit, handleEditConfirmation, getPendingEdit } from '../workflows/operational-query';
 import {
   handleInitiateSwap,
   handleRespondSwap,
@@ -34,11 +35,13 @@ import {
 // Intents that require manager role — employee attempting these is an unauthorized_action
 const MANAGER_ONLY_INTENTS = new Set([
   'build_schedule',
+  'distribute_schedule',
   'approve_time_off',
   'deny_time_off',
   'approve_swap',
   'deny_swap',
   'request_emergency_coverage',
+  'homebase_edit',
   'operational_question',
 ]);
 
@@ -75,8 +78,14 @@ export async function routeIntent(
     }
   }
 
-  // Pre-classification: manager check — coverage session awaiting name reply
+  // Pre-classification: manager checks (edit confirmation, coverage session)
   if (contact.role === 'manager') {
+    const pendingEdit = await getPendingEdit(contact.company_id, contact.matched_identifier);
+    if (pendingEdit) {
+      await handleEditConfirmation(message, contact, pendingEdit);
+      return;
+    }
+
     const session = await getActiveCoverageSession(contact.company_id, contact.matched_identifier);
     if (session && session.state === 'awaiting_names') {
       await handleManagerCoverageReply(message, contact, session);
@@ -150,9 +159,18 @@ export async function routeIntent(
         await handleEmergencyCoverage(message, contact, classification.extracted);
         break;
 
-      case 'general_question':
+      case 'distribute_schedule':
+        await handleDistributeSchedule(message, contact, classification.extracted);
+        break;
+
+      case 'homebase_edit':
+        await handleHomebaseEdit(message, contact, classification.extracted);
+        break;
+
+      case 'operational_query':
       case 'operational_question':
-        await handleGeneralQuestion(message, contact);
+      case 'general_question':
+        await handleOperationalQuery(message, contact, classification.extracted);
         break;
 
       default:
@@ -187,21 +205,6 @@ async function loadCompanyContext(companyId: string): Promise<string> {
   if (profile?.manager_priorities) lines.push(`Manager priorities: ${profile.manager_priorities}`);
 
   return lines.join('\n');
-}
-
-async function handleGeneralQuestion(
-  message: InboundMessage,
-  contact: VerifiedContact
-): Promise<void> {
-  const { generateReply } = await import('../ai/claude');
-
-  const systemPrompt = `You are Aegis, an AI workforce assistant for a company that uses Homebase scheduling software. ` +
-    `You are speaking with ${contact.name}, a ${contact.role}. ` +
-    `Answer operational workforce questions concisely. ` +
-    `If a question requires access to specific data you cannot see, say so and ask the manager to check Homebase directly.`;
-
-  const responseText = await generateReply(systemPrompt, message.body, []);
-  await reply(contact, message, responseText);
 }
 
 async function logSecurityUnauthorized(

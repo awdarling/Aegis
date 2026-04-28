@@ -61,17 +61,20 @@ function buildClassifySystemPrompt(role: 'employee' | 'manager', companyContext:
     'respond_swap_accept',
     'respond_swap_decline',
     'general_question',
+    'operational_query',
   ];
 
   const managerIntents = [
     ...employeeIntents,
     'build_schedule',
+    'distribute_schedule',
     'approve_time_off',
     'deny_time_off',
     'approve_swap',
     'deny_swap',
     'request_emergency_coverage',
-    'operational_question',
+    'operational_query',
+    'homebase_edit',
   ];
 
   const allowedIntents = role === 'manager' ? managerIntents : employeeIntents;
@@ -90,8 +93,10 @@ Respond with ONLY valid JSON in this exact shape — no markdown, no explanation
   "extracted": {
     // Any structured data you can extract from the message.
     // For time_off: { "start_date": "YYYY-MM-DD", "end_date": "YYYY-MM-DD", "reason": "..." }
-    // For swap: { "shift_date": "YYYY-MM-DD", "shift_name": "..." }
-    // For schedule: { "week_start": "YYYY-MM-DD" }
+    // For swap: { "shift_date": "YYYY-MM-DD", "shift_name": "...", "target_employee_name": "..." }
+    // For schedule/distribute_schedule: { "week_start": "YYYY-MM-DD" }
+    // For homebase_edit: { "entity_type": "employee|event|policy|wage_rate|shift_type", "entity_name": "...", "field": "...", "new_value": "..." }
+    // For operational_query: {}
     // Otherwise: {}
   }
 }`;

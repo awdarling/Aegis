@@ -12,8 +12,10 @@ export function verifyTwilioSignature(req: Request, res: Response, next: NextFun
     return;
   }
 
-  // Reconstruct the full URL Twilio signed — must match what Twilio sees
-  const url = `${req.protocol}://${req.get('host')}${req.originalUrl}`;
+  // Reconstruct the full public URL Twilio signed. Behind Railway's proxy
+  // req.protocol/host reflect the internal address, not what Twilio sees, so
+  // we use BASE_URL instead.
+  const url = `${env.BASE_URL.replace(/\/$/, '')}${req.originalUrl}`;
   const params = req.body as Record<string, string>;
 
   const valid = twilio.validateRequest(

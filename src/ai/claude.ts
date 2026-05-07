@@ -57,6 +57,7 @@ export async function generateReply(
 function buildClassifySystemPrompt(role: 'employee' | 'manager', companyContext: string): string {
   const employeeIntents = [
     'submit_time_off',
+    'update_availability',
     'initiate_swap',
     'respond_swap_accept',
     'respond_swap_decline',
@@ -73,6 +74,7 @@ function buildClassifySystemPrompt(role: 'employee' | 'manager', companyContext:
     'approve_swap',
     'deny_swap',
     'request_emergency_coverage',
+    'initiate_onboarding',
     'operational_query',
     'homebase_edit',
   ];
@@ -96,6 +98,8 @@ Respond with ONLY valid JSON in this exact shape — no markdown, no explanation
     // For swap: { "shift_date": "YYYY-MM-DD", "shift_name": "...", "target_employee_name": "..." }
     // For schedule/distribute_schedule: { "week_start": "YYYY-MM-DD" }
     // For homebase_edit: { "entity_type": "employee|event|policy|wage_rate|shift_type", "entity_name": "...", "field": "...", "new_value": "..." }
+    // For initiate_onboarding: { "employee_name": "..." } if targeting one employee, or {} for all
+    // For update_availability: {}
     // For operational_query: {}
     // Otherwise: {}
   }

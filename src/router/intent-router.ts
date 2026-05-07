@@ -31,6 +31,16 @@ import {
   getActiveCoverageSession,
   getActiveOutreach,
 } from '../workflows/emergency-coverage';
+import {
+  getOnboardingSession,
+  handleOnboardingResponse,
+  handleInitiateOnboarding,
+  getPendingAvailConfirm,
+  handleAvailabilityConfirmResponse,
+  handleUpdateAvailability,
+  getPendingManagerAvailApproval,
+  handleManagerAvailabilityApproval,
+} from '../workflows/employee-onboarding';
 
 // Intents that require manager role — employee attempting these is an unauthorized_action
 const MANAGER_ONLY_INTENTS = new Set([
@@ -41,6 +51,7 @@ const MANAGER_ONLY_INTENTS = new Set([
   'approve_swap',
   'deny_swap',
   'request_emergency_coverage',
+  'initiate_onboarding',
   'homebase_edit',
   'operational_question',
 ]);
@@ -76,6 +87,20 @@ export async function routeIntent(
       await handleSwapConfirmation(message, contact, pendingSwap);
       return;
     }
+
+    // Check for pending availability update confirmation (employee confirming parsed availability)
+    const pendingAvailConfirm = await getPendingAvailConfirm(contact.company_id, contact.employee_id);
+    if (pendingAvailConfirm) {
+      await handleAvailabilityConfirmResponse(message, contact, pendingAvailConfirm);
+      return;
+    }
+
+    // Check for active onboarding session
+    const onboardingSession = await getOnboardingSession(contact.company_id, contact.employee_id);
+    if (onboardingSession) {
+      await handleOnboardingResponse(message, contact, onboardingSession);
+      return;
+    }
   }
 
   // Pre-classification: manager checks (edit confirmation, coverage session)
@@ -89,6 +114,13 @@ export async function routeIntent(
     const session = await getActiveCoverageSession(contact.company_id, contact.matched_identifier);
     if (session && session.state === 'awaiting_names') {
       await handleManagerCoverageReply(message, contact, session);
+      return;
+    }
+
+    // Check for pending employee availability approval
+    const pendingAvailApproval = await getPendingManagerAvailApproval(contact.company_id);
+    if (pendingAvailApproval) {
+      await handleManagerAvailabilityApproval(message, contact, pendingAvailApproval);
       return;
     }
   }
@@ -157,6 +189,14 @@ export async function routeIntent(
 
       case 'request_emergency_coverage':
         await handleEmergencyCoverage(message, contact, classification.extracted);
+        break;
+
+      case 'initiate_onboarding':
+        await handleInitiateOnboarding(message, contact, classification.extracted);
+        break;
+
+      case 'update_availability':
+        await handleUpdateAvailability(message, contact, classification.extracted);
         break;
 
       case 'distribute_schedule':

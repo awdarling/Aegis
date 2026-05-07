@@ -2,19 +2,24 @@ import { supabase } from '../db/client';
 import { logActivity } from '../logger/activity-log';
 import { reply } from '../messaging/reply';
 import { dispatchOutreach } from '../workflows/emergency-coverage';
+import { checkStaleOnboardingSessions } from '../workflows/employee-onboarding';
 import type { ActiveOutreach, CoverageSession, OutreachResult } from '../workflows/emergency-coverage';
 import type { Employee } from '../db/types';
 import type { InboundMessage, VerifiedContact } from '../security/types';
 
 const POLL_INTERVAL_MS = 60_000;
+const ONBOARDING_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000; // daily
 
 // ── Scheduler entry point ─────────────────────────────────────────────────────
 
 export function startCoverageTimeoutScheduler(): void {
   console.log('[coverage-timeout] scheduler started — polling every 60 seconds');
-  // Run once immediately to catch stale records from before a restart
   void runPollCycle();
   setInterval(() => void runPollCycle(), POLL_INTERVAL_MS);
+
+  console.log('[onboarding-timeout] daily stale-session check started');
+  void checkStaleOnboardingSessions();
+  setInterval(() => void checkStaleOnboardingSessions(), ONBOARDING_CHECK_INTERVAL_MS);
 }
 
 // ── Poll cycle ────────────────────────────────────────────────────────────────

@@ -286,6 +286,35 @@ export interface Database {
           channel_value: string;
         };
       };
+      time_clock_integrations: {
+        Row: {
+          id: string;
+          company_id: string;
+          provider: string;
+          api_key: string | null;
+          api_base_url: string | null;
+          location_id: string | null;
+          active: boolean;
+          created_at: string;
+          updated_at: string;
+        };
+      };
+      payroll_integrations: {
+        Row: {
+          id: string;
+          company_id: string;
+          provider: string;
+          api_key: string | null;
+          company_identifier: string | null;
+          pay_period: 'weekly' | 'biweekly' | 'semimonthly';
+          payroll_check_day: number;
+          auto_check_enabled: boolean;
+          last_run_at: string | null;
+          active: boolean;
+          created_at: string;
+          updated_at: string;
+        };
+      };
     };
   };
 }

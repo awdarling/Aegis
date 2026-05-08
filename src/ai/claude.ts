@@ -77,6 +77,7 @@ function buildClassifySystemPrompt(role: 'employee' | 'manager', companyContext:
     'initiate_onboarding',
     'operational_query',
     'homebase_edit',
+    'run_payroll_check',
   ];
 
   const allowedIntents = role === 'manager' ? managerIntents : employeeIntents;
@@ -101,6 +102,7 @@ Respond with ONLY valid JSON in this exact shape — no markdown, no explanation
     // For initiate_onboarding: { "employee_name": "..." } if targeting one employee, or {} for all
     // For update_availability: {}
     // For operational_query: {}
+    // For run_payroll_check: { "period_start": "YYYY-MM-DD", "period_end": "YYYY-MM-DD" }
     // Otherwise: {}
   }
 }`;

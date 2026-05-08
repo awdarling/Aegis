@@ -3,6 +3,7 @@ import { logActivity } from '../logger/activity-log';
 import { reply } from '../messaging/reply';
 import { generateReply } from '../ai/claude';
 import { computeWageEstimate } from '../lib/schedule-simulator';
+import { handleWageRateSync } from './payroll';
 import type { InboundMessage, VerifiedContact } from '../security/types';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -574,6 +575,17 @@ async function executeEdit(pending: PendingEdit, companyId: string): Promise<voi
   }
 
   await supabase.from(pending.table).update({ [pending.field]: newValue }).eq('id', pending.entity_id).eq('company_id', companyId);
+
+  // Sync wage rate to payroll provider when individual_wage is updated on an employee
+  if (pending.table === 'employees' && pending.field === 'individual_wage' && typeof newValue === 'number') {
+    void handleWageRateSync({
+      companyId,
+      employeeId: pending.entity_id,
+      employeeName: pending.entity_name,
+      newRate: newValue,
+      changedBy: pending.manager_id,
+    });
+  }
 
   // For schedule assignment edits: recompute wages
   if (pending.table === 'schedules' && pending.schedule_id) {

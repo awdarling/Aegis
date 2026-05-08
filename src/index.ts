@@ -5,6 +5,7 @@ import { emailWebhook } from './webhooks/email';
 import { smsWebhook } from './webhooks/sms';
 import { decisionWebhook } from './webhooks/decision';
 import { startCoverageTimeoutScheduler } from './scheduler/coverage-timeout';
+import { startPayrollScheduler } from './scheduler/payroll-scheduler';
 
 const app = express();
 
@@ -28,4 +29,5 @@ app.get('/health', (_req, res) => {
 app.listen(env.PORT, () => {
   console.log(`Aegis running on port ${env.PORT} [${env.NODE_ENV}]`);
   startCoverageTimeoutScheduler();
+  startPayrollScheduler();
 });

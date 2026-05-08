@@ -31,6 +31,7 @@ import {
   getActiveCoverageSession,
   getActiveOutreach,
 } from '../workflows/emergency-coverage';
+import { handlePayrollCheck } from '../workflows/payroll';
 import {
   getOnboardingSession,
   handleOnboardingResponse,
@@ -54,6 +55,7 @@ const MANAGER_ONLY_INTENTS = new Set([
   'initiate_onboarding',
   'homebase_edit',
   'operational_question',
+  'run_payroll_check',
 ]);
 
 export async function routeIntent(
@@ -205,6 +207,10 @@ export async function routeIntent(
 
       case 'homebase_edit':
         await handleHomebaseEdit(message, contact, classification.extracted);
+        break;
+
+      case 'run_payroll_check':
+        await handlePayrollCheck(message, contact, classification.extracted);
         break;
 
       case 'operational_query':

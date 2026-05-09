@@ -1,5 +1,6 @@
 import { supabase } from '../db/client';
 import type { Channel, InboundMessage, VerifiedContact } from './types';
+import { checkQuriaStaff } from './quria-verification';
 
 // Step 1: Given the inbound recipient channel value, resolve the company_id.
 // Returns null if no matching channel is configured — caller logs and drops.
@@ -111,7 +112,25 @@ export async function verifySender(message: InboundMessage): Promise<Verificatio
     return { ok: false, reason: 'unknown_channel' };
   }
 
-  // 2. Look up the sender within that company
+  // 2. Check if sender is a Quria staff member (cross-company admin access)
+  const quriaStaff = await checkQuriaStaff({ channel: message.channel, identifier: message.sender });
+  if (quriaStaff && quriaStaff.active) {
+    return {
+      ok: true,
+      contact: {
+        role: 'quria_admin',
+        company_id: companyId,
+        employee_id: null,
+        user_id: null,
+        name: quriaStaff.name,
+        matched_identifier: message.sender,
+        channel: message.channel,
+        quria_staff_email: quriaStaff.email,
+      },
+    };
+  }
+
+  // 3. Look up the sender as a normal employee or manager within that company
   const contact = await lookupContact(message.sender, companyId, message.channel);
 
   if (!contact) {

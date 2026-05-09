@@ -2,6 +2,7 @@ import { supabase } from '../db/client';
 
 interface ActivityEntry {
   company_id: string;
+  actor?: 'aegis' | 'quria_admin';
   action: string;
   entity_type?: string;
   entity_id?: string;
@@ -12,7 +13,7 @@ interface ActivityEntry {
 export async function logActivity(entry: ActivityEntry): Promise<void> {
   const { error } = await supabase.from('activity_log').insert({
     company_id: entry.company_id,
-    actor: 'aegis',
+    actor: entry.actor ?? 'aegis',
     action: entry.action,
     entity_type: entry.entity_type ?? null,
     entity_id: entry.entity_id ?? null,

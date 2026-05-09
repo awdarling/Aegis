@@ -1,5 +1,5 @@
 export type Channel = 'email' | 'sms';
-export type ContactRole = 'employee' | 'manager';
+export type ContactRole = 'employee' | 'manager' | 'quria_admin';
 
 export interface VerifiedContact {
   role: ContactRole;
@@ -11,6 +11,8 @@ export interface VerifiedContact {
   // The normalized identifier that matched
   matched_identifier: string;
   channel: Channel;
+  // Populated only for quria_admin — used for audit trail metadata
+  quria_staff_email?: string;
 }
 
 export interface InboundMessage {

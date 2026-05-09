@@ -58,6 +58,11 @@ const MANAGER_ONLY_INTENTS = new Set([
   'run_payroll_check',
 ]);
 
+// Placeholder for future cross-company workflows available only to Quria staff.
+// quria_admin always has all MANAGER_ONLY_INTENTS as well.
+// ── Quria-specific routing will live here when built ──────────────────────────
+const QURIA_ONLY_INTENTS = new Set<string>();
+
 export async function routeIntent(
   message: InboundMessage,
   contact: VerifiedContact
@@ -106,7 +111,8 @@ export async function routeIntent(
   }
 
   // Pre-classification: manager checks (edit confirmation, coverage session)
-  if (contact.role === 'manager') {
+  // quria_admin has all manager capabilities and runs the same pre-checks
+  if (contact.role === 'manager' || contact.role === 'quria_admin') {
     const pendingEdit = await getPendingEdit(contact.company_id, contact.matched_identifier);
     if (pendingEdit) {
       await handleEditConfirmation(message, contact, pendingEdit);
@@ -130,9 +136,12 @@ export async function routeIntent(
   // Load company profile for context injection into the classifier
   const companyContext = await loadCompanyContext(contact.company_id);
 
-  const classification = await classifyIntent(message.body, contact.role, companyContext);
+  // quria_admin uses the full manager intent set for classification
+  const classifyRole = contact.role === 'quria_admin' ? 'manager' : contact.role;
+  const classification = await classifyIntent(message.body, classifyRole, companyContext);
 
-  // Authorization check — log and reply if employee tries a manager-only action
+  // Authorization check — block employees attempting manager-only actions.
+  // quria_admin is never blocked: they have all manager intents plus QURIA_ONLY_INTENTS.
   if (contact.role === 'employee' && MANAGER_ONLY_INTENTS.has(classification.intent)) {
     await logSecurityUnauthorized(message, contact);
     await reply(contact, message, "I'm sorry, I can't help with that. Please contact your manager directly.");
@@ -141,6 +150,7 @@ export async function routeIntent(
 
   await logActivity({
     company_id: contact.company_id,
+    actor: contact.role === 'quria_admin' ? 'quria_admin' : 'aegis',
     action: 'intent_classified',
     summary: `${contact.role} ${contact.name} → intent: ${classification.intent} (${classification.confidence})`,
     metadata: {
@@ -148,6 +158,10 @@ export async function routeIntent(
       confidence: classification.confidence,
       channel: message.channel,
       sender: message.sender,
+      ...(contact.role === 'quria_admin' && {
+        quria_staff_email: contact.quria_staff_email,
+        target_company_id: contact.company_id,
+      }),
     },
   });
 

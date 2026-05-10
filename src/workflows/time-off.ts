@@ -440,6 +440,15 @@ async function notifyManager(
     policies
   );
 
+  // Persist recommendation so Homebase can display it
+  await supabase
+    .from('time_off_requests')
+    .update({
+      aegis_recommendation: recommendation.recommendation,
+      aegis_reasoning: recommendation.reasoning,
+    })
+    .eq('id', requestId);
+
   // Build and send manager email
   const { subject, text, html } = buildManagerEmail({
     employeeName: employee.name,

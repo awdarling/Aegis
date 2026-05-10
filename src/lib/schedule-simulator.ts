@@ -324,6 +324,8 @@ export async function runSimulation(input: SimulationInput): Promise<SimulationR
           requested_at: new Date().toISOString(),
           decided_at: null,
           decided_by: null,
+          aegis_recommendation: null,
+          aegis_reasoning: null,
         },
       ]
     : baselineTO;

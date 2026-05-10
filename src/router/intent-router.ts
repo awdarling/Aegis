@@ -4,7 +4,7 @@ import { reply } from '../messaging/reply';
 import { supabase } from '../db/client';
 import type { InboundMessage, VerifiedContact } from '../security/types';
 
-// Workflow handlers — stubs until each phase is built
+// Workflow handlers
 import {
   handleSubmitTimeOff,
   handleApproveTimeOff,
@@ -13,7 +13,12 @@ import {
   getPendingTimeOff,
 } from '../workflows/time-off';
 import { handleBuildSchedule, handleDistributeSchedule } from '../workflows/schedule-build';
-import { handleOperationalQuery, handleHomebaseEdit, handleEditConfirmation, getPendingEdit } from '../workflows/operational-query';
+import {
+  handleOperationalQuery,
+  handleHomebaseEdit,
+  handleEditConfirmation,
+  getPendingEdit,
+} from '../workflows/operational-query';
 import {
   handleInitiateSwap,
   handleRespondSwap,
@@ -42,8 +47,15 @@ import {
   getPendingManagerAvailApproval,
   handleManagerAvailabilityApproval,
 } from '../workflows/employee-onboarding';
+import {
+  handleBroadcast,
+  handleBroadcastConfirmation,
+  getActiveBroadcastSession,
+} from '../workflows/broadcast';
 
-// Intents that require manager role — employee attempting these is an unauthorized_action
+// ── Permission sets ───────────────────────────────────────────────────────────
+
+// Intents that require manager role — employees attempting these are blocked.
 const MANAGER_ONLY_INTENTS = new Set([
   'build_schedule',
   'distribute_schedule',
@@ -54,20 +66,22 @@ const MANAGER_ONLY_INTENTS = new Set([
   'request_emergency_coverage',
   'initiate_onboarding',
   'homebase_edit',
-  'operational_question',
   'run_payroll_check',
 ]);
 
-// Placeholder for future cross-company workflows available only to Quria staff.
-// quria_admin always has all MANAGER_ONLY_INTENTS as well.
-// ── Quria-specific routing will live here when built ──────────────────────────
-const QURIA_ONLY_INTENTS = new Set<string>();
+// Intents available only to quria_admin — managers attempting these are blocked.
+const QURIA_ONLY_INTENTS = new Set([
+  'broadcast_message',
+  'quria_diagnostic',
+]);
+
+// ── Main router ───────────────────────────────────────────────────────────────
 
 export async function routeIntent(
   message: InboundMessage,
   contact: VerifiedContact
 ): Promise<void> {
-  // Pre-classification: employee checks (TO confirmation, active outreach)
+  // Pre-classification: employee session checks
   if (contact.role === 'employee' && contact.employee_id) {
     const pendingTO = await getPendingTimeOff(contact.company_id, contact.employee_id);
     if (pendingTO) {
@@ -81,28 +95,24 @@ export async function routeIntent(
       return;
     }
 
-    // Check for active swap outreach (employee being asked to take a shift)
     const swapOutreach = await getActiveSwapOutreach(contact.company_id, contact.employee_id);
     if (swapOutreach) {
       await handleSwapOutreachResponse(message, contact, swapOutreach);
       return;
     }
 
-    // Check for pending swap confirmation (employee confirming their own request)
     const pendingSwap = await getPendingSwap(contact.company_id, contact.employee_id);
     if (pendingSwap) {
       await handleSwapConfirmation(message, contact, pendingSwap);
       return;
     }
 
-    // Check for pending availability update confirmation (employee confirming parsed availability)
     const pendingAvailConfirm = await getPendingAvailConfirm(contact.company_id, contact.employee_id);
     if (pendingAvailConfirm) {
       await handleAvailabilityConfirmResponse(message, contact, pendingAvailConfirm);
       return;
     }
 
-    // Check for active onboarding session
     const onboardingSession = await getOnboardingSession(contact.company_id, contact.employee_id);
     if (onboardingSession) {
       await handleOnboardingResponse(message, contact, onboardingSession);
@@ -110,9 +120,20 @@ export async function routeIntent(
     }
   }
 
-  // Pre-classification: manager checks (edit confirmation, coverage session)
-  // quria_admin has all manager capabilities and runs the same pre-checks
+  // Pre-classification: manager and quria_admin session checks
   if (contact.role === 'manager' || contact.role === 'quria_admin') {
+    // Quria-specific: broadcast confirmation session
+    if (contact.role === 'quria_admin') {
+      const broadcastSession = await getActiveBroadcastSession(
+        contact.company_id,
+        contact.matched_identifier
+      );
+      if (broadcastSession) {
+        await handleBroadcastConfirmation(message, contact, broadcastSession);
+        return;
+      }
+    }
+
     const pendingEdit = await getPendingEdit(contact.company_id, contact.matched_identifier);
     if (pendingEdit) {
       await handleEditConfirmation(message, contact, pendingEdit);
@@ -125,7 +146,6 @@ export async function routeIntent(
       return;
     }
 
-    // Check for pending employee availability approval
     const pendingAvailApproval = await getPendingManagerAvailApproval(contact.company_id);
     if (pendingAvailApproval) {
       await handleManagerAvailabilityApproval(message, contact, pendingAvailApproval);
@@ -133,18 +153,24 @@ export async function routeIntent(
     }
   }
 
-  // Load company profile for context injection into the classifier
+  // Classify intent — each role gets its own allowed intent list
   const companyContext = await loadCompanyContext(contact.company_id);
+  const classification = await classifyIntent(message.body, contact.role, companyContext);
 
-  // quria_admin uses the full manager intent set for classification
-  const classifyRole = contact.role === 'quria_admin' ? 'manager' : contact.role;
-  const classification = await classifyIntent(message.body, classifyRole, companyContext);
-
-  // Authorization check — block employees attempting manager-only actions.
-  // quria_admin is never blocked: they have all manager intents plus QURIA_ONLY_INTENTS.
+  // Authorization: employee attempting a manager-only action
   if (contact.role === 'employee' && MANAGER_ONLY_INTENTS.has(classification.intent)) {
     await logSecurityUnauthorized(message, contact);
-    await reply(contact, message, "I'm sorry, I can't help with that. Please contact your manager directly.");
+    await reply(
+      contact,
+      message,
+      "That's something your manager handles. Contact them directly if you need help with this."
+    );
+    return;
+  }
+
+  // Authorization: manager attempting a quria-only action
+  if (contact.role === 'manager' && QURIA_ONLY_INTENTS.has(classification.intent)) {
+    await reply(contact, message, 'That action requires Quria administrator access.');
     return;
   }
 
@@ -227,22 +253,32 @@ export async function routeIntent(
         await handlePayrollCheck(message, contact, classification.extracted);
         break;
 
+      case 'broadcast_message':
+        await handleBroadcast(message, contact, classification.extracted);
+        break;
+
+      case 'quria_diagnostic':
+        await reply(contact, message, 'Quria diagnostic is not yet implemented.');
+        break;
+
       case 'operational_query':
-      case 'operational_question':
       case 'general_question':
         await handleOperationalQuery(message, contact, classification.extracted);
         break;
 
       default:
-        await reply(contact, message,
-          "I didn't quite understand that. Could you rephrase? " +
-          'For help, reply with "help".'
+        await reply(
+          contact,
+          message,
+          "I didn't quite understand that. Could you rephrase? For help, reply with \"help\"."
         );
     }
   } catch (err) {
     console.error('[router] workflow error:', err);
-    await reply(contact, message,
-      "Something went wrong on my end. Please try again in a moment."
+    await reply(
+      contact,
+      message,
+      'Something went wrong on my end. Please try again in a moment.'
     );
   }
 }
@@ -251,14 +287,24 @@ export async function routeIntent(
 
 async function loadCompanyContext(companyId: string): Promise<string> {
   const [companyRes, profileRes] = await Promise.all([
-    supabase.from('companies').select('name, timezone, industry').eq('id', companyId).single(),
-    supabase.from('company_profiles').select('business_type, description, operating_hours, manager_priorities').eq('company_id', companyId).maybeSingle(),
+    supabase
+      .from('companies')
+      .select('name, timezone, industry')
+      .eq('id', companyId)
+      .single(),
+    supabase
+      .from('company_profiles')
+      .select('business_type, description, operating_hours, manager_priorities')
+      .eq('company_id', companyId)
+      .maybeSingle(),
   ]);
 
   const company = companyRes.data;
   const profile = profileRes.data;
 
-  const lines = [`Company: ${company?.name ?? 'Unknown'} (timezone: ${company?.timezone ?? 'America/New_York'})`];
+  const lines = [
+    `Company: ${company?.name ?? 'Unknown'} (timezone: ${company?.timezone ?? 'America/New_York'})`,
+  ];
   if (company?.industry) lines.push(`Industry: ${company.industry}`);
   if (profile?.business_type) lines.push(`Business type: ${profile.business_type}`);
   if (profile?.operating_hours) lines.push(`Operating hours: ${profile.operating_hours}`);

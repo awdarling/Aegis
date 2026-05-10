@@ -284,7 +284,14 @@ Available Homebase tables (all scoped to this company):
     .map(([table, rows]) => `${table} (${rows.length} records):\n${JSON.stringify(rows, null, 0).slice(0, 4000)}`)
     .join('\n\n');
 
-  const answerSystem = `${personality}\n\nToday is ${today}. Answer using the Homebase data below. Be direct and specific. If the data doesn't contain what's needed, say so clearly.`;
+  const answerSystem =
+    contact.role === 'employee'
+      ? `${personality}\n\nToday is ${today}. ` +
+        `You are answering a question from ${contact.name}, an employee. ` +
+        `Only answer questions about their own schedule, their own time off, their own availability, and their own shifts. ` +
+        `Do not reveal other employees' hours, wages, availability, or personal details. ` +
+        `Answer using the Homebase data below. Be direct and specific. If the data doesn't contain what's needed, say so clearly.`
+      : `${personality}\n\nToday is ${today}. Answer using the Homebase data below. Be direct and specific. If the data doesn't contain what's needed, say so clearly.`;
 
   const answer = await generateReply(answerSystem, `Question: ${message.body}\n\nData:\n${dataContext || 'No relevant data found.'}`, []);
 

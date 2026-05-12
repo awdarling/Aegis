@@ -16,11 +16,17 @@ export async function checkQuriaStaff(params: {
   identifier: string;
 }): Promise<QuriaStaffRow | null> {
   const field = params.channel === 'sms' ? 'contact_phone' : 'email';
+  const identifier =
+    params.channel === 'sms'
+      ? params.identifier.trim()
+      : params.identifier.trim().toLowerCase();
+
+  console.log(`[quria-verification] checking ${field}=${identifier}`);
 
   const { data, error } = await supabase
     .from('quria_staff')
     .select('id, email, name, contact_phone, active')
-    .eq(field, params.identifier)
+    .eq(field, identifier)
     .maybeSingle();
 
   if (error) {

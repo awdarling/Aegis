@@ -5,6 +5,12 @@ import { env } from '../config/env';
 // Twilio signs every webhook with HMAC-SHA1 using the auth token.
 // Reject any request that doesn't pass this check — not just log it.
 export function verifyTwilioSignature(req: Request, res: Response, next: NextFunction): void {
+  if (process.env.SKIP_TWILIO_VERIFICATION === 'true') {
+    console.warn('[WARNING] Twilio signature verification BYPASSED — test mode only. Never use in production.');
+    next();
+    return;
+  }
+
   const signature = req.headers['x-twilio-signature'] as string | undefined;
 
   if (!signature) {

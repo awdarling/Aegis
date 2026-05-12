@@ -23,16 +23,23 @@ export async function checkQuriaStaff(params: {
 
   console.log(`[quria-verification] checking ${field}=${identifier}`);
 
-  const { data, error } = await supabase
-    .from('quria_staff')
-    .select('id, email, name, contact_phone, active')
-    .eq(field, identifier)
-    .maybeSingle();
+  try {
+    const { data, error } = await supabase
+      .from('quria_staff')
+      .select('id, email, name, contact_phone, active')
+      .eq(field, identifier)
+      .eq('active', true)
+      .limit(1)
+      .maybeSingle();
 
-  if (error) {
-    console.error('[quria-verification] lookup error:', error.message);
+    if (error) {
+      console.error('[quria-verification] lookup error:', error.message);
+      return null;
+    }
+
+    return data ?? null;
+  } catch (err) {
+    console.error('[quria-verification] unexpected error:', err);
     return null;
   }
-
-  return data ?? null;
 }

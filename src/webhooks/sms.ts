@@ -22,24 +22,37 @@ smsWebhook.post('/', verifyTwilioSignature, async (req, res) => {
   // We return 200 before awaiting full processing, then process async
   res.status(200).type('text/xml').send('<Response></Response>');
 
-  if (!message.sender || !message.recipient || !message.body) return;
+  console.log('[sms] request received, starting async processing');
 
-  const verification = await verifySender(message);
-  if (!verification.ok) {
-    // Already logged to security_events — do nothing else
-    return;
+  try {
+    if (!message.sender || !message.recipient || !message.body) {
+      console.log('[sms] skipping — missing sender/recipient/body');
+      return;
+    }
+
+    console.log('[sms] verifying sender:', message.sender);
+    const verification = await verifySender(message);
+    if (!verification.ok) {
+      console.log('[sms] verification failed:', verification.reason);
+      return;
+    }
+    console.log('[sms] sender verified:', JSON.stringify(verification.contact));
+
+    await saveConversation({
+      company_id: verification.contact.company_id,
+      channel: 'sms',
+      direction: 'inbound',
+      content: message.body,
+      from_address: message.sender,
+      to_address: message.recipient,
+    });
+
+    console.log('[sms] routing message, body:', message.body);
+    await routeIntent(message, verification.contact);
+    console.log('[sms] routing complete');
+  } catch (err) {
+    console.error('[sms] FATAL unhandled error:', err);
   }
-
-  await saveConversation({
-    company_id: verification.contact.company_id,
-    channel: 'sms',
-    direction: 'inbound',
-    content: message.body,
-    from_address: message.sender,
-    to_address: message.recipient,
-  });
-
-  await routeIntent(message, verification.contact);
 });
 
 function normalizePhone(raw: string): string {

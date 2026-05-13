@@ -28,7 +28,7 @@ export function htmlFromText(text: string): string {
   return `<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 14px; line-height: 1.6; color: #1a1a1a; max-width: 600px; margin: 0 auto; padding: 24px;">
   ${paragraphs}
   <div style="margin-top: 32px; padding-top: 16px; border-top: 1px solid #e5e5e5; font-size: 12px; color: #888;">
-    Aegis · Quria Solutions · <a href="https://homebase.quriasolutions.com" style="color: #6366f1;">View in Homebase</a>
+    Aegis · Quria Solutions · <a href="https://homebase-liart.vercel.app" style="color: #6366f1;">View in Homebase</a>
   </div>
 </div>`;
 }

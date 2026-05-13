@@ -11,7 +11,7 @@ interface SmsOptions {
   company_id: string;
 }
 
-export async function sendSms(options: SmsOptions): Promise<void> {
+export async function sendSms(options: SmsOptions): Promise<boolean> {
   try {
     await twilioClient.messages.create({
       to: options.to,
@@ -27,7 +27,9 @@ export async function sendSms(options: SmsOptions): Promise<void> {
       from_address: options.from,
       to_address: options.to,
     });
+    return true;
   } catch (err) {
     console.error('[sms] send failed:', err);
+    return false;
   }
 }

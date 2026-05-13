@@ -7,6 +7,14 @@ import { decisionWebhook } from './webhooks/decision';
 import { startCoverageTimeoutScheduler } from './scheduler/coverage-timeout';
 import { startPayrollScheduler } from './scheduler/payroll-scheduler';
 
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[unhandledRejection] Unhandled rejection at:', promise, 'reason:', reason);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('[uncaughtException]', err);
+});
+
 const app = express();
 
 // Raw body needed for Twilio signature verification — must come before json()

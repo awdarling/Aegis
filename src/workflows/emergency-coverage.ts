@@ -10,7 +10,7 @@ import type { Employee, Availability, Event } from '../db/types';
 // ── Internal schedule types ───────────────────────────────────────────────────
 // These define the expected shape of schedules.data — schedule-build must match.
 
-interface ScheduleEntry {
+interface ScheduleAssignment {
   date: string;
   employee_id: string;
   employee_name: string;
@@ -18,11 +18,20 @@ interface ScheduleEntry {
   role: string;
   start_time: string;
   end_time: string;
-  hours?: number;
+  hours: number;
+}
+
+interface ScheduleGap {
+  date: string;
+  shift_name: string;
+  role: string;
+  start_time: string;
+  end_time: string;
 }
 
 interface ScheduleData {
-  shifts: ScheduleEntry[];
+  assignments: ScheduleAssignment[];
+  gaps?: ScheduleGap[];
 }
 
 // ── Public state types ────────────────────────────────────────────────────────
@@ -287,7 +296,7 @@ async function findShiftInfo(
 ): Promise<ShiftInfo | null> {
   // Best case: find the called-out employee's shift in the schedule
   if (scheduleData && calledOutEmployeeId) {
-    const entry = scheduleData.shifts.find(
+    const entry = scheduleData.assignments.find(
       s => s.employee_id === calledOutEmployeeId && s.date === shiftDate
     );
     if (entry) {
@@ -296,7 +305,7 @@ async function findShiftInfo(
         role: entry.role,
         start_time: entry.start_time,
         end_time: entry.end_time,
-        hours: entry.hours ?? computeShiftHours(entry.start_time, entry.end_time),
+        hours: entry.hours,
       };
     }
   }
@@ -369,9 +378,8 @@ async function findEmployeeByName(companyId: string, name: string): Promise<Empl
 function buildWeeklyHoursMap(scheduleData: ScheduleData | null): Map<string, number> {
   const map = new Map<string, number>();
   if (!scheduleData) return map;
-  for (const s of scheduleData.shifts) {
-    const h = s.hours ?? computeShiftHours(s.start_time, s.end_time);
-    map.set(s.employee_id, (map.get(s.employee_id) ?? 0) + h);
+  for (const a of scheduleData.assignments) {
+    map.set(a.employee_id, (map.get(a.employee_id) ?? 0) + a.hours);
   }
   return map;
 }
@@ -379,8 +387,8 @@ function buildWeeklyHoursMap(scheduleData: ScheduleData | null): Map<string, num
 function buildScheduledTodaySet(scheduleData: ScheduleData | null, date: string): Set<string> {
   const set = new Set<string>();
   if (!scheduleData) return set;
-  for (const s of scheduleData.shifts) {
-    if (s.date === date) set.add(s.employee_id);
+  for (const a of scheduleData.assignments) {
+    if (a.date === date) set.add(a.employee_id);
   }
   return set;
 }

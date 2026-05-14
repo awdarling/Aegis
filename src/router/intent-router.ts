@@ -46,6 +46,8 @@ import {
   handleUpdateAvailability,
   getPendingManagerAvailApproval,
   handleManagerAvailabilityApproval,
+  getOnboardingFanoutPending,
+  handleOnboardingFanoutConfirm,
 } from '../workflows/employee-onboarding';
 import {
   handleBroadcast,
@@ -55,7 +57,10 @@ import {
 
 // ── Permission sets ───────────────────────────────────────────────────────────
 
-// Intents that require manager role — employees attempting these are blocked.
+// Intents that require an elevated role (manager OR quria_admin) — employees
+// attempting these are blocked. Both managers and quria_admins are permitted;
+// the check below only filters out employees. `initiate_onboarding` is allowed
+// for both manager and quria_admin.
 const MANAGER_ONLY_INTENTS = new Set([
   'build_schedule',
   'distribute_schedule',
@@ -149,6 +154,15 @@ export async function routeIntent(
     const pendingAvailApproval = await getPendingManagerAvailApproval(contact.company_id);
     if (pendingAvailApproval) {
       await handleManagerAvailabilityApproval(message, contact, pendingAvailApproval);
+      return;
+    }
+
+    const pendingFanout = await getOnboardingFanoutPending(
+      contact.company_id,
+      contact.matched_identifier
+    );
+    if (pendingFanout) {
+      await handleOnboardingFanoutConfirm(message, contact, pendingFanout);
       return;
     }
   }

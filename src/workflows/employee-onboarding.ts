@@ -76,6 +76,24 @@ interface PendingManagerAvailApproval {
   expires_at: string;
 }
 
+export interface OnboardingFanoutPending {
+  company_id: string;
+  manager_contact: string;
+  manager_channel: 'sms' | 'email';
+  manager_sender: string;
+  manager_recipient: string;
+  aegis_sms_channel: string;
+  target_employee_ids: string[];
+  expires_at: string;
+}
+
+// Test employee setup: add Bubba Ganush to Watermark's company via Supabase SQL,
+// not via this file. Required fields:
+//   name='Bubba Ganush', contact_phone='+16163280114',
+//   company_id=<Watermark's id>, primary_role=null, contact_email=null,
+//   active=true. Leaving primary_role and contact_email null ensures the
+//   onboarding flow collects them.
+
 // ── Session keys ──────────────────────────────────────────────────────────────
 
 function sessionSource(employeeId: string): string {
@@ -88,6 +106,10 @@ function availConfirmSource(employeeId: string): string {
 
 function availApprovalSource(companyId: string, employeeId: string): string {
   return `avail_pending_mgr:${companyId}:${employeeId}`;
+}
+
+function fanoutSource(companyId: string, managerIdentifier: string): string {
+  return `onboarding_fanout:${companyId}:${managerIdentifier}`;
 }
 
 // ── Session management ────────────────────────────────────────────────────────
@@ -400,6 +422,24 @@ async function claudeParseAvailability(
   }
 }
 
+// Binary yes/no classifier — used in onboarding confirmation steps where natural
+// language ("right but Friday's wrong", "looks good") needs to be interpreted
+// reliably. Falls back to 'no' on parse failure (the safe default everywhere
+// it's used: re-prompt rather than silently accept).
+async function claudeClassifyYesNo(message: string, question: string): Promise<'yes' | 'no'> {
+  const response = await client.messages.create({
+    model: MODEL,
+    max_tokens: 16,
+    system:
+      `${question} Reply with ONLY one word: "yes" or "no". ` +
+      `"yes" only if the message clearly affirms. "no" for anything else, ` +
+      `including denials, requests to change, ambiguity, or partial mentions.`,
+    messages: [{ role: 'user', content: message }],
+  });
+  const text = response.content[0].type === 'text' ? response.content[0].text : '';
+  return text.trim().toLowerCase().startsWith('y') ? 'yes' : 'no';
+}
+
 async function claudeExtractDates(
   message: string
 ): Promise<{ start_date: string; end_date: string }[]> {
@@ -650,16 +690,12 @@ async function handleAvailabilityConfirmStep(
   managerContact: VerifiedContact,
   managerMsg: InboundMessage
 ): Promise<void> {
-  const lower = body.trim().toLowerCase();
-  const isYes = /^(yes|yeah|yep|y\b|correct|confirmed|confirm|that'?s right|right|ok|okay|sure|looks good)/i.test(lower);
-  const isNo = /^(no|nope|n\b|wrong|incorrect|change|nah)/i.test(lower);
+  const verdict = await claudeClassifyYesNo(
+    body,
+    `The employee was asked to confirm their availability. Did they confirm (yes) or request changes (no)?`
+  );
 
-  if (!isYes && !isNo) {
-    await textEmployee(session, `Please reply YES to confirm or NO to restate your availability.`);
-    return;
-  }
-
-  if (isNo) {
+  if (verdict === 'no') {
     session.step = 'availability';
     session.collected.availability_raw = null;
     session.collected.availability_parsed = [];
@@ -703,22 +739,30 @@ async function handleTimeOffStep(
   managerContact: VerifiedContact,
   managerMsg: InboundMessage
 ): Promise<void> {
-  const lower = body.trim().toLowerCase();
-  const isNo = /^(no|nope|n\b|none|nothing|nah)/i.test(lower);
-
-  if (isNo) {
-    session.step = 'complete';
-    await saveOnboardingSession(session);
-    await completeOnboarding(session, managerContact, managerMsg);
-    return;
-  }
-
   const dates = await claudeExtractDates(body);
 
   if (dates.length === 0) {
-    session.step = 'complete';
-    await saveOnboardingSession(session);
-    await completeOnboarding(session, managerContact, managerMsg);
+    // Don't silently complete on an empty parse — confirm the employee really
+    // means "no time off" before closing out the workflow. Claude classifies
+    // whether the message is a clear no vs. ambiguous mention.
+    const clearlyNoTimeOff = await claudeClassifyYesNo(
+      body,
+      `The employee was asked if they have any upcoming time off. Did they clearly say they have no upcoming time off?`
+    );
+
+    if (clearlyNoTimeOff === 'yes') {
+      session.step = 'complete';
+      await saveOnboardingSession(session);
+      await completeOnboarding(session, managerContact, managerMsg);
+      return;
+    }
+
+    // Ambiguous — stay in the time_off step and ask for clarification.
+    await textEmployee(
+      session,
+      `Just to confirm — you don't have any upcoming dates you need off? ` +
+        `Reply YES if that's correct, or tell me the specific dates.`
+    );
     return;
   }
 
@@ -955,14 +999,81 @@ export async function handleInitiateOnboarding(
       }
       return;
     }
-  } else {
-    candidates = await getIncompleteEmployees(contact.company_id);
-    if (candidates.length === 0) {
-      await reply(contact, message, `All active employees already have their information on file. No onboarding needed.`);
-      return;
-    }
+
+    // Named target — proceed immediately, even if substring matches multiple.
+    await executeOnboardingForCandidates(
+      candidates,
+      companyName,
+      roles,
+      aegisSmsChannel,
+      contact,
+      message
+    );
+    return;
   }
 
+  // No name specified — onboard all incomplete employees.
+  candidates = await getIncompleteEmployees(contact.company_id);
+  if (candidates.length === 0) {
+    await reply(contact, message, `All active employees already have their information on file. No onboarding needed.`);
+    return;
+  }
+
+  // Fan-out confirmation gate: if 2+ reachable employees would be SMSed at once,
+  // ask the manager to confirm first so they don't accidentally spam staff.
+  const reachable = candidates.filter(e => e.contact_phone);
+  if (reachable.length > 1) {
+    const pending: OnboardingFanoutPending = {
+      company_id: contact.company_id,
+      manager_contact: contact.matched_identifier,
+      manager_channel: message.channel,
+      manager_sender: message.sender,
+      manager_recipient: message.recipient,
+      aegis_sms_channel: aegisSmsChannel,
+      target_employee_ids: candidates.map(e => e.id),
+      expires_at: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
+    };
+    await saveFanoutPending(pending);
+
+    const previewNames = reachable.slice(0, 10).map(e => e.name);
+    const overflow = reachable.length > 10 ? `\n...and ${reachable.length - 10} more` : '';
+    const noPhone = candidates.filter(e => !e.contact_phone);
+    const skipNote = noPhone.length > 0
+      ? `\n\n${noPhone.length} will be skipped (no phone on file): ${noPhone.map(e => e.name).join(', ')}.`
+      : '';
+
+    await reply(
+      contact,
+      message,
+      `I'm about to start onboarding for ${reachable.length} employees:\n` +
+        previewNames.join('\n') +
+        overflow +
+        skipNote +
+        `\n\nReply YES to begin or NO to cancel.`
+    );
+    return;
+  }
+
+  // Single reachable (or all unreachable) — execute immediately, existing
+  // executeOnboardingForCandidates handles the skip-no-phone reporting.
+  await executeOnboardingForCandidates(
+    candidates,
+    companyName,
+    roles,
+    aegisSmsChannel,
+    contact,
+    message
+  );
+}
+
+async function executeOnboardingForCandidates(
+  candidates: Employee[],
+  companyName: string,
+  roles: string[],
+  aegisSmsChannel: string,
+  contact: VerifiedContact,
+  message: InboundMessage
+): Promise<void> {
   const started: string[] = [];
   const skippedNoPhone: string[] = [];
 
@@ -1043,6 +1154,96 @@ export async function handleInitiateOnboarding(
   }
 
   await reply(contact, message, lines.join(' '));
+}
+
+// ── Fan-out confirmation ─────────────────────────────────────────────────────
+
+async function saveFanoutPending(pending: OnboardingFanoutPending): Promise<void> {
+  await supabase
+    .from('aegis_memory')
+    .delete()
+    .eq('company_id', pending.company_id)
+    .eq('source', fanoutSource(pending.company_id, pending.manager_contact));
+  await supabase.from('aegis_memory').insert({
+    company_id: pending.company_id,
+    memory_type: 'observation',
+    source: fanoutSource(pending.company_id, pending.manager_contact),
+    content: JSON.stringify(pending),
+  });
+}
+
+export async function getOnboardingFanoutPending(
+  companyId: string,
+  managerIdentifier: string
+): Promise<(OnboardingFanoutPending & { _memory_id: string }) | null> {
+  const { data } = await supabase
+    .from('aegis_memory')
+    .select('id, content')
+    .eq('company_id', companyId)
+    .eq('source', fanoutSource(companyId, managerIdentifier))
+    .maybeSingle();
+
+  if (!data) return null;
+
+  try {
+    const row = data as { id: string; content: string };
+    const pending = JSON.parse(row.content) as OnboardingFanoutPending;
+    if (new Date(pending.expires_at) < new Date()) {
+      await supabase.from('aegis_memory').delete().eq('id', row.id);
+      return null;
+    }
+    return { ...pending, _memory_id: row.id };
+  } catch {
+    return null;
+  }
+}
+
+export async function handleOnboardingFanoutConfirm(
+  message: InboundMessage,
+  contact: VerifiedContact,
+  pending: OnboardingFanoutPending & { _memory_id: string }
+): Promise<void> {
+  const lower = message.body.trim().toLowerCase();
+  const isYes = /^(yes|yeah|yep|y\b|confirm|go(\s|$)|start|begin|do\s?it|proceed|sure|ok|okay)/i.test(lower);
+  const isNo = /^(no|nope|n\b|cancel|stop|nah|don'?t|never\s?mind)/i.test(lower);
+
+  if (!isYes && !isNo) {
+    await reply(contact, message, `Reply YES to start onboarding or NO to cancel.`);
+    return;
+  }
+
+  await supabase.from('aegis_memory').delete().eq('id', pending._memory_id);
+
+  if (isNo) {
+    await reply(contact, message, `Onboarding cancelled.`);
+    return;
+  }
+
+  // YES — load the employees that were queued and execute. Re-fetch in case
+  // anyone became inactive or got deleted in the 10-minute confirmation window.
+  const { data: empData } = await supabase
+    .from('employees')
+    .select('*')
+    .in('id', pending.target_employee_ids)
+    .eq('active', true);
+  const employees = (empData ?? []) as Employee[];
+
+  if (employees.length === 0) {
+    await reply(contact, message, `No active employees found to onboard. They may have been removed or deactivated.`);
+    return;
+  }
+
+  const companyName = await loadCompanyName(pending.company_id);
+  const roles = await loadRoles(pending.company_id);
+
+  await executeOnboardingForCandidates(
+    employees,
+    companyName,
+    roles,
+    pending.aegis_sms_channel,
+    contact,
+    message
+  );
 }
 
 // ── Update availability flow ──────────────────────────────────────────────────
@@ -1335,6 +1536,68 @@ export async function handleManagerAvailabilityApproval(
       body: `Your availability update was not approved. Please speak with your manager directly if you'd like to discuss.`,
       company_id: pending.company_id,
     });
+  }
+}
+
+// ── Proactive expiry (called by scheduler) ────────────────────────────────────
+// Scans every onboarding session and deletes any past its 48h expires_at,
+// notifying the manager on their original channel. Without this, the lazy
+// check inside getOnboardingSession only fires if the employee sends another
+// message — fully-silent sessions would otherwise linger indefinitely.
+
+export async function expireOldOnboardingSessions(): Promise<void> {
+  const { data: rows, error } = await supabase
+    .from('aegis_memory')
+    .select('id, company_id, content')
+    .like('source', 'onboarding:%');
+
+  if (error) {
+    console.error('[onboarding-expire] DB query failed:', error.message);
+    return;
+  }
+
+  const records = (rows ?? []) as { id: string; company_id: string; content: string }[];
+  const now = new Date();
+  let expired = 0;
+
+  for (const record of records) {
+    try {
+      const session = JSON.parse(record.content) as OnboardingSession;
+      if (new Date(session.expires_at) > now) continue;
+
+      // Delete first so a transient notify failure doesn't leave the row stuck.
+      await supabase.from('aegis_memory').delete().eq('id', record.id);
+
+      await logActivity({
+        company_id: session.company_id,
+        action: 'onboarding_timeout',
+        entity_type: 'employee',
+        entity_id: session.employee_id,
+        summary: `Onboarding session expired for ${session.employee_name}`,
+        metadata: {
+          step_reached: session.step,
+          started_at: session.started_at,
+          reaped_by: 'proactive_expiry',
+        },
+      });
+
+      const managerContact = buildManagerContact(session);
+      const managerMsg = buildManagerMsg(session);
+      await reply(
+        managerContact,
+        managerMsg,
+        `${session.employee_name}'s onboarding window expired without completion. ` +
+          `Their session has been cleared. You can restart onboarding anytime.`
+      );
+
+      expired++;
+    } catch (err) {
+      console.error('[onboarding-expire] error processing record:', err);
+    }
+  }
+
+  if (expired > 0) {
+    console.log(`[onboarding-expire] expired ${expired} stale onboarding session(s)`);
   }
 }
 

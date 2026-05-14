@@ -2,7 +2,10 @@ import { supabase } from '../db/client';
 import { logActivity } from '../logger/activity-log';
 import { reply } from '../messaging/reply';
 import { dispatchOutreach } from '../workflows/emergency-coverage';
-import { checkStaleOnboardingSessions } from '../workflows/employee-onboarding';
+import {
+  checkStaleOnboardingSessions,
+  expireOldOnboardingSessions,
+} from '../workflows/employee-onboarding';
 import type { ActiveOutreach, CoverageSession, OutreachResult } from '../workflows/emergency-coverage';
 import type { Employee } from '../db/types';
 import type { InboundMessage, VerifiedContact } from '../security/types';
@@ -20,6 +23,10 @@ export function startCoverageTimeoutScheduler(): void {
   console.log('[onboarding-timeout] daily stale-session check started');
   void checkStaleOnboardingSessions();
   setInterval(() => void checkStaleOnboardingSessions(), ONBOARDING_CHECK_INTERVAL_MS);
+
+  console.log('[onboarding-expire] daily proactive 48h expiry started');
+  void expireOldOnboardingSessions();
+  setInterval(() => void expireOldOnboardingSessions(), ONBOARDING_CHECK_INTERVAL_MS);
 }
 
 // ── Poll cycle ────────────────────────────────────────────────────────────────

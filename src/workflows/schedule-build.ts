@@ -81,29 +81,26 @@ function getDatesInRange(start: string, end: string): string[] {
   return dates;
 }
 
-function getWeekBounds(target: 'this' | 'next'): { weekStart: string; weekEnd: string } {
+// Monday–Sunday weeks. offset 0 = current week, 1 = next week, -1 = last week.
+function getWeekBounds(offset: number = 0): { week_start: string; week_end: string } {
   const today = new Date();
-  const dow = today.getDay();
-  const sunday = new Date(today);
-  if (target === 'next') {
-    // If today is Sunday, jump to next Sunday (7 days). Otherwise advance to the upcoming Sunday.
-    const daysUntilSunday = dow === 0 ? 7 : 7 - dow;
-    sunday.setDate(today.getDate() + daysUntilSunday);
-  } else {
-    // Most recent Sunday (today, if today is Sunday)
-    sunday.setDate(today.getDate() - dow);
-  }
-  const saturday = new Date(sunday);
-  saturday.setDate(sunday.getDate() + 6);
+  const dayOfWeek = today.getDay(); // 0=Sun, 1=Mon, ... 6=Sat
+  const daysToMonday = dayOfWeek === 0 ? 6 : dayOfWeek - 1;
+  const monday = new Date(today);
+  monday.setDate(today.getDate() - daysToMonday + offset * 7);
+  monday.setHours(0, 0, 0, 0);
+  const sunday = new Date(monday);
+  sunday.setDate(monday.getDate() + 6);
   return {
-    weekStart: sunday.toLocaleDateString('en-CA'),
-    weekEnd: saturday.toLocaleDateString('en-CA'),
+    week_start: monday.toLocaleDateString('en-CA'),
+    week_end: sunday.toLocaleDateString('en-CA'),
   };
 }
 
 function parseTargetWeek(extracted: Record<string, unknown>): { weekStart: string; weekEnd: string } {
-  const target = extracted['target_week'] === 'this' ? 'this' : 'next';
-  return getWeekBounds(target);
+  const offset = extracted['target_week'] === 'this' ? 0 : 1;
+  const { week_start, week_end } = getWeekBounds(offset);
+  return { weekStart: week_start, weekEnd: week_end };
 }
 
 function isAvailableForShift(
@@ -545,7 +542,10 @@ export async function handleBuildSchedule(
   extracted: Record<string, unknown>
 ): Promise<void> {
   const { weekStart, weekEnd } = parseTargetWeek(extracted);
-  console.log('[schedule-build] building for week:', weekStart, '→', weekEnd);
+  console.log(
+    '[schedule-build] week:', weekStart, '→', weekEnd,
+    '(today is', new Date().toLocaleDateString('en-CA'), ')'
+  );
   const weekDates = getDatesInRange(weekStart, weekEnd);
 
   // Load all required data

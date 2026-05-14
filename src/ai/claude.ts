@@ -114,7 +114,10 @@ Respond with ONLY valid JSON in this exact shape — no markdown, no explanation
     // Any structured data you can extract from the message.
     // For submit_time_off: { "start_date": "YYYY-MM-DD", "end_date": "YYYY-MM-DD", "reason": "..." }
     // For initiate_swap: { "shift_date": "YYYY-MM-DD", "shift_name": "...", "target_employee_name": "..." }
-    // For build_schedule / distribute_schedule: { "week_start": "YYYY-MM-DD" }
+    // For build_schedule: { "target_week": "this" | "next" } — "next" if unspecified.
+    //   Map "this week", "current week" → "this". Map "next week", "upcoming week", "the week after" → "next".
+    //   Never emit a calendar date — you do not know today's date reliably.
+    // For distribute_schedule: {}
     // For homebase_edit: { "entity_type": "employee|event|policy|wage_rate|shift_type", "entity_name": "...", "field": "...", "new_value": "..." }
     // For initiate_onboarding: { "employee_name": "..." } if targeting one employee, or {} for all
     // For update_availability: {}

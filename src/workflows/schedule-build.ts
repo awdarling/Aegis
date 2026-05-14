@@ -81,34 +81,29 @@ function getDatesInRange(start: string, end: string): string[] {
   return dates;
 }
 
-function getNextWeekBounds(today: string): { weekStart: string; weekEnd: string } {
-  const d = new Date(today + 'T12:00:00Z');
-  // Advance to the next Sunday (if today is Sunday, go to the following Sunday)
-  const daysUntilSunday = d.getUTCDay() === 0 ? 7 : 7 - d.getUTCDay();
-  const sunday = new Date(d);
-  sunday.setUTCDate(d.getUTCDate() + daysUntilSunday);
+function getWeekBounds(target: 'this' | 'next'): { weekStart: string; weekEnd: string } {
+  const today = new Date();
+  const dow = today.getDay();
+  const sunday = new Date(today);
+  if (target === 'next') {
+    // If today is Sunday, jump to next Sunday (7 days). Otherwise advance to the upcoming Sunday.
+    const daysUntilSunday = dow === 0 ? 7 : 7 - dow;
+    sunday.setDate(today.getDate() + daysUntilSunday);
+  } else {
+    // Most recent Sunday (today, if today is Sunday)
+    sunday.setDate(today.getDate() - dow);
+  }
   const saturday = new Date(sunday);
-  saturday.setUTCDate(sunday.getUTCDate() + 6);
+  saturday.setDate(sunday.getDate() + 6);
   return {
-    weekStart: sunday.toISOString().slice(0, 10),
-    weekEnd: saturday.toISOString().slice(0, 10),
+    weekStart: sunday.toLocaleDateString('en-CA'),
+    weekEnd: saturday.toLocaleDateString('en-CA'),
   };
 }
 
-function parseTargetWeek(
-  extracted: Record<string, unknown>,
-  today: string
-): { weekStart: string; weekEnd: string } {
-  const raw = extracted['week_start'] as string | undefined;
-  if (raw) {
-    const d = new Date(raw + 'T12:00:00Z');
-    const sun = new Date(d);
-    sun.setUTCDate(d.getUTCDate() - d.getUTCDay());
-    const sat = new Date(sun);
-    sat.setUTCDate(sun.getUTCDate() + 6);
-    return { weekStart: sun.toISOString().slice(0, 10), weekEnd: sat.toISOString().slice(0, 10) };
-  }
-  return getNextWeekBounds(today);
+function parseTargetWeek(extracted: Record<string, unknown>): { weekStart: string; weekEnd: string } {
+  const target = extracted['target_week'] === 'this' ? 'this' : 'next';
+  return getWeekBounds(target);
 }
 
 function isAvailableForShift(
@@ -549,8 +544,8 @@ export async function handleBuildSchedule(
   contact: VerifiedContact,
   extracted: Record<string, unknown>
 ): Promise<void> {
-  const today = new Date().toISOString().slice(0, 10);
-  const { weekStart, weekEnd } = parseTargetWeek(extracted, today);
+  const { weekStart, weekEnd } = parseTargetWeek(extracted);
+  console.log('[schedule-build] building for week:', weekStart, '→', weekEnd);
   const weekDates = getDatesInRange(weekStart, weekEnd);
 
   // Load all required data

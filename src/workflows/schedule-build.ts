@@ -132,6 +132,25 @@ function formatTime(t: string): string {
   return `${h12}:${m.toString().padStart(2, '0')} ${ampm}`;
 }
 
+const DAY_SHORTS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+function formatAvailableDays(empId: string, availByEmp: Map<string, Availability[]>): string {
+  const avail = availByEmp.get(empId) ?? [];
+  if (avail.length === 0) return 'None';
+  const days = [...new Set(avail.map(a => a.day_of_week))].sort((a, b) => a - b);
+  return days.map(d => DAY_SHORTS[d]).join(', ');
+}
+
+function buildEmployeeListForPrompt(
+  employees: Employee[],
+  availByEmp: Map<string, Availability[]>
+): string {
+  return employees.map(e => {
+    const veteranTag = e.is_veteran ? ' | VETERAN' : '';
+    return `- ${e.name} | ${e.primary_role} | ${e.max_weekly_hours}h max | Available: ${formatAvailableDays(e.id, availByEmp)}${veteranTag}`;
+  }).join('\n');
+}
+
 // ── Data loading ──────────────────────────────────────────────────────────────
 
 async function loadBuildData(
@@ -584,11 +603,28 @@ export async function handleBuildSchedule(
   };
 
   // Generate plain-language summary for schedule.data.summary
-  const summaryPrompt =
-    `You are Aegis, building a schedule for ${data.companyName}. Write a concise 2-3 sentence summary of this week's schedule (${weekStart} to ${weekEnd}). ` +
-    `Coverage: ${totalFilled}/${totalRequired} slots filled. Gaps: ${gaps.length}. ` +
-    `Top contributors: ${Array.from(new Map(assignments.map(a => [a.employee_id, { name: a.employee_name, hours: 0 }])).values()).slice(0, 3).map(e => e.name).join(', ')}. ` +
-    `Be direct and operational. No preamble.`;
+  const veteranPreference = typeof extracted['veteran_preference'] === 'string' && extracted['veteran_preference'].trim() !== ''
+    ? extracted['veteran_preference'] as string
+    : null;
+
+  const employeeList = buildEmployeeListForPrompt(data.employees, data.availByEmp);
+  const topContributors = Array.from(new Map(assignments.map(a => [a.employee_id, { name: a.employee_name, hours: 0 }])).values()).slice(0, 3).map(e => e.name).join(', ');
+
+  const summaryPrompt = [
+    `You are Aegis, building a schedule for ${data.companyName}. Write a concise 2-3 sentence summary of this week's schedule (${weekStart} to ${weekEnd}).`,
+    ``,
+    `Some employees are marked as VETERAN. When the manager specifies scheduling preferences related to veterans (e.g. "schedule only veterans for Memorial Day", "prioritize veterans on July 4th", "make sure a veteran is on every shift this weekend"), apply that filter or preference when selecting employees for affected shifts. If no veteran preference is specified, treat all qualified available employees equally.`,
+    ``,
+    `Employees:`,
+    employeeList,
+    ``,
+    `Coverage: ${totalFilled}/${totalRequired} slots filled. Gaps: ${gaps.length}.`,
+    `Top contributors: ${topContributors}.`,
+    veteranPreference ? `Manager veteran preference: ${veteranPreference}` : null,
+    ``,
+    `Be direct and operational. No preamble.`,
+  ].filter((line): line is string => line !== null).join('\n');
+
   const summary = await generateReply(summaryPrompt, 'Summarize the schedule.', []);
 
   // Save schedule record to Homebase

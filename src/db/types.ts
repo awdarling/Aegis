@@ -47,6 +47,7 @@ export interface Database {
           active: boolean;
           created_at: string;
           individual_wage: number | null;
+          is_veteran: boolean | null;
         };
       };
       availability: {

@@ -151,6 +151,21 @@ function buildEmployeeListForPrompt(
   }).join('\n');
 }
 
+// ── Veteran preference ────────────────────────────────────────────────────────
+
+export type VeteranMode = 'only' | 'prioritize' | 'at_least_one' | null;
+
+function parseVeteranPreference(pref: string | null): VeteranMode {
+  if (!pref) return null;
+  const lower = pref.toLowerCase();
+  // Check "at least one" before "only" — "only one veteran per shift" should match
+  // at_least_one semantics, not only-veterans semantics.
+  if (lower.includes('at least one') || lower.includes('at least 1')) return 'at_least_one';
+  if (lower.includes('only')) return 'only';
+  if (lower.includes('prioritize') || lower.includes('prefer')) return 'prioritize';
+  return null;
+}
+
 // ── Data loading ──────────────────────────────────────────────────────────────
 
 async function loadBuildData(
@@ -292,8 +307,9 @@ function findBestEmployee(params: {
   weeklyHoursMap: Map<string, number>;
   assignedToShift: string[];
   conflicts: EmployeeConflict[];
-}): Employee | null {
-  const { role, date, dayOfWeek, shiftStart, shiftEnd, shiftHours } = params;
+  veteranMode: VeteranMode;
+}): { employee: Employee | null; veteranFallback: boolean } {
+  const { role, date, dayOfWeek, shiftStart, shiftEnd, shiftHours, veteranMode } = params;
 
   // Build conflict sets from already-assigned employees on this shift
   const neverExcluded = new Set<string>();
@@ -309,7 +325,7 @@ function findBestEmployee(params: {
     }
   }
 
-  const candidates = params.employees.filter(e => {
+  const baseCandidates = params.employees.filter(e => {
     if (!e.qualified_roles.includes(role)) return false;
     if (params.assignedToShift.includes(e.id)) return false;
     if (neverExcluded.has(e.id)) return false;
@@ -319,19 +335,38 @@ function findBestEmployee(params: {
     return true;
   });
 
-  if (candidates.length === 0) return null;
+  // Veterans-only mode: restrict to veterans if any are available; otherwise fall
+  // back to the full pool and flag the assignment for soft-gap reporting.
+  let candidates = baseCandidates;
+  let veteranFallback = false;
+  if (veteranMode === 'only') {
+    const veterans = baseCandidates.filter(e => e.is_veteran);
+    if (veterans.length > 0) {
+      candidates = veterans;
+    } else if (baseCandidates.length > 0) {
+      veteranFallback = true;
+    }
+  }
 
-  // Sort: avoid-conflict employees last, then fewest hours, then alphabetically
+  if (candidates.length === 0) return { employee: null, veteranFallback: false };
+
+  // Sort: avoid-conflict last → (in prioritize mode) veterans before non-veterans
+  // → fewest weekly hours → alphabetical.
   candidates.sort((a, b) => {
     const aAvoid = avoidDeprioritized.has(a.id) ? 1 : 0;
     const bAvoid = avoidDeprioritized.has(b.id) ? 1 : 0;
     if (aAvoid !== bAvoid) return aAvoid - bAvoid;
+    if (veteranMode === 'prioritize') {
+      const aVet = a.is_veteran ? 1 : 0;
+      const bVet = b.is_veteran ? 1 : 0;
+      if (aVet !== bVet) return bVet - aVet;
+    }
     const ha = params.weeklyHoursMap.get(a.id) ?? 0;
     const hb = params.weeklyHoursMap.get(b.id) ?? 0;
     return ha !== hb ? ha - hb : a.name.localeCompare(b.name);
   });
 
-  return candidates[0];
+  return { employee: candidates[0], veteranFallback };
 }
 
 // ── Main scheduling algorithm ─────────────────────────────────────────────────
@@ -339,13 +374,16 @@ function findBestEmployee(params: {
 function buildScheduleForWeek(
   data: BuildData,
   weekDates: string[],
-  eventsByDate: Map<string, Event[]>
+  eventsByDate: Map<string, Event[]>,
+  veteranMode: VeteranMode
 ): { assignments: ScheduleAssignment[]; gaps: ScheduleGap[]; totalRequired: number; totalFilled: number } {
   const assignments: ScheduleAssignment[] = [];
   const gaps: ScheduleGap[] = [];
   const weeklyHoursMap = new Map<string, number>();
   let totalRequired = 0;
   let totalFilled = 0;
+
+  const employeeById = new Map(data.employees.map(e => [e.id, e]));
 
   for (const date of weekDates) {
     const dayOfWeek = new Date(date + 'T12:00:00Z').getUTCDay();
@@ -372,7 +410,7 @@ function buildScheduleForWeek(
 
         for (let slot = 0; slot < req.required_count; slot++) {
           totalRequired++;
-          const emp = findBestEmployee({
+          const { employee: emp, veteranFallback } = findBestEmployee({
             role: req.role,
             date,
             dayOfWeek,
@@ -385,6 +423,7 @@ function buildScheduleForWeek(
             weeklyHoursMap,
             assignedToShift,
             conflicts: data.conflicts,
+            veteranMode,
           });
 
           if (emp) {
@@ -402,6 +441,18 @@ function buildScheduleForWeek(
               end_time: shiftType.end_time,
               hours,
             });
+            if (veteranFallback) {
+              // Slot is filled, but no veteran was available — surface a soft gap
+              // so the manager sees the veterans-only request couldn't be honored here.
+              gaps.push({
+                date,
+                shift_name: shiftType.name,
+                role: req.role,
+                required_count: 1,
+                filled_count: 1,
+                reason: 'No veteran available for this slot',
+              });
+            }
           } else {
             gaps.push({
               date,
@@ -430,10 +481,103 @@ function buildScheduleForWeek(
           }
         }
       }
+
+      // "At least one veteran per shift": after filling all roles for this
+      // (date, shiftType), swap in a veteran if none was assigned.
+      if (veteranMode === 'at_least_one') {
+        ensureVeteranOnShift({
+          assignments,
+          date,
+          dayOfWeek,
+          shiftType,
+          shiftHrs: hours,
+          weeklyHoursMap,
+          employees: data.employees,
+          employeeById,
+          availByEmp: data.availByEmp,
+          approvedTOSet: data.approvedTOSet,
+          conflicts: data.conflicts,
+        });
+      }
     }
   }
 
   return { assignments, gaps, totalRequired, totalFilled };
+}
+
+// Ensures at least one veteran is assigned to a given (date, shiftType). Mutates
+// `assignments` and `weeklyHoursMap` in place — swaps the lowest-hours non-veteran
+// out for the highest-hours eligible veteran. No-op if a veteran is already on
+// the shift or no swap candidate is found.
+function ensureVeteranOnShift(params: {
+  assignments: ScheduleAssignment[];
+  date: string;
+  dayOfWeek: number;
+  shiftType: ShiftType;
+  shiftHrs: number;
+  weeklyHoursMap: Map<string, number>;
+  employees: Employee[];
+  employeeById: Map<string, Employee>;
+  availByEmp: Map<string, Availability[]>;
+  approvedTOSet: Set<string>;
+  conflicts: EmployeeConflict[];
+}): void {
+  const { assignments, date, dayOfWeek, shiftType, shiftHrs, weeklyHoursMap, employeeById } = params;
+
+  const shiftAssignments = assignments.filter(a => a.date === date && a.shift_name === shiftType.name);
+  if (shiftAssignments.length === 0) return;
+
+  const hasVeteran = shiftAssignments.some(a => employeeById.get(a.employee_id)?.is_veteran);
+  if (hasVeteran) return;
+
+  // Lowest-hours non-veteran assignment first (most disposable to swap out).
+  const nonVetAssignments = [...shiftAssignments].sort((a, b) =>
+    (weeklyHoursMap.get(a.employee_id) ?? 0) - (weeklyHoursMap.get(b.employee_id) ?? 0)
+  );
+
+  const onShiftIds = new Set(shiftAssignments.map(a => a.employee_id));
+
+  for (const candidate of nonVetAssignments) {
+    const eligibleVets = params.employees.filter(e => {
+      if (!e.is_veteran) return false;
+      if (!e.qualified_roles.includes(candidate.role)) return false;
+      if (onShiftIds.has(e.id)) return false;
+      if (params.approvedTOSet.has(`${e.id}:${date}`)) return false;
+      if (!isAvailableForShift(e.id, dayOfWeek, shiftType.start_time, shiftType.end_time, params.availByEmp)) return false;
+      if ((weeklyHoursMap.get(e.id) ?? 0) + shiftHrs > e.max_weekly_hours) return false;
+      // never-conflict with anyone remaining on the shift after the swap
+      const remainingIds = shiftAssignments.filter(a => a.employee_id !== candidate.employee_id).map(a => a.employee_id);
+      for (const c of params.conflicts) {
+        if (c.severity !== 'never') continue;
+        if ((c.employee_id_1 === e.id && remainingIds.includes(c.employee_id_2)) ||
+            (c.employee_id_2 === e.id && remainingIds.includes(c.employee_id_1))) {
+          return false;
+        }
+      }
+      return true;
+    });
+
+    if (eligibleVets.length === 0) continue;
+
+    // Highest scheduled-hours veteran first (most engaged), name as tiebreak.
+    eligibleVets.sort((a, b) => {
+      const ha = weeklyHoursMap.get(a.id) ?? 0;
+      const hb = weeklyHoursMap.get(b.id) ?? 0;
+      return hb !== ha ? hb - ha : a.name.localeCompare(b.name);
+    });
+    const vet = eligibleVets[0];
+
+    const idx = assignments.findIndex(a =>
+      a.date === date && a.shift_name === shiftType.name &&
+      a.employee_id === candidate.employee_id && a.role === candidate.role
+    );
+    if (idx < 0) continue;
+
+    weeklyHoursMap.set(candidate.employee_id, (weeklyHoursMap.get(candidate.employee_id) ?? 0) - shiftHrs);
+    weeklyHoursMap.set(vet.id, (weeklyHoursMap.get(vet.id) ?? 0) + shiftHrs);
+    assignments[idx] = { ...assignments[idx], employee_id: vet.id, employee_name: vet.name };
+    return;
+  }
 }
 
 // ── Staffing report ───────────────────────────────────────────────────────────
@@ -590,8 +734,18 @@ export async function handleBuildSchedule(
     ));
   }
 
+  // Parse veteran preference once so we can both steer the algorithm and surface
+  // it in the Claude summary prompt below.
+  const veteranPreference = typeof extracted['veteran_preference'] === 'string' && extracted['veteran_preference'].trim() !== ''
+    ? extracted['veteran_preference'] as string
+    : null;
+  const veteranMode = parseVeteranPreference(veteranPreference);
+  if (veteranMode) {
+    console.log('[schedule-build] applying veteran preference:', veteranPreference);
+  }
+
   // Run scheduling algorithm
-  const { assignments, gaps, totalRequired, totalFilled } = buildScheduleForWeek(data, weekDates, eventsByDate);
+  const { assignments, gaps, totalRequired, totalFilled } = buildScheduleForWeek(data, weekDates, eventsByDate, veteranMode);
 
   // Compute wages
   const wages = await computeWageEstimate(contact.company_id, assignments);
@@ -601,11 +755,6 @@ export async function handleBuildSchedule(
     ...buildStaffingReport(assignments, gaps, totalRequired, totalFilled, data.employees, specialNotes),
     estimated_wages: wages,
   };
-
-  // Generate plain-language summary for schedule.data.summary
-  const veteranPreference = typeof extracted['veteran_preference'] === 'string' && extracted['veteran_preference'].trim() !== ''
-    ? extracted['veteran_preference'] as string
-    : null;
 
   const employeeList = buildEmployeeListForPrompt(data.employees, data.availByEmp);
   const topContributors = Array.from(new Map(assignments.map(a => [a.employee_id, { name: a.employee_name, hours: 0 }])).values()).slice(0, 3).map(e => e.name).join(', ');

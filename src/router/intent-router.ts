@@ -39,6 +39,7 @@ import {
 import { handlePayrollCheck } from '../workflows/payroll';
 import {
   getOnboardingSession,
+  getOnboardingSessionByPhone,
   handleOnboardingResponse,
   handleInitiateOnboarding,
   getPendingAvailConfirm,
@@ -86,6 +87,19 @@ export async function routeIntent(
   message: InboundMessage,
   contact: VerifiedContact
 ): Promise<void> {
+  // Phone-keyed onboarding lookup. Runs before role-based routing so that an
+  // inbound SMS from a phone with an active onboarding session is handled as an
+  // onboarding reply even when identity verification matched the sender to a
+  // different role (e.g., a Quria admin whose personal phone is also the phone
+  // of a test employee being onboarded).
+  if (message.channel === 'sms') {
+    const phoneSession = await getOnboardingSessionByPhone(message.sender);
+    if (phoneSession) {
+      await handleOnboardingResponse(message, contact, phoneSession);
+      return;
+    }
+  }
+
   // Pre-classification: employee session checks
   if (contact.role === 'employee' && contact.employee_id) {
     const pendingTO = await getPendingTimeOff(contact.company_id, contact.employee_id);

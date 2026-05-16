@@ -159,6 +159,58 @@ export async function getOnboardingSession(
   }
 }
 
+// Phone-keyed lookup. Used by the router to find an active onboarding session
+// for an inbound SMS whose sender is the employee being onboarded — regardless
+// of how identity verification resolved the sender (e.g., a Quria admin whose
+// personal phone is also the phone of a test employee being onboarded).
+export async function getOnboardingSessionByPhone(
+  phone: string
+): Promise<(OnboardingSession & { _memory_id: string }) | null> {
+  const { data } = await supabase
+    .from('aegis_memory')
+    .select('id, content')
+    .like('source', 'onboarding:%');
+
+  const rows = (data ?? []) as { id: string; content: string }[];
+
+  for (const row of rows) {
+    let session: OnboardingSession;
+    try {
+      session = JSON.parse(row.content) as OnboardingSession;
+    } catch {
+      continue;
+    }
+
+    if (session.employee_phone !== phone) continue;
+
+    if (new Date(session.expires_at) < new Date()) {
+      await supabase.from('aegis_memory').delete().eq('id', row.id);
+      await logActivity({
+        company_id: session.company_id,
+        action: 'onboarding_timeout',
+        entity_type: 'employee',
+        entity_id: session.employee_id,
+        summary: `Onboarding session expired for ${session.employee_name}`,
+        metadata: {
+          step_reached: session.step,
+          started_at: session.started_at,
+        },
+      });
+      await notifyManagerSmsDirect(
+        session.manager_sender,
+        session.manager_recipient,
+        session.company_id,
+        `${session.employee_name}'s onboarding window (48h) expired without completion. Their session has been cleared.`
+      );
+      return null;
+    }
+
+    return { ...session, _memory_id: row.id };
+  }
+
+  return null;
+}
+
 async function saveOnboardingSession(
   session: OnboardingSession & { _memory_id?: string }
 ): Promise<void> {

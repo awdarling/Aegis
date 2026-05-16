@@ -22,7 +22,7 @@ export interface OnboardingSession {
   company_id: string;
   employee_id: string;
   employee_name: string;
-  employee_phone: string;
+  employee_phone: string | null;
   aegis_sms_channel: string;
   manager_contact: string;
   manager_channel: 'sms' | 'email';
@@ -382,6 +382,10 @@ function clampTime(time: string, min: string, max: string): string {
 // ── Messaging helpers ─────────────────────────────────────────────────────────
 
 async function textEmployee(session: OnboardingSession, body: string): Promise<void> {
+  if (!session.employee_phone) {
+    console.warn(`[onboarding] cannot text ${session.employee_name}: no phone on session`);
+    return;
+  }
   await sendSms({
     to: session.employee_phone,
     from: session.aegis_sms_channel,
@@ -1154,7 +1158,7 @@ async function executeOnboardingForCandidates(
       company_id: contact.company_id,
       employee_id: employee.id,
       employee_name: employee.name,
-      employee_phone: employee.contact_phone,
+      employee_phone: employee.contact_phone ?? null,
       aegis_sms_channel: aegisSmsChannel,
       manager_contact: contact.matched_identifier,
       manager_channel: message.channel,

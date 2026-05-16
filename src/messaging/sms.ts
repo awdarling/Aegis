@@ -13,18 +13,29 @@ interface SmsOptions {
 
 export async function sendSms(options: SmsOptions): Promise<boolean> {
   try {
-    await twilioClient.messages.create({
+    const messagingServiceSid = env.TWILIO_MESSAGING_SERVICE_SID;
+    const fromNumber = options.from || env.TWILIO_FROM_NUMBER;
+
+    const payload: { to: string; body: string; from?: string; messagingServiceSid?: string } = {
       to: options.to,
-      from: options.from,
       body: options.body,
-    });
+    };
+    if (messagingServiceSid) {
+      payload.messagingServiceSid = messagingServiceSid;
+    } else if (fromNumber) {
+      payload.from = fromNumber;
+    } else {
+      throw new Error('No TWILIO_MESSAGING_SERVICE_SID or from number configured');
+    }
+
+    await twilioClient.messages.create(payload);
 
     await saveConversation({
       company_id: options.company_id,
       channel: 'sms',
       direction: 'outbound',
       content: options.body,
-      from_address: options.from,
+      from_address: messagingServiceSid || fromNumber || '',
       to_address: options.to,
     });
     return true;

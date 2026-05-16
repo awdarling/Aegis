@@ -36,6 +36,13 @@ app.get('/health', (_req, res) => {
 
 app.listen(env.PORT, () => {
   console.log(`Aegis running on port ${env.PORT} [${env.NODE_ENV}]`);
+  if (env.TWILIO_MESSAGING_SERVICE_SID) {
+    console.log(`[sms] sending via Messaging Service: ${env.TWILIO_MESSAGING_SERVICE_SID}`);
+  } else if (env.TWILIO_FROM_NUMBER) {
+    console.log(`[sms] sending via FROM number: ${env.TWILIO_FROM_NUMBER}`);
+  } else {
+    console.log('[sms] sending via FROM number: per-call options.from (no global env set)');
+  }
   startCoverageTimeoutScheduler();
   startPayrollScheduler();
 });

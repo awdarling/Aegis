@@ -12,6 +12,8 @@ const envSchema = z.object({
   // Twilio
   TWILIO_ACCOUNT_SID: z.string().min(1),
   TWILIO_AUTH_TOKEN: z.string().min(1),
+  TWILIO_MESSAGING_SERVICE_SID: z.string().optional(),
+  TWILIO_FROM_NUMBER: z.string().optional(),
 
   // SendGrid
   SENDGRID_API_KEY: z.string().min(1),

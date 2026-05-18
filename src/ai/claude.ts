@@ -5,6 +5,60 @@ const client = new Anthropic({ apiKey: env.ANTHROPIC_API_KEY });
 
 const MODEL = 'claude-sonnet-4-6';
 
+// ── Retry / overload handling ─────────────────────────────────────────────────
+// NOTE: The Homebase Soteria routes
+// (src/app/api/soteria-validate-schedule/route.ts and
+// src/app/api/soteria-validate-assignment/route.ts) live in a different repo
+// and make their own Anthropic calls — they need the same retry treatment as
+// what is implemented here. Follow-up in the Homebase repo.
+
+export class AnthropicOverloadError extends Error {
+  constructor(message = 'Anthropic API overloaded after 3 attempts') {
+    super(message);
+    this.name = 'AnthropicOverloadError';
+  }
+}
+
+const MAX_ATTEMPTS = 3;
+const RETRY_DELAYS_MS = [1000, 2000]; // delay before attempt 2, then before attempt 3
+const RETRYABLE_STATUSES = new Set([500, 503, 529]);
+
+function getRetryableStatus(err: unknown): number | null {
+  if (err && typeof err === 'object' && 'status' in err) {
+    const status = (err as { status: unknown }).status;
+    if (typeof status === 'number' && RETRYABLE_STATUSES.has(status)) {
+      return status;
+    }
+  }
+  return null;
+}
+
+export async function withAnthropicRetry<T>(operation: () => Promise<T>): Promise<T> {
+  let lastErr: unknown;
+  let lastStatus: number | null = null;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      return await operation();
+    } catch (err) {
+      const status = getRetryableStatus(err);
+      if (status === null) throw err;
+      lastErr = err;
+      lastStatus = status;
+      if (attempt < MAX_ATTEMPTS) {
+        const delayMs = RETRY_DELAYS_MS[attempt - 1];
+        console.log(
+          `[claude] API overloaded, retry attempt ${attempt + 1}/${MAX_ATTEMPTS} in ${delayMs / 1000}s...`
+        );
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+    }
+  }
+  if (lastStatus === 529) {
+    throw new AnthropicOverloadError();
+  }
+  throw lastErr;
+}
+
 export interface ClassifyResult {
   intent: string;
   confidence: 'high' | 'medium' | 'low';
@@ -54,12 +108,14 @@ export async function classifyIntent(
 ): Promise<ClassifyResult> {
   const systemPrompt = buildClassifySystemPrompt(role, companyContext);
 
-  const response = await client.messages.create({
-    model: MODEL,
-    max_tokens: 512,
-    system: systemPrompt,
-    messages: [{ role: 'user', content: message }],
-  });
+  const response = await withAnthropicRetry(() =>
+    client.messages.create({
+      model: MODEL,
+      max_tokens: 512,
+      system: systemPrompt,
+      messages: [{ role: 'user', content: message }],
+    })
+  );
 
   const text = response.content[0].type === 'text' ? response.content[0].text : '';
 
@@ -78,12 +134,14 @@ export async function generateReply(
 ): Promise<string> {
   const fullSystem = [systemPrompt, ...contextBlocks].join('\n\n');
 
-  const response = await client.messages.create({
-    model: MODEL,
-    max_tokens: 1024,
-    system: fullSystem,
-    messages: [{ role: 'user', content: userMessage }],
-  });
+  const response = await withAnthropicRetry(() =>
+    client.messages.create({
+      model: MODEL,
+      max_tokens: 1024,
+      system: fullSystem,
+      messages: [{ role: 'user', content: userMessage }],
+    })
+  );
 
   return response.content[0].type === 'text' ? response.content[0].text : '';
 }

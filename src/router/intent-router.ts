@@ -1,4 +1,4 @@
-import { classifyIntent } from '../ai/claude';
+import { classifyIntent, AnthropicOverloadError } from '../ai/claude';
 import { logActivity } from '../logger/activity-log';
 import { reply } from '../messaging/reply';
 import { supabase } from '../db/client';
@@ -84,6 +84,30 @@ const QURIA_ONLY_INTENTS = new Set([
 // ── Main router ───────────────────────────────────────────────────────────────
 
 export async function routeIntent(
+  message: InboundMessage,
+  contact: VerifiedContact
+): Promise<void> {
+  try {
+    await routeIntentInner(message, contact);
+  } catch (err) {
+    if (err instanceof AnthropicOverloadError) {
+      const overloadMsg =
+        contact.role === 'employee'
+          ? 'Aegis is temporarily unavailable due to high demand on our servers. Please try again in a few minutes.'
+          : "Aegis couldn't complete that request right now — our AI provider is experiencing high load. Please try again in 2-3 minutes. Your request was not processed.";
+      console.error('[router] Anthropic overloaded after retries; notifying sender');
+      try {
+        await reply(contact, message, overloadMsg);
+      } catch (replyErr) {
+        console.error('[router] failed to send overload notice:', replyErr);
+      }
+      return;
+    }
+    throw err;
+  }
+}
+
+async function routeIntentInner(
   message: InboundMessage,
   contact: VerifiedContact
 ): Promise<void> {
@@ -302,6 +326,7 @@ export async function routeIntent(
         );
     }
   } catch (err) {
+    if (err instanceof AnthropicOverloadError) throw err;
     console.error('[router] workflow error:', err);
     await reply(
       contact,

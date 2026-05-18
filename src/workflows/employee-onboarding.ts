@@ -4,6 +4,7 @@ import { logActivity } from '../logger/activity-log';
 import { sendSms } from '../messaging/sms';
 import { reply } from '../messaging/reply';
 import { env } from '../config/env';
+import { withAnthropicRetry } from '../ai/claude';
 import type { InboundMessage, VerifiedContact } from '../security/types';
 import type { Employee } from '../db/types';
 
@@ -427,17 +428,19 @@ function buildManagerMsg(session: OnboardingSession): InboundMessage {
 // ── AI helpers ────────────────────────────────────────────────────────────────
 
 async function claudeMatchName(message: string, employeeName: string): Promise<boolean> {
-  const response = await client.messages.create({
-    model: MODEL,
-    max_tokens: 64,
-    system:
-      `You are verifying if a message confirms a person's name. ` +
-      `The expected name is: "${employeeName}". ` +
-      `Reply with ONLY valid JSON: {"matches": true} or {"matches": false}. ` +
-      `A match means the message plausibly confirms or states this name, ` +
-      `including nicknames, partial names, or affirmatives like "yes that's me".`,
-    messages: [{ role: 'user', content: message }],
-  });
+  const response = await withAnthropicRetry(() =>
+    client.messages.create({
+      model: MODEL,
+      max_tokens: 64,
+      system:
+        `You are verifying if a message confirms a person's name. ` +
+        `The expected name is: "${employeeName}". ` +
+        `Reply with ONLY valid JSON: {"matches": true} or {"matches": false}. ` +
+        `A match means the message plausibly confirms or states this name, ` +
+        `including nicknames, partial names, or affirmatives like "yes that's me".`,
+      messages: [{ role: 'user', content: message }],
+    })
+  );
 
   const text = response.content[0].type === 'text' ? response.content[0].text : '';
   try {
@@ -455,20 +458,22 @@ async function claudeParseAvailability(
   message: string,
   bounds: ShiftBounds
 ): Promise<AvailabilitySlot[]> {
-  const response = await client.messages.create({
-    model: MODEL,
-    max_tokens: 512,
-    system:
-      `You are parsing employee availability from natural language into structured data. ` +
-      `Extract all days and time ranges the employee is available. ` +
-      `Clamp all times to ${bounds.earliest_start}–${bounds.latest_end} (24h). ` +
-      `"All day" or "anytime" means ${bounds.earliest_start} to ${bounds.latest_end}. ` +
-      `day_of_week: 0=Sunday through 6=Saturday. Times in HH:MM (24h). ` +
-      `Respond ONLY with valid JSON (no markdown): ` +
-      `{ "slots": [{ "day_of_week": 0, "start_time": "HH:MM", "end_time": "HH:MM" }] } ` +
-      `If nothing clear can be parsed, return { "slots": [] }.`,
-    messages: [{ role: 'user', content: message }],
-  });
+  const response = await withAnthropicRetry(() =>
+    client.messages.create({
+      model: MODEL,
+      max_tokens: 512,
+      system:
+        `You are parsing employee availability from natural language into structured data. ` +
+        `Extract all days and time ranges the employee is available. ` +
+        `Clamp all times to ${bounds.earliest_start}–${bounds.latest_end} (24h). ` +
+        `"All day" or "anytime" means ${bounds.earliest_start} to ${bounds.latest_end}. ` +
+        `day_of_week: 0=Sunday through 6=Saturday. Times in HH:MM (24h). ` +
+        `Respond ONLY with valid JSON (no markdown): ` +
+        `{ "slots": [{ "day_of_week": 0, "start_time": "HH:MM", "end_time": "HH:MM" }] } ` +
+        `If nothing clear can be parsed, return { "slots": [] }.`,
+      messages: [{ role: 'user', content: message }],
+    })
+  );
 
   const text = response.content[0].type === 'text' ? response.content[0].text : '';
   try {
@@ -483,15 +488,17 @@ async function claudeParseAvailability(
 // reliably. Falls back to 'no' on parse failure (the safe default everywhere
 // it's used: re-prompt rather than silently accept).
 async function claudeClassifyYesNo(message: string, question: string): Promise<'yes' | 'no'> {
-  const response = await client.messages.create({
-    model: MODEL,
-    max_tokens: 16,
-    system:
-      `${question} Reply with ONLY one word: "yes" or "no". ` +
-      `"yes" only if the message clearly affirms. "no" for anything else, ` +
-      `including denials, requests to change, ambiguity, or partial mentions.`,
-    messages: [{ role: 'user', content: message }],
-  });
+  const response = await withAnthropicRetry(() =>
+    client.messages.create({
+      model: MODEL,
+      max_tokens: 16,
+      system:
+        `${question} Reply with ONLY one word: "yes" or "no". ` +
+        `"yes" only if the message clearly affirms. "no" for anything else, ` +
+        `including denials, requests to change, ambiguity, or partial mentions.`,
+      messages: [{ role: 'user', content: message }],
+    })
+  );
   const text = response.content[0].type === 'text' ? response.content[0].text : '';
   return text.trim().toLowerCase().startsWith('y') ? 'yes' : 'no';
 }
@@ -500,17 +507,19 @@ async function claudeExtractDates(
   message: string
 ): Promise<{ start_date: string; end_date: string }[]> {
   const today = new Date().toISOString().split('T')[0];
-  const response = await client.messages.create({
-    model: MODEL,
-    max_tokens: 256,
-    system:
-      `Extract time-off dates from a message. Today is ${today}. ` +
-      `If only one date, set start_date = end_date. ` +
-      `Respond ONLY with valid JSON (no markdown): ` +
-      `{ "dates": [{ "start_date": "YYYY-MM-DD", "end_date": "YYYY-MM-DD" }] } ` +
-      `If none, return { "dates": [] }.`,
-    messages: [{ role: 'user', content: message }],
-  });
+  const response = await withAnthropicRetry(() =>
+    client.messages.create({
+      model: MODEL,
+      max_tokens: 256,
+      system:
+        `Extract time-off dates from a message. Today is ${today}. ` +
+        `If only one date, set start_date = end_date. ` +
+        `Respond ONLY with valid JSON (no markdown): ` +
+        `{ "dates": [{ "start_date": "YYYY-MM-DD", "end_date": "YYYY-MM-DD" }] } ` +
+        `If none, return { "dates": [] }.`,
+      messages: [{ role: 'user', content: message }],
+    })
+  );
 
   const text = response.content[0].type === 'text' ? response.content[0].text : '';
   try {

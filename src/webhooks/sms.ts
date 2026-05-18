@@ -1,11 +1,36 @@
 import { Router } from 'express';
+import twilio from 'twilio';
 import { verifyTwilioSignature } from '../middleware/verify-signature';
 import { verifySender } from '../security/sender-verification';
 import { routeIntent } from '../router/intent-router';
 import { saveConversation } from '../logger/conversation';
+import { env } from '../config/env';
 import type { InboundMessage } from '../security/types';
 
 export const smsWebhook = Router();
+
+const HELP_KEYWORDS = new Set(['HELP', 'INFO']);
+const HELP_RESPONSE =
+  'Aegis by Quria Solutions: Scheduling assistant for your employer. ' +
+  'Msg freq varies. Msg & data rates may apply. Reply STOP to opt out. ' +
+  'Support: awdarling@quriasolutions.com';
+
+const twilioClient = twilio(env.TWILIO_ACCOUNT_SID, env.TWILIO_AUTH_TOKEN);
+
+async function sendHelpResponse(to: string): Promise<void> {
+  const payload: { to: string; body: string; from?: string; messagingServiceSid?: string } = {
+    to,
+    body: HELP_RESPONSE,
+  };
+  if (env.TWILIO_MESSAGING_SERVICE_SID) {
+    payload.messagingServiceSid = env.TWILIO_MESSAGING_SERVICE_SID;
+  } else if (env.TWILIO_FROM_NUMBER) {
+    payload.from = env.TWILIO_FROM_NUMBER;
+  } else {
+    throw new Error('No TWILIO_MESSAGING_SERVICE_SID or TWILIO_FROM_NUMBER configured');
+  }
+  await twilioClient.messages.create(payload);
+}
 
 smsWebhook.post('/', verifyTwilioSignature, async (req, res) => {
   // Twilio sends URL-encoded body; express.urlencoded() has already parsed it
@@ -27,6 +52,16 @@ smsWebhook.post('/', verifyTwilioSignature, async (req, res) => {
   try {
     if (!message.sender || !message.recipient || !message.body) {
       console.log('[sms] skipping — missing sender/recipient/body');
+      return;
+    }
+
+    if (HELP_KEYWORDS.has(message.body.toUpperCase())) {
+      console.log(`[sms] HELP keyword received from ${message.sender}, sending compliance response`);
+      try {
+        await sendHelpResponse(message.sender);
+      } catch (err) {
+        console.error('[sms] HELP response send failed:', err);
+      }
       return;
     }
 

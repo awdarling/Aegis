@@ -40,6 +40,7 @@ import { handlePayrollCheck } from '../workflows/payroll';
 import {
   getOnboardingSession,
   getOnboardingSessionByPhone,
+  getOnboardingSessionByEmail,
   handleOnboardingResponse,
   handleInitiateOnboarding,
   getPendingAvailConfirm,
@@ -120,6 +121,17 @@ async function routeIntentInner(
     const phoneSession = await getOnboardingSessionByPhone(message.sender);
     if (phoneSession) {
       await handleOnboardingResponse(message, contact, phoneSession);
+      return;
+    }
+  }
+
+  // Email-keyed onboarding lookup. Same rationale as the phone-keyed check
+  // above — ensures a reply to an onboarding email is routed back into the
+  // workflow regardless of how identity verification resolved the sender.
+  if (message.channel === 'email') {
+    const emailSession = await getOnboardingSessionByEmail(message.sender);
+    if (emailSession) {
+      await handleOnboardingResponse(message, contact, emailSession);
       return;
     }
   }

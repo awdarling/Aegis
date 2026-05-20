@@ -217,6 +217,60 @@ export async function getOnboardingSessionByPhone(
   return null;
 }
 
+// Email-keyed lookup. Mirror of getOnboardingSessionByPhone for email-onboarded
+// employees — finds an active session whose employee_email matches the inbound
+// sender, so a reply to an onboarding email is routed back into the workflow
+// regardless of how identity verification resolved the sender.
+export async function getOnboardingSessionByEmail(
+  email: string
+): Promise<(OnboardingSession & { _memory_id: string }) | null> {
+  const { data } = await supabase
+    .from('aegis_memory')
+    .select('id, content')
+    .like('source', 'onboarding:%');
+
+  const rows = (data ?? []) as { id: string; content: string }[];
+  const target = email.toLowerCase();
+
+  for (const row of rows) {
+    let session: OnboardingSession;
+    try {
+      session = JSON.parse(row.content) as OnboardingSession;
+    } catch {
+      continue;
+    }
+
+    if (session.employee_email?.toLowerCase() !== target) continue;
+
+    if (new Date(session.expires_at) < new Date()) {
+      await supabase.from('aegis_memory').delete().eq('id', row.id);
+      await logActivity({
+        company_id: session.company_id,
+        action: 'onboarding_timeout',
+        entity_type: 'employee',
+        entity_id: session.employee_id,
+        summary: `Onboarding session expired for ${session.employee_name}`,
+        metadata: {
+          step_reached: session.step,
+          started_at: session.started_at,
+        },
+      });
+      const managerContact = buildManagerContact(session);
+      const managerMsg = buildManagerMsg(session);
+      await reply(
+        managerContact,
+        managerMsg,
+        `${session.employee_name}'s onboarding window (48h) expired without completion. Their session has been cleared.`
+      );
+      return null;
+    }
+
+    return { ...session, _memory_id: row.id };
+  }
+
+  return null;
+}
+
 async function saveOnboardingSession(
   session: OnboardingSession & { _memory_id?: string }
 ): Promise<void> {

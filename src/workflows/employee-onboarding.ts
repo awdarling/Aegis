@@ -2,6 +2,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import { supabase } from '../db/client';
 import { logActivity } from '../logger/activity-log';
 import { sendSms } from '../messaging/sms';
+import { sendEmail } from '../messaging/email';
 import { reply } from '../messaging/reply';
 import { env } from '../config/env';
 import { withAnthropicRetry } from '../ai/claude';
@@ -24,6 +25,8 @@ export interface OnboardingSession {
   employee_id: string;
   employee_name: string;
   employee_phone: string | null;
+  employee_email: string | null;
+  employee_channel: 'sms' | 'email';
   aegis_sms_channel: string;
   manager_contact: string;
   manager_channel: 'sms' | 'email';
@@ -145,10 +148,11 @@ export async function getOnboardingSession(
           started_at: session.started_at,
         },
       });
-      await notifyManagerSmsDirect(
-        session.manager_sender,
-        session.manager_recipient,
-        session.company_id,
+      const managerContact = buildManagerContact(session);
+      const managerMsg = buildManagerMsg(session);
+      await reply(
+        managerContact,
+        managerMsg,
         `${session.employee_name}'s onboarding window (48h) expired without completion. Their session has been cleared.`
       );
       return null;
@@ -197,10 +201,11 @@ export async function getOnboardingSessionByPhone(
           started_at: session.started_at,
         },
       });
-      await notifyManagerSmsDirect(
-        session.manager_sender,
-        session.manager_recipient,
-        session.company_id,
+      const managerContact = buildManagerContact(session);
+      const managerMsg = buildManagerMsg(session);
+      await reply(
+        managerContact,
+        managerMsg,
         `${session.employee_name}'s onboarding window (48h) expired without completion. Their session has been cleared.`
       );
       return null;
@@ -382,7 +387,42 @@ function clampTime(time: string, min: string, max: string): string {
 
 // ── Messaging helpers ─────────────────────────────────────────────────────────
 
+function getStepSubject(step: string): string {
+  switch (step) {
+    case 'name_confirm':
+      return "Welcome to Watermark — Let's get you set up";
+    case 'email':
+      return 'One more thing — your email address';
+    case 'role':
+      return 'Quick question about your role';
+    case 'availability':
+      return 'Your availability';
+    case 'availability_confirm':
+      return 'Does this look right?';
+    case 'time_off':
+      return 'Almost done';
+    case 'complete':
+      return "You're all set";
+    default:
+      return 'Aegis — Watermark Country Club';
+  }
+}
+
 async function textEmployee(session: OnboardingSession, body: string): Promise<void> {
+  if (session.employee_channel === 'email') {
+    if (!session.employee_email) {
+      console.warn(`[onboarding] cannot email ${session.employee_name}: no email on session`);
+      return;
+    }
+    await sendEmail({
+      to: session.employee_email,
+      subject: getStepSubject(session.step),
+      text: body,
+      company_id: session.company_id,
+    });
+    return;
+  }
+
   if (!session.employee_phone) {
     console.warn(`[onboarding] cannot text ${session.employee_name}: no phone on session`);
     return;
@@ -393,15 +433,6 @@ async function textEmployee(session: OnboardingSession, body: string): Promise<v
     body,
     company_id: session.company_id,
   });
-}
-
-async function notifyManagerSmsDirect(
-  managerPhone: string,
-  aegisNumber: string,
-  companyId: string,
-  body: string
-): Promise<void> {
-  await sendSms({ to: managerPhone, from: aegisNumber, body, company_id: companyId });
 }
 
 function buildManagerContact(session: OnboardingSession): VerifiedContact {
@@ -422,6 +453,7 @@ function buildManagerMsg(session: OnboardingSession): InboundMessage {
     recipient: session.manager_recipient,
     body: '',
     channel: session.manager_channel,
+    raw_subject: 'Aegis — Watermark Country Club',
   };
 }
 
@@ -1084,9 +1116,9 @@ export async function handleInitiateOnboarding(
     return;
   }
 
-  // Fan-out confirmation gate: if 2+ reachable employees would be SMSed at once,
+  // Fan-out confirmation gate: if 2+ reachable employees would be contacted at once,
   // ask the manager to confirm first so they don't accidentally spam staff.
-  const reachable = candidates.filter(e => e.contact_phone);
+  const reachable = candidates.filter(e => e.contact_phone || e.contact_email);
   if (reachable.length > 1) {
     const pending: OnboardingFanoutPending = {
       company_id: contact.company_id,
@@ -1102,9 +1134,9 @@ export async function handleInitiateOnboarding(
 
     const previewNames = reachable.slice(0, 10).map(e => e.name);
     const overflow = reachable.length > 10 ? `\n...and ${reachable.length - 10} more` : '';
-    const noPhone = candidates.filter(e => !e.contact_phone);
-    const skipNote = noPhone.length > 0
-      ? `\n\n${noPhone.length} will be skipped (no phone on file): ${noPhone.map(e => e.name).join(', ')}.`
+    const noContact = candidates.filter(e => !e.contact_phone && !e.contact_email);
+    const skipNote = noContact.length > 0
+      ? `\n\n${noContact.length} will be skipped (no contact info): ${noContact.map(e => e.name).join(', ')}.`
       : '';
 
     await reply(
@@ -1120,7 +1152,7 @@ export async function handleInitiateOnboarding(
   }
 
   // Single reachable (or all unreachable) — execute immediately, existing
-  // executeOnboardingForCandidates handles the skip-no-phone reporting.
+  // executeOnboardingForCandidates handles the skip-no-contact reporting.
   await executeOnboardingForCandidates(
     candidates,
     companyName,
@@ -1140,17 +1172,17 @@ async function executeOnboardingForCandidates(
   message: InboundMessage
 ): Promise<void> {
   const started: string[] = [];
-  const skippedNoPhone: string[] = [];
+  const skippedNoContact: string[] = [];
 
   for (const employee of candidates) {
-    if (!employee.contact_phone) {
-      skippedNoPhone.push(employee.name);
+    if (!employee.contact_phone && !employee.contact_email) {
+      skippedNoContact.push(employee.name);
       await logActivity({
         company_id: contact.company_id,
-        action: 'onboarding_skipped_no_phone',
+        action: 'onboarding_skipped_no_contact',
         entity_type: 'employee',
         entity_id: employee.id,
-        summary: `Onboarding skipped for ${employee.name} — no phone on file`,
+        summary: `Onboarding skipped for ${employee.name} — no phone or email on file`,
         metadata: { employee_id: employee.id },
       });
       continue;
@@ -1168,6 +1200,8 @@ async function executeOnboardingForCandidates(
       employee_id: employee.id,
       employee_name: employee.name,
       employee_phone: employee.contact_phone ?? null,
+      employee_email: employee.contact_email ?? null,
+      employee_channel: employee.contact_phone ? 'sms' : 'email',
       aegis_sms_channel: aegisSmsChannel,
       manager_contact: contact.matched_identifier,
       manager_channel: message.channel,
@@ -1212,9 +1246,9 @@ async function executeOnboardingForCandidates(
       `Onboarding started for ${started.length} employee${started.length !== 1 ? 's' : ''}: ${started.join(', ')}.`
     );
   }
-  if (skippedNoPhone.length > 0) {
+  if (skippedNoContact.length > 0) {
     lines.push(
-      `Skipped ${skippedNoPhone.length} (no phone on file): ${skippedNoPhone.join(', ')}. Update their phone in Homebase and try again.`
+      `Skipped ${skippedNoContact.length} (no contact info): ${skippedNoContact.join(', ')}. Update their phone or email in Homebase and try again.`
     );
   }
 
@@ -1697,10 +1731,11 @@ export async function checkStaleOnboardingSessions(): Promise<void> {
         .update({ content: JSON.stringify(updated) })
         .eq('id', record.id);
 
-      await notifyManagerSmsDirect(
-        session.manager_sender,
-        session.manager_recipient,
-        session.company_id,
+      const managerContact = buildManagerContact(session);
+      const managerMsg = buildManagerMsg(session);
+      await reply(
+        managerContact,
+        managerMsg,
         `${session.employee_name} hasn't completed onboarding yet. You may want to follow up directly.`
       );
 

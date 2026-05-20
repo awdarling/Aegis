@@ -4,6 +4,7 @@ import { verifySendGridRequest } from '../middleware/verify-signature';
 import { verifySender } from '../security/sender-verification';
 import { routeIntent } from '../router/intent-router';
 import { saveConversation } from '../logger/conversation';
+import { stripEmailBody, stripHtmlTags } from '../utils/strip-email';
 import type { InboundMessage } from '../security/types';
 
 // SendGrid Inbound Parse sends multipart/form-data
@@ -24,7 +25,10 @@ emailWebhook.post(
     const senderRaw = body['from'] ?? body['sender'] ?? '';
     const recipient = body['to'] ?? body['envelope'] ?? '';
     const subject = body['subject'] ?? '';
-    const text = (body['text'] ?? body['html'] ?? '').trim();
+    const rawText = (body['text'] ?? '').trim();
+    const text = rawText
+      ? stripEmailBody(rawText)
+      : stripEmailBody(stripHtmlTags(body['html'] ?? ''));
     const messageId = body['headers']
       ? extractMessageId(body['headers'])
       : undefined;

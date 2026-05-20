@@ -4,6 +4,10 @@ import { checkQuriaStaff } from './quria-verification';
 
 // Step 1: Given the inbound recipient channel value, resolve the company_id.
 // Returns null if no matching channel is configured — caller logs and drops.
+//
+// Required DB row for email routing:
+// INSERT INTO company_channels (company_id, channel_type, channel_value, is_active)
+// VALUES ('<watermark_id>', 'email', 'aegis@quriasolutions.com', true);
 async function resolveCompanyId(
   channelType: Channel,
   channelValue: string
@@ -19,7 +23,39 @@ async function resolveCompanyId(
     console.error('[verification] company_channels lookup error:', error.message);
     return null;
   }
-  return data?.company_id ?? null;
+  if (data?.company_id) return data.company_id;
+
+  // Email fallback: if no exact match for the recipient address, route to the
+  // sole email-configured company when exactly one exists. Prevents silent
+  // drops during early testing when the company_channels row may not yet be
+  // set up. Only triggers for email (SMS routing is strict — wrong number
+  // should never land in someone else's tenant).
+  if (channelType === 'email') {
+    const { data: emailChannels, error: fallbackErr } = await supabase
+      .from('company_channels')
+      .select('company_id')
+      .eq('channel_type', 'email');
+
+    if (fallbackErr) {
+      console.error('[verification] email fallback lookup error:', fallbackErr.message);
+      return null;
+    }
+
+    const uniqueCompanies = new Set(
+      ((emailChannels ?? []) as { company_id: string }[]).map((r) => r.company_id)
+    );
+
+    if (uniqueCompanies.size === 1) {
+      const fallbackCompanyId = [...uniqueCompanies][0];
+      console.warn(
+        `[verification] email fallback: no exact match for ${channelValue}, ` +
+          `routing to sole email-configured company ${fallbackCompanyId}`
+      );
+      return fallbackCompanyId;
+    }
+  }
+
+  return null;
 }
 
 // Step 2: Given a normalized sender identifier and company_id, find the contact.

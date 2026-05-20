@@ -709,6 +709,27 @@ async function handleEmailStep(
   managerContact: VerifiedContact,
   managerMsg: InboundMessage
 ): Promise<void> {
+  // Defensive skip for email-channel sessions: the employee reached us via
+  // their email address, so we already have it. handleNameConfirmStep will
+  // normally route past this step when employee.contact_email is set, but
+  // this guard rescues any session that landed here anyway.
+  if (session.employee_channel === 'email') {
+    session.collected.email = session.employee_email ?? '';
+    const needsRole = !employee.primary_role && !session.collected.role;
+    if (needsRole) {
+      session.step = 'role';
+      const roles = await loadRoles(session.company_id);
+      await saveOnboardingSession(session);
+      await sendRoleStep(session, roles);
+    } else {
+      session.step = 'availability';
+      const bounds = await loadShiftBounds(session.company_id);
+      await saveOnboardingSession(session);
+      await sendAvailabilityStep(session, bounds);
+    }
+    return;
+  }
+
   const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
   const trimmed = body.trim().toLowerCase();
 

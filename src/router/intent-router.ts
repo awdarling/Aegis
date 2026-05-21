@@ -10,6 +10,7 @@ import {
   handleApproveTimeOff,
   handleDenyTimeOff,
   handlePendingTimeOffConfirmation,
+  handleQueryMyTimeOff,
   getPendingTimeOff,
 } from '../workflows/time-off';
 import { handleBuildSchedule, handleDistributeSchedule } from '../workflows/schedule-build';
@@ -259,6 +260,10 @@ async function routeIntentInner(
     switch (classification.intent) {
       case 'submit_time_off':
         await handleSubmitTimeOff(message, contact, classification.extracted);
+        break;
+
+      case 'query_my_time_off':
+        await handleQueryMyTimeOff(message, contact, classification.extracted);
         break;
 
       case 'approve_time_off':

@@ -69,6 +69,7 @@ export interface ClassifyResult {
 
 export const EMPLOYEE_INTENTS = [
   'submit_time_off',
+  'query_my_time_off',
   'update_availability',
   'initiate_swap',
   'respond_swap_accept',
@@ -170,7 +171,31 @@ Respond with ONLY valid JSON in this exact shape — no markdown, no explanation
   "confidence": "high" | "medium" | "low",
   "extracted": {
     // Any structured data you can extract from the message.
-    // For submit_time_off: { "start_date": "YYYY-MM-DD", "end_date": "YYYY-MM-DD", "reason": "..." }
+    // For submit_time_off: {
+    //   "dates": [
+    //     {
+    //       "start_date": "YYYY-MM-DD",
+    //       "end_date": "YYYY-MM-DD",
+    //       "time_off_type": "full_day" | "partial",
+    //       "period_label": "morning" | "afternoon" | "evening" | null,
+    //       "start_time": "HH:MM" | null,
+    //       "end_time": "HH:MM" | null
+    //     }
+    //   ],
+    //   "reason": "..."
+    // }
+    //   - "I need Friday off" → full_day; period_label/start_time/end_time = null.
+    //   - "Friday morning off" → time_off_type=partial, period_label="morning", start_time/end_time=null.
+    //     Named periods map to: morning 09:00–13:00, afternoon 13:00–17:00, evening 17:00–21:00.
+    //   - "Friday 10am to 1pm off" → time_off_type=partial, period_label=null,
+    //     start_time="10:00", end_time="13:00".
+    //   - Multi-day full: single entry with the range. Multi-day partial with the same
+    //     period each day: single entry with the range plus the period info.
+    //   - Multiple distinct dates with different partial windows: one entry per distinct window.
+    //   - If shift names/times are mentioned (e.g. "I need the AM shift off Friday") and
+    //     they appear in the company context, prefer those exact shift times.
+    // For query_my_time_off: {} — used when the employee asks about their own approved
+    //   upcoming time off ("what time off do I have approved?", "when is my next day off?").
     // For initiate_swap: { "shift_date": "YYYY-MM-DD", "shift_name": "...", "target_employee_name": "..." }
     // For build_schedule: { "target_week": "this" | "next", "veteran_preference": string | null }
     //   target_week: "next" if unspecified. Map "this week", "current week" → "this". Map "next week", "upcoming week", "the week after" → "next".

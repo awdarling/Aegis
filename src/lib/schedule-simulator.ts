@@ -326,6 +326,8 @@ export async function runSimulation(input: SimulationInput): Promise<SimulationR
           decided_by: null,
           aegis_recommendation: null,
           aegis_reasoning: null,
+          time_off_type: 'full_day' as const,
+          partial_days: null,
         },
       ]
     : baselineTO;

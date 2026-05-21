@@ -4,6 +4,15 @@
 
 export type Json = string | number | boolean | null | { [key: string]: Json } | Json[];
 
+export interface PartialDayDetail {
+  date: string;
+  type: 'shift_off' | 'custom_hours';
+  shift_id?: string | null;
+  shift_name?: string | null;
+  start_time?: string | null;
+  end_time?: string | null;
+}
+
 export interface Database {
   public: {
     Tables: {
@@ -74,6 +83,8 @@ export interface Database {
           decided_by: string | null;
           aegis_recommendation: 'approve' | 'deny' | 'neutral' | null;
           aegis_reasoning: string | null;
+          time_off_type: 'full_day' | 'partial' | null;
+          partial_days: PartialDayDetail[] | null;
         };
       };
       shift_types: {

@@ -8,7 +8,7 @@ import { generateReply } from '../ai/claude';
 import { runSimulation, getWeekBounds, loadTimeOffPolicies } from '../lib/schedule-simulator';
 import { env } from '../config/env';
 import type { InboundMessage, VerifiedContact } from '../security/types';
-import type { Employee, Policy } from '../db/types';
+import type { Employee, PartialDayDetail, Policy } from '../db/types';
 import type { SimulationResult } from '../lib/schedule-simulator';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -24,7 +24,24 @@ interface PendingTimeOff {
   raw_subject?: string;
   thread_id?: string;
   expires_at: string;
+  time_off_type: 'full_day' | 'partial';
+  partial_days: PartialDayDetail[] | null;
 }
+
+interface ExtractedDateEntry {
+  start_date: string;
+  end_date?: string | null;
+  time_off_type?: 'full_day' | 'partial' | null;
+  period_label?: 'morning' | 'afternoon' | 'evening' | null;
+  start_time?: string | null;
+  end_time?: string | null;
+}
+
+const PERIOD_TIMES: Record<'morning' | 'afternoon' | 'evening', { start: string; end: string }> = {
+  morning: { start: '09:00', end: '13:00' },
+  afternoon: { start: '13:00', end: '17:00' },
+  evening: { start: '17:00', end: '21:00' },
+};
 
 interface DecisionRecommendation {
   recommendation: 'approve' | 'deny';
@@ -51,6 +68,131 @@ function formatShortDate(dateStr: string): string {
     month: 'short',
     day: 'numeric',
   });
+}
+
+function eachDateInRange(startDate: string, endDate: string): string[] {
+  const out: string[] = [];
+  const cur = new Date(startDate + 'T12:00:00Z');
+  const stop = new Date(endDate + 'T12:00:00Z');
+  while (cur.getTime() <= stop.getTime()) {
+    out.push(cur.toISOString().slice(0, 10));
+    cur.setUTCDate(cur.getUTCDate() + 1);
+  }
+  return out;
+}
+
+function resolvePartialWindow(entry: ExtractedDateEntry): { start_time: string; end_time: string } | null {
+  if (entry.start_time && entry.end_time) {
+    return { start_time: entry.start_time, end_time: entry.end_time };
+  }
+  if (entry.period_label && PERIOD_TIMES[entry.period_label]) {
+    const period = PERIOD_TIMES[entry.period_label];
+    return { start_time: period.start, end_time: period.end };
+  }
+  return null;
+}
+
+function normalizeExtractedDates(extracted: Record<string, unknown>): ExtractedDateEntry[] {
+  const rawDates = extracted['dates'];
+  if (Array.isArray(rawDates)) {
+    return rawDates as ExtractedDateEntry[];
+  }
+  // Legacy fallback: top-level start_date/end_date with no partial info.
+  const startDate = extracted['start_date'] as string | undefined;
+  if (startDate) {
+    return [
+      {
+        start_date: startDate,
+        end_date: (extracted['end_date'] as string | undefined) ?? startDate,
+        time_off_type: 'full_day',
+        period_label: null,
+        start_time: null,
+        end_time: null,
+      },
+    ];
+  }
+  return [];
+}
+
+interface ParsedRequest {
+  start_date: string;
+  end_date: string;
+  time_off_type: 'full_day' | 'partial';
+  partial_days: PartialDayDetail[] | null;
+}
+
+function parseRequest(entries: ExtractedDateEntry[]): ParsedRequest | null {
+  if (entries.length === 0) return null;
+
+  const allDates: string[] = [];
+  const partialDays: PartialDayDetail[] = [];
+  let anyPartial = false;
+
+  for (const entry of entries) {
+    const start = entry.start_date;
+    const end = entry.end_date ?? start;
+    if (!start) continue;
+
+    const dates = eachDateInRange(start, end);
+    allDates.push(...dates);
+
+    if (entry.time_off_type === 'partial') {
+      anyPartial = true;
+      const window = resolvePartialWindow(entry);
+      // If we can't resolve a window for a partial entry, fall back to full_day for
+      // those dates so we don't drop the request entirely.
+      if (!window) continue;
+      for (const date of dates) {
+        partialDays.push({
+          date,
+          type: 'custom_hours',
+          shift_id: null,
+          shift_name: null,
+          start_time: window.start_time,
+          end_time: window.end_time,
+        });
+      }
+    }
+  }
+
+  if (allDates.length === 0) return null;
+  allDates.sort();
+
+  return {
+    start_date: allDates[0],
+    end_date: allDates[allDates.length - 1],
+    time_off_type: anyPartial && partialDays.length > 0 ? 'partial' : 'full_day',
+    partial_days: anyPartial && partialDays.length > 0 ? partialDays : null,
+  };
+}
+
+function formatTimeRange(start: string, end: string): string {
+  return `${start}–${end}`;
+}
+
+function formatRequestSummary(parsed: ParsedRequest): string {
+  const range = formatDateRange(parsed.start_date, parsed.end_date);
+  if (parsed.time_off_type === 'full_day' || !parsed.partial_days || parsed.partial_days.length === 0) {
+    return range;
+  }
+  // Compact summary: if all partial_days share one window, show once.
+  const windows = new Set(
+    parsed.partial_days.map(d => `${d.start_time ?? ''}|${d.end_time ?? ''}`)
+  );
+  if (windows.size === 1) {
+    const sample = parsed.partial_days[0];
+    if (sample.start_time && sample.end_time) {
+      return `${range} (${formatTimeRange(sample.start_time, sample.end_time)})`;
+    }
+  }
+  const perDay = parsed.partial_days
+    .map(d =>
+      d.start_time && d.end_time
+        ? `${formatShortDate(d.date)} ${formatTimeRange(d.start_time, d.end_time)}`
+        : formatShortDate(d.date)
+    )
+    .join(', ');
+  return `${range} — partial (${perDay})`;
 }
 
 async function clearPendingTimeOff(companyId: string, employeeId: string): Promise<void> {
@@ -494,11 +636,11 @@ export async function handleSubmitTimeOff(
   contact: VerifiedContact,
   extracted: Record<string, unknown>
 ): Promise<void> {
-  const startDate = extracted['start_date'] as string | undefined;
-  const endDate = ((extracted['end_date'] ?? extracted['start_date']) as string | undefined);
+  const entries = normalizeExtractedDates(extracted);
+  const parsed = parseRequest(entries);
   const reason = (extracted['reason'] as string | undefined) ?? 'personal reasons';
 
-  if (!startDate) {
+  if (!parsed) {
     await reply(
       contact,
       message,
@@ -507,13 +649,11 @@ export async function handleSubmitTimeOff(
     return;
   }
 
-  const end = endDate ?? startDate;
-
   // Store pending confirmation (TTL: 1 hour)
   const pendingData: PendingTimeOff = {
     employee_id: contact.employee_id!,
-    start_date: startDate,
-    end_date: end,
+    start_date: parsed.start_date,
+    end_date: parsed.end_date,
     reason,
     channel: message.channel,
     sender: message.sender,
@@ -521,6 +661,8 @@ export async function handleSubmitTimeOff(
     raw_subject: message.raw_subject,
     thread_id: message.thread_id,
     expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+    time_off_type: parsed.time_off_type,
+    partial_days: parsed.partial_days,
   };
 
   // Delete any stale pending confirmation before inserting
@@ -532,11 +674,11 @@ export async function handleSubmitTimeOff(
     content: JSON.stringify(pendingData),
   });
 
-  const dateDisplay = formatDateRange(startDate, end);
+  const summary = formatRequestSummary(parsed);
   await reply(
     contact,
     message,
-    `Got it — you're requesting ${dateDisplay} off for ${reason}. Is that correct? (Reply "yes" to confirm or "no" to restate.)`
+    `Got it — you're requesting ${summary} off for ${reason}. Is that correct? (Reply "yes" to confirm or "no" to restate.)`
   );
 }
 
@@ -648,6 +790,8 @@ export async function handlePendingTimeOffConfirmation(
       reason: pending.reason,
       status: 'pending',
       requested_at: new Date().toISOString(),
+      time_off_type: pending.time_off_type ?? 'full_day',
+      partial_days: pending.partial_days ?? null,
     })
     .select('id')
     .single();
@@ -725,4 +869,94 @@ export async function handleDenyTimeOff(
     message,
     'To deny a time-off request, please use the Deny button in your Aegis notification email. If you need help finding it, check your inbox for an email from Aegis.'
   );
+}
+
+// Employee asks: "What time off do I have approved?" — lists upcoming approved requests.
+export async function handleQueryMyTimeOff(
+  message: InboundMessage,
+  contact: VerifiedContact,
+  _extracted: Record<string, unknown>
+): Promise<void> {
+  if (!contact.employee_id) {
+    await reply(
+      contact,
+      message,
+      "I couldn't find your employee record. Please contact your manager directly."
+    );
+    return;
+  }
+
+  const today = new Date().toISOString().slice(0, 10);
+
+  const { data } = await supabase
+    .from('time_off_requests')
+    .select('start_date, end_date, time_off_type, partial_days')
+    .eq('employee_id', contact.employee_id)
+    .eq('company_id', contact.company_id)
+    .eq('status', 'approved')
+    .gte('end_date', today)
+    .order('start_date', { ascending: true });
+
+  const rows = (data ?? []) as Array<{
+    start_date: string;
+    end_date: string;
+    time_off_type: 'full_day' | 'partial' | null;
+    partial_days: PartialDayDetail[] | null;
+  }>;
+
+  if (rows.length === 0) {
+    await reply(
+      contact,
+      message,
+      "You don't have any approved time off coming up. You can request time off by texting me the dates you need."
+    );
+    return;
+  }
+
+  const lines = rows.map(row => {
+    const dateRange = formatDateRange(row.start_date, row.end_date);
+    const parsed: ParsedRequest = {
+      start_date: row.start_date,
+      end_date: row.end_date,
+      time_off_type: row.time_off_type === 'partial' ? 'partial' : 'full_day',
+      partial_days: row.partial_days ?? null,
+    };
+
+    if (parsed.time_off_type === 'full_day' || !parsed.partial_days || parsed.partial_days.length === 0) {
+      return `• ${dateRange}: Full day`;
+    }
+
+    const sample = parsed.partial_days[0];
+    const allSame = parsed.partial_days.every(
+      d => d.start_time === sample.start_time && d.end_time === sample.end_time && d.shift_name === sample.shift_name
+    );
+
+    if (allSame) {
+      const detail = sample.shift_name
+        ? sample.shift_name
+        : sample.start_time && sample.end_time
+          ? formatTimeRange(sample.start_time, sample.end_time)
+          : 'partial';
+      return `• ${dateRange}: Partial — ${detail}`;
+    }
+
+    const perDay = parsed.partial_days
+      .map(d => {
+        const label = d.shift_name
+          ? d.shift_name
+          : d.start_time && d.end_time
+            ? formatTimeRange(d.start_time, d.end_time)
+            : 'partial';
+        return `${formatShortDate(d.date)} ${label}`;
+      })
+      .join(', ');
+    return `• ${dateRange}: Partial — ${perDay}`;
+  });
+
+  const header =
+    rows.length === 1
+      ? 'You have 1 approved time off period coming up:'
+      : `You have ${rows.length} approved time off periods coming up:`;
+
+  await reply(contact, message, `${header}\n\n${lines.join('\n')}`);
 }

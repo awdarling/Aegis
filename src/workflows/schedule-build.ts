@@ -5,12 +5,15 @@ import { sendEmail } from '../messaging/email';
 import { sendSms } from '../messaging/sms';
 import { generateReply } from '../ai/claude';
 import { computeWageEstimate } from '../lib/schedule-simulator';
+import { resolveAvailabilityForWeek } from '../lib/custom-availability';
+import { buildTOMap, isBlockedByTO, type TOWindow } from '../lib/to-window';
 import { getSpecialNotesForRange } from './special-notes';
 import type { InboundMessage, VerifiedContact } from '../security/types';
 import type {
   Employee,
   Availability,
-  TimeOffRequest,
+  CustomAvailability,
+  PartialDayDetail,
   ShiftType,
   ShiftRequirement,
   EmployeeConflict,
@@ -51,7 +54,7 @@ interface ScheduleData {
 interface BuildData {
   employees: Employee[];
   availByEmp: Map<string, Availability[]>;
-  approvedTOSet: Set<string>; // 'employeeId:date'
+  toMap: Map<string, TOWindow>; // 'employeeId:date' → full_day | partial windows
   shiftTypes: ShiftType[];
   shiftRequirements: ShiftRequirement[];
   conflicts: EmployeeConflict[];
@@ -155,6 +158,13 @@ function buildEmployeeListForPrompt(
 
 export type VeteranMode = 'only' | 'prioritize' | 'at_least_one' | null;
 
+function isVeteranOnlyDate(
+  date: string,
+  veteranOnlyDates: Array<{ start_date: string; end_date: string }>
+): boolean {
+  return veteranOnlyDates.some(r => date >= r.start_date && date <= r.end_date);
+}
+
 function parseVeteranPreference(pref: string | null): VeteranMode {
   if (!pref) return null;
   const lower = pref.toLowerCase();
@@ -180,7 +190,8 @@ async function loadBuildData(
     supabase.from('companies').select('name, timezone').eq('id', companyId).single(),
     supabase.from('employees').select('*').eq('company_id', companyId).eq('active', true),
     supabase.from('availability').select('*').eq('company_id', companyId),
-    supabase.from('time_off_requests').select('employee_id, start_date, end_date')
+    supabase.from('time_off_requests')
+      .select('employee_id, start_date, end_date, time_off_type, partial_days')
       .eq('company_id', companyId).eq('status', 'approved')
       .lte('start_date', weekEnd).gte('end_date', weekStart),
     supabase.from('shift_types').select('*').eq('company_id', companyId).eq('active', true),
@@ -198,23 +209,24 @@ async function loadBuildData(
     availByEmp.get(a.employee_id)!.push(a);
   }
 
-  // Build TO set: 'employeeId:date'
-  const approvedTOSet = new Set<string>();
+  // Build TO map keyed by 'employeeId:date'. Honors partial-day windows and
+  // shift-based TO. Multiple partial entries on the same date merge.
   const weekDates = getDatesInRange(weekStart, weekEnd);
-  for (const tor of (toRes.data ?? []) as { employee_id: string; start_date: string; end_date: string }[]) {
-    for (const date of weekDates) {
-      if (date >= tor.start_date && date <= tor.end_date) {
-        approvedTOSet.add(`${tor.employee_id}:${date}`);
-      }
-    }
-  }
+  const toRows = (toRes.data ?? []) as Array<{
+    employee_id: string;
+    start_date: string;
+    end_date: string;
+    time_off_type: 'full_day' | 'partial' | null;
+    partial_days: PartialDayDetail[] | null;
+  }>;
+  const toMap = buildTOMap(weekDates, toRows);
 
   const company = (companyRes.data as { name: string; timezone: string } | null);
 
   return {
     employees,
     availByEmp,
-    approvedTOSet,
+    toMap,
     shiftTypes: (stRes.data ?? []) as ShiftType[],
     shiftRequirements: (reqRes.data ?? []) as ShiftRequirement[],
     conflicts: (conflictRes.data ?? []) as EmployeeConflict[],
@@ -253,25 +265,36 @@ function computeGapReason(params: {
   dayOfWeek: number;
   shiftStart: string;
   shiftEnd: string;
+  shiftId: string;
   shiftHours: number;
   employees: Employee[];
   availByEmp: Map<string, Availability[]>;
-  approvedTOSet: Set<string>;
+  toMap: Map<string, TOWindow>;
+  veteranOnlyDates: Array<{ start_date: string; end_date: string }>;
   weeklyHoursMap: Map<string, number>;
   assignedToShift: string[];
   conflicts: EmployeeConflict[];
 }): string {
-  const { role, date, dayOfWeek, shiftStart, shiftEnd, shiftHours, employees } = params;
+  const { role, date, dayOfWeek, shiftStart, shiftEnd, shiftId, shiftHours, employees } = params;
 
-  const qualified = employees.filter(e => e.qualified_roles.includes(role));
-  if (qualified.length === 0) return `No active employees are qualified for the ${role} role`;
+  const veteranOnlyToday = isVeteranOnlyDate(date, params.veteranOnlyDates);
+  const candidatePool = veteranOnlyToday ? employees.filter(e => e.is_veteran) : employees;
+
+  const qualified = candidatePool.filter(e => e.qualified_roles.includes(role));
+  if (qualified.length === 0) {
+    return veteranOnlyToday
+      ? `No veteran employees are qualified for the ${role} role on this veteran-only date`
+      : `No active employees are qualified for the ${role} role`;
+  }
 
   const available = qualified.filter(e =>
     isAvailableForShift(e.id, dayOfWeek, shiftStart, shiftEnd, params.availByEmp)
   );
   if (available.length === 0) return `No qualified ${role} employees have availability on ${new Date(date + 'T12:00:00Z').toLocaleDateString('en-US', { weekday: 'long' })}`;
 
-  const notOnTO = available.filter(e => !params.approvedTOSet.has(`${e.id}:${date}`));
+  const notOnTO = available.filter(e =>
+    !isBlockedByTO(e.id, date, shiftStart, shiftEnd, shiftId, params.toMap)
+  );
   if (notOnTO.length === 0) return `All available ${role} employees have approved time off on ${formatShortDate(date)}`;
 
   const withinHours = notOnTO.filter(e =>
@@ -300,16 +323,19 @@ function findBestEmployee(params: {
   dayOfWeek: number;
   shiftStart: string;
   shiftEnd: string;
+  shiftId: string;
   shiftHours: number;
   employees: Employee[];
   availByEmp: Map<string, Availability[]>;
-  approvedTOSet: Set<string>;
+  toMap: Map<string, TOWindow>;
+  veteranOnlyDates: Array<{ start_date: string; end_date: string }>;
   weeklyHoursMap: Map<string, number>;
   assignedToShift: string[];
   conflicts: EmployeeConflict[];
   veteranMode: VeteranMode;
 }): { employee: Employee | null; veteranFallback: boolean } {
-  const { role, date, dayOfWeek, shiftStart, shiftEnd, shiftHours, veteranMode } = params;
+  const { role, date, dayOfWeek, shiftStart, shiftEnd, shiftId, shiftHours, veteranMode } = params;
+  const veteranOnlyToday = isVeteranOnlyDate(date, params.veteranOnlyDates);
 
   // Build conflict sets from already-assigned employees on this shift
   const neverExcluded = new Set<string>();
@@ -326,10 +352,11 @@ function findBestEmployee(params: {
   }
 
   const baseCandidates = params.employees.filter(e => {
+    if (veteranOnlyToday && !e.is_veteran) return false;
     if (!e.qualified_roles.includes(role)) return false;
     if (params.assignedToShift.includes(e.id)) return false;
     if (neverExcluded.has(e.id)) return false;
-    if (params.approvedTOSet.has(`${e.id}:${date}`)) return false;
+    if (isBlockedByTO(e.id, date, shiftStart, shiftEnd, shiftId, params.toMap)) return false;
     if (!isAvailableForShift(e.id, dayOfWeek, shiftStart, shiftEnd, params.availByEmp)) return false;
     if ((params.weeklyHoursMap.get(e.id) ?? 0) + shiftHours > e.max_weekly_hours) return false;
     return true;
@@ -375,7 +402,8 @@ function buildScheduleForWeek(
   data: BuildData,
   weekDates: string[],
   eventsByDate: Map<string, Event[]>,
-  veteranMode: VeteranMode
+  veteranMode: VeteranMode,
+  veteranOnlyDates: Array<{ start_date: string; end_date: string }>
 ): { assignments: ScheduleAssignment[]; gaps: ScheduleGap[]; totalRequired: number; totalFilled: number } {
   const assignments: ScheduleAssignment[] = [];
   const gaps: ScheduleGap[] = [];
@@ -388,6 +416,10 @@ function buildScheduleForWeek(
   for (const date of weekDates) {
     const dayOfWeek = new Date(date + 'T12:00:00Z').getUTCDay();
     const dateNotes = eventsByDate.get(date) ?? [];
+
+    if (isVeteranOnlyDate(date, veteranOnlyDates)) {
+      console.log(`[schedule] veteran-only restriction active for ${date}: skipping non-veterans`);
+    }
 
     // Sort shift types by start time for consistent ordering
     const activeShiftTypes = data.shiftTypes
@@ -416,10 +448,12 @@ function buildScheduleForWeek(
             dayOfWeek,
             shiftStart: shiftType.start_time,
             shiftEnd: shiftType.end_time,
+            shiftId: shiftType.id,
             shiftHours: hours,
             employees: data.employees,
             availByEmp: data.availByEmp,
-            approvedTOSet: data.approvedTOSet,
+            toMap: data.toMap,
+            veteranOnlyDates,
             weeklyHoursMap,
             assignedToShift,
             conflicts: data.conflicts,
@@ -466,10 +500,12 @@ function buildScheduleForWeek(
                 dayOfWeek,
                 shiftStart: shiftType.start_time,
                 shiftEnd: shiftType.end_time,
+                shiftId: shiftType.id,
                 shiftHours: hours,
                 employees: data.employees,
                 availByEmp: data.availByEmp,
-                approvedTOSet: data.approvedTOSet,
+                toMap: data.toMap,
+                veteranOnlyDates,
                 weeklyHoursMap,
                 assignedToShift,
                 conflicts: data.conflicts,
@@ -495,7 +531,7 @@ function buildScheduleForWeek(
           employees: data.employees,
           employeeById,
           availByEmp: data.availByEmp,
-          approvedTOSet: data.approvedTOSet,
+          toMap: data.toMap,
           conflicts: data.conflicts,
         });
       }
@@ -519,7 +555,7 @@ function ensureVeteranOnShift(params: {
   employees: Employee[];
   employeeById: Map<string, Employee>;
   availByEmp: Map<string, Availability[]>;
-  approvedTOSet: Set<string>;
+  toMap: Map<string, TOWindow>;
   conflicts: EmployeeConflict[];
 }): void {
   const { assignments, date, dayOfWeek, shiftType, shiftHrs, weeklyHoursMap, employeeById } = params;
@@ -542,7 +578,7 @@ function ensureVeteranOnShift(params: {
       if (!e.is_veteran) return false;
       if (!e.qualified_roles.includes(candidate.role)) return false;
       if (onShiftIds.has(e.id)) return false;
-      if (params.approvedTOSet.has(`${e.id}:${date}`)) return false;
+      if (isBlockedByTO(e.id, date, shiftType.start_time, shiftType.end_time, shiftType.id, params.toMap)) return false;
       if (!isAvailableForShift(e.id, dayOfWeek, shiftType.start_time, shiftType.end_time, params.availByEmp)) return false;
       if ((weeklyHoursMap.get(e.id) ?? 0) + shiftHrs > e.max_weekly_hours) return false;
       // never-conflict with anyone remaining on the shift after the swap
@@ -718,6 +754,34 @@ export async function handleBuildSchedule(
   ]);
   data.events = specialNotes;
 
+  // Custom availability override (date-limited or rotating). Resolved per
+  // employee and folded into data.availByEmp so the existing scheduling
+  // functions don't need to change. Newest active row wins if duplicates exist.
+  const { data: customAvailData } = await supabase
+    .from('custom_availability')
+    .select('*')
+    .eq('company_id', contact.company_id)
+    .eq('active', true)
+    .order('created_at', { ascending: false });
+
+  const customAvailByEmployee: Record<string, CustomAvailability> = {};
+  for (const row of (customAvailData ?? []) as CustomAvailability[]) {
+    if (!customAvailByEmployee[row.employee_id]) {
+      customAvailByEmployee[row.employee_id] = row;
+    }
+  }
+
+  for (const emp of data.employees) {
+    const custom = customAvailByEmployee[emp.id] ?? null;
+    if (!custom) continue;
+    const normal = data.availByEmp.get(emp.id) ?? [];
+    const resolved = resolveAvailabilityForWeek(emp, weekStart, weekEnd, normal, custom);
+    if (resolved !== normal) {
+      data.availByEmp.set(emp.id, resolved);
+      console.log(`[schedule] using custom availability for ${emp.name}: ${custom.type}`);
+    }
+  }
+
   // Validate: need shift types to proceed
   if (data.shiftTypes.length === 0) {
     await reply(contact, message,
@@ -744,8 +808,18 @@ export async function handleBuildSchedule(
     console.log('[schedule-build] applying veteran preference:', veteranPreference);
   }
 
+  // Veteran-only date ranges — non-veterans are hard-excluded from these dates.
+  const veteranOnlyDates: Array<{ start_date: string; end_date: string }> =
+    Array.isArray(extracted['veteran_only_dates'])
+      ? (extracted['veteran_only_dates'] as Array<{ start_date: string; end_date: string }>)
+          .filter(r => r && typeof r.start_date === 'string' && typeof r.end_date === 'string')
+      : [];
+  if (veteranOnlyDates.length > 0) {
+    console.log('[schedule-build] veteran-only date ranges:', veteranOnlyDates);
+  }
+
   // Run scheduling algorithm
-  const { assignments, gaps, totalRequired, totalFilled } = buildScheduleForWeek(data, weekDates, eventsByDate, veteranMode);
+  const { assignments, gaps, totalRequired, totalFilled } = buildScheduleForWeek(data, weekDates, eventsByDate, veteranMode, veteranOnlyDates);
 
   // Compute wages
   const wages = await computeWageEstimate(contact.company_id, assignments);

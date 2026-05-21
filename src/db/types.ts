@@ -69,6 +69,44 @@ export interface Database {
           end_time: string;
         };
       };
+      custom_availability: {
+        Row: {
+          id: string;
+          employee_id: string;
+          company_id: string;
+          type: 'date_limited' | 'rotating';
+          end_date: string | null;
+          cycle_weeks: number | null;
+          cycle_start_date: string | null;
+          patterns: Json;
+          active: boolean;
+          created_at: string;
+        };
+        Insert: {
+          id?: string;
+          employee_id: string;
+          company_id: string;
+          type: 'date_limited' | 'rotating';
+          end_date?: string | null;
+          cycle_weeks?: number | null;
+          cycle_start_date?: string | null;
+          patterns: Json;
+          active?: boolean;
+          created_at?: string;
+        };
+        Update: {
+          id?: string;
+          employee_id?: string;
+          company_id?: string;
+          type?: 'date_limited' | 'rotating';
+          end_date?: string | null;
+          cycle_weeks?: number | null;
+          cycle_start_date?: string | null;
+          patterns?: Json;
+          active?: boolean;
+          created_at?: string;
+        };
+      };
       time_off_requests: {
         Row: {
           id: string;
@@ -338,6 +376,7 @@ export type Company = Database['public']['Tables']['companies']['Row'];
 export type User = Database['public']['Tables']['users']['Row'];
 export type Employee = Database['public']['Tables']['employees']['Row'];
 export type Availability = Database['public']['Tables']['availability']['Row'];
+export type CustomAvailability = Database['public']['Tables']['custom_availability']['Row'];
 export type TimeOffRequest = Database['public']['Tables']['time_off_requests']['Row'];
 export type ShiftType = Database['public']['Tables']['shift_types']['Row'];
 export type ShiftRequirement = Database['public']['Tables']['shift_requirements']['Row'];

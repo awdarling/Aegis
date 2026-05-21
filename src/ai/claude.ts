@@ -90,6 +90,7 @@ export const MANAGER_INTENTS = [
   'distribute_schedule',
   'run_payroll_check',
   'homebase_edit',
+  'notify_day_closure',
 ] as const;
 
 export const QURIA_INTENTS = [
@@ -197,10 +198,19 @@ Respond with ONLY valid JSON in this exact shape — no markdown, no explanation
     // For query_my_time_off: {} — used when the employee asks about their own approved
     //   upcoming time off ("what time off do I have approved?", "when is my next day off?").
     // For initiate_swap: { "shift_date": "YYYY-MM-DD", "shift_name": "...", "target_employee_name": "..." }
-    // For build_schedule: { "target_week": "this" | "next", "veteran_preference": string | null }
+    // For build_schedule: {
+    //   "target_week": "this" | "next",
+    //   "veteran_preference": string | null,
+    //   "veteran_only_dates": [
+    //     { "start_date": "YYYY-MM-DD", "end_date": "YYYY-MM-DD" }
+    //   ] | null
+    // }
     //   target_week: "next" if unspecified. Map "this week", "current week" → "this". Map "next week", "upcoming week", "the week after" → "next".
-    //   Never emit a calendar date — you do not know today's date reliably.
+    //   Never emit a calendar date for target_week — you do not know today's date reliably.
     //   veteran_preference: free-text capturing any veteran-related scheduling preference (e.g. "veterans only", "prioritize veterans", "at least one veteran per shift"). null if no veteran preference mentioned.
+    //   veteran_only_dates: specific date ranges where ONLY veteran employees can be scheduled. Non-veterans are excluded from those dates entirely.
+    //     Example: "veterans only Memorial Day weekend" → veteran_only_dates: [{ "start_date": "2026-05-23", "end_date": "2026-05-25" }].
+    //     null or omitted if no date-bounded veteran-only restriction is mentioned.
     // For distribute_schedule: {}
     // For homebase_edit: { "entity_type": "employee|event|policy|wage_rate|shift_type", "entity_name": "...", "field": "...", "new_value": "..." }
     // For initiate_onboarding: { "employee_name": "..." } if targeting one employee, or {} for all
@@ -208,6 +218,19 @@ Respond with ONLY valid JSON in this exact shape — no markdown, no explanation
     // For operational_query: {}
     // For run_payroll_check: { "period_start": "YYYY-MM-DD", "period_end": "YYYY-MM-DD" }
     // For broadcast_message: { "message_text": "exact message to send", "target_type": "all|managers|employees|role|specific", "target_role": "Lifeguard|null", "target_names": ["Name1"]|null, "channel": "sms|email|both" }
+    // For notify_day_closure: {
+    //   "date": "YYYY-MM-DD",
+    //   "employee_name": string,
+    //   "employee_phone": string | null,
+    //   "employee_email": string | null,
+    //   "shift_name": string | null,
+    //   "company_name": string
+    // }
+    //   Triggered when a manager asks Aegis to send a closure notification to a
+    //   specific employee. The message will contain the employee name, their
+    //   contact info, and the date/shift being cancelled. This is typically a
+    //   programmatic call from Homebase's POST /api/notify-day-closure endpoint,
+    //   not a free-form human message.
     // Otherwise: {}
   }
 }`;

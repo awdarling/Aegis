@@ -57,6 +57,7 @@ import {
   handleBroadcastConfirmation,
   getActiveBroadcastSession,
 } from '../workflows/broadcast';
+import { handleNotifyDayClosure } from '../workflows/day-closure';
 
 // ── Permission sets ───────────────────────────────────────────────────────────
 
@@ -75,6 +76,7 @@ const MANAGER_ONLY_INTENTS = new Set([
   'initiate_onboarding',
   'homebase_edit',
   'run_payroll_check',
+  'notify_day_closure',
 ]);
 
 // Intents available only to quria_admin — managers attempting these are blocked.
@@ -324,6 +326,10 @@ async function routeIntentInner(
 
       case 'broadcast_message':
         await handleBroadcast(message, contact, classification.extracted);
+        break;
+
+      case 'notify_day_closure':
+        await handleNotifyDayClosure(message, contact, classification.extracted);
         break;
 
       case 'quria_diagnostic':

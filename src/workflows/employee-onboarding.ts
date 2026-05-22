@@ -1,3 +1,11 @@
+// -- Migration required in Supabase (no-op for this codebase: sessions are JSON
+// -- in aegis_memory.content, not a dedicated table — kept here for parity with
+// -- the spec / future schema migration):
+// --   ALTER TABLE onboarding_sessions
+// --     ADD COLUMN IF NOT EXISTS opt_in_confirmed boolean DEFAULT false;
+// --   ALTER TABLE onboarding_sessions
+// --     ADD COLUMN IF NOT EXISTS opt_in_sent_at timestamptz;
+
 import Anthropic from '@anthropic-ai/sdk';
 import { supabase } from '../db/client';
 import { logActivity } from '../logger/activity-log';
@@ -32,7 +40,7 @@ export interface OnboardingSession {
   manager_channel: 'sms' | 'email';
   manager_sender: string;
   manager_recipient: string;
-  step: 'name_confirm' | 'email' | 'role' | 'availability' | 'availability_confirm' | 'time_off' | 'complete';
+  step: 'opt_in' | 'name_confirm' | 'email' | 'role' | 'availability' | 'availability_confirm' | 'time_off' | 'complete';
   collected: {
     name_confirmed: boolean;
     email: string | null;
@@ -46,6 +54,11 @@ export interface OnboardingSession {
   invalid_email_attempts: number;
   invalid_availability_attempts: number;
   warned_24h: boolean;
+  // TCPA opt-in: employees must reply YES before Aegis sends any further
+  // onboarding content. Sessions reaching the router with opt_in_confirmed
+  // false are gated through handleOptInStep until the employee confirms.
+  opt_in_confirmed: boolean;
+  opt_in_sent_at: string | null;
   started_at: string;
   expires_at: string;
 }
@@ -443,6 +456,8 @@ function clampTime(time: string, min: string, max: string): string {
 
 function getStepSubject(step: string): string {
   switch (step) {
+    case 'opt_in':
+      return 'Confirm to receive scheduling messages from Aegis';
     case 'name_confirm':
       return "Welcome to Watermark — Let's get you set up";
     case 'email':
@@ -462,7 +477,11 @@ function getStepSubject(step: string): string {
   }
 }
 
-async function textEmployee(session: OnboardingSession, body: string): Promise<void> {
+// Unguarded send — only the opt-in step (sending the opt-in prompt itself and
+// handling YES/NO/ambiguous replies) should call this directly. Everything else
+// must go through textEmployee, which gates outbound traffic on
+// opt_in_confirmed.
+async function textEmployeeRaw(session: OnboardingSession, body: string): Promise<void> {
   if (session.employee_channel === 'email') {
     if (!session.employee_email) {
       console.warn(`[onboarding] cannot email ${session.employee_name}: no email on session`);
@@ -487,6 +506,22 @@ async function textEmployee(session: OnboardingSession, body: string): Promise<v
     body,
     company_id: session.company_id,
   });
+}
+
+// Guarded send used by every onboarding step except opt-in. If the employee has
+// not yet confirmed opt-in, the request is dropped and the opt-in prompt is
+// re-sent instead — prevents any race where a downstream step transmits content
+// before YES is received.
+async function textEmployee(session: OnboardingSession, body: string): Promise<void> {
+  if (!session.opt_in_confirmed) {
+    console.warn(
+      `[onboarding] blocked outbound send to ${session.employee_name}: opt-in not confirmed; re-sending opt-in prompt`
+    );
+    const companyName = await loadCompanyName(session.company_id);
+    await sendOptInStep(session, companyName);
+    return;
+  }
+  await textEmployeeRaw(session, body);
 }
 
 function buildManagerContact(session: OnboardingSession): VerifiedContact {
@@ -617,11 +652,13 @@ async function claudeExtractDates(
 
 // ── Step senders ──────────────────────────────────────────────────────────────
 
-async function sendNameConfirmStep(session: OnboardingSession, companyName: string): Promise<void> {
-  await textEmployee(
+async function sendOptInStep(session: OnboardingSession, companyName: string): Promise<void> {
+  const firstName = session.employee_name.split(' ')[0];
+  await textEmployeeRaw(
     session,
-    `Hi, I'm Aegis, the scheduling assistant for ${companyName}. ` +
-      `I'm reaching out to get your info on file. Can you confirm your name?`
+    `Hi ${firstName}! This is Aegis, the scheduling assistant for ${companyName}.\n\n` +
+      `You're being added to our automated scheduling system, which will send you shift notifications and scheduling updates via SMS.\n\n` +
+      `Reply YES to confirm you'd like to receive these messages. Msg & data rates may apply. Reply STOP at any time to opt out.`
   );
 }
 
@@ -664,6 +701,68 @@ async function sendTimeOffStep(session: OnboardingSession): Promise<void> {
 }
 
 // ── Step handlers ─────────────────────────────────────────────────────────────
+
+async function handleOptInStep(
+  body: string,
+  session: OnboardingSession & { _memory_id: string },
+  companyName: string
+): Promise<void> {
+  const trimmed = body.trim().toLowerCase();
+  const isYes = /^(y|yes|yes please|sure|ok|okay|yep|yeah)$/i.test(trimmed);
+  const isNo = /^(n|no|nope|stop|cancel|quit)$/i.test(trimmed);
+
+  if (isYes) {
+    session.opt_in_confirmed = true;
+    session.step = 'name_confirm';
+    await saveOnboardingSession(session);
+    await logActivity({
+      company_id: session.company_id,
+      action: 'employee_opt_in_confirmed',
+      entity_type: 'employee',
+      entity_id: session.employee_id,
+      summary: `${session.employee_name} confirmed SMS opt-in for scheduling notifications`,
+      metadata: {
+        opt_in_sent_at: session.opt_in_sent_at,
+        confirmed_at: new Date().toISOString(),
+        company_name: companyName,
+      },
+    });
+    // Combined YES-confirmation + name_confirm prompt. Subsequent inbound
+    // messages will land on handleNameConfirmStep.
+    await textEmployeeRaw(
+      session,
+      `Great, you're confirmed! Let's get you set up. What's your full name?`
+    );
+    return;
+  }
+
+  if (isNo) {
+    await logActivity({
+      company_id: session.company_id,
+      action: 'employee_opt_in_declined',
+      entity_type: 'employee',
+      entity_id: session.employee_id,
+      summary: `${session.employee_name} declined SMS opt-in — onboarding halted`,
+      metadata: {
+        opt_in_sent_at: session.opt_in_sent_at,
+        declined_at: new Date().toISOString(),
+        reply_body: body.slice(0, 200),
+      },
+    });
+    await textEmployeeRaw(
+      session,
+      `No problem. You won't receive any further messages. Contact your manager if you change your mind.`
+    );
+    await clearOnboardingSession(session.company_id, session.employee_id);
+    return;
+  }
+
+  // Ambiguous reply — re-prompt without re-sending the full opt-in body.
+  await textEmployeeRaw(
+    session,
+    `Please reply YES to receive scheduling notifications or NO to opt out. You won't receive further messages until you reply.`
+  );
+}
 
 async function handleNameConfirmStep(
   body: string,
@@ -1088,6 +1187,11 @@ export async function handleOnboardingResponse(
   }
 
   switch (session.step) {
+    case 'opt_in': {
+      const companyName = await loadCompanyName(session.company_id);
+      await handleOptInStep(message.body, session, companyName);
+      break;
+    }
     case 'name_confirm': {
       const companyName = await loadCompanyName(session.company_id);
       await handleNameConfirmStep(message.body, session, employee, companyName);
@@ -1282,7 +1386,7 @@ async function executeOnboardingForCandidates(
       manager_channel: message.channel,
       manager_sender: message.sender,
       manager_recipient: message.recipient,
-      step: 'name_confirm',
+      step: 'opt_in',
       collected: {
         name_confirmed: false,
         email: null,
@@ -1297,12 +1401,14 @@ async function executeOnboardingForCandidates(
       invalid_email_attempts: 0,
       invalid_availability_attempts: 0,
       warned_24h: false,
+      opt_in_confirmed: false,
+      opt_in_sent_at: now.toISOString(),
       started_at: now.toISOString(),
       expires_at: new Date(now.getTime() + 48 * 60 * 60 * 1000).toISOString(),
     };
 
     await saveOnboardingSession(session);
-    await sendNameConfirmStep(session, companyName);
+    await sendOptInStep(session, companyName);
     started.push(employee.name);
 
     await logActivity({

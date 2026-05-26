@@ -164,6 +164,7 @@ export interface Database {
           company_id: string;
           policy_key: string;
           policy_value: string;
+          policy_value_json: Json | null;
           policy_type: 'time_off' | 'scheduling' | 'swaps' | 'coverage' | 'emergency' | 'general';
           description: string | null;
           version: number;

@@ -272,7 +272,7 @@ async function loadScheduledShifts(
   const shifts: ScheduledShift[] = [];
 
   for (const row of (data ?? []) as Array<{
-    data: { shifts?: Array<{
+    data: { assignments?: Array<{
       employee_id: string;
       employee_name: string;
       date: string;
@@ -285,8 +285,8 @@ async function loadScheduledShifts(
     week_start: string;
     week_end: string;
   }>) {
-    const rowShifts = row.data?.shifts ?? [];
-    for (const s of rowShifts) {
+    const rowAssignments = row.data?.assignments ?? [];
+    for (const s of rowAssignments) {
       if (s.date >= periodStart && s.date <= periodEnd) {
         const hours = s.hours ?? computeHours(s.start_time, s.end_time);
         shifts.push({

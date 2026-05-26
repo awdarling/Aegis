@@ -185,7 +185,7 @@ async function handleSwapDecision(
       .order('generated_at', { ascending: false }).limit(1).maybeSingle();
 
     if (schedRow && receiver) {
-      const row = schedRow as { id: string; data: { shifts: unknown[] } };
+      const row = schedRow as { id: string; data: { assignments: unknown[] } };
       await executeScheduleSwap(
         token.company_id, row.id, token.shift_date, token.shift_name,
         token.requester_id, token.receiver_id, token.receiver_name

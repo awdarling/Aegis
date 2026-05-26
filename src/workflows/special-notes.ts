@@ -23,6 +23,8 @@ export async function getSpecialNotes(
 }
 
 // Returns special notes for an entire date range (week), ordered by date.
+// Single-day events have end_date = NULL — those need date >= startDate to still
+// fall within the target window.
 export async function getSpecialNotesForRange(
   companyId: string,
   startDate: string,
@@ -33,7 +35,7 @@ export async function getSpecialNotesForRange(
     .select('*')
     .eq('company_id', companyId)
     .lte('date', endDate)
-    .gte('end_date', startDate)
+    .or(`end_date.gte.${startDate},and(end_date.is.null,date.gte.${startDate})`)
     .order('date', { ascending: true });
 
   if (error) {

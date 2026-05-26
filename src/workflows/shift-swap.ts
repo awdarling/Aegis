@@ -9,22 +9,12 @@ import { computeWageEstimate } from '../lib/schedule-simulator';
 import { env } from '../config/env';
 import type { InboundMessage, VerifiedContact } from '../security/types';
 import type { Employee, Policy } from '../db/types';
+import type { ScheduleAssignment } from './schedule-build';
 
 // ── Schedule types (shared shape with emergency-coverage and schedule-build) ──
 
-interface ScheduleShift {
-  date: string;
-  employee_id: string;
-  employee_name: string;
-  shift_name: string;
-  role: string;
-  start_time: string;
-  end_time: string;
-  hours?: number;
-}
-
 interface ScheduleData {
-  shifts: ScheduleShift[];
+  assignments: ScheduleAssignment[];
 }
 
 // ── Public state types ────────────────────────────────────────────────────────
@@ -217,9 +207,9 @@ async function getReceiverWeeklyHours(companyId: string, receiverId: string, shi
     .order('generated_at', { ascending: false }).limit(1).maybeSingle();
   if (!data) return 0;
   const sched = (data as { data: ScheduleData }).data;
-  return sched.shifts
-    .filter(s => s.employee_id === receiverId)
-    .reduce((sum, s) => sum + (s.hours ?? computeShiftHours(s.start_time, s.end_time)), 0);
+  return sched.assignments
+    .filter(a => a.employee_id === receiverId)
+    .reduce((sum, a) => sum + (a.hours ?? computeShiftHours(a.start_time, a.end_time)), 0);
 }
 
 // ── Schedule helpers ──────────────────────────────────────────────────────────
@@ -245,8 +235,8 @@ async function findSchedule(
   return null;
 }
 
-function findRequesterShift(schedData: ScheduleData, requesterId: string, shiftDate: string): ScheduleShift | null {
-  return schedData.shifts.find(s => s.employee_id === requesterId && s.date === shiftDate) ?? null;
+function findRequesterShift(schedData: ScheduleData, requesterId: string, shiftDate: string): ScheduleAssignment | null {
+  return schedData.assignments.find(a => a.employee_id === requesterId && a.date === shiftDate) ?? null;
 }
 
 // Executes an approved swap: updates the schedule data and recalculates wages.
@@ -265,15 +255,15 @@ export async function executeScheduleSwap(
   if (!schedRow) return;
 
   const row = schedRow as { id: string; data: ScheduleData; staffing_report: Record<string, unknown> | null };
-  const updatedShifts = row.data.shifts.map(s => {
-    if (s.date === shiftDate && s.shift_name === shiftName && s.employee_id === requesterId) {
-      return { ...s, employee_id: receiverId, employee_name: receiverName };
+  const updatedAssignments = row.data.assignments.map(a => {
+    if (a.date === shiftDate && a.shift_name === shiftName && a.employee_id === requesterId) {
+      return { ...a, employee_id: receiverId, employee_name: receiverName };
     }
-    return s;
+    return a;
   });
 
-  const updatedData: ScheduleData = { ...row.data, shifts: updatedShifts };
-  const wages = await computeWageEstimate(companyId, updatedShifts);
+  const updatedData: ScheduleData = { ...row.data, assignments: updatedAssignments };
+  const wages = await computeWageEstimate(companyId, updatedAssignments);
 
   await supabase.from('schedules').update({
     data: updatedData as unknown as Record<string, unknown>,
@@ -392,9 +382,9 @@ async function buildSwapCandidates(params: {
   const schedData = schedRes.data ? (schedRes.data as { data: ScheduleData }).data : null;
   const weeklyHoursMap = new Map<string, number>();
   if (schedData) {
-    for (const s of schedData.shifts) {
-      const h = s.hours ?? computeShiftHours(s.start_time, s.end_time);
-      weeklyHoursMap.set(s.employee_id, (weeklyHoursMap.get(s.employee_id) ?? 0) + h);
+    for (const a of schedData.assignments) {
+      const h = a.hours ?? computeShiftHours(a.start_time, a.end_time);
+      weeklyHoursMap.set(a.employee_id, (weeklyHoursMap.get(a.employee_id) ?? 0) + h);
     }
   }
 
@@ -669,13 +659,13 @@ export async function handleInitiateSwap(
 
   // Find the requester's shift in the schedule
   const schedule = await findSchedule(contact.company_id, shiftDate);
-  let shift: ScheduleShift | null = null;
+  let shift: ScheduleAssignment | null = null;
   if (schedule) {
     shift = findRequesterShift(schedule.data, contact.employee_id!, shiftDate);
     // If we have a hint but no exact match, try to find by shift_name
     if (!shift && shiftNameHint) {
-      shift = schedule.data.shifts.find(s =>
-        s.date === shiftDate && s.shift_name.toLowerCase().includes(shiftNameHint.toLowerCase())
+      shift = schedule.data.assignments.find(a =>
+        a.date === shiftDate && a.shift_name.toLowerCase().includes(shiftNameHint.toLowerCase())
       ) ?? null;
     }
   }

@@ -3,7 +3,6 @@ import { logActivity } from '../logger/activity-log';
 import { reply } from '../messaging/reply';
 import { sendEmail } from '../messaging/email';
 import { sendSms } from '../messaging/sms';
-import { generateReply } from '../ai/claude';
 import { computeWageEstimate } from '../lib/schedule-simulator';
 import { resolveAvailabilityForWeek } from '../lib/custom-availability';
 import { buildTOMap, isBlockedByTO, type TOWindow } from '../lib/to-window';
@@ -23,7 +22,7 @@ import type {
 
 // ── Output types ──────────────────────────────────────────────────────────────
 
-interface ScheduleAssignment {
+export interface ScheduleAssignment {
   date: string;
   employee_id: string;
   employee_name: string;
@@ -46,7 +45,6 @@ interface ScheduleGap {
 interface ScheduleData {
   assignments: ScheduleAssignment[];
   gaps: ScheduleGap[];
-  summary: string;
 }
 
 // ── Internal build data ───────────────────────────────────────────────────────
@@ -133,25 +131,6 @@ function formatTime(t: string): string {
   const ampm = h >= 12 ? 'PM' : 'AM';
   const h12 = h % 12 || 12;
   return `${h12}:${m.toString().padStart(2, '0')} ${ampm}`;
-}
-
-const DAY_SHORTS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-
-function formatAvailableDays(empId: string, availByEmp: Map<string, Availability[]>): string {
-  const avail = availByEmp.get(empId) ?? [];
-  if (avail.length === 0) return 'None';
-  const days = [...new Set(avail.map(a => a.day_of_week))].sort((a, b) => a - b);
-  return days.map(d => DAY_SHORTS[d]).join(', ');
-}
-
-function buildEmployeeListForPrompt(
-  employees: Employee[],
-  availByEmp: Map<string, Availability[]>
-): string {
-  return employees.map(e => {
-    const veteranTag = e.is_veteran ? ' | VETERAN' : '';
-    return `- ${e.name} | ${e.primary_role} | ${e.max_weekly_hours}h max | Available: ${formatAvailableDays(e.id, availByEmp)}${veteranTag}`;
-  }).join('\n');
 }
 
 // ── Veteran preference ────────────────────────────────────────────────────────
@@ -307,7 +286,7 @@ function computeGapReason(params: {
   for (const assignedId of params.assignedToShift) {
     for (const c of params.conflicts) {
       if (c.severity !== 'never') continue;
-      const otherId = c.employee_id_1 === assignedId ? c.employee_id_2 : c.employee_id_1 === assignedId ? c.employee_id_2 : null;
+      const otherId = c.employee_id_1 === assignedId ? c.employee_id_2 : c.employee_id_2 === assignedId ? c.employee_id_1 : null;
       if (otherId) neverExcluded.add(otherId);
     }
   }
@@ -830,26 +809,6 @@ export async function handleBuildSchedule(
     estimated_wages: wages,
   };
 
-  const employeeList = buildEmployeeListForPrompt(data.employees, data.availByEmp);
-  const topContributors = Array.from(new Map(assignments.map(a => [a.employee_id, { name: a.employee_name, hours: 0 }])).values()).slice(0, 3).map(e => e.name).join(', ');
-
-  const summaryPrompt = [
-    `You are Aegis, building a schedule for ${data.companyName}. Write a concise 2-3 sentence summary of this week's schedule (${weekStart} to ${weekEnd}).`,
-    ``,
-    `Some employees are marked as VETERAN. When the manager specifies scheduling preferences related to veterans (e.g. "schedule only veterans for Memorial Day", "prioritize veterans on July 4th", "make sure a veteran is on every shift this weekend"), apply that filter or preference when selecting employees for affected shifts. If no veteran preference is specified, treat all qualified available employees equally.`,
-    ``,
-    `Employees:`,
-    employeeList,
-    ``,
-    `Coverage: ${totalFilled}/${totalRequired} slots filled. Gaps: ${gaps.length}.`,
-    `Top contributors: ${topContributors}.`,
-    veteranPreference ? `Manager veteran preference: ${veteranPreference}` : null,
-    ``,
-    `Be direct and operational. No preamble.`,
-  ].filter((line): line is string => line !== null).join('\n');
-
-  const summary = await generateReply(summaryPrompt, 'Summarize the schedule.', []);
-
   // Save schedule record to Homebase
   const { data: schedRow, error: schedError } = await supabase
     .from('schedules')
@@ -860,7 +819,7 @@ export async function handleBuildSchedule(
       generated_at: new Date().toISOString(),
       generated_by: 'aegis',
       status: 'draft',
-      data: { assignments, gaps, summary } as unknown as Record<string, unknown>,
+      data: { assignments, gaps } as unknown as Record<string, unknown>,
       staffing_report: staffingReport as unknown as Record<string, unknown>,
     })
     .select('id')

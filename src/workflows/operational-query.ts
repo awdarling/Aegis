@@ -600,11 +600,11 @@ async function executeEdit(pending: PendingEdit, companyId: string): Promise<voi
     const { data: schedRow } = await supabase.from('schedules').select('data, staffing_report')
       .eq('id', pending.schedule_id).single();
     if (schedRow) {
-      const row = schedRow as { data: { shifts?: unknown[] }; staffing_report: Record<string, unknown> | null };
-      const shifts = (row.data.shifts ?? []) as Array<{
+      const row = schedRow as { data: { assignments?: unknown[] }; staffing_report: Record<string, unknown> | null };
+      const assignments = (row.data.assignments ?? []) as Array<{
         employee_id: string; employee_name: string; role: string; start_time: string; end_time: string; hours?: number;
       }>;
-      const wages = await computeWageEstimate(companyId, shifts);
+      const wages = await computeWageEstimate(companyId, assignments);
       await supabase.from('schedules').update({
         staffing_report: { ...(row.staffing_report ?? {}), estimated_wages: wages },
       }).eq('id', pending.schedule_id);

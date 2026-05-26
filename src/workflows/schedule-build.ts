@@ -7,6 +7,21 @@ import { computeWageEstimate } from '../lib/schedule-simulator';
 import { resolveAvailabilityForWeek } from '../lib/custom-availability';
 import { buildTOMap, isBlockedByTO, type TOWindow } from '../lib/to-window';
 import { getSpecialNotesForRange } from './special-notes';
+import { parseConstraints } from '../lib/constraints/parser';
+import type { EngineSettings, AttributeMixConstraint } from '../lib/constraints/types';
+import { getWeekBounds } from '../lib/engine/week-bounds';
+import { buildCanvas } from '../lib/engine/canvas';
+import {
+  buildEligibility,
+  isAvailableForShift as engineIsAvailable,
+  isBlockedByTOForSlot,
+  isVeteranOnlyDate as engineIsVeteranOnlyDate,
+  type VeteranOnlyRange,
+} from '../lib/engine/eligibility';
+import { rankCandidates } from '../lib/engine/ranker';
+import { resolveBannedPairConflict } from '../lib/engine/cascade';
+import { enforceAttributeMixForShift } from '../lib/engine/attribute-mix';
+import type { CanvasSlot, WeekState } from '../lib/engine/types';
 import type { InboundMessage, VerifiedContact } from '../security/types';
 import type {
   Employee,
@@ -19,6 +34,10 @@ import type {
   Policy,
   Event,
 } from '../db/types';
+
+// Engine version stamped into staffing_report so we know which build core
+// produced any given schedule row.
+export const ENGINE_VERSION = '2.0.0';
 
 // ── Output types ──────────────────────────────────────────────────────────────
 
@@ -33,18 +52,29 @@ export interface ScheduleAssignment {
   hours: number;
 }
 
-interface ScheduleGap {
+export interface ScheduleGap {
   date: string;
   shift_name: string;
   role: string;
   required_count: number;
   filled_count: number;
   reason: string;
+  start_time?: string;
+  end_time?: string;
+}
+
+export interface FlaggedIssue {
+  type: 'unresolvable_conflict' | 'unsatisfied_attribute_mix';
+  date: string;
+  shift_name: string;
+  description: string;
+  metadata: Record<string, unknown>;
 }
 
 interface ScheduleData {
   assignments: ScheduleAssignment[];
   gaps: ScheduleGap[];
+  flagged_issues?: FlaggedIssue[];
 }
 
 // ── Internal build data ───────────────────────────────────────────────────────
@@ -52,7 +82,7 @@ interface ScheduleData {
 interface BuildData {
   employees: Employee[];
   availByEmp: Map<string, Availability[]>;
-  toMap: Map<string, TOWindow>; // 'employeeId:date' → full_day | partial windows
+  toMap: Map<string, TOWindow>;
   shiftTypes: ShiftType[];
   shiftRequirements: ShiftRequirement[];
   conflicts: EmployeeConflict[];
@@ -63,13 +93,6 @@ interface BuildData {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
-function shiftHours(start: string, end: string): number {
-  const toMins = (t: string) => { const [h, m] = t.slice(0, 5).split(':').map(Number); return h * 60 + m; };
-  let mins = toMins(end) - toMins(start);
-  if (mins < 0) mins += 24 * 60;
-  return Math.round((mins / 60) * 10) / 10;
-}
 
 function getDatesInRange(start: string, end: string): string[] {
   const dates: string[] = [];
@@ -82,40 +105,12 @@ function getDatesInRange(start: string, end: string): string[] {
   return dates;
 }
 
-// Monday–Sunday weeks. offset 0 = current week, 1 = next week, -1 = last week.
-function getWeekBounds(offset: number = 0): { week_start: string; week_end: string } {
-  const today = new Date();
-  const dayOfWeek = today.getDay(); // 0=Sun, 1=Mon, ... 6=Sat
-  const daysToMonday = dayOfWeek === 0 ? 6 : dayOfWeek - 1;
-  const monday = new Date(today);
-  monday.setDate(today.getDate() - daysToMonday + offset * 7);
-  monday.setHours(0, 0, 0, 0);
-  const sunday = new Date(monday);
-  sunday.setDate(monday.getDate() + 6);
-  return {
-    week_start: monday.toLocaleDateString('en-CA'),
-    week_end: sunday.toLocaleDateString('en-CA'),
-  };
-}
-
-function parseTargetWeek(extracted: Record<string, unknown>): { weekStart: string; weekEnd: string } {
+function parseTargetWeek(
+  extracted: Record<string, unknown>,
+  settings: EngineSettings
+): { weekStart: string; weekEnd: string } {
   const offset = extracted['target_week'] === 'this' ? 0 : 1;
-  const { week_start, week_end } = getWeekBounds(offset);
-  return { weekStart: week_start, weekEnd: week_end };
-}
-
-function isAvailableForShift(
-  empId: string,
-  dayOfWeek: number,
-  shiftStart: string,
-  shiftEnd: string,
-  availByEmp: Map<string, Availability[]>
-): boolean {
-  const ns = shiftStart.slice(0, 5);
-  const ne = shiftEnd.slice(0, 5);
-  return (availByEmp.get(empId) ?? []).some(
-    a => a.day_of_week === dayOfWeek && a.start_time.slice(0, 5) <= ns && a.end_time.slice(0, 5) >= ne
-  );
+  return getWeekBounds(offset, settings.weekStartDay);
 }
 
 function formatDisplayDate(d: string): string {
@@ -124,6 +119,10 @@ function formatDisplayDate(d: string): string {
 
 function formatShortDate(d: string): string {
   return new Date(d + 'T12:00:00Z').toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+}
+
+function formatWeekday(d: string): string {
+  return new Date(d + 'T12:00:00Z').toLocaleDateString('en-US', { weekday: 'long' });
 }
 
 function formatTime(t: string): string {
@@ -137,18 +136,9 @@ function formatTime(t: string): string {
 
 export type VeteranMode = 'only' | 'prioritize' | 'at_least_one' | null;
 
-function isVeteranOnlyDate(
-  date: string,
-  veteranOnlyDates: Array<{ start_date: string; end_date: string }>
-): boolean {
-  return veteranOnlyDates.some(r => date >= r.start_date && date <= r.end_date);
-}
-
 function parseVeteranPreference(pref: string | null): VeteranMode {
   if (!pref) return null;
   const lower = pref.toLowerCase();
-  // Check "at least one" before "only" — "only one veteran per shift" should match
-  // at_least_one semantics, not only-veterans semantics.
   if (lower.includes('at least one') || lower.includes('at least 1')) return 'at_least_one';
   if (lower.includes('only')) return 'only';
   if (lower.includes('prioritize') || lower.includes('prefer')) return 'prioritize';
@@ -176,7 +166,7 @@ async function loadBuildData(
     supabase.from('shift_types').select('*').eq('company_id', companyId).eq('active', true),
     supabase.from('shift_requirements').select('*').eq('company_id', companyId),
     supabase.from('employee_conflicts').select('*').eq('company_id', companyId),
-    supabase.from('policies').select('*').eq('company_id', companyId).in('policy_type', ['scheduling', 'coverage']),
+    supabase.from('policies').select('*').eq('company_id', companyId),
   ]);
 
   const employees = (empRes.data ?? []) as Employee[];
@@ -188,8 +178,6 @@ async function loadBuildData(
     availByEmp.get(a.employee_id)!.push(a);
   }
 
-  // Build TO map keyed by 'employeeId:date'. Honors partial-day windows and
-  // shift-based TO. Multiple partial entries on the same date merge.
   const weekDates = getDatesInRange(weekStart, weekEnd);
   const toRows = (toRes.data ?? []) as Array<{
     employee_id: string;
@@ -236,363 +224,427 @@ function applyShiftOverrides(
   return requirements;
 }
 
-// ── Core assignment logic ─────────────────────────────────────────────────────
+// ── Gap reason ────────────────────────────────────────────────────────────────
 
-function computeGapReason(params: {
-  role: string;
-  date: string;
-  dayOfWeek: number;
-  shiftStart: string;
-  shiftEnd: string;
-  shiftId: string;
-  shiftHours: number;
+interface GapReasonInput {
+  slot: CanvasSlot;
   employees: Employee[];
   availByEmp: Map<string, Availability[]>;
   toMap: Map<string, TOWindow>;
-  veteranOnlyDates: Array<{ start_date: string; end_date: string }>;
-  weeklyHoursMap: Map<string, number>;
-  assignedToShift: string[];
+  veteranOnlyDates: VeteranOnlyRange[];
+  weekState: WeekState;
+  shiftAssignmentIds: string[];
   conflicts: EmployeeConflict[];
-}): string {
-  const { role, date, dayOfWeek, shiftStart, shiftEnd, shiftId, shiftHours, employees } = params;
+}
 
-  const veteranOnlyToday = isVeteranOnlyDate(date, params.veteranOnlyDates);
-  const candidatePool = veteranOnlyToday ? employees.filter(e => e.is_veteran) : employees;
+// Cites the binding constraint — the last hard filter that any candidate
+// passed before reaching the empty pool. Walked in declared order so the
+// caller can always trust the wording matches the actual binding rule.
+function computeGapReason(input: GapReasonInput): string {
+  const { slot, employees, availByEmp, toMap, veteranOnlyDates, weekState, shiftAssignmentIds, conflicts } = input;
 
-  const qualified = candidatePool.filter(e => e.qualified_roles.includes(role));
+  const vetOnly = engineIsVeteranOnlyDate(slot.date, veteranOnlyDates);
+  const pool = vetOnly ? employees.filter(e => e.is_veteran) : employees;
+
+  const qualified = pool.filter(e => e.qualified_roles.includes(slot.role));
   if (qualified.length === 0) {
-    return veteranOnlyToday
-      ? `No veteran employees are qualified for the ${role} role on this veteran-only date`
-      : `No active employees are qualified for the ${role} role`;
+    return vetOnly
+      ? `No veteran employees are qualified for the ${slot.role} role on this veteran-only date`
+      : `No active employees are qualified for the ${slot.role} role`;
   }
 
-  const available = qualified.filter(e =>
-    isAvailableForShift(e.id, dayOfWeek, shiftStart, shiftEnd, params.availByEmp)
-  );
-  if (available.length === 0) return `No qualified ${role} employees have availability on ${new Date(date + 'T12:00:00Z').toLocaleDateString('en-US', { weekday: 'long' })}`;
+  const available = qualified.filter(e => engineIsAvailable(e, slot, availByEmp));
+  if (available.length === 0) {
+    return `All qualified employees are unavailable on ${formatWeekday(slot.date)}`;
+  }
 
-  const notOnTO = available.filter(e =>
-    !isBlockedByTO(e.id, date, shiftStart, shiftEnd, shiftId, params.toMap)
-  );
-  if (notOnTO.length === 0) return `All available ${role} employees have approved time off on ${formatShortDate(date)}`;
+  const notOnTO = available.filter(e => !isBlockedByTOForSlot(e, slot, toMap));
+  if (notOnTO.length === 0) {
+    return `All qualified employees have approved time off on ${slot.date}`;
+  }
 
-  const withinHours = notOnTO.filter(e =>
-    (params.weeklyHoursMap.get(e.id) ?? 0) + shiftHours <= e.max_weekly_hours
+  const withinHours = notOnTO.filter(
+    e => (weekState.weeklyHoursMap.get(e.id) ?? 0) + slot.hours <= e.max_weekly_hours
   );
-  if (withinHours.length === 0) return `All available ${role} employees have reached their maximum weekly hours`;
+  if (withinHours.length === 0) {
+    return 'All qualified employees are at their maximum weekly hours';
+  }
 
-  // Check for never-conflict exclusions
-  const neverExcluded = new Set<string>();
-  for (const assignedId of params.assignedToShift) {
-    for (const c of params.conflicts) {
+  // Hard banned-pair conflict with already-assigned staff on this shift.
+  const banned = new Set<string>();
+  for (const assignedId of shiftAssignmentIds) {
+    for (const c of conflicts) {
       if (c.severity !== 'never') continue;
-      const otherId = c.employee_id_1 === assignedId ? c.employee_id_2 : c.employee_id_2 === assignedId ? c.employee_id_1 : null;
-      if (otherId) neverExcluded.add(otherId);
+      if (c.employee_id_1 === assignedId) banned.add(c.employee_id_2);
+      else if (c.employee_id_2 === assignedId) banned.add(c.employee_id_1);
     }
   }
-  const noConflict = withinHours.filter(e => !neverExcluded.has(e.id));
-  if (noConflict.length === 0) return `All available ${role} employees have scheduling conflicts with already-assigned staff`;
+  const noConflict = withinHours.filter(e => !banned.has(e.id) && !shiftAssignmentIds.includes(e.id));
+  if (noConflict.length === 0) {
+    return 'All qualified employees have hard conflicts with already-assigned staff';
+  }
 
-  return `No available ${role} employee could be assigned`;
+  return 'No qualified employee could be assigned';
 }
 
-function findBestEmployee(params: {
-  role: string;
-  date: string;
-  dayOfWeek: number;
-  shiftStart: string;
-  shiftEnd: string;
-  shiftId: string;
-  shiftHours: number;
-  employees: Employee[];
-  availByEmp: Map<string, Availability[]>;
-  toMap: Map<string, TOWindow>;
-  veteranOnlyDates: Array<{ start_date: string; end_date: string }>;
-  weeklyHoursMap: Map<string, number>;
-  assignedToShift: string[];
-  conflicts: EmployeeConflict[];
+// ── Build core ────────────────────────────────────────────────────────────────
+
+interface BuildContext {
+  data: BuildData;
+  weekDates: string[];
+  eventsByDate: Map<string, Event[]>;
   veteranMode: VeteranMode;
-}): { employee: Employee | null; veteranFallback: boolean } {
-  const { role, date, dayOfWeek, shiftStart, shiftEnd, shiftId, shiftHours, veteranMode } = params;
-  const veteranOnlyToday = isVeteranOnlyDate(date, params.veteranOnlyDates);
-
-  // Build conflict sets from already-assigned employees on this shift
-  const neverExcluded = new Set<string>();
-  const avoidDeprioritized = new Set<string>();
-  for (const assignedId of params.assignedToShift) {
-    for (const c of params.conflicts) {
-      let otherId: string | null = null;
-      if (c.employee_id_1 === assignedId) otherId = c.employee_id_2;
-      else if (c.employee_id_2 === assignedId) otherId = c.employee_id_1;
-      if (!otherId) continue;
-      if (c.severity === 'never') neverExcluded.add(otherId);
-      else avoidDeprioritized.add(otherId);
-    }
-  }
-
-  const baseCandidates = params.employees.filter(e => {
-    if (veteranOnlyToday && !e.is_veteran) return false;
-    if (!e.qualified_roles.includes(role)) return false;
-    if (params.assignedToShift.includes(e.id)) return false;
-    if (neverExcluded.has(e.id)) return false;
-    if (isBlockedByTO(e.id, date, shiftStart, shiftEnd, shiftId, params.toMap)) return false;
-    if (!isAvailableForShift(e.id, dayOfWeek, shiftStart, shiftEnd, params.availByEmp)) return false;
-    if ((params.weeklyHoursMap.get(e.id) ?? 0) + shiftHours > e.max_weekly_hours) return false;
-    return true;
-  });
-
-  // Veterans-only mode: restrict to veterans if any are available; otherwise fall
-  // back to the full pool and flag the assignment for soft-gap reporting.
-  let candidates = baseCandidates;
-  let veteranFallback = false;
-  if (veteranMode === 'only') {
-    const veterans = baseCandidates.filter(e => e.is_veteran);
-    if (veterans.length > 0) {
-      candidates = veterans;
-    } else if (baseCandidates.length > 0) {
-      veteranFallback = true;
-    }
-  }
-
-  if (candidates.length === 0) return { employee: null, veteranFallback: false };
-
-  // Sort: avoid-conflict last → (in prioritize mode) veterans before non-veterans
-  // → fewest weekly hours → alphabetical.
-  candidates.sort((a, b) => {
-    const aAvoid = avoidDeprioritized.has(a.id) ? 1 : 0;
-    const bAvoid = avoidDeprioritized.has(b.id) ? 1 : 0;
-    if (aAvoid !== bAvoid) return aAvoid - bAvoid;
-    if (veteranMode === 'prioritize') {
-      const aVet = a.is_veteran ? 1 : 0;
-      const bVet = b.is_veteran ? 1 : 0;
-      if (aVet !== bVet) return bVet - aVet;
-    }
-    const ha = params.weeklyHoursMap.get(a.id) ?? 0;
-    const hb = params.weeklyHoursMap.get(b.id) ?? 0;
-    return ha !== hb ? ha - hb : a.name.localeCompare(b.name);
-  });
-
-  return { employee: candidates[0], veteranFallback };
+  veteranOnlyDates: VeteranOnlyRange[];
+  settings: EngineSettings;
+  attributeMix: AttributeMixConstraint[];
 }
 
-// ── Main scheduling algorithm ─────────────────────────────────────────────────
+interface BuildResult {
+  assignments: ScheduleAssignment[];
+  gaps: ScheduleGap[];
+  flagged_issues: FlaggedIssue[];
+  totalRequired: number;
+  totalFilled: number;
+}
 
-function buildScheduleForWeek(
-  data: BuildData,
-  weekDates: string[],
-  eventsByDate: Map<string, Event[]>,
-  veteranMode: VeteranMode,
-  veteranOnlyDates: Array<{ start_date: string; end_date: string }>
-): { assignments: ScheduleAssignment[]; gaps: ScheduleGap[]; totalRequired: number; totalFilled: number } {
-  const assignments: ScheduleAssignment[] = [];
-  const gaps: ScheduleGap[] = [];
-  const weeklyHoursMap = new Map<string, number>();
-  let totalRequired = 0;
-  let totalFilled = 0;
+function hasHardBannedPair(
+  empId: string,
+  cohabIds: string[],
+  conflicts: EmployeeConflict[]
+): boolean {
+  for (const other of cohabIds) {
+    for (const c of conflicts) {
+      if (c.severity !== 'never') continue;
+      if (
+        (c.employee_id_1 === empId && c.employee_id_2 === other) ||
+        (c.employee_id_2 === empId && c.employee_id_1 === other)
+      ) return true;
+    }
+  }
+  return false;
+}
 
+// New deterministic build core. Orchestrates canvas → eligibility → ranking
+// → cascade resolution → post-fill enforcement. The previous engine
+// (findBestEmployee, ensureVeteranOnShift, computeGapReason inline) is gone;
+// behavior is driven entirely by parsed constraints and module outputs.
+function buildScheduleForWeek(ctx: BuildContext): BuildResult {
+  const { data, weekDates, eventsByDate, veteranMode, veteranOnlyDates, settings, attributeMix } = ctx;
   const employeeById = new Map(data.employees.map(e => [e.id, e]));
 
+  // 1) Build canvas (priority first, then chronological).
+  // Apply shift-overrides from special notes to requirements before canvas build.
+  const overriddenReqs: ShiftRequirement[] = [];
   for (const date of weekDates) {
     const dayOfWeek = new Date(date + 'T12:00:00Z').getUTCDay();
     const dateNotes = eventsByDate.get(date) ?? [];
-
-    if (isVeteranOnlyDate(date, veteranOnlyDates)) {
-      console.log(`[schedule] veteran-only restriction active for ${date}: skipping non-veterans`);
-    }
-
-    // Sort shift types by start time for consistent ordering
-    const activeShiftTypes = data.shiftTypes
-      .filter(st => st.days_active.includes(dayOfWeek))
-      .sort((a, b) => a.start_time.localeCompare(b.start_time));
-
-    for (const shiftType of activeShiftTypes) {
+    for (const st of data.shiftTypes) {
+      if (!st.days_active.includes(dayOfWeek)) continue;
       const baseReqs = data.shiftRequirements.filter(req =>
-        (req.shift_type_id ? req.shift_type_id === shiftType.id : req.shift_name === shiftType.name) &&
+        (req.shift_type_id ? req.shift_type_id === st.id : req.shift_name === st.name) &&
         req.days_active.includes(dayOfWeek)
       );
+      const adjusted = applyShiftOverrides(baseReqs, dateNotes, st.name);
+      for (const r of adjusted) {
+        // Tag this requirement with the date so canvas can scope properly.
+        overriddenReqs.push({ ...r, days_active: [dayOfWeek] });
+      }
+    }
+  }
 
-      const reqs = applyShiftOverrides(baseReqs, dateNotes, shiftType.name);
-      const hours = shiftHours(shiftType.start_time, shiftType.end_time);
+  // The canvas builder dedupes by (date, shift_type, requirement) — pass
+  // a single union of overridden requirements scoped to each day-of-week.
+  // Because canvas already filters by days_active, we don't double-apply.
+  const allEvents: Event[] = [];
+  for (const list of eventsByDate.values()) allEvents.push(...list);
+  const canvas = buildCanvas(weekDates, data.shiftTypes, overriddenReqs, allEvents);
 
-      for (const req of reqs) {
-        if (req.required_count === 0) continue;
-        const assignedToShift: string[] = [];
-        let filledInReq = 0;
+  const weekState: WeekState = {
+    weeklyHoursMap: new Map(),
+    assignmentsByDate: new Map(),
+    assignments: [],
+    gaps: [],
+    flagged_issues: [],
+  };
 
-        for (let slot = 0; slot < req.required_count; slot++) {
-          totalRequired++;
-          const { employee: emp, veteranFallback } = findBestEmployee({
-            role: req.role,
-            date,
-            dayOfWeek,
-            shiftStart: shiftType.start_time,
-            shiftEnd: shiftType.end_time,
-            shiftId: shiftType.id,
-            shiftHours: hours,
+  // Track required vs filled. required = sum of slot counts across canvas.
+  // We compute totalRequired from canvas length.
+  const totalRequired = canvas.length;
+  let totalFilled = 0;
+
+  // Track gaps by requirement so we increment a single ScheduleGap row per
+  // (date, shift_name, requirement_id) instead of one per missed slot.
+  const gapByReqId = new Map<string, ScheduleGap>();
+
+  // 2-7) Visit each slot in fill order.
+  for (const slot of canvas) {
+    const dayPool = buildEligibility(slot, data.employees, data.availByEmp, data.toMap, veteranOnlyDates);
+
+    const shiftAssignmentIds = weekState.assignments
+      .filter(a => a.date === slot.date && a.shift_name === slot.shift_name)
+      .map(a => a.employee_id);
+    const todayIds = weekState.assignmentsByDate.get(slot.date) ?? [];
+
+    // Slot-level filters.
+    const slotEligible = dayPool.employees.filter(e => {
+      if (shiftAssignmentIds.includes(e.id)) return false;
+      if (settings.doublesPolicy === 'never' && todayIds.includes(e.id)) return false;
+      if ((weekState.weeklyHoursMap.get(e.id) ?? 0) + slot.hours > e.max_weekly_hours) return false;
+      if (hasHardBannedPair(e.id, shiftAssignmentIds, data.conflicts)) return false;
+      return true;
+    });
+
+    let chosen: Employee | null = null;
+
+    if (slotEligible.length > 0) {
+      const ranked = rankCandidates(slotEligible, slot, weekState, data.conflicts, settings, veteranMode);
+      chosen = ranked[0] ?? null;
+    } else {
+      // Slot-level pool empty. Check whether the binding constraint is a
+      // banned pair — if so, try cascade resolution to bring a viable
+      // candidate in by displacing the conflicting partner.
+      const blockedByConflictOnly = dayPool.employees.filter(e => {
+        if (shiftAssignmentIds.includes(e.id)) return false;
+        if (settings.doublesPolicy === 'never' && todayIds.includes(e.id)) return false;
+        if ((weekState.weeklyHoursMap.get(e.id) ?? 0) + slot.hours > e.max_weekly_hours) return false;
+        return hasHardBannedPair(e.id, shiftAssignmentIds, data.conflicts);
+      });
+
+      for (const candidate of blockedByConflictOnly) {
+        const partnerIdx = weekState.assignments.findIndex(a => {
+          if (!(a.date === slot.date && a.shift_name === slot.shift_name)) return false;
+          for (const c of data.conflicts) {
+            if (c.severity !== 'never') continue;
+            if (
+              (c.employee_id_1 === candidate.id && c.employee_id_2 === a.employee_id) ||
+              (c.employee_id_2 === candidate.id && c.employee_id_1 === a.employee_id)
+            ) return true;
+          }
+          return false;
+        });
+        if (partnerIdx < 0) continue;
+
+        const op = resolveBannedPairConflict(
+          slot,
+          candidate,
+          partnerIdx,
+          weekState,
+          {
             employees: data.employees,
+            employeeById,
             availByEmp: data.availByEmp,
             toMap: data.toMap,
-            veteranOnlyDates,
-            weeklyHoursMap,
-            assignedToShift,
             conflicts: data.conflicts,
-            veteranMode,
-          });
-
-          if (emp) {
-            totalFilled++;
-            filledInReq++;
-            assignedToShift.push(emp.id);
-            weeklyHoursMap.set(emp.id, (weeklyHoursMap.get(emp.id) ?? 0) + hours);
-            assignments.push({
-              date,
-              employee_id: emp.id,
-              employee_name: emp.name,
-              shift_name: shiftType.name,
-              role: req.role,
-              start_time: shiftType.start_time,
-              end_time: shiftType.end_time,
-              hours,
-            });
-            if (veteranFallback) {
-              // Slot is filled, but no veteran was available — surface a soft gap
-              // so the manager sees the veterans-only request couldn't be honored here.
-              gaps.push({
-                date,
-                shift_name: shiftType.name,
-                role: req.role,
-                required_count: 1,
-                filled_count: 1,
-                reason: 'No veteran available for this slot',
-              });
-            }
-          } else {
-            gaps.push({
-              date,
-              shift_name: shiftType.name,
-              role: req.role,
-              required_count: req.required_count,
-              filled_count: filledInReq,
-              reason: computeGapReason({
-                role: req.role,
-                date,
-                dayOfWeek,
-                shiftStart: shiftType.start_time,
-                shiftEnd: shiftType.end_time,
-                shiftId: shiftType.id,
-                shiftHours: hours,
-                employees: data.employees,
-                availByEmp: data.availByEmp,
-                toMap: data.toMap,
-                veteranOnlyDates,
-                weeklyHoursMap,
-                assignedToShift,
-                conflicts: data.conflicts,
-              }),
-            });
-            // Remaining slots in this req will have the same problem — count them as required but unfilled
-            totalRequired += req.required_count - slot - 1;
-            break;
+            veteranOnlyDates,
+            canvasSlots: canvas,
           }
+        );
+        if (op) {
+          // Apply the cascade moves first, then place candidate at this slot.
+          for (const m of op.moves) {
+            const prev = weekState.assignments[m.assignment_index];
+            const prevSlot = canvas.find(
+              s => s.date === prev.date && s.shift_name === prev.shift_name && s.role === prev.role
+            );
+            if (!prevSlot) continue;
+            const movedInEmp = employeeById.get(m.new_employee_id);
+            if (!movedInEmp) continue;
+            weekState.weeklyHoursMap.set(
+              prev.employee_id,
+              (weekState.weeklyHoursMap.get(prev.employee_id) ?? 0) - prevSlot.hours
+            );
+            weekState.weeklyHoursMap.set(
+              movedInEmp.id,
+              (weekState.weeklyHoursMap.get(movedInEmp.id) ?? 0) + prevSlot.hours
+            );
+            const dayIds = weekState.assignmentsByDate.get(prev.date) ?? [];
+            weekState.assignmentsByDate.set(
+              prev.date,
+              dayIds.filter(id => id !== prev.employee_id).concat(movedInEmp.id)
+            );
+            weekState.assignments[m.assignment_index] = {
+              ...prev,
+              employee_id: movedInEmp.id,
+              employee_name: movedInEmp.name,
+            };
+          }
+          chosen = candidate;
+          break;
         }
       }
+    }
 
-      // "At least one veteran per shift": after filling all roles for this
-      // (date, shiftType), swap in a veteran if none was assigned.
-      if (veteranMode === 'at_least_one') {
-        ensureVeteranOnShift({
-          assignments,
-          date,
-          dayOfWeek,
-          shiftType,
-          shiftHrs: hours,
-          weeklyHoursMap,
-          employees: data.employees,
-          employeeById,
-          availByEmp: data.availByEmp,
-          toMap: data.toMap,
-          conflicts: data.conflicts,
+    if (chosen) {
+      totalFilled++;
+      weekState.weeklyHoursMap.set(chosen.id, (weekState.weeklyHoursMap.get(chosen.id) ?? 0) + slot.hours);
+      const dayIds = weekState.assignmentsByDate.get(slot.date) ?? [];
+      dayIds.push(chosen.id);
+      weekState.assignmentsByDate.set(slot.date, dayIds);
+      weekState.assignments.push({
+        date: slot.date,
+        employee_id: chosen.id,
+        employee_name: chosen.name,
+        shift_name: slot.shift_name,
+        role: slot.role,
+        start_time: slot.start_time,
+        end_time: slot.end_time,
+        hours: slot.hours,
+      });
+    } else {
+      const reason = computeGapReason({
+        slot,
+        employees: data.employees,
+        availByEmp: data.availByEmp,
+        toMap: data.toMap,
+        veteranOnlyDates,
+        weekState,
+        shiftAssignmentIds,
+        conflicts: data.conflicts,
+      });
+      const key = `${slot.date}|${slot.shift_requirement_id}`;
+      const existing = gapByReqId.get(key);
+      if (existing) {
+        existing.required_count++;
+      } else {
+        const gap: ScheduleGap = {
+          date: slot.date,
+          shift_name: slot.shift_name,
+          role: slot.role,
+          required_count: 1,
+          filled_count: 0,
+          reason,
+          start_time: slot.start_time,
+          end_time: slot.end_time,
+        };
+        gapByReqId.set(key, gap);
+        weekState.gaps.push(gap);
+      }
+    }
+  }
+
+  // After all slots in a (date, shift_type) are filled, run post-fill
+  // enforcement: attribute mix and 'at_least_one'/'only' veteran modes.
+  const shiftGroups = new Map<string, { date: string; shift_name: string; shift_type_id: string; indices: number[] }>();
+  for (let i = 0; i < weekState.assignments.length; i++) {
+    const a = weekState.assignments[i];
+    const key = `${a.date}|${a.shift_name}`;
+    const slotForA = canvas.find(s => s.date === a.date && s.shift_name === a.shift_name);
+    if (!shiftGroups.has(key)) {
+      shiftGroups.set(key, {
+        date: a.date,
+        shift_name: a.shift_name,
+        shift_type_id: slotForA?.shift_type_id ?? '',
+        indices: [],
+      });
+    }
+    shiftGroups.get(key)!.indices.push(i);
+  }
+
+  const attrDeps = {
+    employees: data.employees,
+    employeeById,
+    availByEmp: data.availByEmp,
+    toMap: data.toMap,
+    conflicts: data.conflicts,
+    veteranOnlyDates,
+    canvasSlots: canvas,
+    settings,
+  };
+
+  for (const group of shiftGroups.values()) {
+    const shiftAssigns = group.indices.map(i => weekState.assignments[i]);
+    const result = enforceAttributeMixForShift(
+      shiftAssigns,
+      group.indices,
+      attributeMix,
+      { date: group.date, shift_type_id: group.shift_type_id, shift_name: group.shift_name },
+      undefined,
+      weekState,
+      attrDeps
+    );
+    if (result.flagged) {
+      weekState.flagged_issues.push(result.flagged);
+    }
+  }
+
+  // Veteran 'at_least_one' / 'only' enforcement.
+  if (veteranMode === 'at_least_one' || veteranMode === 'only') {
+    for (const group of shiftGroups.values()) {
+      const indices = group.indices;
+      if (indices.length === 0) continue;
+      const hasVet = indices.some(i => employeeById.get(weekState.assignments[i].employee_id)?.is_veteran);
+      const need = veteranMode === 'only' ? indices.length : 1;
+      const currentVets = indices.filter(i => employeeById.get(weekState.assignments[i].employee_id)?.is_veteran).length;
+      if (currentVets >= need) continue;
+      if (veteranMode === 'at_least_one' && hasVet) continue;
+
+      const placedVets: Set<string> = new Set(
+        indices.map(i => weekState.assignments[i].employee_id).filter(id => employeeById.get(id)?.is_veteran)
+      );
+      let stillNeed = need - currentVets;
+
+      // Try swapping the lowest-hours non-veteran out for an eligible veteran.
+      const sortedNonVet = [...indices]
+        .filter(i => !employeeById.get(weekState.assignments[i].employee_id)?.is_veteran)
+        .sort((a, b) => {
+          const ha = weekState.weeklyHoursMap.get(weekState.assignments[a].employee_id) ?? 0;
+          const hb = weekState.weeklyHoursMap.get(weekState.assignments[b].employee_id) ?? 0;
+          return ha - hb;
+        });
+
+      for (const idx of sortedNonVet) {
+        if (stillNeed <= 0) break;
+        const cur = weekState.assignments[idx];
+        const slot = canvas.find(s => s.date === cur.date && s.shift_name === cur.shift_name && s.role === cur.role);
+        if (!slot) continue;
+        const elig = buildEligibility(slot, data.employees, data.availByEmp, data.toMap, veteranOnlyDates);
+        const cohabIds = indices.filter(i => i !== idx).map(i => weekState.assignments[i].employee_id);
+        const candidate = elig.employees.find(e => {
+          if (!e.is_veteran) return false;
+          if (placedVets.has(e.id)) return false;
+          if (cohabIds.includes(e.id)) return false;
+          if (hasHardBannedPair(e.id, cohabIds, data.conflicts)) return false;
+          if ((weekState.weeklyHoursMap.get(e.id) ?? 0) + slot.hours > e.max_weekly_hours) return false;
+          return true;
+        });
+        if (!candidate) continue;
+
+        const prevId = cur.employee_id;
+        weekState.weeklyHoursMap.set(prevId, (weekState.weeklyHoursMap.get(prevId) ?? 0) - slot.hours);
+        weekState.weeklyHoursMap.set(candidate.id, (weekState.weeklyHoursMap.get(candidate.id) ?? 0) + slot.hours);
+        const dayIds = weekState.assignmentsByDate.get(cur.date) ?? [];
+        weekState.assignmentsByDate.set(cur.date, dayIds.filter(id => id !== prevId).concat(candidate.id));
+        weekState.assignments[idx] = { ...cur, employee_id: candidate.id, employee_name: candidate.name };
+        placedVets.add(candidate.id);
+        stillNeed--;
+      }
+
+      if (stillNeed > 0 && veteranMode === 'at_least_one') {
+        weekState.flagged_issues.push({
+          type: 'unsatisfied_attribute_mix',
+          date: group.date,
+          shift_name: group.shift_name,
+          description: `No veteran could be assigned to ${group.shift_name} on ${group.date}`,
+          metadata: { attribute: 'is_veteran', value: 'true', required: 1, actual: 0 },
         });
       }
     }
   }
 
-  return { assignments, gaps, totalRequired, totalFilled };
-}
-
-// Ensures at least one veteran is assigned to a given (date, shiftType). Mutates
-// `assignments` and `weeklyHoursMap` in place — swaps the lowest-hours non-veteran
-// out for the highest-hours eligible veteran. No-op if a veteran is already on
-// the shift or no swap candidate is found.
-function ensureVeteranOnShift(params: {
-  assignments: ScheduleAssignment[];
-  date: string;
-  dayOfWeek: number;
-  shiftType: ShiftType;
-  shiftHrs: number;
-  weeklyHoursMap: Map<string, number>;
-  employees: Employee[];
-  employeeById: Map<string, Employee>;
-  availByEmp: Map<string, Availability[]>;
-  toMap: Map<string, TOWindow>;
-  conflicts: EmployeeConflict[];
-}): void {
-  const { assignments, date, dayOfWeek, shiftType, shiftHrs, weeklyHoursMap, employeeById } = params;
-
-  const shiftAssignments = assignments.filter(a => a.date === date && a.shift_name === shiftType.name);
-  if (shiftAssignments.length === 0) return;
-
-  const hasVeteran = shiftAssignments.some(a => employeeById.get(a.employee_id)?.is_veteran);
-  if (hasVeteran) return;
-
-  // Lowest-hours non-veteran assignment first (most disposable to swap out).
-  const nonVetAssignments = [...shiftAssignments].sort((a, b) =>
-    (weeklyHoursMap.get(a.employee_id) ?? 0) - (weeklyHoursMap.get(b.employee_id) ?? 0)
-  );
-
-  const onShiftIds = new Set(shiftAssignments.map(a => a.employee_id));
-
-  for (const candidate of nonVetAssignments) {
-    const eligibleVets = params.employees.filter(e => {
-      if (!e.is_veteran) return false;
-      if (!e.qualified_roles.includes(candidate.role)) return false;
-      if (onShiftIds.has(e.id)) return false;
-      if (isBlockedByTO(e.id, date, shiftType.start_time, shiftType.end_time, shiftType.id, params.toMap)) return false;
-      if (!isAvailableForShift(e.id, dayOfWeek, shiftType.start_time, shiftType.end_time, params.availByEmp)) return false;
-      if ((weeklyHoursMap.get(e.id) ?? 0) + shiftHrs > e.max_weekly_hours) return false;
-      // never-conflict with anyone remaining on the shift after the swap
-      const remainingIds = shiftAssignments.filter(a => a.employee_id !== candidate.employee_id).map(a => a.employee_id);
-      for (const c of params.conflicts) {
-        if (c.severity !== 'never') continue;
-        if ((c.employee_id_1 === e.id && remainingIds.includes(c.employee_id_2)) ||
-            (c.employee_id_2 === e.id && remainingIds.includes(c.employee_id_1))) {
-          return false;
-        }
-      }
-      return true;
-    });
-
-    if (eligibleVets.length === 0) continue;
-
-    // Highest scheduled-hours veteran first (most engaged), name as tiebreak.
-    eligibleVets.sort((a, b) => {
-      const ha = weeklyHoursMap.get(a.id) ?? 0;
-      const hb = weeklyHoursMap.get(b.id) ?? 0;
-      return hb !== ha ? hb - ha : a.name.localeCompare(b.name);
-    });
-    const vet = eligibleVets[0];
-
-    const idx = assignments.findIndex(a =>
-      a.date === date && a.shift_name === shiftType.name &&
-      a.employee_id === candidate.employee_id && a.role === candidate.role
-    );
-    if (idx < 0) continue;
-
-    weeklyHoursMap.set(candidate.employee_id, (weeklyHoursMap.get(candidate.employee_id) ?? 0) - shiftHrs);
-    weeklyHoursMap.set(vet.id, (weeklyHoursMap.get(vet.id) ?? 0) + shiftHrs);
-    assignments[idx] = { ...assignments[idx], employee_id: vet.id, employee_name: vet.name };
-    return;
+  // After post-fill swaps, refresh gap filled_counts.
+  for (const gap of weekState.gaps) {
+    gap.filled_count = weekState.assignments.filter(
+      a => a.date === gap.date && a.shift_name === gap.shift_name && a.role === gap.role
+    ).length;
   }
+
+  return {
+    assignments: weekState.assignments,
+    gaps: weekState.gaps,
+    flagged_issues: weekState.flagged_issues,
+    totalRequired,
+    totalFilled,
+  };
 }
 
 // ── Staffing report ───────────────────────────────────────────────────────────
@@ -607,7 +659,6 @@ function buildStaffingReport(
 ): Record<string, unknown> {
   const coverage_rate = totalRequired > 0 ? Math.round((totalFilled / totalRequired) * 1000) / 10 : 100;
 
-  // Weekly hours per employee
   const hoursMap = new Map<string, number>();
   for (const a of assignments) {
     hoursMap.set(a.employee_id, (hoursMap.get(a.employee_id) ?? 0) + a.hours);
@@ -662,13 +713,12 @@ async function buildManagerSummary(
   totalFilled: number,
   totalRequired: number,
   specialNotes: Event[],
-  companyName: string,
+  _companyName: string,
   estimatedWages: { total_estimated: number }
 ): Promise<string> {
   const coverageRate = totalRequired > 0 ? Math.round((totalFilled / totalRequired) * 1000) / 10 : 100;
   const weekLabel = `${formatShortDate(weekStart)}–${formatShortDate(weekEnd)}`;
 
-  // Top 3 contributors
   const hoursMap = new Map<string, { name: string; hours: number }>();
   for (const a of assignments) {
     if (!hoursMap.has(a.employee_id)) hoursMap.set(a.employee_id, { name: a.employee_name, hours: 0 });
@@ -719,23 +769,35 @@ export async function handleBuildSchedule(
   contact: VerifiedContact,
   extracted: Record<string, unknown>
 ): Promise<void> {
-  const { weekStart, weekEnd } = parseTargetWeek(extracted);
+  const { data: policyRows } = await supabase
+    .from('policies')
+    .select('*')
+    .eq('company_id', contact.company_id);
+  const parsedEarly = parseConstraints((policyRows ?? []) as Policy[]);
+  console.log('[schedule-build] week start day:', parsedEarly.settings.weekStartDay);
+
+  const { weekStart, weekEnd } = parseTargetWeek(extracted, parsedEarly.settings);
   console.log(
     '[schedule-build] week:', weekStart, '→', weekEnd,
     '(today is', new Date().toLocaleDateString('en-CA'), ')'
   );
   const weekDates = getDatesInRange(weekStart, weekEnd);
 
-  // Load all required data
   const [data, specialNotes] = await Promise.all([
     loadBuildData(contact.company_id, weekStart, weekEnd),
     getSpecialNotesForRange(contact.company_id, weekStart, weekEnd),
   ]);
   data.events = specialNotes;
 
-  // Custom availability override (date-limited or rotating). Resolved per
-  // employee and folded into data.availByEmp so the existing scheduling
-  // functions don't need to change. Newest active row wins if duplicates exist.
+  // Parse constraint vocabulary out of policies. Unknown rows are dropped
+  // permissively; malformed known rows are logged for Railway visibility.
+  const parsed = parseConstraints(data.policies);
+  console.log(
+    '[schedule-build] engine settings:', parsed.settings,
+    '— attribute_mix rules:', parsed.hard.attributeMix.length,
+    '— unrecognized policies:', parsed.unrecognized.length
+  );
+
   const { data: customAvailData } = await supabase
     .from('custom_availability')
     .select('*')
@@ -761,7 +823,6 @@ export async function handleBuildSchedule(
     }
   }
 
-  // Validate: need shift types to proceed
   if (data.shiftTypes.length === 0) {
     await reply(contact, message,
       `No active shift types are configured for this company. Before Aegis can build a schedule, set up shift types in Homebase under Scheduling → Shift Types, then define shift requirements (which roles are needed for each shift type and on which days).`
@@ -769,7 +830,6 @@ export async function handleBuildSchedule(
     return;
   }
 
-  // Build event-by-date index
   const eventsByDate = new Map<string, Event[]>();
   for (const date of weekDates) {
     eventsByDate.set(date, specialNotes.filter(e =>
@@ -777,18 +837,20 @@ export async function handleBuildSchedule(
     ));
   }
 
-  // Parse veteran preference once so we can both steer the algorithm and surface
-  // it in the Claude summary prompt below.
-  const veteranPreference = typeof extracted['veteran_preference'] === 'string' && extracted['veteran_preference'].trim() !== ''
+  const veteranPreferenceRaw = typeof extracted['veteran_preference'] === 'string' && extracted['veteran_preference'].trim() !== ''
     ? extracted['veteran_preference'] as string
     : null;
-  const veteranMode = parseVeteranPreference(veteranPreference);
+  const requested = parseVeteranPreference(veteranPreferenceRaw);
+  // Fall back to the parsed engine default if no request was supplied.
+  const veteranMode: VeteranMode = requested
+    ?? (parsed.settings.veteranPreferenceDefault === 'none'
+      ? null
+      : parsed.settings.veteranPreferenceDefault as VeteranMode);
   if (veteranMode) {
-    console.log('[schedule-build] applying veteran preference:', veteranPreference);
+    console.log('[schedule-build] applying veteran preference:', veteranPreferenceRaw ?? `default ${parsed.settings.veteranPreferenceDefault}`);
   }
 
-  // Veteran-only date ranges — non-veterans are hard-excluded from these dates.
-  const veteranOnlyDates: Array<{ start_date: string; end_date: string }> =
+  const veteranOnlyDates: VeteranOnlyRange[] =
     Array.isArray(extracted['veteran_only_dates'])
       ? (extracted['veteran_only_dates'] as Array<{ start_date: string; end_date: string }>)
           .filter(r => r && typeof r.start_date === 'string' && typeof r.end_date === 'string')
@@ -797,19 +859,24 @@ export async function handleBuildSchedule(
     console.log('[schedule-build] veteran-only date ranges:', veteranOnlyDates);
   }
 
-  // Run scheduling algorithm
-  const { assignments, gaps, totalRequired, totalFilled } = buildScheduleForWeek(data, weekDates, eventsByDate, veteranMode, veteranOnlyDates);
+  const { assignments, gaps, flagged_issues, totalRequired, totalFilled } = buildScheduleForWeek({
+    data,
+    weekDates,
+    eventsByDate,
+    veteranMode,
+    veteranOnlyDates,
+    settings: parsed.settings,
+    attributeMix: parsed.hard.attributeMix,
+  });
 
-  // Compute wages
   const wages = await computeWageEstimate(contact.company_id, assignments);
 
-  // Build staffing report
   const staffingReport = {
     ...buildStaffingReport(assignments, gaps, totalRequired, totalFilled, data.employees, specialNotes),
     estimated_wages: wages,
+    engine_version: ENGINE_VERSION,
   };
 
-  // Save schedule record to Homebase
   const { data: schedRow, error: schedError } = await supabase
     .from('schedules')
     .insert({
@@ -819,7 +886,7 @@ export async function handleBuildSchedule(
       generated_at: new Date().toISOString(),
       generated_by: 'aegis',
       status: 'draft',
-      data: { assignments, gaps } as unknown as Record<string, unknown>,
+      data: { assignments, gaps, flagged_issues } as unknown as Record<string, unknown>,
       staffing_report: staffingReport as unknown as Record<string, unknown>,
     })
     .select('id')
@@ -831,25 +898,25 @@ export async function handleBuildSchedule(
     console.error('[schedule-build] save failed:', schedError.message);
   }
 
-  // Log to activity_log
   await logActivity({
     company_id: contact.company_id,
     action: 'schedule_built',
     entity_type: 'schedule',
     entity_id: scheduleId,
-    summary: `Schedule built for ${weekStart}–${weekEnd}: ${totalFilled}/${totalRequired} slots filled (${gaps.length} gaps)`,
+    summary: `Schedule built for ${weekStart}–${weekEnd}: ${totalFilled}/${totalRequired} slots filled (${gaps.length} gaps, ${flagged_issues.length} flagged)`,
     metadata: {
       week_start: weekStart,
       week_end: weekEnd,
       total_filled: totalFilled,
       total_required: totalRequired,
       gaps: gaps.length,
+      flagged_issues: flagged_issues.length,
       estimated_wages: wages.total_estimated,
       special_notes_count: specialNotes.length,
+      engine_version: ENGINE_VERSION,
     },
   });
 
-  // Reply to manager
   const summaryMsg = await buildManagerSummary(
     weekStart, weekEnd, assignments, gaps, totalFilled, totalRequired,
     specialNotes, data.companyName, wages
@@ -865,9 +932,7 @@ export async function handleDistributeSchedule(
   contact: VerifiedContact,
   extracted: Record<string, unknown>
 ): Promise<void> {
-  const today = new Date().toISOString().slice(0, 10);
-
-  // Find the most recent schedule (prefer published, fall back to draft)
+  void extracted;
   type ScheduleRow = { id: string; week_start: string; week_end: string; data: ScheduleData; status: string };
   let scheduleRow: ScheduleRow | null = null;
 
@@ -896,7 +961,6 @@ export async function handleDistributeSchedule(
   const schedData = scheduleRow.data as unknown as ScheduleData;
   const weekLabel = `${formatShortDate(scheduleRow.week_start)}–${formatShortDate(scheduleRow.week_end)}`;
 
-  // Load company name and Aegis SMS channel
   const [companyRes, channelRes, empRes] = await Promise.all([
     supabase.from('companies').select('name').eq('id', contact.company_id).single(),
     supabase.from('company_channels').select('channel_value').eq('company_id', contact.company_id).eq('channel_type', 'sms').maybeSingle(),
@@ -918,7 +982,6 @@ export async function handleDistributeSchedule(
     const hasShifts = myShifts.length > 0;
     const totalHours = myShifts.reduce((s, a) => s + a.hours, 0);
 
-    // Build email content
     if (emp.contact_email) {
       const shiftRows = hasShifts
         ? myShifts.map(s =>
@@ -964,7 +1027,6 @@ ${hasShifts ? `<p style="color:#374151;">Total: <strong>${totalHours}h</strong> 
       emailed++;
     }
 
-    // SMS notification
     if (emp.contact_phone && aegisSmsChannel) {
       const smsBody = emp.contact_email
         ? `${companyName}: Your schedule for ${weekLabel} has been posted. Check your email for details.`
@@ -981,13 +1043,11 @@ ${hasShifts ? `<p style="color:#374151;">Total: <strong>${totalHours}h</strong> 
     }
   }
 
-  // Mark schedule as published and set distributed_at
   await supabase.from('schedules').update({
     status: 'published',
     distributed_at: new Date().toISOString(),
   }).eq('id', scheduleRow.id);
 
-  // Log warnings for employees with no contact info
   if (noContact.length > 0) {
     await logActivity({
       company_id: contact.company_id,

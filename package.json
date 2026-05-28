@@ -6,7 +6,9 @@
   "scripts": {
     "dev": "nodemon --watch src --ext ts --exec ts-node src/index.ts",
     "build": "tsc",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "dry-run-schedule": "ts-node --skip-project scripts/dry-run-schedule.ts",
+    "test-cascade": "ts-node --skip-project scripts/test-cascade.ts"
   },
   "license": "ISC",
   "dependencies": {

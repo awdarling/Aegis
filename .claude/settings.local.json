@@ -4,7 +4,11 @@
       "Bash(git add *)",
       "Bash(git commit *)",
       "Bash(npx tsc *)",
-      "Bash(echo \"exit=$?\")"
+      "Bash(echo \"exit=$?\")",
+      "Bash(awk -F: '{print $1}')",
+      "Bash(echo \"EXIT: $?\")",
+      "Bash(echo \"=== exit: $? ===\")",
+      "Bash(TS_NODE_COMPILER_OPTIONS='{\"module\":\"commonjs\"}' npx ts-node *)"
     ]
   }
 }

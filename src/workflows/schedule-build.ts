@@ -16,6 +16,7 @@ import {
   isAvailableForShift as engineIsAvailable,
   isBlockedByTOForSlot,
   isVeteranOnlyDate as engineIsVeteranOnlyDate,
+  sameDayDoubleReason,
   type VeteranOnlyRange,
 } from '../lib/engine/eligibility';
 import { rankCandidates } from '../lib/engine/ranker';
@@ -235,13 +236,14 @@ interface GapReasonInput {
   weekState: WeekState;
   shiftAssignmentIds: string[];
   conflicts: EmployeeConflict[];
+  settings: EngineSettings;
 }
 
 // Cites the binding constraint — the last hard filter that any candidate
 // passed before reaching the empty pool. Walked in declared order so the
 // caller can always trust the wording matches the actual binding rule.
 function computeGapReason(input: GapReasonInput): string {
-  const { slot, employees, availByEmp, toMap, veteranOnlyDates, weekState, shiftAssignmentIds, conflicts } = input;
+  const { slot, employees, availByEmp, toMap, veteranOnlyDates, weekState, shiftAssignmentIds, conflicts, settings } = input;
 
   const vetOnly = engineIsVeteranOnlyDate(slot.date, veteranOnlyDates);
   const pool = vetOnly ? employees.filter(e => e.is_veteran) : employees;
@@ -263,7 +265,17 @@ function computeGapReason(input: GapReasonInput): string {
     return `All qualified employees have approved time off on ${slot.date}`;
   }
 
-  const withinHours = notOnTO.filter(
+  // Same-day-doubles / hard overlap. Mirrors the slot-level filter order.
+  const sameDayReasons = notOnTO.map(e => sameDayDoubleReason(e.id, slot, weekState, settings));
+  const notDoubled = notOnTO.filter((_, i) => sameDayReasons[i] === null);
+  if (notDoubled.length === 0) {
+    const anyOverlap = sameDayReasons.some(r => r === 'already scheduled for an overlapping shift this day');
+    return anyOverlap
+      ? `All qualified employees are already scheduled for an overlapping shift on ${slot.date}`
+      : `All qualified employees already have a shift on ${slot.date} and the company doubles policy doesn't allow another`;
+  }
+
+  const withinHours = notDoubled.filter(
     e => (weekState.weeklyHoursMap.get(e.id) ?? 0) + slot.hours <= e.max_weekly_hours
   );
   if (withinHours.length === 0) {
@@ -361,7 +373,6 @@ function buildScheduleForWeek(ctx: BuildContext): BuildResult {
 
   const weekState: WeekState = {
     weeklyHoursMap: new Map(),
-    assignmentsByDate: new Map(),
     assignments: [],
     gaps: [],
     flagged_issues: [],
@@ -383,12 +394,13 @@ function buildScheduleForWeek(ctx: BuildContext): BuildResult {
     const shiftAssignmentIds = weekState.assignments
       .filter(a => a.date === slot.date && a.shift_name === slot.shift_name)
       .map(a => a.employee_id);
-    const todayIds = weekState.assignmentsByDate.get(slot.date) ?? [];
 
-    // Slot-level filters.
+    // Slot-level filters. Same-day-doubles is checked via sameDayDoubleReason,
+    // which also rejects time-overlap regardless of policy (a hard physical
+    // constraint — no human can be in two places at once).
     const slotEligible = dayPool.employees.filter(e => {
       if (shiftAssignmentIds.includes(e.id)) return false;
-      if (settings.doublesPolicy === 'never' && todayIds.includes(e.id)) return false;
+      if (sameDayDoubleReason(e.id, slot, weekState, settings) !== null) return false;
       if ((weekState.weeklyHoursMap.get(e.id) ?? 0) + slot.hours > e.max_weekly_hours) return false;
       if (hasHardBannedPair(e.id, shiftAssignmentIds, data.conflicts)) return false;
       return true;
@@ -405,7 +417,7 @@ function buildScheduleForWeek(ctx: BuildContext): BuildResult {
       // candidate in by displacing the conflicting partner.
       const blockedByConflictOnly = dayPool.employees.filter(e => {
         if (shiftAssignmentIds.includes(e.id)) return false;
-        if (settings.doublesPolicy === 'never' && todayIds.includes(e.id)) return false;
+        if (sameDayDoubleReason(e.id, slot, weekState, settings) !== null) return false;
         if ((weekState.weeklyHoursMap.get(e.id) ?? 0) + slot.hours > e.max_weekly_hours) return false;
         return hasHardBannedPair(e.id, shiftAssignmentIds, data.conflicts);
       });
@@ -437,6 +449,7 @@ function buildScheduleForWeek(ctx: BuildContext): BuildResult {
             conflicts: data.conflicts,
             veteranOnlyDates,
             canvasSlots: canvas,
+            settings,
           }
         );
         if (op) {
@@ -457,11 +470,6 @@ function buildScheduleForWeek(ctx: BuildContext): BuildResult {
               movedInEmp.id,
               (weekState.weeklyHoursMap.get(movedInEmp.id) ?? 0) + prevSlot.hours
             );
-            const dayIds = weekState.assignmentsByDate.get(prev.date) ?? [];
-            weekState.assignmentsByDate.set(
-              prev.date,
-              dayIds.filter(id => id !== prev.employee_id).concat(movedInEmp.id)
-            );
             weekState.assignments[m.assignment_index] = {
               ...prev,
               employee_id: movedInEmp.id,
@@ -477,9 +485,6 @@ function buildScheduleForWeek(ctx: BuildContext): BuildResult {
     if (chosen) {
       totalFilled++;
       weekState.weeklyHoursMap.set(chosen.id, (weekState.weeklyHoursMap.get(chosen.id) ?? 0) + slot.hours);
-      const dayIds = weekState.assignmentsByDate.get(slot.date) ?? [];
-      dayIds.push(chosen.id);
-      weekState.assignmentsByDate.set(slot.date, dayIds);
       weekState.assignments.push({
         date: slot.date,
         employee_id: chosen.id,
@@ -500,6 +505,7 @@ function buildScheduleForWeek(ctx: BuildContext): BuildResult {
         weekState,
         shiftAssignmentIds,
         conflicts: data.conflicts,
+        settings,
       });
       const key = `${slot.date}|${slot.shift_requirement_id}`;
       const existing = gapByReqId.get(key);
@@ -612,8 +618,6 @@ function buildScheduleForWeek(ctx: BuildContext): BuildResult {
         const prevId = cur.employee_id;
         weekState.weeklyHoursMap.set(prevId, (weekState.weeklyHoursMap.get(prevId) ?? 0) - slot.hours);
         weekState.weeklyHoursMap.set(candidate.id, (weekState.weeklyHoursMap.get(candidate.id) ?? 0) + slot.hours);
-        const dayIds = weekState.assignmentsByDate.get(cur.date) ?? [];
-        weekState.assignmentsByDate.set(cur.date, dayIds.filter(id => id !== prevId).concat(candidate.id));
         weekState.assignments[idx] = { ...cur, employee_id: candidate.id, employee_name: candidate.name };
         placedVets.add(candidate.id);
         stillNeed--;

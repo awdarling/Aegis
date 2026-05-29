@@ -156,12 +156,9 @@ export function enforceAttributeMixForShift(
           new_employee_name: replacement.name,
         });
 
-        const prevId = removable.employee_id;
         const prev = weekState.assignments[assignIdx];
-        weekState.weeklyHoursMap.set(prevId, (weekState.weeklyHoursMap.get(prevId) ?? 0) - removableSlot.hours);
+        weekState.weeklyHoursMap.set(removable.employee_id, (weekState.weeklyHoursMap.get(removable.employee_id) ?? 0) - removableSlot.hours);
         weekState.weeklyHoursMap.set(replacement.id, (weekState.weeklyHoursMap.get(replacement.id) ?? 0) + removableSlot.hours);
-        const dayIds = weekState.assignmentsByDate.get(prev.date) ?? [];
-        weekState.assignmentsByDate.set(prev.date, dayIds.filter(id => id !== prevId).concat(replacement.id));
         weekState.assignments[assignIdx] = {
           ...prev,
           employee_id: replacement.id,

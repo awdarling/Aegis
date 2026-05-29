@@ -656,9 +656,10 @@ async function sendOptInStep(session: OnboardingSession, companyName: string): P
   const firstName = session.employee_name.split(' ')[0];
   await textEmployeeRaw(
     session,
-    `Hi ${firstName}! This is Aegis, the scheduling assistant for ${companyName}.\n\n` +
-      `You're being added to our automated scheduling system, which will send you shift notifications and scheduling updates via SMS.\n\n` +
-      `Reply YES to confirm you'd like to receive these messages. Msg & data rates may apply. Reply STOP at any time to opt out.`
+    `Hi ${firstName}! This is Aegis, scheduling assistant for ${companyName}. ` +
+      `We'll send shift notifications via SMS. Reply YES to confirm. ` +
+      `Msg & data rates may apply. Reply STOP to opt out. ` +
+      `Info: quriasolutions.com/sms-consent`
   );
 }
 

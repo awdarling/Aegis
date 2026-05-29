@@ -1,7 +1,8 @@
 import type { Availability, Employee, EmployeeConflict } from '../../db/types';
+import type { EngineSettings } from '../constraints/types';
 import type { TOWindow } from '../to-window';
 import type { ScheduleAssignment } from '../../workflows/schedule-build';
-import { buildEligibility, type VeteranOnlyRange } from './eligibility';
+import { buildEligibility, sameDayDoubleReason, type VeteranOnlyRange } from './eligibility';
 import type { CanvasSlot, WeekState } from './types';
 
 export interface SwapOperation {
@@ -23,6 +24,7 @@ interface ResolverDeps {
   conflicts: EmployeeConflict[];
   veteranOnlyDates: VeteranOnlyRange[];
   canvasSlots: CanvasSlot[];
+  settings: EngineSettings;
 }
 
 function hardConflictExists(
@@ -63,10 +65,18 @@ function legalToPlace(
   const pool = buildEligibility(slot, [emp], deps.availByEmp, deps.toMap, deps.veteranOnlyDates);
   if (pool.employees.length === 0) return false;
 
-  const assignedTodayIds = (weekState.assignmentsByDate.get(slot.date) ?? []).filter(
-    id => id !== ignoreEmployeeIdOnShift
-  );
-  if (assignedTodayIds.includes(emp.id)) return false;
+  // Same-day double / overlap check. We compute over a view of weekState
+  // that hides the assignment(s) being displaced by this resolver step —
+  // otherwise the employee we're trying to move BACK in would always look
+  // like they're already on the day.
+  const viewState: WeekState = {
+    ...weekState,
+    assignments: weekState.assignments.filter((a, i) =>
+      i !== ignoreAssignmentIndex &&
+      !(a.date === slot.date && a.shift_name === slot.shift_name && a.employee_id === ignoreEmployeeIdOnShift)
+    ),
+  };
+  if (sameDayDoubleReason(emp.id, slot, viewState, deps.settings) !== null) return false;
 
   const cohabIds = weekState.assignments
     .filter((a, i) =>
@@ -168,7 +178,6 @@ export function resolveBannedPairConflict(
   function cloneState(s: WeekState): WeekState {
     return {
       weeklyHoursMap: new Map(s.weeklyHoursMap),
-      assignmentsByDate: new Map(Array.from(s.assignmentsByDate, ([k, v]) => [k, [...v]])),
       assignments: s.assignments.map(a => ({ ...a })),
       gaps: s.gaps,
       flagged_issues: s.flagged_issues,
@@ -182,10 +191,6 @@ export function resolveBannedPairConflict(
     if (!slot) return next;
     next.weeklyHoursMap.set(prev.employee_id, (next.weeklyHoursMap.get(prev.employee_id) ?? 0) - slot.hours);
     next.weeklyHoursMap.set(newEmp.id, (next.weeklyHoursMap.get(newEmp.id) ?? 0) + slot.hours);
-    const day = next.assignmentsByDate.get(prev.date) ?? [];
-    const dayCopy = day.filter(id => id !== prev.employee_id);
-    dayCopy.push(newEmp.id);
-    next.assignmentsByDate.set(prev.date, dayCopy);
     next.assignments[assignmentIndex] = {
       ...prev,
       employee_id: newEmp.id,

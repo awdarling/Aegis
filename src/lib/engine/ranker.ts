@@ -21,7 +21,6 @@ export function rankCandidates(
   settings: EngineSettings,
   veteranMode: VeteranMode
 ): Employee[] {
-  const assignedToday = weekState.assignmentsByDate.get(slot.date) ?? [];
   const assignedToShift = weekState.assignments
     .filter(a => a.date === slot.date && a.shift_name === slot.shift_name)
     .map(a => a.employee_id);
@@ -86,11 +85,6 @@ export function rankCandidates(
 
     return a.name.localeCompare(b.name);
   });
-
-  // Ensure assignedToday is consulted by callers — but the ranker itself does
-  // not exclude on it (slot-level filter belongs to caller). Variable kept to
-  // make the data dependency explicit; not used directly here.
-  void assignedToday;
 
   return ranked;
 }

@@ -25,10 +25,11 @@ export interface CandidatePool {
   removed_reasons: Map<string, string>;
 }
 
-// Engine mutable state for one week build.
+// Engine mutable state for one week build. `assignments` is the source of
+// truth for "who's working what" — same-day / overlap checks read it via
+// sameDayDoubleReason in eligibility.ts. Don't reintroduce a parallel index.
 export interface WeekState {
   weeklyHoursMap: Map<string, number>;
-  assignmentsByDate: Map<string, string[]>;
   assignments: ScheduleAssignment[];
   gaps: ScheduleGap[];
   flagged_issues: FlaggedIssue[];

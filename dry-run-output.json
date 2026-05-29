@@ -1,0 +1,1256 @@
+{
+  "metadata": {
+    "engine_version": "2.0.0",
+    "company_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "company_name": "Watermark Country Club",
+    "target_week": "next",
+    "week_start": "2026-06-01",
+    "week_end": "2026-06-07",
+    "week_start_day_setting": "monday",
+    "generated_at": "2026-05-28T23:16:04.071Z",
+    "ran_against": "live Watermark data — no writes performed"
+  },
+  "settings_in_effect": {
+    "hoursFairnessWeight": 0.8,
+    "partialShiftsAllowed": false,
+    "veteranPreferenceDefault": "none",
+    "doublesPolicy": "never",
+    "conflictResolution": "fairness_first",
+    "weekStartDay": "monday"
+  },
+  "constraints_parsed": {
+    "attribute_mix_count": 1,
+    "unrecognized_policy_count": 0,
+    "unrecognized_details": []
+  },
+  "input_summary": {
+    "active_employees": 30,
+    "shift_types_active": 6,
+    "shift_requirements_total": 12,
+    "approved_time_off_overlapping_week": 36,
+    "employee_conflicts": 0,
+    "custom_availability_active": 10,
+    "special_notes_for_week": 1
+  },
+  "coverage": {
+    "total_required": 72,
+    "total_filled": 70,
+    "coverage_rate_percent": 97.2,
+    "gaps": 2,
+    "flagged_issues": 16
+  },
+  "assignments_by_day": {
+    "Monday 2026-06-01": [
+      {
+        "date": "2026-06-01",
+        "employee_id": "774acc69-556b-4289-a846-e790f8615a7c",
+        "employee_name": "Bennet Nieukoop",
+        "shift_name": "Weekend Greeter",
+        "role": "Greeter",
+        "start_time": "11:00:00",
+        "end_time": "19:30:00",
+        "hours": 8.5
+      },
+      {
+        "date": "2026-06-01",
+        "employee_id": "1aca64a5-714f-4842-9e35-4052d5017b92",
+        "employee_name": "Lucas Witham",
+        "shift_name": "AM Weekday",
+        "role": "Headguard",
+        "start_time": "11:00:00",
+        "end_time": "15:30:00",
+        "hours": 4.5
+      },
+      {
+        "date": "2026-06-01",
+        "employee_id": "0a599085-c241-41fe-a3b5-1b7dd2db2023",
+        "employee_name": "Ally Becker",
+        "shift_name": "AM Weekday",
+        "role": "Lifeguard",
+        "start_time": "11:00:00",
+        "end_time": "15:30:00",
+        "hours": 4.5
+      },
+      {
+        "date": "2026-06-01",
+        "employee_id": "c077564b-3f20-4e94-9482-3245d35b3e71",
+        "employee_name": "Avery Harmon",
+        "shift_name": "AM Weekday",
+        "role": "Lifeguard",
+        "start_time": "11:00:00",
+        "end_time": "15:30:00",
+        "hours": 4.5
+      },
+      {
+        "date": "2026-06-01",
+        "employee_id": "1ef96273-22e6-4e53-b8e9-bde2be3c2453",
+        "employee_name": "Carolyn Ringler",
+        "shift_name": "AM Weekday",
+        "role": "Manager",
+        "start_time": "11:00:00",
+        "end_time": "15:30:00",
+        "hours": 4.5
+      },
+      {
+        "date": "2026-06-01",
+        "employee_id": "22d57227-da58-4c07-9c55-8d89819fc46a",
+        "employee_name": "Emily Vander Heide",
+        "shift_name": "Flex",
+        "role": "Lifeguard",
+        "start_time": "13:00:00",
+        "end_time": "21:00:00",
+        "hours": 8
+      },
+      {
+        "date": "2026-06-01",
+        "employee_id": "00262dbb-7902-4225-93fc-956a1a29b3f7",
+        "employee_name": "Michael McCorkle",
+        "shift_name": "Afternoon",
+        "role": "Headguard",
+        "start_time": "15:00:00",
+        "end_time": "21:15:00",
+        "hours": 6.3
+      },
+      {
+        "date": "2026-06-01",
+        "employee_id": "ee063955-c6b9-461e-abb6-b2beb056ea91",
+        "employee_name": "Ian Tyrrell",
+        "shift_name": "Afternoon",
+        "role": "Lifeguard",
+        "start_time": "15:00:00",
+        "end_time": "21:15:00",
+        "hours": 6.3
+      },
+      {
+        "date": "2026-06-01",
+        "employee_id": "d5f076f7-7272-418e-874d-500aec00d34a",
+        "employee_name": "Letizia Cumbo-Nacheli",
+        "shift_name": "Afternoon",
+        "role": "Lifeguard",
+        "start_time": "15:00:00",
+        "end_time": "21:15:00",
+        "hours": 6.3
+      },
+      {
+        "date": "2026-06-01",
+        "employee_id": "48c65d49-9e4b-4f3a-9411-a5dfc406d9c6",
+        "employee_name": "Jack McCorkle",
+        "shift_name": "Afternoon",
+        "role": "Manager",
+        "start_time": "15:00:00",
+        "end_time": "21:15:00",
+        "hours": 6.3
+      }
+    ],
+    "Tuesday 2026-06-02": [
+      {
+        "date": "2026-06-02",
+        "employee_id": "774acc69-556b-4289-a846-e790f8615a7c",
+        "employee_name": "Bennet Nieukoop",
+        "shift_name": "Weekend Greeter",
+        "role": "Greeter",
+        "start_time": "11:00:00",
+        "end_time": "19:30:00",
+        "hours": 8.5
+      },
+      {
+        "date": "2026-06-02",
+        "employee_id": "dc832954-9d41-4ccb-9308-5e86d2a1f420",
+        "employee_name": "Kori Baumann",
+        "shift_name": "AM Weekday",
+        "role": "Headguard",
+        "start_time": "11:00:00",
+        "end_time": "15:30:00",
+        "hours": 4.5
+      },
+      {
+        "date": "2026-06-02",
+        "employee_id": "6db46109-236d-4a49-98bd-ec434a5fea98",
+        "employee_name": "Margaret Holt",
+        "shift_name": "AM Weekday",
+        "role": "Lifeguard",
+        "start_time": "11:00:00",
+        "end_time": "15:30:00",
+        "hours": 4.5
+      },
+      {
+        "date": "2026-06-02",
+        "employee_id": "a7057fa6-a283-42ec-8918-0bba7631ba4b",
+        "employee_name": "Miles Holter",
+        "shift_name": "AM Weekday",
+        "role": "Lifeguard",
+        "start_time": "11:00:00",
+        "end_time": "15:30:00",
+        "hours": 4.5
+      },
+      {
+        "date": "2026-06-02",
+        "employee_id": "1ef96273-22e6-4e53-b8e9-bde2be3c2453",
+        "employee_name": "Carolyn Ringler",
+        "shift_name": "AM Weekday",
+        "role": "Manager",
+        "start_time": "11:00:00",
+        "end_time": "15:30:00",
+        "hours": 4.5
+      },
+      {
+        "date": "2026-06-02",
+        "employee_id": "ad8bc00f-4598-4a41-87b3-c9657f6b6508",
+        "employee_name": "Will Roelofs",
+        "shift_name": "Flex",
+        "role": "Lifeguard",
+        "start_time": "13:00:00",
+        "end_time": "21:00:00",
+        "hours": 8
+      },
+      {
+        "date": "2026-06-02",
+        "employee_id": "1aca64a5-714f-4842-9e35-4052d5017b92",
+        "employee_name": "Lucas Witham",
+        "shift_name": "Afternoon",
+        "role": "Headguard",
+        "start_time": "15:00:00",
+        "end_time": "21:15:00",
+        "hours": 6.3
+      },
+      {
+        "date": "2026-06-02",
+        "employee_id": "c077564b-3f20-4e94-9482-3245d35b3e71",
+        "employee_name": "Avery Harmon",
+        "shift_name": "Afternoon",
+        "role": "Lifeguard",
+        "start_time": "15:00:00",
+        "end_time": "21:15:00",
+        "hours": 6.3
+      },
+      {
+        "date": "2026-06-02",
+        "employee_id": "4bc56fe3-5840-4d81-928d-fad7f6382982",
+        "employee_name": "Rosa Thornburg",
+        "shift_name": "Afternoon",
+        "role": "Lifeguard",
+        "start_time": "15:00:00",
+        "end_time": "21:15:00",
+        "hours": 6.3
+      },
+      {
+        "date": "2026-06-02",
+        "employee_id": "48c65d49-9e4b-4f3a-9411-a5dfc406d9c6",
+        "employee_name": "Jack McCorkle",
+        "shift_name": "Afternoon",
+        "role": "Manager",
+        "start_time": "15:00:00",
+        "end_time": "21:15:00",
+        "hours": 6.3
+      }
+    ],
+    "Wednesday 2026-06-03": [
+      {
+        "date": "2026-06-03",
+        "employee_id": "774acc69-556b-4289-a846-e790f8615a7c",
+        "employee_name": "Bennet Nieukoop",
+        "shift_name": "Weekend Greeter",
+        "role": "Greeter",
+        "start_time": "11:00:00",
+        "end_time": "19:30:00",
+        "hours": 8.5
+      },
+      {
+        "date": "2026-06-03",
+        "employee_id": "00262dbb-7902-4225-93fc-956a1a29b3f7",
+        "employee_name": "Michael McCorkle",
+        "shift_name": "AM Weekday",
+        "role": "Headguard",
+        "start_time": "11:00:00",
+        "end_time": "15:30:00",
+        "hours": 4.5
+      },
+      {
+        "date": "2026-06-03",
+        "employee_id": "0a599085-c241-41fe-a3b5-1b7dd2db2023",
+        "employee_name": "Ally Becker",
+        "shift_name": "AM Weekday",
+        "role": "Lifeguard",
+        "start_time": "11:00:00",
+        "end_time": "15:30:00",
+        "hours": 4.5
+      },
+      {
+        "date": "2026-06-03",
+        "employee_id": "6db46109-236d-4a49-98bd-ec434a5fea98",
+        "employee_name": "Margaret Holt",
+        "shift_name": "AM Weekday",
+        "role": "Lifeguard",
+        "start_time": "11:00:00",
+        "end_time": "15:30:00",
+        "hours": 4.5
+      },
+      {
+        "date": "2026-06-03",
+        "employee_id": "1ef96273-22e6-4e53-b8e9-bde2be3c2453",
+        "employee_name": "Carolyn Ringler",
+        "shift_name": "AM Weekday",
+        "role": "Manager",
+        "start_time": "11:00:00",
+        "end_time": "15:30:00",
+        "hours": 4.5
+      },
+      {
+        "date": "2026-06-03",
+        "employee_id": "a7057fa6-a283-42ec-8918-0bba7631ba4b",
+        "employee_name": "Miles Holter",
+        "shift_name": "Flex",
+        "role": "Lifeguard",
+        "start_time": "13:00:00",
+        "end_time": "21:00:00",
+        "hours": 8
+      },
+      {
+        "date": "2026-06-03",
+        "employee_id": "1aca64a5-714f-4842-9e35-4052d5017b92",
+        "employee_name": "Lucas Witham",
+        "shift_name": "Afternoon",
+        "role": "Headguard",
+        "start_time": "15:00:00",
+        "end_time": "21:15:00",
+        "hours": 6.3
+      },
+      {
+        "date": "2026-06-03",
+        "employee_id": "ee063955-c6b9-461e-abb6-b2beb056ea91",
+        "employee_name": "Ian Tyrrell",
+        "shift_name": "Afternoon",
+        "role": "Lifeguard",
+        "start_time": "15:00:00",
+        "end_time": "21:15:00",
+        "hours": 6.3
+      },
+      {
+        "date": "2026-06-03",
+        "employee_id": "d5f076f7-7272-418e-874d-500aec00d34a",
+        "employee_name": "Letizia Cumbo-Nacheli",
+        "shift_name": "Afternoon",
+        "role": "Lifeguard",
+        "start_time": "15:00:00",
+        "end_time": "21:15:00",
+        "hours": 6.3
+      },
+      {
+        "date": "2026-06-03",
+        "employee_id": "48c65d49-9e4b-4f3a-9411-a5dfc406d9c6",
+        "employee_name": "Jack McCorkle",
+        "shift_name": "Afternoon",
+        "role": "Manager",
+        "start_time": "15:00:00",
+        "end_time": "21:15:00",
+        "hours": 6.3
+      }
+    ],
+    "Thursday 2026-06-04": [
+      {
+        "date": "2026-06-04",
+        "employee_id": "774acc69-556b-4289-a846-e790f8615a7c",
+        "employee_name": "Bennet Nieukoop",
+        "shift_name": "Weekend Greeter",
+        "role": "Greeter",
+        "start_time": "11:00:00",
+        "end_time": "19:30:00",
+        "hours": 8.5
+      },
+      {
+        "date": "2026-06-04",
+        "employee_id": "dc832954-9d41-4ccb-9308-5e86d2a1f420",
+        "employee_name": "Kori Baumann",
+        "shift_name": "AM Weekday",
+        "role": "Headguard",
+        "start_time": "11:00:00",
+        "end_time": "15:30:00",
+        "hours": 4.5
+      },
+      {
+        "date": "2026-06-04",
+        "employee_id": "0a599085-c241-41fe-a3b5-1b7dd2db2023",
+        "employee_name": "Ally Becker",
+        "shift_name": "AM Weekday",
+        "role": "Lifeguard",
+        "start_time": "11:00:00",
+        "end_time": "15:30:00",
+        "hours": 4.5
+      },
+      {
+        "date": "2026-06-04",
+        "employee_id": "22d57227-da58-4c07-9c55-8d89819fc46a",
+        "employee_name": "Emily Vander Heide",
+        "shift_name": "AM Weekday",
+        "role": "Lifeguard",
+        "start_time": "11:00:00",
+        "end_time": "15:30:00",
+        "hours": 4.5
+      },
+      {
+        "date": "2026-06-04",
+        "employee_id": "1ef96273-22e6-4e53-b8e9-bde2be3c2453",
+        "employee_name": "Carolyn Ringler",
+        "shift_name": "AM Weekday",
+        "role": "Manager",
+        "start_time": "11:00:00",
+        "end_time": "15:30:00",
+        "hours": 4.5
+      },
+      {
+        "date": "2026-06-04",
+        "employee_id": "6db46109-236d-4a49-98bd-ec434a5fea98",
+        "employee_name": "Margaret Holt",
+        "shift_name": "Flex",
+        "role": "Lifeguard",
+        "start_time": "13:00:00",
+        "end_time": "21:00:00",
+        "hours": 8
+      },
+      {
+        "date": "2026-06-04",
+        "employee_id": "dc832954-9d41-4ccb-9308-5e86d2a1f420",
+        "employee_name": "Kori Baumann",
+        "shift_name": "Afternoon",
+        "role": "Headguard",
+        "start_time": "15:00:00",
+        "end_time": "21:15:00",
+        "hours": 6.3
+      },
+      {
+        "date": "2026-06-04",
+        "employee_id": "c077564b-3f20-4e94-9482-3245d35b3e71",
+        "employee_name": "Avery Harmon",
+        "shift_name": "Afternoon",
+        "role": "Lifeguard",
+        "start_time": "15:00:00",
+        "end_time": "21:15:00",
+        "hours": 6.3
+      },
+      {
+        "date": "2026-06-04",
+        "employee_id": "a7057fa6-a283-42ec-8918-0bba7631ba4b",
+        "employee_name": "Miles Holter",
+        "shift_name": "Afternoon",
+        "role": "Lifeguard",
+        "start_time": "15:00:00",
+        "end_time": "21:15:00",
+        "hours": 6.3
+      },
+      {
+        "date": "2026-06-04",
+        "employee_id": "48c65d49-9e4b-4f3a-9411-a5dfc406d9c6",
+        "employee_name": "Jack McCorkle",
+        "shift_name": "Afternoon",
+        "role": "Manager",
+        "start_time": "15:00:00",
+        "end_time": "21:15:00",
+        "hours": 6.3
+      }
+    ],
+    "Friday 2026-06-05": [
+      {
+        "date": "2026-06-05",
+        "employee_id": "a1d2d6ab-bb6e-461f-ac7c-9882c9caa8ab",
+        "employee_name": "Nick Jovanovic",
+        "shift_name": "Weekend Greeter",
+        "role": "Greeter",
+        "start_time": "11:00:00",
+        "end_time": "19:30:00",
+        "hours": 8.5
+      },
+      {
+        "date": "2026-06-05",
+        "employee_id": "dc832954-9d41-4ccb-9308-5e86d2a1f420",
+        "employee_name": "Kori Baumann",
+        "shift_name": "AM Weekday",
+        "role": "Headguard",
+        "start_time": "11:00:00",
+        "end_time": "15:30:00",
+        "hours": 4.5
+      },
+      {
+        "date": "2026-06-05",
+        "employee_id": "ad186924-c2eb-4e0b-a787-8bb5902cd7d5",
+        "employee_name": "Mia Shaffer",
+        "shift_name": "AM Weekday",
+        "role": "Lifeguard",
+        "start_time": "11:00:00",
+        "end_time": "15:30:00",
+        "hours": 4.5
+      },
+      {
+        "date": "2026-06-05",
+        "employee_id": "ad8bc00f-4598-4a41-87b3-c9657f6b6508",
+        "employee_name": "Will Roelofs",
+        "shift_name": "AM Weekday",
+        "role": "Lifeguard",
+        "start_time": "11:00:00",
+        "end_time": "15:30:00",
+        "hours": 4.5
+      },
+      {
+        "date": "2026-06-05",
+        "employee_id": "1ef96273-22e6-4e53-b8e9-bde2be3c2453",
+        "employee_name": "Carolyn Ringler",
+        "shift_name": "AM Weekday",
+        "role": "Manager",
+        "start_time": "11:00:00",
+        "end_time": "15:30:00",
+        "hours": 4.5
+      },
+      {
+        "date": "2026-06-05",
+        "employee_id": "22d57227-da58-4c07-9c55-8d89819fc46a",
+        "employee_name": "Emily Vander Heide",
+        "shift_name": "Flex",
+        "role": "Lifeguard",
+        "start_time": "13:00:00",
+        "end_time": "21:00:00",
+        "hours": 8
+      },
+      {
+        "date": "2026-06-05",
+        "employee_id": "1aca64a5-714f-4842-9e35-4052d5017b92",
+        "employee_name": "Lucas Witham",
+        "shift_name": "Afternoon",
+        "role": "Headguard",
+        "start_time": "15:00:00",
+        "end_time": "21:15:00",
+        "hours": 6.3
+      },
+      {
+        "date": "2026-06-05",
+        "employee_id": "ee063955-c6b9-461e-abb6-b2beb056ea91",
+        "employee_name": "Ian Tyrrell",
+        "shift_name": "Afternoon",
+        "role": "Lifeguard",
+        "start_time": "15:00:00",
+        "end_time": "21:15:00",
+        "hours": 6.3
+      },
+      {
+        "date": "2026-06-05",
+        "employee_id": "d5f076f7-7272-418e-874d-500aec00d34a",
+        "employee_name": "Letizia Cumbo-Nacheli",
+        "shift_name": "Afternoon",
+        "role": "Lifeguard",
+        "start_time": "15:00:00",
+        "end_time": "21:15:00",
+        "hours": 6.3
+      },
+      {
+        "date": "2026-06-05",
+        "employee_id": "48c65d49-9e4b-4f3a-9411-a5dfc406d9c6",
+        "employee_name": "Jack McCorkle",
+        "shift_name": "Afternoon",
+        "role": "Manager",
+        "start_time": "15:00:00",
+        "end_time": "21:15:00",
+        "hours": 6.3
+      }
+    ],
+    "Saturday 2026-06-06": [
+      {
+        "date": "2026-06-06",
+        "employee_id": "bab43ff2-c901-41d8-be3b-134e1a54d079",
+        "employee_name": "Addison Pulley",
+        "shift_name": "AM Weekend",
+        "role": "Headguard",
+        "start_time": "09:00:00",
+        "end_time": "15:30:00",
+        "hours": 6.5
+      },
+      {
+        "date": "2026-06-06",
+        "employee_id": "644ca663-1b5f-4b90-8610-7489f7ac6b91",
+        "employee_name": "Karsten Krampe",
+        "shift_name": "AM Weekend",
+        "role": "Lifeguard",
+        "start_time": "09:00:00",
+        "end_time": "15:30:00",
+        "hours": 6.5
+      },
+      {
+        "date": "2026-06-06",
+        "employee_id": "11cca682-8a9d-43f8-9398-7b7881059f73",
+        "employee_name": "Katie Schillaci",
+        "shift_name": "AM Weekend",
+        "role": "Lifeguard",
+        "start_time": "09:00:00",
+        "end_time": "15:30:00",
+        "hours": 6.5
+      },
+      {
+        "date": "2026-06-06",
+        "employee_id": "1ef96273-22e6-4e53-b8e9-bde2be3c2453",
+        "employee_name": "Carolyn Ringler",
+        "shift_name": "AM Weekend",
+        "role": "Manager",
+        "start_time": "09:00:00",
+        "end_time": "15:30:00",
+        "hours": 6.5
+      },
+      {
+        "date": "2026-06-06",
+        "employee_id": "89cf2455-ecde-4466-a78c-180885ee4c37",
+        "employee_name": "Kason Schneider",
+        "shift_name": "Weekend Greeter",
+        "role": "Greeter",
+        "start_time": "11:00:00",
+        "end_time": "19:30:00",
+        "hours": 8.5
+      },
+      {
+        "date": "2026-06-06",
+        "employee_id": "68adca9c-722e-49d6-ab17-c244f03d2664",
+        "employee_name": "Mya Vanderzwaag",
+        "shift_name": "Flex",
+        "role": "Lifeguard",
+        "start_time": "13:00:00",
+        "end_time": "21:00:00",
+        "hours": 8
+      },
+      {
+        "date": "2026-06-06",
+        "employee_id": "dc832954-9d41-4ccb-9308-5e86d2a1f420",
+        "employee_name": "Kori Baumann",
+        "shift_name": "Afternoon",
+        "role": "Headguard",
+        "start_time": "15:00:00",
+        "end_time": "21:15:00",
+        "hours": 6.3
+      },
+      {
+        "date": "2026-06-06",
+        "employee_id": "0a599085-c241-41fe-a3b5-1b7dd2db2023",
+        "employee_name": "Ally Becker",
+        "shift_name": "Afternoon",
+        "role": "Lifeguard",
+        "start_time": "15:00:00",
+        "end_time": "21:15:00",
+        "hours": 6.3
+      },
+      {
+        "date": "2026-06-06",
+        "employee_id": "4bc56fe3-5840-4d81-928d-fad7f6382982",
+        "employee_name": "Rosa Thornburg",
+        "shift_name": "Afternoon",
+        "role": "Lifeguard",
+        "start_time": "15:00:00",
+        "end_time": "21:15:00",
+        "hours": 6.3
+      },
+      {
+        "date": "2026-06-06",
+        "employee_id": "48c65d49-9e4b-4f3a-9411-a5dfc406d9c6",
+        "employee_name": "Jack McCorkle",
+        "shift_name": "Afternoon",
+        "role": "Manager",
+        "start_time": "15:00:00",
+        "end_time": "21:15:00",
+        "hours": 6.3
+      }
+    ],
+    "Sunday 2026-06-07": [
+      {
+        "date": "2026-06-07",
+        "employee_id": "b04ac980-fcfc-4cc2-8bad-b6d6ddcf6e9d",
+        "employee_name": "Audrey Rook",
+        "shift_name": "AM Weekend",
+        "role": "Headguard",
+        "start_time": "09:00:00",
+        "end_time": "15:30:00",
+        "hours": 6.5
+      },
+      {
+        "date": "2026-06-07",
+        "employee_id": "644ca663-1b5f-4b90-8610-7489f7ac6b91",
+        "employee_name": "Karsten Krampe",
+        "shift_name": "AM Weekend",
+        "role": "Lifeguard",
+        "start_time": "09:00:00",
+        "end_time": "15:30:00",
+        "hours": 6.5
+      },
+      {
+        "date": "2026-06-07",
+        "employee_id": "ad186924-c2eb-4e0b-a787-8bb5902cd7d5",
+        "employee_name": "Mia Shaffer",
+        "shift_name": "AM Weekend",
+        "role": "Lifeguard",
+        "start_time": "09:00:00",
+        "end_time": "15:30:00",
+        "hours": 6.5
+      },
+      {
+        "date": "2026-06-07",
+        "employee_id": "1ef96273-22e6-4e53-b8e9-bde2be3c2453",
+        "employee_name": "Carolyn Ringler",
+        "shift_name": "AM Weekend",
+        "role": "Manager",
+        "start_time": "09:00:00",
+        "end_time": "15:30:00",
+        "hours": 6.5
+      },
+      {
+        "date": "2026-06-07",
+        "employee_id": "89cf2455-ecde-4466-a78c-180885ee4c37",
+        "employee_name": "Kason Schneider",
+        "shift_name": "Weekend Greeter",
+        "role": "Greeter",
+        "start_time": "11:00:00",
+        "end_time": "19:30:00",
+        "hours": 8.5
+      },
+      {
+        "date": "2026-06-07",
+        "employee_id": "a1d2d6ab-bb6e-461f-ac7c-9882c9caa8ab",
+        "employee_name": "Nick Jovanovic",
+        "shift_name": "Weekday Greeter",
+        "role": "Greeter",
+        "start_time": "12:00:00",
+        "end_time": "19:30:00",
+        "hours": 7.5
+      },
+      {
+        "date": "2026-06-07",
+        "employee_id": "11cca682-8a9d-43f8-9398-7b7881059f73",
+        "employee_name": "Katie Schillaci",
+        "shift_name": "Flex",
+        "role": "Lifeguard",
+        "start_time": "13:00:00",
+        "end_time": "21:00:00",
+        "hours": 8
+      },
+      {
+        "date": "2026-06-07",
+        "employee_id": "bab43ff2-c901-41d8-be3b-134e1a54d079",
+        "employee_name": "Addison Pulley",
+        "shift_name": "Afternoon",
+        "role": "Headguard",
+        "start_time": "15:00:00",
+        "end_time": "21:15:00",
+        "hours": 6.3
+      },
+      {
+        "date": "2026-06-07",
+        "employee_id": "68adca9c-722e-49d6-ab17-c244f03d2664",
+        "employee_name": "Mya Vanderzwaag",
+        "shift_name": "Afternoon",
+        "role": "Lifeguard",
+        "start_time": "15:00:00",
+        "end_time": "21:15:00",
+        "hours": 6.3
+      },
+      {
+        "date": "2026-06-07",
+        "employee_id": "ad8bc00f-4598-4a41-87b3-c9657f6b6508",
+        "employee_name": "Will Roelofs",
+        "shift_name": "Afternoon",
+        "role": "Lifeguard",
+        "start_time": "15:00:00",
+        "end_time": "21:15:00",
+        "hours": 6.3
+      }
+    ]
+  },
+  "gaps_detail": [
+    {
+      "date": "2026-06-06",
+      "shift_name": "Weekday Greeter",
+      "role": "Greeter",
+      "required_count": 1,
+      "filled_count": 0,
+      "reason": "No qualified employee could be assigned",
+      "start_time": "12:00:00",
+      "end_time": "19:30:00"
+    },
+    {
+      "date": "2026-06-07",
+      "shift_name": "Afternoon",
+      "role": "Manager",
+      "required_count": 1,
+      "filled_count": 0,
+      "reason": "All qualified employees are at their maximum weekly hours",
+      "start_time": "15:00:00",
+      "end_time": "21:15:00"
+    }
+  ],
+  "flagged_issues_detail": [
+    {
+      "type": "unsatisfied_attribute_mix",
+      "date": "2026-06-01",
+      "shift_name": "Weekend Greeter",
+      "description": "Attribute mix unsatisfied on 2026-06-01 Weekend Greeter: need 1 of sex=female",
+      "metadata": {
+        "attribute": "sex",
+        "value": "female",
+        "required": 1,
+        "actual": 0
+      }
+    },
+    {
+      "type": "unsatisfied_attribute_mix",
+      "date": "2026-06-01",
+      "shift_name": "Flex",
+      "description": "Attribute mix unsatisfied on 2026-06-01 Flex: need 1 of sex=male",
+      "metadata": {
+        "attribute": "sex",
+        "value": "male",
+        "required": 1,
+        "actual": 0
+      }
+    },
+    {
+      "type": "unsatisfied_attribute_mix",
+      "date": "2026-06-02",
+      "shift_name": "Weekend Greeter",
+      "description": "Attribute mix unsatisfied on 2026-06-02 Weekend Greeter: need 1 of sex=female",
+      "metadata": {
+        "attribute": "sex",
+        "value": "female",
+        "required": 1,
+        "actual": 0
+      }
+    },
+    {
+      "type": "unsatisfied_attribute_mix",
+      "date": "2026-06-02",
+      "shift_name": "Flex",
+      "description": "Attribute mix unsatisfied on 2026-06-02 Flex: need 1 of sex=female",
+      "metadata": {
+        "attribute": "sex",
+        "value": "female",
+        "required": 1,
+        "actual": 0
+      }
+    },
+    {
+      "type": "unsatisfied_attribute_mix",
+      "date": "2026-06-03",
+      "shift_name": "Weekend Greeter",
+      "description": "Attribute mix unsatisfied on 2026-06-03 Weekend Greeter: need 1 of sex=female",
+      "metadata": {
+        "attribute": "sex",
+        "value": "female",
+        "required": 1,
+        "actual": 0
+      }
+    },
+    {
+      "type": "unsatisfied_attribute_mix",
+      "date": "2026-06-03",
+      "shift_name": "Flex",
+      "description": "Attribute mix unsatisfied on 2026-06-03 Flex: need 1 of sex=female",
+      "metadata": {
+        "attribute": "sex",
+        "value": "female",
+        "required": 1,
+        "actual": 0
+      }
+    },
+    {
+      "type": "unsatisfied_attribute_mix",
+      "date": "2026-06-04",
+      "shift_name": "AM Weekday",
+      "description": "Attribute mix unsatisfied on 2026-06-04 AM Weekday: need 1 of sex=male",
+      "metadata": {
+        "attribute": "sex",
+        "value": "male",
+        "required": 1,
+        "actual": 0
+      }
+    },
+    {
+      "type": "unsatisfied_attribute_mix",
+      "date": "2026-06-04",
+      "shift_name": "Weekend Greeter",
+      "description": "Attribute mix unsatisfied on 2026-06-04 Weekend Greeter: need 1 of sex=female",
+      "metadata": {
+        "attribute": "sex",
+        "value": "female",
+        "required": 1,
+        "actual": 0
+      }
+    },
+    {
+      "type": "unsatisfied_attribute_mix",
+      "date": "2026-06-04",
+      "shift_name": "Flex",
+      "description": "Attribute mix unsatisfied on 2026-06-04 Flex: need 1 of sex=male",
+      "metadata": {
+        "attribute": "sex",
+        "value": "male",
+        "required": 1,
+        "actual": 0
+      }
+    },
+    {
+      "type": "unsatisfied_attribute_mix",
+      "date": "2026-06-05",
+      "shift_name": "Weekend Greeter",
+      "description": "Attribute mix unsatisfied on 2026-06-05 Weekend Greeter: need 1 of sex=female",
+      "metadata": {
+        "attribute": "sex",
+        "value": "female",
+        "required": 1,
+        "actual": 0
+      }
+    },
+    {
+      "type": "unsatisfied_attribute_mix",
+      "date": "2026-06-05",
+      "shift_name": "Flex",
+      "description": "Attribute mix unsatisfied on 2026-06-05 Flex: need 1 of sex=male",
+      "metadata": {
+        "attribute": "sex",
+        "value": "male",
+        "required": 1,
+        "actual": 0
+      }
+    },
+    {
+      "type": "unsatisfied_attribute_mix",
+      "date": "2026-06-06",
+      "shift_name": "Weekend Greeter",
+      "description": "Attribute mix unsatisfied on 2026-06-06 Weekend Greeter: need 1 of sex=female",
+      "metadata": {
+        "attribute": "sex",
+        "value": "female",
+        "required": 1,
+        "actual": 0
+      }
+    },
+    {
+      "type": "unsatisfied_attribute_mix",
+      "date": "2026-06-06",
+      "shift_name": "Flex",
+      "description": "Attribute mix unsatisfied on 2026-06-06 Flex: need 1 of sex=male",
+      "metadata": {
+        "attribute": "sex",
+        "value": "male",
+        "required": 1,
+        "actual": 0
+      }
+    },
+    {
+      "type": "unsatisfied_attribute_mix",
+      "date": "2026-06-07",
+      "shift_name": "Weekend Greeter",
+      "description": "Attribute mix unsatisfied on 2026-06-07 Weekend Greeter: need 1 of sex=female",
+      "metadata": {
+        "attribute": "sex",
+        "value": "female",
+        "required": 1,
+        "actual": 0
+      }
+    },
+    {
+      "type": "unsatisfied_attribute_mix",
+      "date": "2026-06-07",
+      "shift_name": "Weekday Greeter",
+      "description": "Attribute mix unsatisfied on 2026-06-07 Weekday Greeter: need 1 of sex=female",
+      "metadata": {
+        "attribute": "sex",
+        "value": "female",
+        "required": 1,
+        "actual": 0
+      }
+    },
+    {
+      "type": "unsatisfied_attribute_mix",
+      "date": "2026-06-07",
+      "shift_name": "Flex",
+      "description": "Attribute mix unsatisfied on 2026-06-07 Flex: need 1 of sex=male",
+      "metadata": {
+        "attribute": "sex",
+        "value": "male",
+        "required": 1,
+        "actual": 0
+      }
+    }
+  ],
+  "weekly_hours_by_employee": [
+    {
+      "employee_id": "48c65d49-9e4b-4f3a-9411-a5dfc406d9c6",
+      "name": "Jack McCorkle",
+      "primary_role": "Manager",
+      "hours_assigned": 37.8,
+      "max_hours": 40,
+      "percent_of_max": 94.5
+    },
+    {
+      "employee_id": "1ef96273-22e6-4e53-b8e9-bde2be3c2453",
+      "name": "Carolyn Ringler",
+      "primary_role": "Manager",
+      "hours_assigned": 35.5,
+      "max_hours": 40,
+      "percent_of_max": 88.8
+    },
+    {
+      "employee_id": "774acc69-556b-4289-a846-e790f8615a7c",
+      "name": "Bennet Nieukoop",
+      "primary_role": "Greeter",
+      "hours_assigned": 34,
+      "max_hours": 40,
+      "percent_of_max": 85
+    },
+    {
+      "employee_id": "dc832954-9d41-4ccb-9308-5e86d2a1f420",
+      "name": "Kori Baumann",
+      "primary_role": "Headguard",
+      "hours_assigned": 26.1,
+      "max_hours": 40,
+      "percent_of_max": 65.3
+    },
+    {
+      "employee_id": "1aca64a5-714f-4842-9e35-4052d5017b92",
+      "name": "Lucas Witham",
+      "primary_role": "Headguard",
+      "hours_assigned": 23.4,
+      "max_hours": 40,
+      "percent_of_max": 58.5
+    },
+    {
+      "employee_id": "22d57227-da58-4c07-9c55-8d89819fc46a",
+      "name": "Emily Vander Heide",
+      "primary_role": "Lifeguard",
+      "hours_assigned": 20.5,
+      "max_hours": 40,
+      "percent_of_max": 51.3
+    },
+    {
+      "employee_id": "0a599085-c241-41fe-a3b5-1b7dd2db2023",
+      "name": "Ally Becker",
+      "primary_role": "Lifeguard",
+      "hours_assigned": 19.8,
+      "max_hours": 40,
+      "percent_of_max": 49.5
+    },
+    {
+      "employee_id": "ee063955-c6b9-461e-abb6-b2beb056ea91",
+      "name": "Ian Tyrrell",
+      "primary_role": "Lifeguard",
+      "hours_assigned": 18.9,
+      "max_hours": 40,
+      "percent_of_max": 47.3
+    },
+    {
+      "employee_id": "d5f076f7-7272-418e-874d-500aec00d34a",
+      "name": "Letizia Cumbo-Nacheli",
+      "primary_role": "Lifeguard",
+      "hours_assigned": 18.9,
+      "max_hours": 40,
+      "percent_of_max": 47.3
+    },
+    {
+      "employee_id": "a7057fa6-a283-42ec-8918-0bba7631ba4b",
+      "name": "Miles Holter",
+      "primary_role": "Lifeguard",
+      "hours_assigned": 18.8,
+      "max_hours": 40,
+      "percent_of_max": 47
+    },
+    {
+      "employee_id": "ad8bc00f-4598-4a41-87b3-c9657f6b6508",
+      "name": "Will Roelofs",
+      "primary_role": "Lifeguard",
+      "hours_assigned": 18.8,
+      "max_hours": 40,
+      "percent_of_max": 47
+    },
+    {
+      "employee_id": "c077564b-3f20-4e94-9482-3245d35b3e71",
+      "name": "Avery Harmon",
+      "primary_role": "Lifeguard",
+      "hours_assigned": 17.1,
+      "max_hours": 40,
+      "percent_of_max": 42.8
+    },
+    {
+      "employee_id": "6db46109-236d-4a49-98bd-ec434a5fea98",
+      "name": "Margaret Holt",
+      "primary_role": "Lifeguard",
+      "hours_assigned": 17,
+      "max_hours": 40,
+      "percent_of_max": 42.5
+    },
+    {
+      "employee_id": "89cf2455-ecde-4466-a78c-180885ee4c37",
+      "name": "Kason Schneider",
+      "primary_role": "Greeter",
+      "hours_assigned": 17,
+      "max_hours": 40,
+      "percent_of_max": 42.5
+    },
+    {
+      "employee_id": "a1d2d6ab-bb6e-461f-ac7c-9882c9caa8ab",
+      "name": "Nick Jovanovic",
+      "primary_role": "Junior Lifeguard",
+      "hours_assigned": 16,
+      "max_hours": 40,
+      "percent_of_max": 40
+    },
+    {
+      "employee_id": "11cca682-8a9d-43f8-9398-7b7881059f73",
+      "name": "Katie Schillaci",
+      "primary_role": "Lifeguard",
+      "hours_assigned": 14.5,
+      "max_hours": 40,
+      "percent_of_max": 36.3
+    },
+    {
+      "employee_id": "68adca9c-722e-49d6-ab17-c244f03d2664",
+      "name": "Mya Vanderzwaag",
+      "primary_role": "Lifeguard",
+      "hours_assigned": 14.3,
+      "max_hours": 40,
+      "percent_of_max": 35.8
+    },
+    {
+      "employee_id": "644ca663-1b5f-4b90-8610-7489f7ac6b91",
+      "name": "Karsten Krampe",
+      "primary_role": "Lifeguard",
+      "hours_assigned": 13,
+      "max_hours": 40,
+      "percent_of_max": 32.5
+    },
+    {
+      "employee_id": "bab43ff2-c901-41d8-be3b-134e1a54d079",
+      "name": "Addison Pulley",
+      "primary_role": "Headguard",
+      "hours_assigned": 12.8,
+      "max_hours": 40,
+      "percent_of_max": 32
+    },
+    {
+      "employee_id": "4bc56fe3-5840-4d81-928d-fad7f6382982",
+      "name": "Rosa Thornburg",
+      "primary_role": "Lifeguard",
+      "hours_assigned": 12.6,
+      "max_hours": 40,
+      "percent_of_max": 31.5
+    },
+    {
+      "employee_id": "ad186924-c2eb-4e0b-a787-8bb5902cd7d5",
+      "name": "Mia Shaffer",
+      "primary_role": "Lifeguard",
+      "hours_assigned": 11,
+      "max_hours": 40,
+      "percent_of_max": 27.5
+    },
+    {
+      "employee_id": "00262dbb-7902-4225-93fc-956a1a29b3f7",
+      "name": "Michael McCorkle",
+      "primary_role": "Headguard",
+      "hours_assigned": 10.8,
+      "max_hours": 40,
+      "percent_of_max": 27
+    },
+    {
+      "employee_id": "b04ac980-fcfc-4cc2-8bad-b6d6ddcf6e9d",
+      "name": "Audrey Rook",
+      "primary_role": "Headguard",
+      "hours_assigned": 6.5,
+      "max_hours": 40,
+      "percent_of_max": 16.3
+    },
+    {
+      "employee_id": "6432a385-4fb2-42ce-b73f-0dfe4860f037",
+      "name": "Jenna Stibitz",
+      "primary_role": "Junior Lifeguard",
+      "hours_assigned": 0,
+      "max_hours": 40,
+      "percent_of_max": 0
+    },
+    {
+      "employee_id": "a02a3860-59f8-4f8b-8d1c-d2ad50a6cc0b",
+      "name": "Cameron Osterhaven",
+      "primary_role": "Junior Lifeguard",
+      "hours_assigned": 0,
+      "max_hours": 40,
+      "percent_of_max": 0
+    },
+    {
+      "employee_id": "1b868570-1ade-443d-9781-4cbe16a5cf06",
+      "name": "Erin Berigan",
+      "primary_role": "AManager",
+      "hours_assigned": 0,
+      "max_hours": 40,
+      "percent_of_max": 0
+    },
+    {
+      "employee_id": "d447e978-3cb9-45f0-a84b-bc488a1757a2",
+      "name": "Bubba Ganush",
+      "primary_role": "Manager",
+      "hours_assigned": 0,
+      "max_hours": 40,
+      "percent_of_max": 0
+    },
+    {
+      "employee_id": "14d3b1d9-2d84-4ed3-be29-f8a2dd7be2e7",
+      "name": "Colin Marvin",
+      "primary_role": "Junior Lifeguard",
+      "hours_assigned": 0,
+      "max_hours": 40,
+      "percent_of_max": 0
+    },
+    {
+      "employee_id": "d49452f1-f881-4fd6-b68d-c5824454aa99",
+      "name": "Maisey Pell",
+      "primary_role": "Lifeguard",
+      "hours_assigned": 0,
+      "max_hours": 40,
+      "percent_of_max": 0
+    },
+    {
+      "employee_id": "4b3b870e-b3af-4bba-9111-e35a339a8419",
+      "name": "Quin Mead",
+      "primary_role": "Junior Lifeguard",
+      "hours_assigned": 0,
+      "max_hours": 40,
+      "percent_of_max": 0
+    }
+  ],
+  "wage_estimate": {
+    "total_estimated": 7278.4,
+    "top_5_by_pay": [
+      {
+        "employee_id": "48c65d49-9e4b-4f3a-9411-a5dfc406d9c6",
+        "employee_name": "Jack McCorkle",
+        "hours": 37.8,
+        "hourly_rate": 24,
+        "estimated_pay": 907.2
+      },
+      {
+        "employee_id": "1ef96273-22e6-4e53-b8e9-bde2be3c2453",
+        "employee_name": "Carolyn Ringler",
+        "hours": 35.5,
+        "hourly_rate": 24,
+        "estimated_pay": 852
+      },
+      {
+        "employee_id": "774acc69-556b-4289-a846-e790f8615a7c",
+        "employee_name": "Bennet Nieukoop",
+        "hours": 34,
+        "hourly_rate": 14,
+        "estimated_pay": 476
+      },
+      {
+        "employee_id": "dc832954-9d41-4ccb-9308-5e86d2a1f420",
+        "employee_name": "Kori Baumann",
+        "hours": 26.1,
+        "hourly_rate": 17,
+        "estimated_pay": 443.7
+      },
+      {
+        "employee_id": "1aca64a5-714f-4842-9e35-4052d5017b92",
+        "employee_name": "Lucas Witham",
+        "hours": 23.4,
+        "hourly_rate": 17,
+        "estimated_pay": 397.8
+      }
+    ]
+  }
+}

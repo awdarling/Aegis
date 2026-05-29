@@ -21,7 +21,13 @@ import {
 } from '../lib/engine/eligibility';
 import { rankCandidates } from '../lib/engine/ranker';
 import { resolveBannedPairConflict } from '../lib/engine/cascade';
-import { enforceAttributeMixForShift } from '../lib/engine/attribute-mix';
+import { buildAttributeShortageReason, enforceAttributeMixForShift } from '../lib/engine/attribute-mix';
+import {
+  classifyEmployeeForSlot,
+  formatDispositionList,
+  type EmployeeDisposition,
+} from '../lib/engine/dispositions';
+import type { ClosedDate } from '../lib/engine/canvas';
 import type { CanvasSlot, WeekState } from '../lib/engine/types';
 import type { InboundMessage, VerifiedContact } from '../security/types';
 import type {
@@ -39,6 +45,12 @@ import type {
 // Engine version stamped into staffing_report so we know which build core
 // produced any given schedule row.
 export const ENGINE_VERSION = '2.0.0';
+
+// Activity-log action emitted when the engine successfully builds a schedule
+// but the supabase insert fails. Surfaced separately from 'schedule_built' so
+// monitoring / dashboards can alert specifically on save failures (where the
+// manager will NOT receive the standard success summary).
+export const SCHEDULE_BUILD_SAVE_FAILED = 'schedule_build_save_failed';
 
 // ── Output types ──────────────────────────────────────────────────────────────
 
@@ -59,13 +71,20 @@ export interface ScheduleGap {
   role: string;
   required_count: number;
   filled_count: number;
+  // Short bucket string for backwards compatibility — the binding constraint
+  // category. Stable across releases for any downstream that parses it.
   reason: string;
+  // Manager-facing rich diagnostic naming every qualified candidate and the
+  // reason each was not placed. Computed once per (date, shift_name, role)
+  // gap-row, not per missed head.
+  description: string;
+  per_employee_dispositions: EmployeeDisposition[];
   start_time?: string;
   end_time?: string;
 }
 
 export interface FlaggedIssue {
-  type: 'unresolvable_conflict' | 'unsatisfied_attribute_mix';
+  type: 'unsatisfied_attribute_mix';
   date: string;
   shift_name: string;
   description: string;
@@ -210,16 +229,39 @@ async function loadBuildData(
 
 // ── Shift override from special notes ─────────────────────────────────────────
 
+export interface ShiftOverrideMismatch {
+  date: string;
+  shift_name: string;
+  override_key: string;
+  available_roles: string[];
+}
+
 function applyShiftOverrides(
   requirements: ShiftRequirement[],
   dateNotes: Event[],
-  shiftTypeName: string
+  shiftTypeName: string,
+  date: string,
+  mismatches: ShiftOverrideMismatch[]
 ): ShiftRequirement[] {
   for (const note of dateNotes) {
     if (!note.shift_overrides) continue;
     const overrides = note.shift_overrides as Record<string, Record<string, number>>;
     const forShift = overrides[shiftTypeName];
     if (!forShift) continue;
+    const availableRoles = requirements.map(r => r.role);
+    for (const key of Object.keys(forShift)) {
+      if (!availableRoles.includes(key)) {
+        console.log(
+          `[schedule-build] shift override key '${key}' on ${date} ${shiftTypeName} doesn't match any requirement role (available: ${availableRoles.join(',')})`
+        );
+        mismatches.push({
+          date,
+          shift_name: shiftTypeName,
+          override_key: key,
+          available_roles: [...availableRoles],
+        });
+      }
+    }
     return requirements.map(req => {
       const count = forShift[req.role];
       return count !== undefined ? { ...req, required_count: count } : req;
@@ -302,6 +344,65 @@ function computeGapReason(input: GapReasonInput): string {
   return 'No qualified employee could be assigned';
 }
 
+// Pairs the short binding-reason string with a manager-facing rich
+// description that names every qualified employee and the reason each was
+// not placed. Reuses the shared classifier so the wording stays consistent
+// with attribute-mix dispositions.
+function buildGapDiagnostic(input: GapReasonInput): {
+  short_reason: string;
+  description: string;
+  per_employee_dispositions: EmployeeDisposition[];
+} {
+  const short_reason = computeGapReason(input);
+  const { slot, employees, availByEmp, toMap, veteranOnlyDates, weekState, conflicts, settings } = input;
+
+  const vetOnly = engineIsVeteranOnlyDate(slot.date, veteranOnlyDates);
+  const pool = (vetOnly ? employees.filter(e => e.is_veteran) : employees).filter(e => e.active);
+  const qualified = pool.filter(e => e.qualified_roles.includes(slot.role));
+
+  const head = `${slot.role} slot on ${slot.date} ${slot.shift_name} unfilled.`;
+
+  if (qualified.length === 0) {
+    const desc = vetOnly
+      ? `${head} No veteran employees are qualified for the ${slot.role} role on this veteran-only date.`
+      : `${head} No active employees are qualified for the ${slot.role} role.`;
+    return { short_reason, description: desc, per_employee_dispositions: [] };
+  }
+
+  const assignedIds = new Set(
+    weekState.assignments
+      .filter(a => a.date === slot.date && a.shift_name === slot.shift_name)
+      .map(a => a.employee_id)
+  );
+
+  const candidates = qualified.filter(e => !assignedIds.has(e.id));
+
+  if (candidates.length === 0) {
+    return {
+      short_reason,
+      description: `${head} All qualified employees are already assigned to this shift on this date.`,
+      per_employee_dispositions: [],
+    };
+  }
+
+  const dispositions: EmployeeDisposition[] = candidates.map(emp => ({
+    employee_id: emp.id,
+    name: emp.name,
+    reason: classifyEmployeeForSlot(emp, {
+      slot,
+      acceptedRoles: new Set([slot.role]),
+      assignedIds,
+      weekState,
+      deps: { employees, availByEmp, toMap, conflicts, settings },
+    }),
+  }));
+
+  const total = dispositions.length;
+  const grouped = formatDispositionList(dispositions);
+  const description = `${head} ${total} employee${total === 1 ? '' : 's'} qualified for ${slot.role}: ${grouped}.`;
+  return { short_reason, description, per_employee_dispositions: dispositions };
+}
+
 // ── Build core ────────────────────────────────────────────────────────────────
 
 interface BuildContext {
@@ -318,6 +419,8 @@ interface BuildResult {
   assignments: ScheduleAssignment[];
   gaps: ScheduleGap[];
   flagged_issues: FlaggedIssue[];
+  closed_dates: ClosedDate[];
+  shift_override_mismatches: ShiftOverrideMismatch[];
   totalRequired: number;
   totalFilled: number;
 }
@@ -352,6 +455,7 @@ function buildScheduleForWeek(ctx: BuildContext): BuildResult {
   // shift_requirements.days_active is dormant — only shift_types.days_active is
   // consulted. The shift_type gate below is the single source of truth.
   const overriddenReqs: ShiftRequirement[] = [];
+  const shiftOverrideMismatches: ShiftOverrideMismatch[] = [];
   for (const date of weekDates) {
     const dayOfWeek = new Date(date + 'T12:00:00Z').getUTCDay();
     const dateNotes = eventsByDate.get(date) ?? [];
@@ -360,7 +464,7 @@ function buildScheduleForWeek(ctx: BuildContext): BuildResult {
       const baseReqs = data.shiftRequirements.filter(req =>
         (req.shift_type_id ? req.shift_type_id === st.id : req.shift_name === st.name)
       );
-      const adjusted = applyShiftOverrides(baseReqs, dateNotes, st.name);
+      const adjusted = applyShiftOverrides(baseReqs, dateNotes, st.name, date, shiftOverrideMismatches);
       for (const r of adjusted) {
         // Tag this requirement with the date so canvas can scope properly.
         overriddenReqs.push({ ...r, days_active: [dayOfWeek] });
@@ -373,7 +477,7 @@ function buildScheduleForWeek(ctx: BuildContext): BuildResult {
   // Because canvas already filters by days_active, we don't double-apply.
   const allEvents: Event[] = [];
   for (const list of eventsByDate.values()) allEvents.push(...list);
-  const canvas = buildCanvas(weekDates, data.shiftTypes, overriddenReqs, allEvents);
+  const { slots: canvas, closed_dates } = buildCanvas(weekDates, data.shiftTypes, overriddenReqs, allEvents);
 
   const weekState: WeekState = {
     weeklyHoursMap: new Map(),
@@ -500,7 +604,7 @@ function buildScheduleForWeek(ctx: BuildContext): BuildResult {
         hours: slot.hours,
       });
     } else {
-      const reason = computeGapReason({
+      const diagnostic = buildGapDiagnostic({
         slot,
         employees: data.employees,
         availByEmp: data.availByEmp,
@@ -522,7 +626,9 @@ function buildScheduleForWeek(ctx: BuildContext): BuildResult {
           role: slot.role,
           required_count: 1,
           filled_count: 0,
-          reason,
+          reason: diagnostic.short_reason,
+          description: diagnostic.description,
+          per_employee_dispositions: diagnostic.per_employee_dispositions,
           start_time: slot.start_time,
           end_time: slot.end_time,
         };
@@ -637,12 +743,35 @@ function buildScheduleForWeek(ctx: BuildContext): BuildResult {
       }
 
       if (stillNeed > 0 && veteranMode === 'at_least_one') {
+        const veteranReason = buildAttributeShortageReason({
+          shift: { date: group.date, shift_type_id: group.shift_type_id, shift_name: group.shift_name },
+          missingAttribute: 'is_veteran',
+          missingValue: 'true',
+          needed: 1,
+          weekState,
+          deps: {
+            employees: data.employees,
+            employeeById,
+            availByEmp: data.availByEmp,
+            toMap: data.toMap,
+            conflicts: data.conflicts,
+            veteranOnlyDates,
+            canvasSlots: canvas,
+            settings,
+          },
+        });
         weekState.flagged_issues.push({
           type: 'unsatisfied_attribute_mix',
           date: group.date,
           shift_name: group.shift_name,
-          description: `No veteran could be assigned to ${group.shift_name} on ${group.date}`,
-          metadata: { attribute: 'is_veteran', value: 'true', required: 1, actual: 0 },
+          description: veteranReason.description,
+          metadata: {
+            attribute: 'is_veteran',
+            value: 'true',
+            required: 1,
+            actual: 0,
+            per_employee_dispositions: veteranReason.per_employee,
+          },
         });
       }
     }
@@ -659,6 +788,8 @@ function buildScheduleForWeek(ctx: BuildContext): BuildResult {
     assignments: weekState.assignments,
     gaps: weekState.gaps,
     flagged_issues: weekState.flagged_issues,
+    closed_dates,
+    shift_override_mismatches: shiftOverrideMismatches,
     totalRequired,
     totalFilled,
   };
@@ -670,6 +801,8 @@ export interface RunScheduleBuildResult {
   assignments: ScheduleAssignment[];
   gaps: ScheduleGap[];
   flagged_issues: FlaggedIssue[];
+  closed_dates: ClosedDate[];
+  shift_override_mismatches: ShiftOverrideMismatch[];
   totalRequired: number;
   totalFilled: number;
 }
@@ -715,6 +848,8 @@ export function runScheduleBuild(
     assignments: result.assignments,
     gaps: result.gaps,
     flagged_issues: result.flagged_issues,
+    closed_dates: result.closed_dates,
+    shift_override_mismatches: result.shift_override_mismatches,
     totalRequired: result.totalRequired,
     totalFilled: result.totalFilled,
   };
@@ -728,7 +863,9 @@ function buildStaffingReport(
   totalRequired: number,
   totalFilled: number,
   employees: Employee[],
-  specialNotes: Event[]
+  specialNotes: Event[],
+  closedDates: ClosedDate[],
+  shiftOverrideMismatches: ShiftOverrideMismatch[]
 ): Record<string, unknown> {
   const coverage_rate = totalRequired > 0 ? Math.round((totalFilled / totalRequired) * 1000) / 10 : 100;
 
@@ -770,6 +907,8 @@ function buildStaffingReport(
     overtime_risk,
     gap_summary,
     special_notes_applied,
+    closed_dates: closedDates,
+    shift_override_mismatches: shiftOverrideMismatches,
     aegis_notes: overtime_risk.length > 0
       ? `${overtime_risk.length} employee(s) are near or at maximum weekly hours.`
       : '',
@@ -787,7 +926,8 @@ async function buildManagerSummary(
   totalRequired: number,
   specialNotes: Event[],
   _companyName: string,
-  estimatedWages: { total_estimated: number }
+  estimatedWages: { total_estimated: number; missing_wages?: Array<{ name: string }> },
+  closedDates: ClosedDate[]
 ): Promise<string> {
   const coverageRate = totalRequired > 0 ? Math.round((totalFilled / totalRequired) * 1000) / 10 : 100;
   const weekLabel = `${formatShortDate(weekStart)}–${formatShortDate(weekEnd)}`;
@@ -822,11 +962,24 @@ async function buildManagerSummary(
 
   lines.push(`Estimated labor: $${estimatedWages.total_estimated.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`);
 
+  const missing = estimatedWages.missing_wages ?? [];
+  if (missing.length > 0) {
+    const names = missing.map(m => m.name).join(', ');
+    lines.push(`Heads up: ${missing.length} employee${missing.length === 1 ? '' : 's'} have no wage configured — labor estimate excludes them (${names}).`);
+  }
+
   if (specialNotes.length > 0) {
     const applied = specialNotes.filter(n => n.staffing_notes || n.shift_overrides);
     if (applied.length > 0) {
       lines.push(`Notes applied: ${applied.map(n => n.title).join(', ')}`);
     }
+  }
+
+  if (closedDates.length > 0) {
+    const formatted = closedDates
+      .map(c => `${new Date(c.date + 'T12:00:00Z').toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' })} (${c.event_title})`)
+      .join(', ');
+    lines.push(`Closed dates honored: ${formatted}`);
   }
 
   lines.push('');
@@ -924,7 +1077,7 @@ export async function handleBuildSchedule(
     console.log('[schedule-build] veteran-only date ranges:', veteranOnlyDates);
   }
 
-  const { assignments, gaps, flagged_issues, totalRequired, totalFilled } = runScheduleBuild(
+  const { assignments, gaps, flagged_issues, closed_dates, shift_override_mismatches, totalRequired, totalFilled } = runScheduleBuild(
     data,
     parsed.settings,
     veteranMode,
@@ -936,11 +1089,12 @@ export async function handleBuildSchedule(
   const wages = await computeWageEstimate(contact.company_id, assignments);
 
   const staffingReport = {
-    ...buildStaffingReport(assignments, gaps, totalRequired, totalFilled, data.employees, specialNotes),
+    ...buildStaffingReport(assignments, gaps, totalRequired, totalFilled, data.employees, specialNotes, closed_dates, shift_override_mismatches),
     estimated_wages: wages,
     engine_version: ENGINE_VERSION,
   };
 
+  const schedulePayload = { assignments, gaps, flagged_issues } as unknown as Record<string, unknown>;
   const { data: schedRow, error: schedError } = await supabase
     .from('schedules')
     .insert({
@@ -950,17 +1104,43 @@ export async function handleBuildSchedule(
       generated_at: new Date().toISOString(),
       generated_by: 'aegis',
       status: 'draft',
-      data: { assignments, gaps, flagged_issues } as unknown as Record<string, unknown>,
+      data: schedulePayload,
       staffing_report: staffingReport as unknown as Record<string, unknown>,
     })
     .select('id')
     .single();
 
-  const scheduleId = (schedRow as { id: string } | null)?.id ?? 'unknown';
-
   if (schedError) {
     console.error('[schedule-build] save failed:', schedError.message);
+    await logActivity({
+      company_id: contact.company_id,
+      action: SCHEDULE_BUILD_SAVE_FAILED,
+      entity_type: 'schedule',
+      entity_id: 'unsaved',
+      summary: `Schedule built for ${weekStart}–${weekEnd} but failed to save to Homebase: ${schedError.message}`,
+      metadata: {
+        week_start: weekStart,
+        week_end: weekEnd,
+        total_filled: totalFilled,
+        total_required: totalRequired,
+        error_message: schedError.message,
+        payload_assignments: assignments.length,
+        payload_gaps: gaps.length,
+        payload_flagged_issues: flagged_issues.length,
+        engine_version: ENGINE_VERSION,
+      },
+    });
+    await reply(
+      contact,
+      message,
+      `Built your schedule for ${weekStart}–${weekEnd} but couldn't save it to Homebase. ` +
+      `DB error: ${schedError.message}. ` +
+      `Please message me again in 5 minutes to retry, or check Homebase to see if it appeared.`
+    );
+    return;
   }
+
+  const scheduleId = (schedRow as { id: string } | null)?.id ?? 'unknown';
 
   await logActivity({
     company_id: contact.company_id,
@@ -983,7 +1163,7 @@ export async function handleBuildSchedule(
 
   const summaryMsg = await buildManagerSummary(
     weekStart, weekEnd, assignments, gaps, totalFilled, totalRequired,
-    specialNotes, data.companyName, wages
+    specialNotes, data.companyName, wages, closed_dates
   );
 
   await reply(contact, message, summaryMsg);

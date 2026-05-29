@@ -133,13 +133,18 @@ export function parseConstraints(policies: Policy[]): ParsedConstraints {
 
   for (const row of policies) {
     const key = row.policy_key;
-    if (!ALL_RECOGNIZED.has(key)) continue;
+    if (!ALL_RECOGNIZED.has(key)) {
+      const reason = 'unknown_key';
+      unrecognized.push({ policy_id: row.id, policy_key: key, reason });
+      console.log(`[constraints] unknown policy_key dropped: ${key} (id=${row.id})`);
+      continue;
+    }
 
     const valJson = (row as Policy & { policy_value_json?: unknown }).policy_value_json;
     if (valJson === undefined || valJson === null) {
-      const reason = 'policy_value_json is null; text policy_value is not consulted by the engine parser';
+      const reason = 'null_json';
       unrecognized.push({ policy_id: row.id, policy_key: key, reason });
-      console.log('[constraints] dropped policy', row.id, key, '—', reason);
+      console.log('[constraints] dropped policy', row.id, key, '— policy_value_json is null; text policy_value is not consulted by the engine parser');
       continue;
     }
 

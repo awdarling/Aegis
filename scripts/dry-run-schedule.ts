@@ -196,7 +196,7 @@ async function dryRun(): Promise<void> {
   const veteranOnlyDates: VeteranOnlyRange[] = [];
 
   console.log('[dry-run] Running engine...');
-  const { assignments, gaps, flagged_issues, totalRequired, totalFilled } = runScheduleBuild(
+  const { assignments, gaps, flagged_issues, closed_dates, totalRequired, totalFilled } = runScheduleBuild(
     data,
     parsed.settings,
     veteranMode,
@@ -204,7 +204,7 @@ async function dryRun(): Promise<void> {
     weekStart,
     weekEnd,
   );
-  console.log(`[dry-run] Assignments: ${totalFilled} / ${totalRequired} filled, ${gaps.length} gaps, ${flagged_issues.length} flagged issues`);
+  console.log(`[dry-run] Assignments: ${totalFilled} / ${totalRequired} filled, ${gaps.length} gaps, ${flagged_issues.length} flagged issues, ${closed_dates.length} closed dates`);
 
   const wages = await computeWageEstimate(COMPANY_ID, assignments);
 
@@ -296,12 +296,14 @@ async function dryRun(): Promise<void> {
       gaps: gaps.length,
       flagged_issues: flagged_issues.length,
     },
+    closed_dates,
     assignments_by_day: assignmentsByDay,
     gaps_detail: gaps,
     flagged_issues_detail: flagged_issues,
     weekly_hours_by_employee: weeklyHoursByEmployee,
     wage_estimate: {
       total_estimated: wages.total_estimated,
+      missing_wages: wages.missing_wages,
       top_5_by_pay: top5ByPay,
     },
   };

@@ -5,7 +5,7 @@
 // directly (e.g. `npx ts-node src/lib/engine/__tests__/smoke.ts`).
 
 import { getWeekBounds } from '../week-bounds';
-import { buildCanvas } from '../canvas';
+import { buildCanvas, type CanvasResult } from '../canvas';
 import {
   buildEligibility,
   isAvailableForShift,
@@ -20,6 +20,7 @@ import { rankCandidates } from '../ranker';
 import { resolveBannedPairConflict } from '../cascade';
 import { enforceAttributeMixForShift } from '../attribute-mix';
 import { parseConstraints } from '../../constraints/parser';
+import { computeWageEstimateFromMaps } from '../../schedule-simulator';
 import {
   DEFAULT_ENGINE_SETTINGS,
   type AttributeMixConstraint,
@@ -43,7 +44,13 @@ import type {
   WeekState,
 } from '../types';
 import type { TOWindow } from '../../to-window';
-import { runScheduleBuild, type BuildData, type ScheduleAssignment, type VeteranMode } from '../../../workflows/schedule-build';
+import {
+  runScheduleBuild,
+  SCHEDULE_BUILD_SAVE_FAILED,
+  type BuildData,
+  type ScheduleAssignment,
+  type VeteranMode,
+} from '../../../workflows/schedule-build';
 
 // Type-level signature assertions. The compiler errors on any drift.
 
@@ -56,7 +63,7 @@ type _Canvas = (
   shiftTypes: ShiftType[],
   shiftRequirements: ShiftRequirement[],
   events: Event[]
-) => CanvasSlot[];
+) => CanvasResult;
 const _c: _Canvas = buildCanvas;
 void _c;
 
@@ -119,7 +126,7 @@ const _amix: AttributeMixConstraint = {
 };
 void _amix;
 const _fi: FlaggedIssue = {
-  type: 'unresolvable_conflict',
+  type: 'unsatisfied_attribute_mix',
   date: '2026-01-01',
   shift_name: 'Lunch',
   description: 'sample',
@@ -719,6 +726,515 @@ function runAttributeMixDiagnosticSmoke(): void {
   );
 }
 
+// Locks the activity-log action emitted on save failure. The string is part
+// of the monitoring contract (dashboards/alerts may match on it), so any
+// rename should fail this check first.
+function runSaveFailedContractSmoke(): void {
+  expect(
+    SCHEDULE_BUILD_SAVE_FAILED === 'schedule_build_save_failed',
+    `SCHEDULE_BUILD_SAVE_FAILED constant === 'schedule_build_save_failed' (got '${SCHEDULE_BUILD_SAVE_FAILED}')`,
+  );
+}
+
+// Verifies coverage gaps carry per-employee dispositions that name every
+// qualified employee. Two fixtures isolate two binding-reason buckets so we
+// can assert on classification, not just shape.
+function runCoverageGapDispositionSmoke(): void {
+  const COMPANY_ID = 'company-gap-disp';
+  const ST_ID = 'st-test-gap';
+
+  const shiftType: ShiftType = {
+    id: ST_ID,
+    company_id: COMPANY_ID,
+    name: 'Test Gap Shift',
+    start_time: '09:00',
+    end_time: '13:00',
+    days_active: [1],
+    active: true,
+    created_at: '2026-01-01T00:00:00Z',
+  };
+  const req: ShiftRequirement = {
+    id: 'req-test-gap',
+    company_id: COMPANY_ID,
+    shift_name: 'Test Gap Shift',
+    role: 'Greeter',
+    required_count: 1,
+    start_time: '09:00',
+    end_time: '13:00',
+    days_active: [1],
+    shift_type_id: ST_ID,
+  };
+
+  const mondayAvail = (empId: string): Availability => ({
+    id: `av-${empId}`,
+    employee_id: empId,
+    company_id: COMPANY_ID,
+    day_of_week: 1,
+    start_time: '00:00',
+    end_time: '23:59',
+  });
+
+  // ── Fixture A: all qualified employees on full-day TO Monday ──────────────
+  {
+    const emps: Employee[] = ['A', 'B', 'C'].map(letter => ({
+      id: `emp-to-${letter}`,
+      company_id: COMPANY_ID,
+      name: `TO Greeter ${letter}`,
+      primary_role: 'Greeter',
+      qualified_roles: ['Greeter'],
+      max_weekly_hours: 40,
+      contact_phone: null,
+      contact_email: null,
+      active: true,
+      created_at: '2026-01-01T00:00:00Z',
+      individual_wage: null,
+      is_veteran: false,
+    }));
+    const availByEmp = new Map<string, Availability[]>(emps.map(e => [e.id, [mondayAvail(e.id)]]));
+    const toMap = new Map<string, TOWindow>(
+      emps.map(e => [`${e.id}:2026-06-01`, { type: 'full_day', blockedWindows: [] }])
+    );
+
+    const data: BuildData = {
+      employees: emps,
+      availByEmp,
+      toMap,
+      shiftTypes: [shiftType],
+      shiftRequirements: [req],
+      conflicts: [],
+      policies: [],
+      events: [],
+      companyName: 'Test Co',
+      companyTimezone: 'America/New_York',
+    };
+
+    const result = runScheduleBuild(data, DEFAULT_ENGINE_SETTINGS, null, [], '2026-06-01', '2026-06-01');
+    expect(
+      result.gaps.length === 1,
+      `Gap-disposition A: exactly 1 gap (got ${result.gaps.length})`,
+    );
+    const gap = result.gaps[0];
+    expect(
+      gap.per_employee_dispositions.length === 3,
+      `Gap-disposition A: 3 employees classified (got ${gap.per_employee_dispositions.length})`,
+    );
+    expect(
+      gap.per_employee_dispositions.every(d => d.reason === 'on_time_off'),
+      `Gap-disposition A: every disposition is on_time_off (got reasons: ${gap.per_employee_dispositions.map(d => d.reason).join(',')})`,
+    );
+    expect(
+      gap.description.includes('TO Greeter A') &&
+        gap.description.includes('TO Greeter B') &&
+        gap.description.includes('TO Greeter C') &&
+        gap.description.includes('on approved time off'),
+      `Gap-disposition A: description names all three (got: ${gap.description})`,
+    );
+  }
+
+  // ── Fixture B: all qualified employees at max weekly hours ────────────────
+  {
+    const emps: Employee[] = ['A', 'B'].map(letter => ({
+      id: `emp-max-${letter}`,
+      company_id: COMPANY_ID,
+      name: `Max Greeter ${letter}`,
+      primary_role: 'Greeter',
+      qualified_roles: ['Greeter'],
+      max_weekly_hours: 0,  // any positive shift exceeds this — clean trigger for max_hours_reached
+      contact_phone: null,
+      contact_email: null,
+      active: true,
+      created_at: '2026-01-01T00:00:00Z',
+      individual_wage: null,
+      is_veteran: false,
+    }));
+    const availByEmp = new Map<string, Availability[]>(emps.map(e => [e.id, [mondayAvail(e.id)]]));
+
+    const data: BuildData = {
+      employees: emps,
+      availByEmp,
+      toMap: new Map(),
+      shiftTypes: [shiftType],
+      shiftRequirements: [req],
+      conflicts: [],
+      policies: [],
+      events: [],
+      companyName: 'Test Co',
+      companyTimezone: 'America/New_York',
+    };
+
+    const result = runScheduleBuild(data, DEFAULT_ENGINE_SETTINGS, null, [], '2026-06-01', '2026-06-01');
+    expect(
+      result.gaps.length === 1,
+      `Gap-disposition B: exactly 1 gap (got ${result.gaps.length})`,
+    );
+    const gap = result.gaps[0];
+    expect(
+      gap.per_employee_dispositions.length === 2,
+      `Gap-disposition B: 2 employees classified (got ${gap.per_employee_dispositions.length})`,
+    );
+    expect(
+      gap.per_employee_dispositions.every(d => d.reason === 'max_hours_reached'),
+      `Gap-disposition B: every disposition is max_hours_reached (got reasons: ${gap.per_employee_dispositions.map(d => d.reason).join(',')})`,
+    );
+    expect(
+      gap.description.includes('Max Greeter A') &&
+        gap.description.includes('Max Greeter B') &&
+        gap.description.includes('at max weekly hours'),
+      `Gap-disposition B: description names both and cites max hours (got: ${gap.description})`,
+    );
+  }
+}
+
+// Verifies closure events surface in the build result rather than silently
+// dropping a date from the canvas.
+function runClosureEventSmoke(): void {
+  const COMPANY_ID = 'company-closure';
+  const ST_ID = 'st-closure';
+
+  const shiftType: ShiftType = {
+    id: ST_ID,
+    company_id: COMPANY_ID,
+    name: 'Daily Shift',
+    start_time: '09:00',
+    end_time: '13:00',
+    days_active: [1, 2, 3, 4, 5],
+    active: true,
+    created_at: '2026-01-01T00:00:00Z',
+  };
+  const req: ShiftRequirement = {
+    id: 'req-closure',
+    company_id: COMPANY_ID,
+    shift_name: 'Daily Shift',
+    role: 'Greeter',
+    required_count: 1,
+    start_time: '09:00',
+    end_time: '13:00',
+    days_active: [1, 2, 3, 4, 5],
+    shift_type_id: ST_ID,
+  };
+
+  // Closure on Wednesday 2026-06-03.
+  const closureEvent: Event = {
+    id: 'evt-closure-1',
+    company_id: COMPANY_ID,
+    title: 'Maintenance Day',
+    date: '2026-06-03',
+    end_date: '2026-06-03',
+    description: null,
+    event_type: 'closure',
+    staffing_notes: null,
+    shift_overrides: null,
+    created_by: 'manager',
+    created_at: '2026-01-01T00:00:00Z',
+    updated_at: '2026-01-01T00:00:00Z',
+  };
+
+  const data: BuildData = {
+    employees: [],
+    availByEmp: new Map(),
+    toMap: new Map(),
+    shiftTypes: [shiftType],
+    shiftRequirements: [req],
+    conflicts: [],
+    policies: [],
+    events: [closureEvent],
+    companyName: 'Test Co',
+    companyTimezone: 'America/New_York',
+  };
+
+  const result = runScheduleBuild(data, DEFAULT_ENGINE_SETTINGS, null, [], '2026-06-01', '2026-06-05');
+
+  expect(
+    result.closed_dates.length === 1,
+    `Closure: exactly 1 closed date in result (got ${result.closed_dates.length})`,
+  );
+  expect(
+    result.closed_dates[0]?.date === '2026-06-03' && result.closed_dates[0]?.event_title === 'Maintenance Day',
+    `Closure: date=2026-06-03 event_title='Maintenance Day' (got ${JSON.stringify(result.closed_dates[0])})`,
+  );
+  expect(
+    !result.gaps.some(g => g.date === '2026-06-03') && result.totalRequired === 4,
+    `Closure: no slots planned for the closed date — totalRequired === 4 (Mon/Tue/Thu/Fri), got ${result.totalRequired}`,
+  );
+}
+
+// Task 4 — parser must surface unknown policy_keys (with reason 'unknown_key')
+// rather than dropping them silently; known-good policies parse normally.
+function runParserUnknownKeySmoke(): void {
+  const COMPANY_ID = 'company-parser-unk';
+  const goodPolicy: Policy = {
+    id: 'pol-known',
+    company_id: COMPANY_ID,
+    policy_key: 'gender_requirement',
+    policy_value: '1m+1f',
+    policy_value_json: { attribute: 'sex', minimums: { male: 1, female: 1 }, scope: 'all_shifts' },
+    policy_type: 'coverage',
+    description: null,
+    version: 1,
+    created_at: '2026-01-01T00:00:00Z',
+  };
+  const bogusPolicy: Policy = {
+    id: 'pol-bogus',
+    company_id: COMPANY_ID,
+    policy_key: 'totally_made_up_key',
+    policy_value: 'whatever',
+    policy_value_json: { x: 1 },
+    policy_type: 'general',
+    description: null,
+    version: 1,
+    created_at: '2026-01-01T00:00:00Z',
+  };
+  const result = parseConstraints([goodPolicy, bogusPolicy]);
+
+  const bogusEntry = result.unrecognized.find(u => u.policy_key === 'totally_made_up_key');
+  expect(
+    bogusEntry !== undefined && bogusEntry.reason === 'unknown_key',
+    `Parser unknown: bogus key surfaced with reason='unknown_key' (got ${JSON.stringify(bogusEntry)})`,
+  );
+  expect(
+    result.hard.attributeMix.length === 1,
+    `Parser unknown: known gender_requirement still parsed alongside (got ${result.hard.attributeMix.length})`,
+  );
+}
+
+// Task 5 — wage estimate flags employees whose rate falls back to $0 and
+// excludes their pay from the total.
+function runWageFallbackSmoke(): void {
+  const individualWages = new Map<string, number>([
+    ['emp-paid', 20],
+  ]);
+  const roleRates = new Map<string, number>([
+    ['Greeter', 15],
+    // Lifeguard has no rate row → fallback path
+  ]);
+
+  const shifts = [
+    { employee_id: 'emp-paid', employee_name: 'Paid Person', role: 'Greeter', start_time: '09:00', end_time: '13:00', hours: 4 },
+    { employee_id: 'emp-unwaged', employee_name: 'Unwaged Person', role: 'Lifeguard', start_time: '09:00', end_time: '13:00', hours: 4 },
+  ];
+  const result = computeWageEstimateFromMaps(shifts, individualWages, roleRates);
+
+  expect(
+    result.missing_wages.length === 1,
+    `Wage fallback: 1 missing_wages entry (got ${result.missing_wages.length})`,
+  );
+  expect(
+    result.missing_wages[0]?.name === 'Unwaged Person' && result.missing_wages[0]?.role === 'Lifeguard',
+    `Wage fallback: missing_wages names 'Unwaged Person' as Lifeguard (got ${JSON.stringify(result.missing_wages[0])})`,
+  );
+  // Paid person: 4h * $20 = $80. Unwaged person excluded from total.
+  expect(
+    result.total_estimated === 80,
+    `Wage fallback: total_estimated excludes unwaged employee (expected 80, got ${result.total_estimated})`,
+  );
+}
+
+// Task 6 — veteran 'at_least_one' flag carries the same enriched shape as
+// other attribute_mix flags (per_employee_dispositions for every candidate
+// considered, classified into reason buckets).
+function runVeteranEnrichmentSmoke(): void {
+  const COMPANY_ID = 'company-vet-enrich';
+  const ST_ID = 'st-vet';
+
+  const shiftType: ShiftType = {
+    id: ST_ID,
+    company_id: COMPANY_ID,
+    name: 'Vet Shift',
+    start_time: '09:00',
+    end_time: '13:00',
+    days_active: [1],
+    active: true,
+    created_at: '2026-01-01T00:00:00Z',
+  };
+  const req: ShiftRequirement = {
+    id: 'req-vet',
+    company_id: COMPANY_ID,
+    shift_name: 'Vet Shift',
+    role: 'Lifeguard',
+    required_count: 1,
+    start_time: '09:00',
+    end_time: '13:00',
+    days_active: [1],
+    shift_type_id: ST_ID,
+  };
+
+  const mondayAvail = (empId: string): Availability => ({
+    id: `av-${empId}`,
+    employee_id: empId,
+    company_id: COMPANY_ID,
+    day_of_week: 1,
+    start_time: '00:00',
+    end_time: '23:59',
+  });
+
+  // 1 non-vet who fills the slot. 2 other non-vets to be classified by the
+  // diagnostic: one on full-day TO, one not qualified.
+  const filler: Employee = {
+    id: 'emp-filler',
+    company_id: COMPANY_ID,
+    name: 'Filler Civilian',
+    primary_role: 'Lifeguard',
+    qualified_roles: ['Lifeguard'],
+    max_weekly_hours: 40,
+    contact_phone: null,
+    contact_email: null,
+    active: true,
+    created_at: '2026-01-01T00:00:00Z',
+    individual_wage: null,
+    is_veteran: false,
+  };
+  const civTO: Employee = {
+    ...filler,
+    id: 'emp-civ-to',
+    name: 'Civ On TO',
+  };
+  const civNotQual: Employee = {
+    ...filler,
+    id: 'emp-civ-noqual',
+    name: 'Civ Not Qualified',
+    primary_role: 'Cashier',
+    qualified_roles: ['Cashier'],
+  };
+
+  const availByEmp = new Map<string, Availability[]>([
+    [filler.id, [mondayAvail(filler.id)]],
+    [civTO.id, [mondayAvail(civTO.id)]],
+    [civNotQual.id, [mondayAvail(civNotQual.id)]],
+  ]);
+  const toMap = new Map<string, TOWindow>([
+    [`${civTO.id}:2026-06-01`, { type: 'full_day', blockedWindows: [] }],
+  ]);
+
+  const data: BuildData = {
+    employees: [filler, civTO, civNotQual],
+    availByEmp,
+    toMap,
+    shiftTypes: [shiftType],
+    shiftRequirements: [req],
+    conflicts: [],
+    policies: [],
+    events: [],
+    companyName: 'Test Co',
+    companyTimezone: 'America/New_York',
+  };
+
+  const result = runScheduleBuild(
+    data,
+    DEFAULT_ENGINE_SETTINGS,
+    'at_least_one',
+    [],
+    '2026-06-01',
+    '2026-06-01',
+  );
+
+  const vetFlags = result.flagged_issues.filter(f =>
+    f.type === 'unsatisfied_attribute_mix' &&
+    (f.metadata as { attribute?: string }).attribute === 'is_veteran'
+  );
+  expect(
+    vetFlags.length === 1,
+    `Veteran enrichment: 1 veteran flag fires (got ${vetFlags.length})`,
+  );
+  const meta = vetFlags[0]?.metadata as {
+    attribute?: string;
+    value?: string;
+    per_employee_dispositions?: Array<{ name: string; reason: string }>;
+  };
+  expect(
+    meta?.attribute === 'is_veteran' && meta?.value === 'true',
+    `Veteran enrichment: metadata identifies attribute=is_veteran value='true' (got ${meta?.attribute}/${meta?.value})`,
+  );
+  const disp = meta?.per_employee_dispositions ?? [];
+  // Filler is on the shift (skipped by the candidate filter), so dispositions
+  // cover civTO + civNotQual. The remaining non-vet who couldn't be replaced
+  // by a vet (filler) is the over-represented value, classified separately
+  // by the swap pass — but `per_employee_dispositions` enumerates ALL
+  // candidates with the missing attribute (vets only). Since no vets exist,
+  // dispositions covers them: empty pool.
+  expect(
+    disp.length === 0,
+    `Veteran enrichment: dispositions enumerate veterans only — none exist, so length === 0 (got ${disp.length})`,
+  );
+  expect(
+    vetFlags[0]?.description.startsWith('Need 1 is_veteran=true on 2026-06-01 Vet Shift.'),
+    `Veteran enrichment: description uses standard need-clause with is_veteran=true (got: ${vetFlags[0]?.description})`,
+  );
+}
+
+// Task 7 — shift_overrides referencing a role that doesn't exist on any
+// requirement surface as a structured mismatch entry.
+function runShiftOverrideMismatchSmoke(): void {
+  const COMPANY_ID = 'company-override-mm';
+  const ST_ID = 'st-override-mm';
+
+  const shiftType: ShiftType = {
+    id: ST_ID,
+    company_id: COMPANY_ID,
+    name: 'Override Shift',
+    start_time: '09:00',
+    end_time: '13:00',
+    days_active: [1],
+    active: true,
+    created_at: '2026-01-01T00:00:00Z',
+  };
+  const req: ShiftRequirement = {
+    id: 'req-override-mm',
+    company_id: COMPANY_ID,
+    shift_name: 'Override Shift',
+    role: 'Lifeguard',
+    required_count: 1,
+    start_time: '09:00',
+    end_time: '13:00',
+    days_active: [1],
+    shift_type_id: ST_ID,
+  };
+
+  // Override targets a 'Cleaner' role that doesn't exist on this shift.
+  const noteWithBadOverride: Event = {
+    id: 'evt-bad-override',
+    company_id: COMPANY_ID,
+    title: 'Try to add a Cleaner',
+    date: '2026-06-01',
+    end_date: '2026-06-01',
+    description: null,
+    event_type: 'staffing',
+    staffing_notes: null,
+    shift_overrides: { 'Override Shift': { 'Cleaner': 1 } },
+    created_by: 'manager',
+    created_at: '2026-01-01T00:00:00Z',
+    updated_at: '2026-01-01T00:00:00Z',
+  };
+
+  const data: BuildData = {
+    employees: [],
+    availByEmp: new Map(),
+    toMap: new Map(),
+    shiftTypes: [shiftType],
+    shiftRequirements: [req],
+    conflicts: [],
+    policies: [],
+    events: [noteWithBadOverride],
+    companyName: 'Test Co',
+    companyTimezone: 'America/New_York',
+  };
+
+  const result = runScheduleBuild(data, DEFAULT_ENGINE_SETTINGS, null, [], '2026-06-01', '2026-06-01');
+
+  expect(
+    result.shift_override_mismatches.length === 1,
+    `Override mismatch: exactly 1 mismatch (got ${result.shift_override_mismatches.length})`,
+  );
+  const mm = result.shift_override_mismatches[0];
+  expect(
+    mm?.override_key === 'Cleaner' && mm?.shift_name === 'Override Shift' && mm?.date === '2026-06-01',
+    `Override mismatch: identifies key='Cleaner', shift='Override Shift', date='2026-06-01' (got ${JSON.stringify(mm)})`,
+  );
+  expect(
+    mm?.available_roles.includes('Lifeguard') && mm?.available_roles.length === 1,
+    `Override mismatch: available_roles lists only 'Lifeguard' (got ${JSON.stringify(mm?.available_roles)})`,
+  );
+}
+
 if (require.main === module) {
   runDoublesAndOverlapsSmoke();
   console.log('');
@@ -727,5 +1243,19 @@ if (require.main === module) {
   runAttributeMixUnsatisfiabilitySmoke();
   console.log('');
   runAttributeMixDiagnosticSmoke();
+  console.log('');
+  runSaveFailedContractSmoke();
+  console.log('');
+  runCoverageGapDispositionSmoke();
+  console.log('');
+  runClosureEventSmoke();
+  console.log('');
+  runParserUnknownKeySmoke();
+  console.log('');
+  runWageFallbackSmoke();
+  console.log('');
+  runVeteranEnrichmentSmoke();
+  console.log('');
+  runShiftOverrideMismatchSmoke();
   if (!process.exitCode) console.log('\nAll smoke checks passed.');
 }

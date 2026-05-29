@@ -30,9 +30,23 @@ function eventsForDate(date: string, events: Event[]): Event[] {
   });
 }
 
+// Per-date closure record returned alongside the canvas so callers (and the
+// manager-facing summary) can surface honored closures instead of letting
+// dropped dates disappear silently.
+export interface ClosedDate {
+  date: string;
+  event_title: string;
+}
+
+export interface CanvasResult {
+  slots: CanvasSlot[];
+  closed_dates: ClosedDate[];
+}
+
 // Produces one CanvasSlot per required head per requirement per active date.
-// Dates with a closure event drop out entirely. Priority is determined by the
-// presence of staffing_notes or any busy-day event_type on the date.
+// Dates with a closure event drop out entirely (recorded in closed_dates).
+// Priority is determined by the presence of staffing_notes or any busy-day
+// event_type on the date.
 //
 // Final order: priority slots first, then date ASC, then start_time ASC. This
 // is the visit order used by the fill loop.
@@ -41,12 +55,17 @@ export function buildCanvas(
   shiftTypes: ShiftType[],
   shiftRequirements: ShiftRequirement[],
   events: Event[]
-): CanvasSlot[] {
+): CanvasResult {
   const slots: CanvasSlot[] = [];
+  const closed_dates: ClosedDate[] = [];
 
   for (const date of weekDates) {
     const dateEvents = eventsForDate(date, events);
-    if (dateEvents.some(e => e.event_type === 'closure')) continue;
+    const closure = dateEvents.find(e => e.event_type === 'closure');
+    if (closure) {
+      closed_dates.push({ date, event_title: closure.title ?? 'Closure' });
+      continue;
+    }
 
     const isPriority = dateEvents.some(
       e => e.staffing_notes != null || BUSY_DAY_EVENT_TYPES.has(e.event_type)
@@ -99,5 +118,5 @@ export function buildCanvas(
     return a.slot_index - b.slot_index;
   });
 
-  return slots;
+  return { slots, closed_dates };
 }

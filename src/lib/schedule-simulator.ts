@@ -408,9 +408,19 @@ export interface WageLineItem {
   estimated_pay: number;
 }
 
+export interface MissingWage {
+  employee_id: string;
+  name: string;
+  role: string;
+}
+
 export interface WageEstimate {
   total_estimated: number;
   by_employee: WageLineItem[];
+  // Employees with at least one shift whose wage couldn't be resolved (no
+  // individual_wage AND no matching wage_rates row). Surfaced so the manager
+  // sees that the labor estimate excludes them. Dedup'd by employee_id.
+  missing_wages: MissingWage[];
 }
 
 // Computes estimated wages for a set of shifts.
@@ -442,12 +452,41 @@ export async function computeWageEstimate(
     roleRates.set(rate.role, rate.hourly_rate);
   }
 
+  return computeWageEstimateFromMaps(shifts, individualWages, roleRates);
+}
+
+// Pure helper extracted so wage logic is testable without supabase round-trips.
+// Called by the supabase-loading `computeWageEstimate` and directly by smoke.
+export function computeWageEstimateFromMaps(
+  shifts: Array<{
+    employee_id: string;
+    employee_name: string;
+    role: string;
+    start_time: string;
+    end_time: string;
+    hours?: number;
+  }>,
+  individualWages: Map<string, number>,
+  roleRates: Map<string, number>
+): WageEstimate {
   const byEmployee = new Map<string, WageLineItem>();
+  const missingMap = new Map<string, MissingWage>();
 
   for (const shift of shifts) {
     const hours = shift.hours ?? wageShiftHours(shift.start_time, shift.end_time);
-    const rate = individualWages.get(shift.employee_id) ?? roleRates.get(shift.role) ?? 0;
+    const individual = individualWages.get(shift.employee_id);
+    const fallback = roleRates.get(shift.role);
+    const resolved = individual ?? fallback;
+    const rate = resolved ?? 0;
     const pay = Math.round(hours * rate * 100) / 100;
+
+    if (resolved === undefined && !missingMap.has(shift.employee_id)) {
+      missingMap.set(shift.employee_id, {
+        employee_id: shift.employee_id,
+        name: shift.employee_name,
+        role: shift.role,
+      });
+    }
 
     if (!byEmployee.has(shift.employee_id)) {
       byEmployee.set(shift.employee_id, {
@@ -467,6 +506,7 @@ export async function computeWageEstimate(
   return {
     total_estimated: Math.round(items.reduce((s, e) => s + e.estimated_pay, 0) * 100) / 100,
     by_employee: items,
+    missing_wages: Array.from(missingMap.values()),
   };
 }
 

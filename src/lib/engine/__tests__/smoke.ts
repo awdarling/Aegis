@@ -391,9 +391,201 @@ function runDaysActiveConsolidationSmoke(): void {
   );
 }
 
+// Locks in the attribute-mix unsatisfiability skip. A rule whose minimums
+// sum exceeds the total positions on a shift must be silently skipped (no
+// flag), but a rule that COULD be satisfied with the right pool but isn't
+// (because no candidates with the needed attribute exist) must still flag.
+function runAttributeMixUnsatisfiabilitySmoke(): void {
+  const COMPANY_ID = 'company-attr-mix';
+
+  // Shared policy: needs 1 male + 1 female per shift (sum = 2).
+  const genderPolicy: Policy = {
+    id: 'pol-gender',
+    company_id: COMPANY_ID,
+    policy_key: 'gender_requirement',
+    policy_value: 'At least 1 male and 1 female per shift.',
+    policy_value_json: { attribute: 'sex', minimums: { male: 1, female: 1 }, scope: 'all_shifts' },
+    policy_type: 'coverage',
+    description: null,
+    version: 1,
+    created_at: '2026-01-01T00:00:00Z',
+  };
+
+  // Monday-only availability for our fixture employees.
+  const mondayAvail = (id: string, empId: string): Availability => ({
+    id,
+    employee_id: empId,
+    company_id: COMPANY_ID,
+    day_of_week: 1,
+    start_time: '00:00',
+    end_time: '23:59',
+  });
+
+  // ── Fixture A: UNSATISFIABLE (1 position, rule needs 2) ────────────────────
+  {
+    const ST_ID = 'st-test-greeter';
+    const shiftType: ShiftType = {
+      id: ST_ID,
+      company_id: COMPANY_ID,
+      name: 'Test Greeter',
+      start_time: '09:00',
+      end_time: '13:00',
+      days_active: [1],
+      active: true,
+      created_at: '2026-01-01T00:00:00Z',
+    };
+    const req: ShiftRequirement = {
+      id: 'req-test-greeter',
+      company_id: COMPANY_ID,
+      shift_name: 'Test Greeter',
+      role: 'Greeter',
+      required_count: 1,
+      start_time: '09:00',
+      end_time: '13:00',
+      days_active: [1],
+      shift_type_id: ST_ID,
+    };
+    const male: Employee = {
+      id: 'emp-male-1',
+      company_id: COMPANY_ID,
+      name: 'Male One',
+      primary_role: 'Greeter',
+      qualified_roles: ['Greeter'],
+      max_weekly_hours: 40,
+      contact_phone: null,
+      contact_email: null,
+      active: true,
+      created_at: '2026-01-01T00:00:00Z',
+      individual_wage: null,
+      is_veteran: false,
+    };
+    // `sex` is read by attribute-mix via dynamic attribute lookup; the
+    // hand-written Employee type doesn't list it, so cast through unknown.
+    (male as unknown as Record<string, unknown>).sex = 'male';
+
+    const availByEmp = new Map<string, Availability[]>([[male.id, [mondayAvail('av-m1', male.id)]]]);
+
+    const data: BuildData = {
+      employees: [male],
+      availByEmp,
+      toMap: new Map(),
+      shiftTypes: [shiftType],
+      shiftRequirements: [req],
+      conflicts: [],
+      policies: [genderPolicy],
+      events: [],
+      companyName: 'Test Co',
+      companyTimezone: 'America/New_York',
+    };
+
+    const result = runScheduleBuild(
+      data,
+      DEFAULT_ENGINE_SETTINGS,
+      null,
+      [],
+      '2026-06-01',
+      '2026-06-01',
+    );
+
+    const attrFlags = result.flagged_issues.filter(f => f.type === 'unsatisfied_attribute_mix');
+    expect(
+      attrFlags.length === 0,
+      `Fixture A: rule needs 2 (1m+1f) on a 1-position shift — no attribute_mix flags (got ${attrFlags.length})`,
+    );
+    expect(
+      result.totalFilled === 1,
+      `Fixture A: the male still fills the 1 Greeter slot (totalFilled === 1, got ${result.totalFilled})`,
+    );
+  }
+
+  // ── Fixture B: SATISFIABLE BUT UNSATISFIED (4 positions, no females) ───────
+  {
+    const ST_ID = 'st-test-big';
+    const shiftType: ShiftType = {
+      id: ST_ID,
+      company_id: COMPANY_ID,
+      name: 'Test Big Shift',
+      start_time: '09:00',
+      end_time: '13:00',
+      days_active: [1],
+      active: true,
+      created_at: '2026-01-01T00:00:00Z',
+    };
+    const req: ShiftRequirement = {
+      id: 'req-test-big',
+      company_id: COMPANY_ID,
+      shift_name: 'Test Big Shift',
+      role: 'Lifeguard',
+      required_count: 4,
+      start_time: '09:00',
+      end_time: '13:00',
+      days_active: [1],
+      shift_type_id: ST_ID,
+    };
+
+    const males: Employee[] = [1, 2, 3, 4].map(n => ({
+      id: `emp-male-${n}`,
+      company_id: COMPANY_ID,
+      name: `Male ${n}`,
+      primary_role: 'Lifeguard',
+      qualified_roles: ['Lifeguard'],
+      max_weekly_hours: 40,
+      contact_phone: null,
+      contact_email: null,
+      active: true,
+      created_at: '2026-01-01T00:00:00Z',
+      individual_wage: null,
+      is_veteran: false,
+    }));
+    for (const m of males) (m as unknown as Record<string, unknown>).sex = 'male';
+
+    const availByEmp = new Map<string, Availability[]>(
+      males.map(m => [m.id, [mondayAvail(`av-${m.id}`, m.id)]])
+    );
+
+    const data: BuildData = {
+      employees: males,
+      availByEmp,
+      toMap: new Map(),
+      shiftTypes: [shiftType],
+      shiftRequirements: [req],
+      conflicts: [],
+      policies: [genderPolicy],
+      events: [],
+      companyName: 'Test Co',
+      companyTimezone: 'America/New_York',
+    };
+
+    const result = runScheduleBuild(
+      data,
+      DEFAULT_ENGINE_SETTINGS,
+      null,
+      [],
+      '2026-06-01',
+      '2026-06-01',
+    );
+
+    const attrFlags = result.flagged_issues.filter(f => f.type === 'unsatisfied_attribute_mix');
+    expect(
+      attrFlags.length === 1,
+      `Fixture B: 4-position shift, no females — exactly 1 attribute_mix flag (got ${attrFlags.length})`,
+    );
+    expect(
+      attrFlags[0]?.metadata.attribute === 'sex' && attrFlags[0]?.metadata.value === 'female',
+      `Fixture B: flag identifies the missing female (attribute=sex, value=female)`,
+    );
+    expect(
+      result.totalFilled === 4,
+      `Fixture B: all 4 positions still filled with males (totalFilled === 4, got ${result.totalFilled})`,
+    );
+  }
+}
+
 if (require.main === module) {
   runDoublesAndOverlapsSmoke();
   console.log('');
   runDaysActiveConsolidationSmoke();
+  console.log('');
+  runAttributeMixUnsatisfiabilitySmoke();
   if (!process.exitCode) console.log('\nAll smoke checks passed.');
 }

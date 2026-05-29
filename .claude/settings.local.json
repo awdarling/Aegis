@@ -8,7 +8,12 @@
       "Bash(awk -F: '{print $1}')",
       "Bash(echo \"EXIT: $?\")",
       "Bash(echo \"=== exit: $? ===\")",
-      "Bash(TS_NODE_COMPILER_OPTIONS='{\"module\":\"commonjs\"}' npx ts-node *)"
+      "Bash(TS_NODE_COMPILER_OPTIONS='{\"module\":\"commonjs\"}' npx ts-node *)",
+      "Bash(node *)",
+      "Bash(cp /tmp/query-policies.ts /Users/awdarling/Desktop/Aegis/scripts/_tmp-query-policies.ts)",
+      "Bash(sed -i '' \"s|'./src/db/client'|'../src/db/client'|\" scripts/_tmp-query-policies.ts)",
+      "Bash(npx tsx *)",
+      "Bash(npx ts-node *)"
     ]
   }
 }

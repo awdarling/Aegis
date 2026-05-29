@@ -99,10 +99,26 @@ export function enforceAttributeMixForShift(
     return { satisfied: true, swaps: [], flagged: null };
   }
 
+  // Total fillable positions for this shift on this date. A rule whose
+  // minimums sum exceeds this is mathematically unsatisfiable and would
+  // otherwise generate phantom flags on every run (e.g. a 1m+1f rule on a
+  // single-position Greeter shift).
+  const totalPositions = deps.canvasSlots.filter(
+    s => s.date === shift.date && s.shift_name === shift.shift_name
+  ).length;
+
   const swaps: SwapOperation[] = [];
   let flagged: FlaggedIssue | null = null;
 
   for (const c of applicable) {
+    const requiredSum = Object.values(c.minimums).reduce((a, b) => a + b, 0);
+    if (requiredSum > totalPositions) {
+      console.log(
+        `[attribute-mix] skipped ${c.attribute} rule on ${shift.date} ${shift.shift_name}: ` +
+        `${requiredSum} positions required, only ${totalPositions} available`
+      );
+      continue;
+    }
     let counts = countByAttr(shiftAssignments, deps.employeeById, c.attribute);
     const unsatisfied: string[] = [];
     for (const [value, need] of Object.entries(c.minimums)) {

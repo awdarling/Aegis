@@ -2,7 +2,7 @@ import type { Availability, Employee, EmployeeConflict } from '../../db/types';
 import type { TOWindow } from '../to-window';
 import type { ScheduleAssignment } from '../../workflows/schedule-build';
 import type { AttributeMixConstraint, EngineSettings } from '../constraints/types';
-import { buildEligibility, type VeteranOnlyRange } from './eligibility';
+import { buildEligibility, sameDayDoubleReason, type VeteranOnlyRange } from './eligibility';
 import type { CanvasSlot, FlaggedIssue, WeekState } from './types';
 
 interface ShiftContext {
@@ -138,12 +138,25 @@ export function enforceAttributeMixForShift(
           .filter((_, i) => i !== removableIdx)
           .map(a => a.employee_id);
 
+        // Same-day-doubles check needs to see weekState as if the row we're
+        // about to overwrite were already gone — otherwise the displaced
+        // employee's existing assignment would look like a candidate's
+        // existing same-day commitment, and any candidate matching the row's
+        // own employee_id would self-reject. Filter the to-be-replaced row
+        // out of the view.
+        const assignIdxForView = shiftAssignmentIndices[removableIdx];
+        const viewState: WeekState = {
+          ...weekState,
+          assignments: weekState.assignments.filter((_, i) => i !== assignIdxForView),
+        };
+
         const replacement = eligible.employees.find(e => {
           if (readAttr(e, c.attribute) !== wantValue) return false;
           if (cohabIds.includes(e.id)) return false;
           if (hardConflict(e.id, cohabIds, deps.conflicts)) return false;
           const cur = weekState.weeklyHoursMap.get(e.id) ?? 0;
           if (cur + removableSlot.hours > e.max_weekly_hours) return false;
+          if (sameDayDoubleReason(e.id, removableSlot, viewState, deps.settings) !== null) return false;
           return true;
         });
 

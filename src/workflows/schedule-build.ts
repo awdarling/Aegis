@@ -78,9 +78,12 @@ interface ScheduleData {
   flagged_issues?: FlaggedIssue[];
 }
 
-// ── Internal build data ───────────────────────────────────────────────────────
+// ── Build data ────────────────────────────────────────────────────────────────
 
-interface BuildData {
+// Loaded shape shared between the production handler and the dry-run script.
+// `events` is populated by the caller from special notes; the engine reads it
+// during canvas build to apply shift overrides and route priority shifts.
+export interface BuildData {
   employees: Employee[];
   availByEmp: Map<string, Availability[]>;
   toMap: Map<string, TOWindow>;
@@ -605,12 +608,21 @@ function buildScheduleForWeek(ctx: BuildContext): BuildResult {
         if (!slot) continue;
         const elig = buildEligibility(slot, data.employees, data.availByEmp, data.toMap, veteranOnlyDates);
         const cohabIds = indices.filter(i => i !== idx).map(i => weekState.assignments[i].employee_id);
+        // Same-day-doubles check needs to see weekState without the row we're
+        // about to overwrite. Without this filter, the displaced employee's
+        // assignment at index `idx` would block any candidate from matching
+        // and would self-reject candidates whose own id sits at that index.
+        const viewState: WeekState = {
+          ...weekState,
+          assignments: weekState.assignments.filter((_, i) => i !== idx),
+        };
         const candidate = elig.employees.find(e => {
           if (!e.is_veteran) return false;
           if (placedVets.has(e.id)) return false;
           if (cohabIds.includes(e.id)) return false;
           if (hasHardBannedPair(e.id, cohabIds, data.conflicts)) return false;
           if ((weekState.weeklyHoursMap.get(e.id) ?? 0) + slot.hours > e.max_weekly_hours) return false;
+          if (sameDayDoubleReason(e.id, slot, viewState, settings) !== null) return false;
           return true;
         });
         if (!candidate) continue;
@@ -648,6 +660,62 @@ function buildScheduleForWeek(ctx: BuildContext): BuildResult {
     flagged_issues: weekState.flagged_issues,
     totalRequired,
     totalFilled,
+  };
+}
+
+// ── Public engine entry point ─────────────────────────────────────────────────
+
+export interface RunScheduleBuildResult {
+  assignments: ScheduleAssignment[];
+  gaps: ScheduleGap[];
+  flagged_issues: FlaggedIssue[];
+  totalRequired: number;
+  totalFilled: number;
+}
+
+// Pure engine orchestration: canvas → fill loop → cascade → attribute-mix
+// → veteran swap → gap recount. No DB writes, no messaging, no logging.
+// Both handleBuildSchedule (production) and scripts/dry-run-schedule.ts call
+// this so there is exactly one engine implementation.
+//
+// data.events and data.policies must already be populated by the caller.
+// attribute_mix constraints are derived here from data.policies so callers
+// don't need to parse twice.
+export function runScheduleBuild(
+  data: BuildData,
+  settings: EngineSettings,
+  veteranMode: VeteranMode,
+  veteranOnlyDates: VeteranOnlyRange[],
+  weekStart: string,
+  weekEnd: string,
+): RunScheduleBuildResult {
+  const weekDates = getDatesInRange(weekStart, weekEnd);
+
+  const eventsByDate = new Map<string, Event[]>();
+  for (const date of weekDates) {
+    eventsByDate.set(date, data.events.filter(e =>
+      (e.date ?? '') <= date && (e.end_date ?? e.date ?? '') >= date
+    ));
+  }
+
+  const attributeMix = parseConstraints(data.policies).hard.attributeMix;
+
+  const result = buildScheduleForWeek({
+    data,
+    weekDates,
+    eventsByDate,
+    veteranMode,
+    veteranOnlyDates,
+    settings,
+    attributeMix,
+  });
+
+  return {
+    assignments: result.assignments,
+    gaps: result.gaps,
+    flagged_issues: result.flagged_issues,
+    totalRequired: result.totalRequired,
+    totalFilled: result.totalFilled,
   };
 }
 
@@ -785,7 +853,6 @@ export async function handleBuildSchedule(
     '[schedule-build] week:', weekStart, '→', weekEnd,
     '(today is', new Date().toLocaleDateString('en-CA'), ')'
   );
-  const weekDates = getDatesInRange(weekStart, weekEnd);
 
   const [data, specialNotes] = await Promise.all([
     loadBuildData(contact.company_id, weekStart, weekEnd),
@@ -834,13 +901,6 @@ export async function handleBuildSchedule(
     return;
   }
 
-  const eventsByDate = new Map<string, Event[]>();
-  for (const date of weekDates) {
-    eventsByDate.set(date, specialNotes.filter(e =>
-      (e.date ?? '') <= date && (e.end_date ?? e.date ?? '') >= date
-    ));
-  }
-
   const veteranPreferenceRaw = typeof extracted['veteran_preference'] === 'string' && extracted['veteran_preference'].trim() !== ''
     ? extracted['veteran_preference'] as string
     : null;
@@ -863,15 +923,14 @@ export async function handleBuildSchedule(
     console.log('[schedule-build] veteran-only date ranges:', veteranOnlyDates);
   }
 
-  const { assignments, gaps, flagged_issues, totalRequired, totalFilled } = buildScheduleForWeek({
+  const { assignments, gaps, flagged_issues, totalRequired, totalFilled } = runScheduleBuild(
     data,
-    weekDates,
-    eventsByDate,
+    parsed.settings,
     veteranMode,
     veteranOnlyDates,
-    settings: parsed.settings,
-    attributeMix: parsed.hard.attributeMix,
-  });
+    weekStart,
+    weekEnd,
+  );
 
   const wages = await computeWageEstimate(contact.company_id, assignments);
 

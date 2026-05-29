@@ -2,7 +2,13 @@ import type { Availability, Employee, EmployeeConflict } from '../../db/types';
 import type { TOWindow } from '../to-window';
 import type { ScheduleAssignment } from '../../workflows/schedule-build';
 import type { AttributeMixConstraint, EngineSettings } from '../constraints/types';
-import { buildEligibility, sameDayDoubleReason, type VeteranOnlyRange } from './eligibility';
+import {
+  buildEligibility,
+  isAvailableForShift,
+  isBlockedByTOForSlot,
+  sameDayDoubleReason,
+  type VeteranOnlyRange,
+} from './eligibility';
 import type { CanvasSlot, FlaggedIssue, WeekState } from './types';
 
 interface ShiftContext {
@@ -66,6 +72,46 @@ function countByAttr(
   return counts;
 }
 
+export type AttributeShortageReasonCode =
+  | 'not_qualified'
+  | 'on_time_off'
+  | 'max_hours_reached'
+  | 'in_conflict'
+  | 'availability_mismatch'
+  | 'eligible_but_unchosen';
+
+export interface AttributeShortagePerEmployee {
+  employee_id: string;
+  name: string;
+  reason: AttributeShortageReasonCode;
+}
+
+export interface AttributeShortageReason {
+  description: string;
+  per_employee: AttributeShortagePerEmployee[];
+}
+
+const REASON_LABELS: Record<AttributeShortageReasonCode, string> = {
+  on_time_off: 'on approved time off',
+  max_hours_reached: 'at max weekly hours',
+  in_conflict: 'in hard conflict with assigned staff',
+  availability_mismatch: 'unavailable per regular availability',
+  not_qualified: 'not qualified for the role',
+  eligible_but_unchosen: 'eligible but not chosen by ranker',
+};
+
+// Reason ordering controls the grouped sentence in the description. Listed
+// first → mentioned first. Bucketing roughly by "managers can act on these
+// fastest" (TO and hours first; structural reasons last).
+const REASON_ORDER: AttributeShortageReasonCode[] = [
+  'on_time_off',
+  'max_hours_reached',
+  'in_conflict',
+  'availability_mismatch',
+  'not_qualified',
+  'eligible_but_unchosen',
+];
+
 function hardConflict(empId: string, cohabIds: string[], conflicts: EmployeeConflict[]): boolean {
   for (const other of cohabIds) {
     for (const c of conflicts) {
@@ -79,6 +125,95 @@ function hardConflict(empId: string, cohabIds: string[], conflicts: EmployeeConf
     }
   }
   return false;
+}
+
+// Produces a manager-readable explanation of why no employee with the missing
+// attribute value could be placed. Classifies every candidate carrying that
+// attribute value (excluding those already on this shift) into a single
+// reason bucket, then groups by reason for the description.
+//
+// The classification order matters: the first matching condition wins, so
+// e.g. an unqualified employee with TO is reported as 'not_qualified'.
+export function buildAttributeShortageReason(args: {
+  shift: ShiftContext;
+  missingAttribute: string;
+  missingValue: string;
+  needed: number;
+  weekState: WeekState;
+  deps: AttrMixDeps;
+}): AttributeShortageReason {
+  const { shift, missingAttribute, missingValue, needed, weekState, deps } = args;
+
+  // All slots for this (date, shift_name). Roles across slots define the set
+  // of accepted roles; any slot supplies time/hours since the shift_type
+  // dictates a single time window for the group.
+  const shiftSlots = deps.canvasSlots.filter(
+    s => s.date === shift.date && s.shift_name === shift.shift_name
+  );
+  const acceptedRoles = new Set(shiftSlots.map(s => s.role));
+  const exemplar = shiftSlots[0];
+
+  const assignedIds = new Set(
+    weekState.assignments
+      .filter(a => a.date === shift.date && a.shift_name === shift.shift_name)
+      .map(a => a.employee_id)
+  );
+  const cohabIds = Array.from(assignedIds);
+
+  const candidates = deps.employees.filter(
+    e => readAttr(e, missingAttribute) === missingValue && !assignedIds.has(e.id)
+  );
+
+  const dispositions: AttributeShortagePerEmployee[] = candidates.map(emp => {
+    let reason: AttributeShortageReasonCode;
+    const qualifies = emp.qualified_roles.some(r => acceptedRoles.has(r));
+    if (!qualifies) {
+      reason = 'not_qualified';
+    } else if (exemplar && isBlockedByTOForSlot(emp, exemplar, deps.toMap)) {
+      reason = 'on_time_off';
+    } else if (
+      exemplar &&
+      (weekState.weeklyHoursMap.get(emp.id) ?? 0) + exemplar.hours > emp.max_weekly_hours
+    ) {
+      reason = 'max_hours_reached';
+    } else if (hardConflict(emp.id, cohabIds, deps.conflicts)) {
+      reason = 'in_conflict';
+    } else if (exemplar && !isAvailableForShift(emp, exemplar, deps.availByEmp)) {
+      reason = 'availability_mismatch';
+    } else {
+      reason = 'eligible_but_unchosen';
+    }
+    return { employee_id: emp.id, name: emp.name, reason };
+  });
+
+  const head = `Need ${needed} ${missingAttribute}=${missingValue} on ${shift.date} ${shift.shift_name}.`;
+
+  if (dispositions.length === 0) {
+    return {
+      description: `${head} No employees with ${missingAttribute}=${missingValue} exist in the company.`,
+      per_employee: [],
+    };
+  }
+
+  const groups = new Map<AttributeShortageReasonCode, string[]>();
+  for (const d of dispositions) {
+    if (!groups.has(d.reason)) groups.set(d.reason, []);
+    groups.get(d.reason)!.push(d.name);
+  }
+
+  const parts: string[] = [];
+  for (const r of REASON_ORDER) {
+    const names = groups.get(r);
+    if (!names || names.length === 0) continue;
+    parts.push(`${names.length} ${REASON_LABELS[r]} (${names.join(', ')})`);
+  }
+
+  const total = dispositions.length;
+  const summary = `${total} employee${total === 1 ? '' : 's'} with ${missingAttribute}=${missingValue} exist: ${parts.join('; ')}.`;
+  return {
+    description: `${head} ${summary}`,
+    per_employee: dispositions,
+  };
 }
 
 // Tries to satisfy each attribute_mix constraint applicable to this shift by
@@ -200,16 +335,25 @@ export function enforceAttributeMixForShift(
       }
 
       if (placed < need) {
+        const reason = buildAttributeShortageReason({
+          shift,
+          missingAttribute: c.attribute,
+          missingValue: wantValue,
+          needed: c.minimums[wantValue],
+          weekState,
+          deps,
+        });
         flagged = {
           type: 'unsatisfied_attribute_mix',
           date: shift.date,
           shift_name: shift.shift_name,
-          description: `Attribute mix unsatisfied on ${shift.date} ${shift.shift_name}: need ${c.minimums[wantValue]} of ${c.attribute}=${wantValue}`,
+          description: reason.description,
           metadata: {
             attribute: c.attribute,
             value: wantValue,
             required: c.minimums[wantValue],
             actual: counts.get(wantValue) ?? 0,
+            per_employee_dispositions: reason.per_employee,
           },
         };
       }

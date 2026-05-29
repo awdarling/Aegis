@@ -581,11 +581,151 @@ function runAttributeMixUnsatisfiabilitySmoke(): void {
   }
 }
 
+// Locks in the enriched attribute-mix flag description: when no candidate
+// with the missing attribute can be placed, each blocked candidate is
+// classified into a reason bucket and the description names everyone.
+function runAttributeMixDiagnosticSmoke(): void {
+  const COMPANY_ID = 'company-attr-diag';
+  const ST_ID = 'st-test-2pos';
+
+  const shiftType: ShiftType = {
+    id: ST_ID,
+    company_id: COMPANY_ID,
+    name: 'Test 2-Position',
+    start_time: '09:00',
+    end_time: '13:00',
+    days_active: [1],
+    active: true,
+    created_at: '2026-01-01T00:00:00Z',
+  };
+  const req: ShiftRequirement = {
+    id: 'req-test-2pos',
+    company_id: COMPANY_ID,
+    shift_name: 'Test 2-Position',
+    role: 'Lifeguard',
+    required_count: 2,
+    start_time: '09:00',
+    end_time: '13:00',
+    days_active: [1],
+    shift_type_id: ST_ID,
+  };
+
+  const baseEmp = (id: string, name: string, roles: string[], sex: 'male' | 'female'): Employee => {
+    const e: Employee = {
+      id,
+      company_id: COMPANY_ID,
+      name,
+      primary_role: roles[0] ?? 'Lifeguard',
+      qualified_roles: roles,
+      max_weekly_hours: 40,
+      contact_phone: null,
+      contact_email: null,
+      active: true,
+      created_at: '2026-01-01T00:00:00Z',
+      individual_wage: null,
+      is_veteran: false,
+    };
+    (e as unknown as Record<string, unknown>).sex = sex;
+    return e;
+  };
+
+  const male = baseEmp('emp-m', 'Male Picked', ['Lifeguard'], 'male');
+  const femTO = baseEmp('emp-f-to', 'Female TO', ['Lifeguard'], 'female');
+  const femNoAvail = baseEmp('emp-f-noav', 'Female NoAvail', ['Lifeguard'], 'female');
+  const femNotQual = baseEmp('emp-f-noqual', 'Female NotQual', ['Cashier'], 'female');
+
+  // Monday-only blanket availability for the three that should have it.
+  const mondayAvail = (empId: string): Availability => ({
+    id: `av-${empId}`,
+    employee_id: empId,
+    company_id: COMPANY_ID,
+    day_of_week: 1,
+    start_time: '00:00',
+    end_time: '23:59',
+  });
+  const availByEmp = new Map<string, Availability[]>([
+    [male.id, [mondayAvail(male.id)]],
+    [femTO.id, [mondayAvail(femTO.id)]],
+    // femNoAvail intentionally has zero rows
+    [femNotQual.id, [mondayAvail(femNotQual.id)]],
+  ]);
+
+  // femTO has an approved full-day TO on Monday 2026-06-01.
+  const toMap = new Map<string, TOWindow>([
+    [`${femTO.id}:2026-06-01`, { type: 'full_day', blockedWindows: [] }],
+  ]);
+
+  const genderPolicy: Policy = {
+    id: 'pol-gender-diag',
+    company_id: COMPANY_ID,
+    policy_key: 'gender_requirement',
+    policy_value: 'At least 1 male and 1 female per shift.',
+    policy_value_json: { attribute: 'sex', minimums: { male: 1, female: 1 }, scope: 'all_shifts' },
+    policy_type: 'coverage',
+    description: null,
+    version: 1,
+    created_at: '2026-01-01T00:00:00Z',
+  };
+
+  const data: BuildData = {
+    employees: [male, femTO, femNoAvail, femNotQual],
+    availByEmp,
+    toMap,
+    shiftTypes: [shiftType],
+    shiftRequirements: [req],
+    conflicts: [],
+    policies: [genderPolicy],
+    events: [],
+    companyName: 'Test Co',
+    companyTimezone: 'America/New_York',
+  };
+
+  const result = runScheduleBuild(
+    data,
+    DEFAULT_ENGINE_SETTINGS,
+    null,
+    [],
+    '2026-06-01',
+    '2026-06-01',
+  );
+
+  const attrFlags = result.flagged_issues.filter(f => f.type === 'unsatisfied_attribute_mix');
+  expect(
+    attrFlags.length === 1,
+    `Fixture C: exactly 1 attribute_mix flag (got ${attrFlags.length})`,
+  );
+
+  const flag = attrFlags[0];
+  const disp = (flag?.metadata as { per_employee_dispositions?: Array<{ employee_id: string; name: string; reason: string }> })?.per_employee_dispositions ?? [];
+  expect(
+    disp.length === 3,
+    `Fixture C: 3 female candidates classified (got ${disp.length})`,
+  );
+
+  const reasons = new Set(disp.map(d => d.reason));
+  expect(
+    reasons.has('on_time_off') && reasons.has('availability_mismatch') && reasons.has('not_qualified'),
+    `Fixture C: each of {on_time_off, availability_mismatch, not_qualified} present in dispositions (got ${[...reasons].join(',')})`,
+  );
+
+  const desc = flag?.description ?? '';
+  expect(
+    desc.includes('Female TO') && desc.includes('Female NoAvail') && desc.includes('Female NotQual'),
+    `Fixture C: description names all three females (got: ${desc})`,
+  );
+  expect(
+    desc.startsWith('Need 1 sex=female on 2026-06-01 Test 2-Position.'),
+    `Fixture C: description leads with the standard need-clause (got: ${desc})`,
+  );
+}
+
 if (require.main === module) {
   runDoublesAndOverlapsSmoke();
   console.log('');
   runDaysActiveConsolidationSmoke();
   console.log('');
   runAttributeMixUnsatisfiabilitySmoke();
+  console.log('');
+  runAttributeMixDiagnosticSmoke();
   if (!process.exitCode) console.log('\nAll smoke checks passed.');
 }

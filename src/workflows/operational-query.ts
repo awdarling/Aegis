@@ -247,7 +247,7 @@ Available Homebase tables (all scoped to this company):
 - time_off_requests: employee_id, start_date, end_date, reason, status (pending/approved/denied), requested_at
 - schedules: week_start, week_end, status (draft/published), data (JSON: assignments[], gaps[]), staffing_report (JSON), generated_at
 - shift_types: name, start_time, end_time, days_active, active
-- shift_requirements: shift_name, role, required_count, days_active
+- shift_requirements: role, required_count
 - wage_rates: role, hourly_rate
 - policies: policy_key, policy_value, policy_type, description
 - events: title, date, end_date, event_type, staffing_notes
@@ -567,6 +567,13 @@ async function executeEdit(pending: PendingEdit, companyId: string): Promise<voi
 
   // Update
   if (!pending.entity_id || !pending.field) throw new Error('Missing entity_id or field for update');
+
+  // shift_requirements.days_active is dormant — the engine reads days_active
+  // from shift_types only. Block direct edits to keep the column from
+  // diverging silently. days_active edits to shift_types still pass through.
+  if (pending.table === 'shift_requirements' && pending.field === 'days_active') {
+    throw new Error('Days are set on the shift type, not on the role requirement. Try editing the shift instead.');
+  }
 
   let newValue = pending.new_value;
 

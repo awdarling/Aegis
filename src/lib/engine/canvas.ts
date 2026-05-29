@@ -56,6 +56,12 @@ export function buildCanvas(
     const activeShiftTypes = shiftTypes.filter(st => st.days_active.includes(dow));
 
     for (const st of activeShiftTypes) {
+      // days_active here is a per-date STAMP set by schedule-build.ts (line ~365)
+      // to scope per-date shift_overrides to a single day. It is NOT a read of
+      // the shift_requirements DB column — schedule-build.ts ignores that
+      // column. Callers passing un-stamped requirements must set
+      // days_active = the shift_type's days_active (or just call
+      // runScheduleBuild from workflows/schedule-build.ts instead).
       const reqs = shiftRequirements.filter(req =>
         (req.shift_type_id ? req.shift_type_id === st.id : req.shift_name === st.name) &&
         req.days_active.includes(dow)

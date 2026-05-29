@@ -43,7 +43,7 @@ import type {
   WeekState,
 } from '../types';
 import type { TOWindow } from '../../to-window';
-import type { ScheduleAssignment, VeteranMode } from '../../../workflows/schedule-build';
+import { runScheduleBuild, type BuildData, type ScheduleAssignment, type VeteranMode } from '../../../workflows/schedule-build';
 
 // Type-level signature assertions. The compiler errors on any drift.
 
@@ -297,7 +297,103 @@ function runDoublesAndOverlapsSmoke(): void {
   );
 }
 
+// Regression: shift_requirements.days_active must be ignored end-to-end.
+// Only the parent shift_type's days_active gates which days the engine plans
+// for. This calls runScheduleBuild (the production entry point) so the test
+// covers the canvas-build pre-filter inside schedule-build.ts — the
+// dispositive site for the Watermark Greeter bug. Direct buildCanvas calls
+// rely on schedule-build's stamping mechanism and are out of scope here.
+function runDaysActiveConsolidationSmoke(): void {
+  const COMPANY_ID = 'company-1';
+  const ST_ID = 'st-weekday-greeter';
+
+  const shiftType: ShiftType = {
+    id: ST_ID,
+    company_id: COMPANY_ID,
+    name: 'Weekday Greeter',
+    start_time: '09:00',
+    end_time: '13:00',
+    days_active: [1, 2, 3, 4, 5], // Mon-Fri on shift_type — correct
+    active: true,
+    created_at: '2026-01-01T00:00:00Z',
+  };
+
+  // The bug condition: parent shift_type says Mon-Fri, requirement says []
+  // (stale). Pre-fix engine silently dropped all 5 weekday slots.
+  const stale: ShiftRequirement = {
+    id: 'req-greeter',
+    company_id: COMPANY_ID,
+    shift_name: 'Weekday Greeter',
+    role: 'Greeter',
+    required_count: 1,
+    start_time: '09:00',
+    end_time: '13:00',
+    days_active: [], // ← the bug condition
+    shift_type_id: ST_ID,
+  };
+
+  const data: BuildData = {
+    employees: [],
+    availByEmp: new Map(),
+    toMap: new Map(),
+    shiftTypes: [shiftType],
+    shiftRequirements: [stale],
+    conflicts: [],
+    policies: [],
+    events: [],
+    companyName: 'Test Co',
+    companyTimezone: 'America/New_York',
+  };
+
+  // Week of Mon 2026-06-01 → Sun 2026-06-07.
+  const result = runScheduleBuild(
+    data,
+    DEFAULT_ENGINE_SETTINGS,
+    null,
+    [],
+    '2026-06-01',
+    '2026-06-07',
+  );
+
+  expect(
+    result.totalRequired === 5,
+    `engine planned 5 weekday slots even with shift_requirement.days_active = [] (got ${result.totalRequired})`,
+  );
+  expect(
+    result.totalFilled === 0,
+    'no employees in fixture, so zero slots filled (totalFilled === 0)',
+  );
+  expect(
+    result.gaps.length === 5 && result.gaps.every(g => g.role === 'Greeter' && g.shift_name === 'Weekday Greeter'),
+    'all 5 missed slots show as Greeter gaps under the Weekday Greeter shift',
+  );
+  expect(
+    new Set(result.gaps.map(g => g.date)).size === 5 &&
+      result.gaps.map(g => g.date).every(d => /^2026-06-0[1-5]$/.test(d)),
+    'gap dates cover Mon-Fri exactly (one per weekday, no weekend, no dupes)',
+  );
+
+  // Sanity check: a shift_type with empty days_active produces zero slots
+  // even if the requirement's own days_active would have permitted them.
+  const inactiveST: ShiftType = { ...shiftType, days_active: [] };
+  const inactiveData: BuildData = { ...data, shiftTypes: [inactiveST] };
+  const inactiveResult = runScheduleBuild(
+    inactiveData,
+    DEFAULT_ENGINE_SETTINGS,
+    null,
+    [],
+    '2026-06-01',
+    '2026-06-07',
+  );
+  expect(
+    inactiveResult.totalRequired === 0,
+    'shift_type with empty days_active produces no slots (sole source of truth)',
+  );
+}
+
 if (require.main === module) {
   runDoublesAndOverlapsSmoke();
-  if (!process.exitCode) console.log('\nAll doubles/overlap smoke checks passed.');
+  console.log('');
+  runDaysActiveConsolidationSmoke();
+  if (!process.exitCode) console.log('\nAll smoke checks passed.');
 }

@@ -8,6 +8,7 @@ import type {
   CustomAvailability,
   TimeOffRequest,
   ShiftRequirement,
+  ShiftType,
   Policy,
   Event,
 } from '../db/types';
@@ -68,6 +69,7 @@ interface SimData {
   employees: Employee[];
   availabilityByEmployee: Map<string, Availability[]>;
   shiftRequirements: ShiftRequirement[];
+  shiftTypesById: Map<string, ShiftType>;
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -130,10 +132,11 @@ async function loadSimData(
   periodStart: string,
   periodEnd: string
 ): Promise<SimData> {
-  const [empRes, availRes, reqRes, customAvailRes] = await Promise.all([
+  const [empRes, availRes, reqRes, stRes, customAvailRes] = await Promise.all([
     supabase.from('employees').select('*').eq('company_id', companyId).eq('active', true),
     supabase.from('availability').select('*').eq('company_id', companyId),
     supabase.from('shift_requirements').select('*').eq('company_id', companyId),
+    supabase.from('shift_types').select('*').eq('company_id', companyId).eq('active', true),
     supabase.from('custom_availability').select('*')
       .eq('company_id', companyId).eq('active', true)
       .order('created_at', { ascending: false }),
@@ -142,6 +145,9 @@ async function loadSimData(
   const employees = (empRes.data ?? []) as Employee[];
   const availability = (availRes.data ?? []) as Availability[];
   const shiftRequirements = (reqRes.data ?? []) as ShiftRequirement[];
+  const shiftTypesById = new Map<string, ShiftType>(
+    ((stRes.data ?? []) as ShiftType[]).map(s => [s.id, s])
+  );
 
   const availabilityByEmployee = new Map<string, Availability[]>();
   for (const avail of availability) {
@@ -172,7 +178,7 @@ async function loadSimData(
     }
   }
 
-  return { employees, availabilityByEmployee, shiftRequirements };
+  return { employees, availabilityByEmployee, shiftRequirements, shiftTypesById };
 }
 
 async function loadApprovedTimeOff(
@@ -220,7 +226,16 @@ function runBothScenarios(
     const dayOfWeek = new Date(date + 'T12:00:00Z').getUTCDay(); // 0 = Sunday
 
     for (const req of data.shiftRequirements) {
-      if (!req.days_active.includes(dayOfWeek)) continue;
+      // Gate by the parent shift_type's days_active — shift_requirements.days_active
+      // is dormant and may be stale. Mirrors the canvas builder in
+      // src/lib/engine/canvas.ts.
+      if (req.shift_type_id) {
+        const st = data.shiftTypesById.get(req.shift_type_id);
+        if (!st || !st.days_active.includes(dayOfWeek)) continue;
+      } else {
+        // Legacy rows with no shift_type_id: fall back to the requirement's own field.
+        if (!req.days_active.includes(dayOfWeek)) continue;
+      }
 
       let baselineCovered = 0;
       let withNewCovered = 0;

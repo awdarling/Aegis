@@ -349,6 +349,8 @@ function buildScheduleForWeek(ctx: BuildContext): BuildResult {
 
   // 1) Build canvas (priority first, then chronological).
   // Apply shift-overrides from special notes to requirements before canvas build.
+  // shift_requirements.days_active is dormant — only shift_types.days_active is
+  // consulted. The shift_type gate below is the single source of truth.
   const overriddenReqs: ShiftRequirement[] = [];
   for (const date of weekDates) {
     const dayOfWeek = new Date(date + 'T12:00:00Z').getUTCDay();
@@ -356,8 +358,7 @@ function buildScheduleForWeek(ctx: BuildContext): BuildResult {
     for (const st of data.shiftTypes) {
       if (!st.days_active.includes(dayOfWeek)) continue;
       const baseReqs = data.shiftRequirements.filter(req =>
-        (req.shift_type_id ? req.shift_type_id === st.id : req.shift_name === st.name) &&
-        req.days_active.includes(dayOfWeek)
+        (req.shift_type_id ? req.shift_type_id === st.id : req.shift_name === st.name)
       );
       const adjusted = applyShiftOverrides(baseReqs, dateNotes, st.name);
       for (const r of adjusted) {

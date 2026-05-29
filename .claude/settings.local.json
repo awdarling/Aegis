@@ -13,7 +13,8 @@
       "Bash(cp /tmp/query-policies.ts /Users/awdarling/Desktop/Aegis/scripts/_tmp-query-policies.ts)",
       "Bash(sed -i '' \"s|'./src/db/client'|'../src/db/client'|\" scripts/_tmp-query-policies.ts)",
       "Bash(npx tsx *)",
-      "Bash(npx ts-node *)"
+      "Bash(npx ts-node *)",
+      "Bash(python3 -c ' *)"
     ]
   }
 }

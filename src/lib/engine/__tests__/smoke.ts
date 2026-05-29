@@ -588,6 +588,312 @@ function runAttributeMixUnsatisfiabilitySmoke(): void {
   }
 }
 
+// Locks in the swap-pass cascade fix: when the first over-represented
+// assignee is filling a role the candidate doesn't qualify for, the swap
+// pass must iterate to the next over-represented assignee rather than
+// aborting. Three fixtures cover (A) success after one non-match, (B)
+// graceful failure when no role composes, (C) success after three
+// consecutive non-matches.
+function runAttributeMixSwapPassSmoke(): void {
+  const COMPANY_ID = 'company-swap-pass';
+
+  const baseEmp = (
+    id: string,
+    name: string,
+    primaryRole: string,
+    qualifiedRoles: string[],
+    sex: 'male' | 'female',
+  ): Employee => {
+    const e: Employee = {
+      id,
+      company_id: COMPANY_ID,
+      name,
+      primary_role: primaryRole,
+      qualified_roles: qualifiedRoles,
+      max_weekly_hours: 40,
+      contact_phone: null,
+      contact_email: null,
+      active: true,
+      created_at: '2026-01-01T00:00:00Z',
+      individual_wage: null,
+      is_veteran: false,
+    };
+    (e as unknown as Record<string, unknown>).sex = sex;
+    return e;
+  };
+
+  const mondayAvail = (empId: string): Availability => ({
+    id: `av-${empId}`,
+    employee_id: empId,
+    company_id: COMPANY_ID,
+    day_of_week: 1,
+    start_time: '00:00',
+    end_time: '23:59',
+  });
+
+  // Policy: at-least-one of each sex. Minimums must list both values so the
+  // 'over' set is non-empty when females dominate (required for swap-pass
+  // to consider any removable).
+  const genderPolicy: Policy = {
+    id: 'pol-gender-swap',
+    company_id: COMPANY_ID,
+    policy_key: 'gender_requirement',
+    policy_value: '1m+1f',
+    policy_value_json: { attribute: 'sex', minimums: { male: 1, female: 1 }, scope: 'all_shifts' },
+    policy_type: 'coverage',
+    description: null,
+    version: 1,
+    created_at: '2026-01-01T00:00:00Z',
+  };
+
+  const buildReqs = (stId: string, shiftName: string, layout: Array<{ role: string; count: number }>): ShiftRequirement[] =>
+    layout.map((spec, i) => ({
+      id: `req-${stId}-${i}`,
+      company_id: COMPANY_ID,
+      shift_name: shiftName,
+      role: spec.role,
+      required_count: spec.count,
+      start_time: '09:00',
+      end_time: '13:00',
+      days_active: [1],
+      shift_type_id: stId,
+    }));
+
+  // ── Fixture A: 4 positions (1 HG, 2 LG, 1 Mgr), 4 females + 1 male LG-only ─
+  // After initial fill all 4 slots are female. Swap pass walks removables —
+  // HG and Mgr roles don't compose with the LG-only male; one of the LG
+  // assignees does. Expect: 0 attribute_mix flags, male on an LG slot.
+  {
+    const ST_ID = 'st-fixA';
+    const shiftType: ShiftType = {
+      id: ST_ID,
+      company_id: COMPANY_ID,
+      name: 'Swap-A Shift',
+      start_time: '09:00',
+      end_time: '13:00',
+      days_active: [1],
+      active: true,
+      created_at: '2026-01-01T00:00:00Z',
+    };
+    const reqs = buildReqs(ST_ID, 'Swap-A Shift', [
+      { role: 'Head Guard', count: 1 },
+      { role: 'Lifeguard', count: 2 },
+      { role: 'Manager', count: 1 },
+    ]);
+
+    const femHG = baseEmp('emp-A-fHG', 'Alpha FHG', 'Head Guard', ['Head Guard'], 'female');
+    const femLG1 = baseEmp('emp-A-fLG1', 'Beta FLG', 'Lifeguard', ['Lifeguard'], 'female');
+    const femLG2 = baseEmp('emp-A-fLG2', 'Cara FLG', 'Lifeguard', ['Lifeguard'], 'female');
+    const femMgr = baseEmp('emp-A-fMgr', 'Delta FMgr', 'Manager', ['Manager'], 'female');
+    // Male is LG-only and named to sort AFTER the female LGs so the initial
+    // fill picks the females. Swap pass should still be able to displace one.
+    const maleLG = baseEmp('emp-A-mLG', 'Zed MLG', 'Lifeguard', ['Lifeguard'], 'male');
+
+    const employees = [femHG, femLG1, femLG2, femMgr, maleLG];
+    const availByEmp = new Map<string, Availability[]>(
+      employees.map(e => [e.id, [mondayAvail(e.id)]])
+    );
+
+    const data: BuildData = {
+      employees,
+      availByEmp,
+      toMap: new Map(),
+      shiftTypes: [shiftType],
+      shiftRequirements: reqs,
+      conflicts: [],
+      policies: [genderPolicy],
+      events: [],
+      companyName: 'Test Co',
+      companyTimezone: 'America/New_York',
+    };
+
+    const result = runScheduleBuild(data, DEFAULT_ENGINE_SETTINGS, null, [], '2026-06-01', '2026-06-01');
+
+    const attrFlags = result.flagged_issues.filter(f => f.type === 'unsatisfied_attribute_mix');
+    expect(
+      attrFlags.length === 0,
+      `Swap-pass A: swap past HG/Mgr non-matches resolves the rule — 0 attribute_mix flags (got ${attrFlags.length})`,
+    );
+
+    const maleAssignments = result.assignments.filter(a => a.employee_id === maleLG.id);
+    expect(
+      maleAssignments.length === 1 && maleAssignments[0]?.role === 'Lifeguard',
+      `Swap-pass A: male ends up on exactly 1 LG slot (got ${maleAssignments.length} assignments, role ${maleAssignments[0]?.role})`,
+    );
+
+    const hgAssignment = result.assignments.find(a => a.role === 'Head Guard');
+    const mgrAssignment = result.assignments.find(a => a.role === 'Manager');
+    expect(
+      hgAssignment?.employee_id === femHG.id,
+      `Swap-pass A: HG slot untouched — still filled by ${femHG.name} (got ${hgAssignment?.employee_name})`,
+    );
+    expect(
+      mgrAssignment?.employee_id === femMgr.id,
+      `Swap-pass A: Mgr slot untouched — still filled by ${femMgr.name} (got ${mgrAssignment?.employee_name})`,
+    );
+    expect(
+      result.totalFilled === 4,
+      `Swap-pass A: all 4 positions still filled after swap (totalFilled === 4, got ${result.totalFilled})`,
+    );
+  }
+
+  // ── Fixture B: 4 positions, all female-fillable, male qualified only for ──
+  // a role NOT on the shift (Bartender). Swap pass iterates every removable
+  // but no role composes. Expect: rule unsatisfied, flag fires, male
+  // surfaces in per_employee_dispositions (preserving diagnostic shape).
+  {
+    const ST_ID = 'st-fixB';
+    const shiftType: ShiftType = {
+      id: ST_ID,
+      company_id: COMPANY_ID,
+      name: 'Swap-B Shift',
+      start_time: '09:00',
+      end_time: '13:00',
+      days_active: [1],
+      active: true,
+      created_at: '2026-01-01T00:00:00Z',
+    };
+    const reqs = buildReqs(ST_ID, 'Swap-B Shift', [
+      { role: 'Head Guard', count: 1 },
+      { role: 'Lifeguard', count: 2 },
+      { role: 'Manager', count: 1 },
+    ]);
+
+    const femHG = baseEmp('emp-B-fHG', 'Alpha FHG', 'Head Guard', ['Head Guard'], 'female');
+    const femLG1 = baseEmp('emp-B-fLG1', 'Beta FLG', 'Lifeguard', ['Lifeguard'], 'female');
+    const femLG2 = baseEmp('emp-B-fLG2', 'Cara FLG', 'Lifeguard', ['Lifeguard'], 'female');
+    const femMgr = baseEmp('emp-B-fMgr', 'Delta FMgr', 'Manager', ['Manager'], 'female');
+    // Male only qualifies for Bartender — no role on this shift accepts him.
+    const maleBar = baseEmp('emp-B-mBar', 'Zed MBar', 'Bartender', ['Bartender'], 'male');
+
+    const employees = [femHG, femLG1, femLG2, femMgr, maleBar];
+    const availByEmp = new Map<string, Availability[]>(
+      employees.map(e => [e.id, [mondayAvail(e.id)]])
+    );
+
+    const data: BuildData = {
+      employees,
+      availByEmp,
+      toMap: new Map(),
+      shiftTypes: [shiftType],
+      shiftRequirements: reqs,
+      conflicts: [],
+      policies: [genderPolicy],
+      events: [],
+      companyName: 'Test Co',
+      companyTimezone: 'America/New_York',
+    };
+
+    const result = runScheduleBuild(data, DEFAULT_ENGINE_SETTINGS, null, [], '2026-06-01', '2026-06-01');
+
+    const attrFlags = result.flagged_issues.filter(f => f.type === 'unsatisfied_attribute_mix');
+    expect(
+      attrFlags.length === 1,
+      `Swap-pass B: no role composes — rule remains unsatisfied, exactly 1 attribute_mix flag (got ${attrFlags.length})`,
+    );
+    const flag = attrFlags[0];
+    const meta = flag?.metadata as {
+      attribute?: string;
+      value?: string;
+      per_employee_dispositions?: Array<{ employee_id: string; name: string; reason: string }>;
+    };
+    expect(
+      meta?.attribute === 'sex' && meta?.value === 'male',
+      `Swap-pass B: flag identifies missing male (got attribute=${meta?.attribute} value=${meta?.value})`,
+    );
+    const dispEntry = meta?.per_employee_dispositions?.find(d => d.employee_id === maleBar.id);
+    expect(
+      dispEntry !== undefined,
+      `Swap-pass B: male is enumerated in per_employee_dispositions (current diagnostic shape preserved)`,
+    );
+    // Classifier sees no role overlap (Bartender ∉ accepted roles) → not_qualified.
+    expect(
+      dispEntry?.reason === 'not_qualified',
+      `Swap-pass B: male classified as not_qualified — diagnostic correctly attributes the failure (got ${dispEntry?.reason})`,
+    );
+    expect(
+      result.totalFilled === 4,
+      `Swap-pass B: all 4 female positions still filled (totalFilled === 4, got ${result.totalFilled})`,
+    );
+  }
+
+  // ── Fixture C: 5 positions (2 HG, 1 Mgr, 2 LG), 5 females + 1 male LG-only ─
+  // Designed so the LG removables are not first in iteration order. Locks
+  // in that the swap pass keeps scanning past consecutive non-matches.
+  {
+    const ST_ID = 'st-fixC';
+    const shiftType: ShiftType = {
+      id: ST_ID,
+      company_id: COMPANY_ID,
+      name: 'Swap-C Shift',
+      start_time: '09:00',
+      end_time: '13:00',
+      days_active: [1],
+      active: true,
+      created_at: '2026-01-01T00:00:00Z',
+    };
+    const reqs = buildReqs(ST_ID, 'Swap-C Shift', [
+      { role: 'Head Guard', count: 2 },
+      { role: 'Manager', count: 1 },
+      { role: 'Lifeguard', count: 2 },
+    ]);
+
+    const femHG1 = baseEmp('emp-C-fHG1', 'Alpha FHG', 'Head Guard', ['Head Guard'], 'female');
+    const femHG2 = baseEmp('emp-C-fHG2', 'Beta FHG', 'Head Guard', ['Head Guard'], 'female');
+    const femMgr = baseEmp('emp-C-fMgr', 'Cara FMgr', 'Manager', ['Manager'], 'female');
+    const femLG1 = baseEmp('emp-C-fLG1', 'Delta FLG', 'Lifeguard', ['Lifeguard'], 'female');
+    const femLG2 = baseEmp('emp-C-fLG2', 'Eve FLG', 'Lifeguard', ['Lifeguard'], 'female');
+    const maleLG = baseEmp('emp-C-mLG', 'Zed MLG', 'Lifeguard', ['Lifeguard'], 'male');
+
+    const employees = [femHG1, femHG2, femMgr, femLG1, femLG2, maleLG];
+    const availByEmp = new Map<string, Availability[]>(
+      employees.map(e => [e.id, [mondayAvail(e.id)]])
+    );
+
+    const data: BuildData = {
+      employees,
+      availByEmp,
+      toMap: new Map(),
+      shiftTypes: [shiftType],
+      shiftRequirements: reqs,
+      conflicts: [],
+      policies: [genderPolicy],
+      events: [],
+      companyName: 'Test Co',
+      companyTimezone: 'America/New_York',
+    };
+
+    const result = runScheduleBuild(data, DEFAULT_ENGINE_SETTINGS, null, [], '2026-06-01', '2026-06-01');
+
+    const attrFlags = result.flagged_issues.filter(f => f.type === 'unsatisfied_attribute_mix');
+    expect(
+      attrFlags.length === 0,
+      `Swap-pass C: swap past 2 HG + 1 Mgr non-matches succeeds on an LG — 0 attribute_mix flags (got ${attrFlags.length})`,
+    );
+
+    const maleAssignments = result.assignments.filter(a => a.employee_id === maleLG.id);
+    expect(
+      maleAssignments.length === 1 && maleAssignments[0]?.role === 'Lifeguard',
+      `Swap-pass C: male on exactly 1 LG slot (got ${maleAssignments.length} assignments, role ${maleAssignments[0]?.role})`,
+    );
+
+    const hgEmps = result.assignments.filter(a => a.role === 'Head Guard').map(a => a.employee_id);
+    expect(
+      hgEmps.length === 2 && hgEmps.includes(femHG1.id) && hgEmps.includes(femHG2.id),
+      `Swap-pass C: both HG slots untouched (got ${hgEmps.join(',')})`,
+    );
+    const mgrEmp = result.assignments.find(a => a.role === 'Manager')?.employee_id;
+    expect(
+      mgrEmp === femMgr.id,
+      `Swap-pass C: Mgr slot untouched (got ${mgrEmp})`,
+    );
+    expect(
+      result.totalFilled === 5,
+      `Swap-pass C: all 5 positions still filled after swap (totalFilled === 5, got ${result.totalFilled})`,
+    );
+  }
+}
+
 // Locks in the enriched attribute-mix flag description: when no candidate
 // with the missing attribute can be placed, each blocked candidate is
 // classified into a reason bucket and the description names everyone.
@@ -1241,6 +1547,8 @@ if (require.main === module) {
   runDaysActiveConsolidationSmoke();
   console.log('');
   runAttributeMixUnsatisfiabilitySmoke();
+  console.log('');
+  runAttributeMixSwapPassSmoke();
   console.log('');
   runAttributeMixDiagnosticSmoke();
   console.log('');

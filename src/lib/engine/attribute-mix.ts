@@ -220,68 +220,83 @@ export function enforceAttributeMixForShift(
           .filter(([v, n]) => (counts.get(v) ?? 0) > n)
           .map(([v]) => v);
 
-        const removableIdx = shiftAssignments.findIndex(a => {
-          const emp = deps.employeeById.get(a.employee_id);
-          if (!emp) return false;
-          const v = readAttr(emp, c.attribute);
-          return over.includes(v);
-        });
-        if (removableIdx < 0) break;
+        // All removable assignees on this shift whose attribute is in `over`.
+        // Iterating across the full set (rather than just the first match)
+        // lets the swap succeed when the candidate composes with SOME role
+        // on the shift even if it doesn't compose with the first removable's
+        // role. Example: candidate is LG-only, first removable is HG, but a
+        // later removable is also LG — that pair composes.
+        const removableIndices = shiftAssignments
+          .map((a, i) => {
+            const emp = deps.employeeById.get(a.employee_id);
+            if (!emp) return -1;
+            const v = readAttr(emp, c.attribute);
+            return over.includes(v) ? i : -1;
+          })
+          .filter(i => i >= 0);
+        if (removableIndices.length === 0) break;
 
-        const removable = shiftAssignments[removableIdx];
-        const removableSlot = deps.canvasSlots.find(
-          s => s.date === removable.date && s.shift_name === removable.shift_name && s.role === removable.role
-        );
-        if (!removableSlot) break;
+        let swapped = false;
+        for (const removableIdx of removableIndices) {
+          const removable = shiftAssignments[removableIdx];
+          const removableSlot = deps.canvasSlots.find(
+            s => s.date === removable.date && s.shift_name === removable.shift_name && s.role === removable.role
+          );
+          if (!removableSlot) continue;
 
-        const eligible = buildEligibility(removableSlot, deps.employees, deps.availByEmp, deps.toMap, deps.veteranOnlyDates);
-        const cohabIds = shiftAssignments
-          .filter((_, i) => i !== removableIdx)
-          .map(a => a.employee_id);
+          const eligible = buildEligibility(removableSlot, deps.employees, deps.availByEmp, deps.toMap, deps.veteranOnlyDates);
+          const cohabIds = shiftAssignments
+            .filter((_, i) => i !== removableIdx)
+            .map(a => a.employee_id);
 
-        // Same-day-doubles check needs to see weekState as if the row we're
-        // about to overwrite were already gone — otherwise the displaced
-        // employee's existing assignment would look like a candidate's
-        // existing same-day commitment, and any candidate matching the row's
-        // own employee_id would self-reject. Filter the to-be-replaced row
-        // out of the view.
-        const assignIdxForView = shiftAssignmentIndices[removableIdx];
-        const viewState: WeekState = {
-          ...weekState,
-          assignments: weekState.assignments.filter((_, i) => i !== assignIdxForView),
-        };
+          // Same-day-doubles check needs to see weekState as if the row we're
+          // about to overwrite were already gone — otherwise the displaced
+          // employee's existing assignment would look like a candidate's
+          // existing same-day commitment, and any candidate matching the row's
+          // own employee_id would self-reject. Filter the to-be-replaced row
+          // out of the view.
+          const assignIdxForView = shiftAssignmentIndices[removableIdx];
+          const viewState: WeekState = {
+            ...weekState,
+            assignments: weekState.assignments.filter((_, i) => i !== assignIdxForView),
+          };
 
-        const replacement = eligible.employees.find(e => {
-          if (readAttr(e, c.attribute) !== wantValue) return false;
-          if (cohabIds.includes(e.id)) return false;
-          if (hardConflict(e.id, cohabIds, deps.conflicts)) return false;
-          const cur = weekState.weeklyHoursMap.get(e.id) ?? 0;
-          if (cur + removableSlot.hours > e.max_weekly_hours) return false;
-          if (sameDayDoubleReason(e.id, removableSlot, viewState, deps.settings) !== null) return false;
-          return true;
-        });
+          const replacement = eligible.employees.find(e => {
+            if (readAttr(e, c.attribute) !== wantValue) return false;
+            if (cohabIds.includes(e.id)) return false;
+            if (hardConflict(e.id, cohabIds, deps.conflicts)) return false;
+            const cur = weekState.weeklyHoursMap.get(e.id) ?? 0;
+            if (cur + removableSlot.hours > e.max_weekly_hours) return false;
+            if (sameDayDoubleReason(e.id, removableSlot, viewState, deps.settings) !== null) return false;
+            return true;
+          });
 
-        if (!replacement) break;
+          if (!replacement) continue;
 
-        const assignIdx = shiftAssignmentIndices[removableIdx];
-        swaps.push({
-          assignment_index: assignIdx,
-          new_employee_id: replacement.id,
-          new_employee_name: replacement.name,
-        });
+          const assignIdx = shiftAssignmentIndices[removableIdx];
+          swaps.push({
+            assignment_index: assignIdx,
+            new_employee_id: replacement.id,
+            new_employee_name: replacement.name,
+          });
 
-        const prev = weekState.assignments[assignIdx];
-        weekState.weeklyHoursMap.set(removable.employee_id, (weekState.weeklyHoursMap.get(removable.employee_id) ?? 0) - removableSlot.hours);
-        weekState.weeklyHoursMap.set(replacement.id, (weekState.weeklyHoursMap.get(replacement.id) ?? 0) + removableSlot.hours);
-        weekState.assignments[assignIdx] = {
-          ...prev,
-          employee_id: replacement.id,
-          employee_name: replacement.name,
-        };
-        shiftAssignments[removableIdx] = weekState.assignments[assignIdx];
+          const prev = weekState.assignments[assignIdx];
+          weekState.weeklyHoursMap.set(removable.employee_id, (weekState.weeklyHoursMap.get(removable.employee_id) ?? 0) - removableSlot.hours);
+          weekState.weeklyHoursMap.set(replacement.id, (weekState.weeklyHoursMap.get(replacement.id) ?? 0) + removableSlot.hours);
+          weekState.assignments[assignIdx] = {
+            ...prev,
+            employee_id: replacement.id,
+            employee_name: replacement.name,
+          };
+          shiftAssignments[removableIdx] = weekState.assignments[assignIdx];
 
-        counts = countByAttr(shiftAssignments, deps.employeeById, c.attribute);
-        placed++;
+          counts = countByAttr(shiftAssignments, deps.employeeById, c.attribute);
+          placed++;
+          swapped = true;
+          break;
+        }
+
+        if (!swapped) break;
       }
 
       if (placed < need) {

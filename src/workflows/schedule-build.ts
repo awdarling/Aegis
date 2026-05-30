@@ -4,6 +4,7 @@ import { reply } from '../messaging/reply';
 import { sendEmail } from '../messaging/email';
 import { sendSms } from '../messaging/sms';
 import { computeWageEstimate } from '../lib/schedule-simulator';
+import { buildScheduleResultEmail } from './schedule-build-email';
 import { resolveAvailabilityForWeek } from '../lib/custom-availability';
 import { buildTOMap, isBlockedByTO, type TOWindow } from '../lib/to-window';
 import { getSpecialNotesForRange } from './special-notes';
@@ -1130,13 +1131,21 @@ export async function handleBuildSchedule(
         engine_version: ENGINE_VERSION,
       },
     });
-    await reply(
-      contact,
-      message,
+    const failureText =
       `Built your schedule for ${weekStart}–${weekEnd} but couldn't save it to Homebase. ` +
       `DB error: ${schedError.message}. ` +
-      `Please message me again in 5 minutes to retry, or check Homebase to see if it appeared.`
-    );
+      `Please message me again in 5 minutes to retry, or check Homebase to see if it appeared.`;
+    if (message.channel === 'email') {
+      await sendEmail({
+        to: message.sender,
+        subject: 'Schedule build failed',
+        text: failureText,
+        company_id: contact.company_id,
+        thread_id: message.thread_id,
+      });
+    } else {
+      await reply(contact, message, failureText);
+    }
     return;
   }
 
@@ -1160,6 +1169,42 @@ export async function handleBuildSchedule(
       engine_version: ENGINE_VERSION,
     },
   });
+
+  if (message.channel === 'email') {
+    const employeeMaxHours = new Map<string, { name: string; max_weekly_hours: number }>();
+    for (const emp of data.employees) {
+      employeeMaxHours.set(emp.id, { name: emp.name, max_weekly_hours: emp.max_weekly_hours });
+    }
+    const { subject, html, text } = await buildScheduleResultEmail({
+      result: {
+        assignments,
+        gaps,
+        flagged_issues,
+        closed_dates,
+        shift_override_mismatches,
+        totalRequired,
+        totalFilled,
+      },
+      schedule_id: scheduleId,
+      company_id: contact.company_id,
+      company_name: data.companyName,
+      week_start: weekStart,
+      week_end: weekEnd,
+      manager_email: message.sender,
+      manager_user_id: contact.user_id ?? undefined,
+      wages,
+      employee_max_hours: employeeMaxHours,
+    });
+    await sendEmail({
+      to: message.sender,
+      subject,
+      text,
+      html,
+      company_id: contact.company_id,
+      thread_id: message.thread_id,
+    });
+    return;
+  }
 
   const summaryMsg = await buildManagerSummary(
     weekStart, weekEnd, assignments, gaps, totalFilled, totalRequired,

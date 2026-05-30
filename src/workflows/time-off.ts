@@ -7,8 +7,9 @@ import { sendSms } from '../messaging/sms';
 import { generateReply } from '../ai/claude';
 import { runSimulation, getWeekBounds, loadTimeOffPolicies } from '../lib/schedule-simulator';
 import { env } from '../config/env';
+import { buildTimeOffManagerEmail, type TimeOffRecommendation } from './time-off-manager-email';
 import type { InboundMessage, VerifiedContact } from '../security/types';
-import type { Employee, PartialDayDetail, Policy } from '../db/types';
+import type { Employee, PartialDayDetail, Policy, TimeOffRequest } from '../db/types';
 import type { SimulationResult } from '../lib/schedule-simulator';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -628,6 +629,105 @@ async function notifyManager(
   }
 }
 
+// ── Manager notification — email-channel (new aegis_action_tokens path) ──────
+
+// Fan out a rich HTML email with magic-link approve/deny buttons to every
+// manager/owner with an email on file. Used only when the employee submitted
+// via email (the existing notifyManager() handles SMS-channel submissions and
+// is intentionally left untouched).
+//
+// Each manager gets their own pair of tokens so the consume audit identifies
+// who clicked. The Aegis AI recommendation is generated once and persisted to
+// time_off_requests, then included in every manager's email.
+async function notifyManagersByEmail(
+  companyId: string,
+  companyName: string,
+  employee: Employee,
+  torRow: TimeOffRequest,
+  pending: PendingTimeOff,
+  stage1: SimulationResult,
+  stage2: SimulationResult | null
+): Promise<{ emailed: number; total_managers: number }> {
+  const { data: managersData } = await supabase
+    .from('users')
+    .select('id, email, name, role')
+    .eq('company_id', companyId)
+    .in('role', ['manager', 'owner']);
+
+  const managers = (managersData ?? []) as Array<{
+    id: string;
+    email: string | null;
+    name: string;
+    role: string;
+  }>;
+  const withEmail = managers.filter(m => !!m.email);
+
+  if (withEmail.length === 0) {
+    console.warn('[time-off] email-channel: no manager/owner with email on file for company', companyId);
+    return { emailed: 0, total_managers: managers.length };
+  }
+
+  // Generate the Aegis recommendation once. If Claude is unavailable or returns
+  // garbage, the helper has a structural fallback — but if it throws (e.g.
+  // network blip), skip the recommendation block instead of blocking the email.
+  let recommendation: TimeOffRecommendation | undefined;
+  try {
+    const policies = await loadTimeOffPolicies(companyId);
+    const decision = await generateTimeOffRecommendation(
+      employee,
+      pending.start_date,
+      pending.end_date,
+      pending.reason,
+      stage1,
+      stage2,
+      policies
+    );
+    recommendation = { type: decision.recommendation, reasoning: decision.reasoning };
+
+    await supabase
+      .from('time_off_requests')
+      .update({
+        aegis_recommendation: decision.recommendation,
+        aegis_reasoning: decision.reasoning,
+      })
+      .eq('id', torRow.id);
+  } catch (err) {
+    console.warn('[time-off] recommendation generation failed; sending without it:', err);
+  }
+
+  // Prefer the full-week simulation (more context for the manager); fall back
+  // to the target-day simulation if Stage 2 didn't run.
+  const simulation = stage2 ?? stage1;
+
+  let emailed = 0;
+  for (const manager of withEmail) {
+    try {
+      const { subject, text, html } = await buildTimeOffManagerEmail({
+        time_off_request: torRow,
+        employee,
+        company_id: companyId,
+        company_name: companyName,
+        manager_email: manager.email!,
+        manager_user_id: manager.id,
+        simulation,
+        recommendation,
+      });
+      await sendEmail({
+        to: manager.email!,
+        subject,
+        text,
+        html,
+        company_id: companyId,
+      });
+      emailed++;
+    } catch (err) {
+      console.error('[time-off] manager email failed for', manager.email, err);
+    }
+  }
+
+  return { emailed, total_managers: managers.length };
+}
+
 // ── Public workflow handlers ───────────────────────────────────────────────────
 
 // Step 1: Employee submits request — parse, store pending, ask for confirmation.
@@ -823,9 +923,48 @@ export async function handlePendingTimeOffConfirmation(
     },
   });
 
-  // Notify manager (non-blocking — errors are caught and logged)
+  // Notify manager (non-blocking — errors are caught and logged).
+  // Email-channel submissions get the rich aegis_action_tokens magic-link
+  // email; SMS-channel submissions stay on the existing notifyManager path
+  // (legacy ad-hoc token + manager SMS).
   try {
-    await notifyManager(contact.company_id, employee, pending, requestId, stage1, stage2);
+    if (pending.channel === 'email') {
+      const torRow: TimeOffRequest = {
+        id: requestId,
+        employee_id: employee.id,
+        company_id: contact.company_id,
+        start_date: pending.start_date,
+        end_date: pending.end_date,
+        reason: pending.reason,
+        status: 'pending',
+        requested_at: new Date().toISOString(),
+        decided_at: null,
+        decided_by: null,
+        aegis_recommendation: null,
+        aegis_reasoning: null,
+        time_off_type: pending.time_off_type ?? 'full_day',
+        partial_days: pending.partial_days ?? null,
+      };
+      // Resolve company name once for the email header / payload.
+      const { data: companyData } = await supabase
+        .from('companies')
+        .select('name')
+        .eq('id', contact.company_id)
+        .single();
+      const companyName = (companyData as { name: string } | null)?.name ?? 'Your Company';
+
+      await notifyManagersByEmail(
+        contact.company_id,
+        companyName,
+        employee,
+        torRow,
+        pending,
+        stage1,
+        stage2
+      );
+    } else {
+      await notifyManager(contact.company_id, employee, pending, requestId, stage1, stage2);
+    }
   } catch (err) {
     console.error('[time-off] manager notification failed:', err);
     await logActivity({

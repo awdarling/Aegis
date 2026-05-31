@@ -39,7 +39,7 @@ internalRouter.post('/notify-to-decision', async (req: Request, res: Response) =
 
   try {
     const result = await sendDecisionNotification(requestId, decision);
-    res.json({ ok: true, channel_sent: result.channel, sent_to: result.sent_to });
+    res.json({ ok: true, channel: result.channel, sent_to: result.sent_to });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[internal] notify-to-decision failed:', msg);

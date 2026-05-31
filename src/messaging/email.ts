@@ -1,8 +1,13 @@
+// AEGIS_REPLY_TO_EMAIL — env var that sets the Reply-To header on every
+// outbound email so replies thread back through SendGrid Inbound Parse on the
+// dedicated subdomain. Defaults to aegis@aegis.quriasolutions.com when unset.
 import sgMail from '@sendgrid/mail';
 import { env } from '../config/env';
 import { saveConversation } from '../logger/conversation';
 
 sgMail.setApiKey(env.SENDGRID_API_KEY);
+
+const REPLY_TO_EMAIL = process.env.AEGIS_REPLY_TO_EMAIL ?? 'aegis@aegis.quriasolutions.com';
 
 interface EmailOptions {
   to: string;
@@ -41,6 +46,7 @@ export async function sendEmail(options: EmailOptions): Promise<void> {
         email: env.SENDGRID_FROM_EMAIL,
         name: env.SENDGRID_FROM_NAME,
       },
+      replyTo: REPLY_TO_EMAIL,
       subject: options.subject,
       text: options.text,
       html: options.html ?? htmlFromText(options.text),

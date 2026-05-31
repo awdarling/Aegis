@@ -487,6 +487,110 @@ ${policiesHtml}
   return { subject, text, html };
 }
 
+// ── Decision notification (employee-facing) ───────────────────────────────────
+
+// Called by the Homebase /api/aegis-action dispatcher (Phase 4) via the
+// /internal/notify-to-decision endpoint after a manager clicks Approve/Deny in
+// an aegis_action_tokens magic-link email and the TO status has been updated.
+//
+// Loads the TO + employee, picks the employee's best channel (email first,
+// then SMS), sends the decision notification, and logs activity. Throws on
+// hard failure so the calling endpoint can return 5xx with a clear error.
+export async function sendDecisionNotification(
+  requestId: string,
+  decision: 'approved' | 'denied'
+): Promise<{ channel: 'email' | 'sms'; sent_to: string }> {
+  const { data: torData, error: torError } = await supabase
+    .from('time_off_requests')
+    .select('id, company_id, employee_id, start_date, end_date')
+    .eq('id', requestId)
+    .single();
+  if (torError || !torData) {
+    throw new Error(`time_off_request ${requestId} not found: ${torError?.message ?? 'no row'}`);
+  }
+  const tor = torData as {
+    id: string;
+    company_id: string;
+    employee_id: string;
+    start_date: string;
+    end_date: string;
+  };
+
+  const { data: empData, error: empError } = await supabase
+    .from('employees')
+    .select('id, name, contact_email, contact_phone')
+    .eq('id', tor.employee_id)
+    .eq('company_id', tor.company_id)
+    .single();
+  if (empError || !empData) {
+    throw new Error(`employee ${tor.employee_id} not found: ${empError?.message ?? 'no row'}`);
+  }
+  const employee = empData as { id: string; name: string; contact_email: string | null; contact_phone: string | null };
+
+  const dateRange = formatDateRange(tor.start_date, tor.end_date);
+  const text =
+    decision === 'approved'
+      ? `Your time-off request for ${dateRange} has been approved. Enjoy your time off!`
+      : `Your time-off request for ${dateRange} has been denied. Please contact your manager if you have questions or would like to discuss alternatives.`;
+
+  let channel: 'email' | 'sms';
+  let sent_to: string;
+
+  if (employee.contact_email) {
+    await sendEmail({
+      to: employee.contact_email,
+      subject: `Your time-off request has been ${decision}`,
+      text,
+      company_id: tor.company_id,
+    });
+    channel = 'email';
+    sent_to = employee.contact_email;
+  } else if (employee.contact_phone) {
+    // SMS path needs the company's Aegis outbound number.
+    const { data: channelRow } = await supabase
+      .from('company_channels')
+      .select('channel_value')
+      .eq('company_id', tor.company_id)
+      .eq('channel_type', 'sms')
+      .maybeSingle();
+    const aegisSmsChannel = (channelRow as { channel_value: string } | null)?.channel_value ?? null;
+    if (!aegisSmsChannel) {
+      throw new Error(
+        `employee ${employee.id} has no email and company ${tor.company_id} has no Aegis SMS channel configured`
+      );
+    }
+    const sent = await sendSms({
+      to: employee.contact_phone,
+      from: aegisSmsChannel,
+      body: text,
+      company_id: tor.company_id,
+    });
+    if (!sent) {
+      throw new Error(`SMS send failed for employee ${employee.id}`);
+    }
+    channel = 'sms';
+    sent_to = employee.contact_phone;
+  } else {
+    throw new Error(`employee ${employee.id} has neither contact_email nor contact_phone`);
+  }
+
+  await logActivity({
+    company_id: tor.company_id,
+    action: `time_off_${decision === 'approved' ? 'approved' : 'denied'}_notified`,
+    entity_type: 'time_off_request',
+    entity_id: requestId,
+    summary: `${employee.name} notified that their time-off request for ${dateRange} was ${decision} (via ${channel})`,
+    metadata: {
+      employee_id: employee.id,
+      decision,
+      channel,
+      sent_to,
+    },
+  });
+
+  return { channel, sent_to };
+}
+
 // ── Manager notification ───────────────────────────────────────────────────────
 
 async function notifyManager(

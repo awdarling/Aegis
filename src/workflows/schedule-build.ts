@@ -1214,46 +1214,51 @@ export async function handleBuildSchedule(
   await reply(contact, message, summaryMsg);
 }
 
-// ── Distribute handler ────────────────────────────────────────────────────────
+// ── Distribute core ───────────────────────────────────────────────────────────
 
-export async function handleDistributeSchedule(
-  message: InboundMessage,
-  contact: VerifiedContact,
-  extracted: Record<string, unknown>
-): Promise<void> {
-  void extracted;
+export interface DistributeScheduleResult {
+  sent: number;
+  total_employees: number;
+  errors: Array<{ employee_id: string; reason: string }>;
+  // Internal extras used by handleDistributeSchedule to build the manager
+  // reply; the /internal/distribute-schedule endpoint only echoes the three
+  // documented fields above.
+  emailed: number;
+  texted: number;
+  no_contact: string[];
+  week_label: string;
+}
+
+// Pure callable used by both the SMS/email intent handler and the
+// /internal/distribute-schedule endpoint (which is hit by Homebase after a
+// manager clicks Distribute in an aegis_action_tokens magic-link email).
+//
+// Loads the schedule, fans out per-employee summaries, marks the schedule
+// published + distributed_at, logs per-send + aggregate activity. Throws on
+// schedule-not-found so callers can surface the error.
+export async function distributeScheduleCore(
+  scheduleId: string,
+  companyId: string
+): Promise<DistributeScheduleResult> {
   type ScheduleRow = { id: string; week_start: string; week_end: string; data: ScheduleData; status: string };
-  let scheduleRow: ScheduleRow | null = null;
 
-  const { data: pubData } = await supabase
-    .from('schedules').select('id, week_start, week_end, data, status')
-    .eq('company_id', contact.company_id).eq('status', 'published')
-    .order('generated_at', { ascending: false }).limit(1).maybeSingle();
-
-  if (pubData) {
-    scheduleRow = pubData as unknown as ScheduleRow;
-  } else {
-    const { data: draftData } = await supabase
-      .from('schedules').select('id, week_start, week_end, data, status')
-      .eq('company_id', contact.company_id).eq('status', 'draft')
-      .order('generated_at', { ascending: false }).limit(1).maybeSingle();
-    if (draftData) scheduleRow = draftData as unknown as ScheduleRow;
+  const { data: schedRowData, error: schedError } = await supabase
+    .from('schedules')
+    .select('id, week_start, week_end, data, status')
+    .eq('id', scheduleId)
+    .eq('company_id', companyId)
+    .single();
+  if (schedError || !schedRowData) {
+    throw new Error(`schedule ${scheduleId} not found for company ${companyId}: ${schedError?.message ?? 'no row'}`);
   }
-
-  if (!scheduleRow) {
-    await reply(contact, message,
-      "No schedule found to distribute. Ask Aegis to build a schedule first."
-    );
-    return;
-  }
-
+  const scheduleRow = schedRowData as unknown as ScheduleRow;
   const schedData = scheduleRow.data as unknown as ScheduleData;
   const weekLabel = `${formatShortDate(scheduleRow.week_start)}–${formatShortDate(scheduleRow.week_end)}`;
 
   const [companyRes, channelRes, empRes] = await Promise.all([
-    supabase.from('companies').select('name').eq('id', contact.company_id).single(),
-    supabase.from('company_channels').select('channel_value').eq('company_id', contact.company_id).eq('channel_type', 'sms').maybeSingle(),
-    supabase.from('employees').select('id, name, contact_email, contact_phone').eq('company_id', contact.company_id).eq('active', true),
+    supabase.from('companies').select('name').eq('id', companyId).single(),
+    supabase.from('company_channels').select('channel_value').eq('company_id', companyId).eq('channel_type', 'sms').maybeSingle(),
+    supabase.from('employees').select('id, name, contact_email, contact_phone').eq('company_id', companyId).eq('active', true),
   ]);
 
   const companyName = (companyRes.data as { name: string } | null)?.name ?? 'Your Company';
@@ -1262,27 +1267,34 @@ export async function handleDistributeSchedule(
 
   let emailed = 0;
   let texted = 0;
-  const noContact: string[] = [];
+  let sent = 0;
+  const no_contact: string[] = [];
+  const errors: Array<{ employee_id: string; reason: string }> = [];
 
   for (const emp of employees) {
-    const myShifts = schedData.assignments.filter(a => a.employee_id === emp.id)
+    const myShifts = schedData.assignments
+      .filter(a => a.employee_id === emp.id)
       .sort((a, b) => a.date.localeCompare(b.date));
 
     const hasShifts = myShifts.length > 0;
     const totalHours = myShifts.reduce((s, a) => s + a.hours, 0);
 
-    if (emp.contact_email) {
-      const shiftRows = hasShifts
-        ? myShifts.map(s =>
-            `<tr><td style="padding:6px 12px;border:1px solid #e5e7eb;">${formatDisplayDate(s.date)}</td>` +
-            `<td style="padding:6px 12px;border:1px solid #e5e7eb;">${s.shift_name}</td>` +
-            `<td style="padding:6px 12px;border:1px solid #e5e7eb;">${s.role}</td>` +
-            `<td style="padding:6px 12px;border:1px solid #e5e7eb;">${formatTime(s.start_time)}–${formatTime(s.end_time)}</td>` +
-            `<td style="padding:6px 12px;border:1px solid #e5e7eb;">${s.hours}h</td></tr>`
-          ).join('')
-        : `<tr><td colspan="5" style="padding:12px;text-align:center;color:#6b7280;">You are not scheduled this week.</td></tr>`;
+    let empEmailed = false;
+    let empTexted = false;
 
-      const html = `<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:24px;">
+    if (emp.contact_email) {
+      try {
+        const shiftRows = hasShifts
+          ? myShifts.map(s =>
+              `<tr><td style="padding:6px 12px;border:1px solid #e5e7eb;">${formatDisplayDate(s.date)}</td>` +
+              `<td style="padding:6px 12px;border:1px solid #e5e7eb;">${s.shift_name}</td>` +
+              `<td style="padding:6px 12px;border:1px solid #e5e7eb;">${s.role}</td>` +
+              `<td style="padding:6px 12px;border:1px solid #e5e7eb;">${formatTime(s.start_time)}–${formatTime(s.end_time)}</td>` +
+              `<td style="padding:6px 12px;border:1px solid #e5e7eb;">${s.hours}h</td></tr>`
+            ).join('')
+          : `<tr><td colspan="5" style="padding:12px;text-align:center;color:#6b7280;">You are not scheduled this week.</td></tr>`;
+
+        const html = `<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:24px;">
 <h2 style="margin:0 0 4px;">Your Schedule — ${weekLabel}</h2>
 <p style="color:#6b7280;margin:0 0 20px;">Hi ${emp.name.split(' ')[0]},</p>
 <table style="width:100%;border-collapse:collapse;margin-bottom:16px;">
@@ -1300,35 +1312,62 @@ ${hasShifts ? `<p style="color:#374151;">Total: <strong>${totalHours}h</strong> 
 <p style="color:#9ca3af;font-size:12px;">— ${companyName}</p>
 </body></html>`;
 
-      const text = hasShifts
-        ? `Hi ${emp.name.split(' ')[0]},\n\nYour schedule for ${weekLabel}:\n\n` +
-          myShifts.map(s => `${formatDisplayDate(s.date)}: ${s.shift_name} (${formatTime(s.start_time)}–${formatTime(s.end_time)}, ${s.role})`).join('\n') +
-          `\n\nTotal: ${totalHours}h\n\nQuestions? Contact your manager.`
-        : `Hi ${emp.name.split(' ')[0]},\n\nYou are not scheduled for the week of ${weekLabel}.\n\n— ${companyName}`;
+        const text = hasShifts
+          ? `Hi ${emp.name.split(' ')[0]},\n\nYour schedule for ${weekLabel}:\n\n` +
+            myShifts.map(s => `${formatDisplayDate(s.date)}: ${s.shift_name} (${formatTime(s.start_time)}–${formatTime(s.end_time)}, ${s.role})`).join('\n') +
+            `\n\nTotal: ${totalHours}h\n\nQuestions? Contact your manager.`
+          : `Hi ${emp.name.split(' ')[0]},\n\nYou are not scheduled for the week of ${weekLabel}.\n\n— ${companyName}`;
 
-      await sendEmail({
-        to: emp.contact_email,
-        subject: `${companyName} — Your Schedule ${weekLabel}`,
-        text,
-        html,
-        company_id: contact.company_id,
-      });
-      emailed++;
+        await sendEmail({
+          to: emp.contact_email,
+          subject: `${companyName} — Your Schedule ${weekLabel}`,
+          text,
+          html,
+          company_id: companyId,
+        });
+        emailed++;
+        empEmailed = true;
+      } catch (err) {
+        errors.push({ employee_id: emp.id, reason: `email send failed: ${err instanceof Error ? err.message : String(err)}` });
+      }
     }
 
     if (emp.contact_phone && aegisSmsChannel) {
-      const smsBody = emp.contact_email
-        ? `${companyName}: Your schedule for ${weekLabel} has been posted. Check your email for details.`
-        : hasShifts
-          ? `${companyName} schedule ${weekLabel}: ${myShifts.slice(0, 3).map(s => `${new Date(s.date + 'T12:00:00Z').toLocaleDateString('en-US', { weekday: 'short' })} ${s.shift_name}`).join(', ')}${myShifts.length > 3 ? ` +${myShifts.length - 3} more` : ''}`
-          : `${companyName}: No shifts scheduled for ${weekLabel}.`;
+      try {
+        const smsBody = emp.contact_email
+          ? `${companyName}: Your schedule for ${weekLabel} has been posted. Check your email for details.`
+          : hasShifts
+            ? `${companyName} schedule ${weekLabel}: ${myShifts.slice(0, 3).map(s => `${new Date(s.date + 'T12:00:00Z').toLocaleDateString('en-US', { weekday: 'short' })} ${s.shift_name}`).join(', ')}${myShifts.length > 3 ? ` +${myShifts.length - 3} more` : ''}`
+            : `${companyName}: No shifts scheduled for ${weekLabel}.`;
 
-      await sendSms({ to: emp.contact_phone, from: aegisSmsChannel, body: smsBody, company_id: contact.company_id });
-      texted++;
+        const ok = await sendSms({ to: emp.contact_phone, from: aegisSmsChannel, body: smsBody, company_id: companyId });
+        if (ok) {
+          texted++;
+          empTexted = true;
+        } else {
+          errors.push({ employee_id: emp.id, reason: 'sms send returned false' });
+        }
+      } catch (err) {
+        errors.push({ employee_id: emp.id, reason: `sms send failed: ${err instanceof Error ? err.message : String(err)}` });
+      }
     }
 
     if (!emp.contact_email && !emp.contact_phone) {
-      noContact.push(emp.name);
+      no_contact.push(emp.name);
+      errors.push({ employee_id: emp.id, reason: 'no contact_email or contact_phone on file' });
+    } else if (empEmailed || empTexted) {
+      sent++;
+      await logActivity({
+        company_id: companyId,
+        action: 'schedule_distributed_to_employee',
+        entity_type: 'employee',
+        entity_id: emp.id,
+        summary: `${emp.name} received schedule for ${weekLabel} (${[empEmailed ? 'email' : null, empTexted ? 'sms' : null].filter(Boolean).join('+')})`,
+        metadata: {
+          schedule_id: scheduleRow.id,
+          channels: { email: empEmailed, sms: empTexted },
+        },
+      });
     }
   }
 
@@ -1337,30 +1376,76 @@ ${hasShifts ? `<p style="color:#374151;">Total: <strong>${totalHours}h</strong> 
     distributed_at: new Date().toISOString(),
   }).eq('id', scheduleRow.id);
 
-  if (noContact.length > 0) {
+  if (no_contact.length > 0) {
     await logActivity({
-      company_id: contact.company_id,
+      company_id: companyId,
       action: 'schedule_distribute_partial',
       entity_type: 'schedule',
       entity_id: scheduleRow.id,
-      summary: `Schedule distributed — ${noContact.length} employee(s) could not be notified (no contact info)`,
-      metadata: { employees_missing_contact: noContact },
+      summary: `Schedule distributed — ${no_contact.length} employee(s) could not be notified (no contact info)`,
+      metadata: { employees_missing_contact: no_contact },
     });
   }
 
   await logActivity({
-    company_id: contact.company_id,
+    company_id: companyId,
     action: 'schedule_distributed',
     entity_type: 'schedule',
     entity_id: scheduleRow.id,
     summary: `Schedule for ${weekLabel} distributed — ${emailed} emails, ${texted} texts sent`,
-    metadata: { week: weekLabel, emailed, texted, no_contact: noContact },
+    metadata: { week: weekLabel, emailed, texted, no_contact, errors: errors.length },
   });
 
-  const lines = [`Schedule for ${weekLabel} has been sent.`];
-  lines.push(`${emailed} employee${emailed !== 1 ? 's' : ''} emailed, ${texted} notified by SMS.`);
-  if (noContact.length > 0) {
-    lines.push(`⚠ Could not notify ${noContact.length} employee${noContact.length !== 1 ? 's' : ''} (no contact info on file): ${noContact.join(', ')}`);
+  return {
+    sent,
+    total_employees: employees.length,
+    errors,
+    emailed,
+    texted,
+    no_contact,
+    week_label: weekLabel,
+  };
+}
+
+// ── Distribute handler ────────────────────────────────────────────────────────
+
+export async function handleDistributeSchedule(
+  message: InboundMessage,
+  contact: VerifiedContact,
+  extracted: Record<string, unknown>
+): Promise<void> {
+  void extracted;
+  type ScheduleRow = { id: string };
+  let scheduleRow: ScheduleRow | null = null;
+
+  const { data: pubData } = await supabase
+    .from('schedules').select('id')
+    .eq('company_id', contact.company_id).eq('status', 'published')
+    .order('generated_at', { ascending: false }).limit(1).maybeSingle();
+
+  if (pubData) {
+    scheduleRow = pubData as ScheduleRow;
+  } else {
+    const { data: draftData } = await supabase
+      .from('schedules').select('id')
+      .eq('company_id', contact.company_id).eq('status', 'draft')
+      .order('generated_at', { ascending: false }).limit(1).maybeSingle();
+    if (draftData) scheduleRow = draftData as ScheduleRow;
+  }
+
+  if (!scheduleRow) {
+    await reply(contact, message,
+      "No schedule found to distribute. Ask Aegis to build a schedule first."
+    );
+    return;
+  }
+
+  const result = await distributeScheduleCore(scheduleRow.id, contact.company_id);
+
+  const lines = [`Schedule for ${result.week_label} has been sent.`];
+  lines.push(`${result.emailed} employee${result.emailed !== 1 ? 's' : ''} emailed, ${result.texted} notified by SMS.`);
+  if (result.no_contact.length > 0) {
+    lines.push(`⚠ Could not notify ${result.no_contact.length} employee${result.no_contact.length !== 1 ? 's' : ''} (no contact info on file): ${result.no_contact.join(', ')}`);
   }
 
   await reply(contact, message, lines.join('\n'));

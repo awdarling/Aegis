@@ -4,6 +4,7 @@ import { env } from './config/env';
 import { emailWebhook } from './webhooks/email';
 import { smsWebhook } from './webhooks/sms';
 import { decisionWebhook } from './webhooks/decision';
+import { internalRouter } from './webhooks/internal';
 import { startCoverageTimeoutScheduler } from './scheduler/coverage-timeout';
 import { startPayrollScheduler } from './scheduler/payroll-scheduler';
 
@@ -29,6 +30,10 @@ app.use('/webhooks/email', emailWebhook);
 
 // Manager approve/deny clicks from time-off notification emails
 app.use('/webhooks/decision', decisionWebhook);
+
+// Internal endpoints called by Homebase /api/aegis-action dispatcher after
+// magic-link consumption. Bearer-token auth via AEGIS_INTERNAL_SECRET.
+app.use('/internal', internalRouter);
 
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', service: 'aegis' });

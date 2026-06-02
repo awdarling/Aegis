@@ -18,6 +18,16 @@ process.on('uncaughtException', (err) => {
 
 const app = express();
 
+app.use((req, res, next) => {
+  console.log('[req]', req.method, req.path, {
+    ua: req.get('user-agent') || 'none',
+    ct: req.get('content-type') || 'none',
+    cl: req.get('content-length') || 'none',
+    ip: req.ip,
+  });
+  next();
+});
+
 // Raw body needed for Twilio signature verification — must come before json()
 app.use(
   '/webhooks/sms',

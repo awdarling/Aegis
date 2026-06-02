@@ -40,14 +40,26 @@ export function verifyTwilioSignature(req: Request, res: Response, next: NextFun
   next();
 }
 
-// SendGrid Inbound Parse does not provide a cryptographic signature on the
-// multipart webhook payload. We rely on:
-//   1. The webhook URL being a secret path
-//   2. Twilio-style sender verification at the application layer
-// If SendGrid Event Webhook (separate from Inbound Parse) is used later,
-// add ECDSA verification here using SENDGRID_WEBHOOK_VERIFICATION_KEY.
-export function verifySendGridRequest(_req: Request, _res: Response, next: NextFunction): void {
-  // No cryptographic verification available for SendGrid Inbound Parse.
-  // Application-layer sender verification in verifySender() is the gate.
-  next();
+// SendGrid Inbound Parse is not signed, so we allowlist by source IP.
+// Behind Railway's proxy, req.ip is the proxy's internal IP — the real
+// client IP arrives via x-forwarded-for. Fall back to req.ip when XFF
+// is absent (e.g., local curl tests).
+export function verifySendGridRequest(req: Request, res: Response, next: NextFunction): void {
+  const xff = req.get('x-forwarded-for');
+  const sourceIp = xff ? xff.split(',')[0].trim() : (req.ip || '');
+
+  if (process.env.SKIP_SENDGRID_VERIFICATION === 'true') {
+    console.log('[sendgrid-verify] skipped via env var');
+    next();
+    return;
+  }
+
+  if (sourceIp.startsWith('159.26.')) {
+    console.log(`[sendgrid-verify] ip allowlisted: ${sourceIp}`);
+    next();
+    return;
+  }
+
+  console.log(`[sendgrid-verify] rejecting request from ${sourceIp}`);
+  res.status(403).send('Forbidden: source IP not allowlisted');
 }

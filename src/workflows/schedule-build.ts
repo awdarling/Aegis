@@ -1006,8 +1006,8 @@ export async function handleBuildSchedule(
       : `Got it. Building your schedule now — I'll send the full breakdown over in just a moment.`;
     await sendInThreadAck({ message, contact, bodyText });
     // Brief delay so the ack arrives before the schedule result email.
-    // SendGrid + Outlook deliver within ~1s normally; 3s gives clear separation.
-    await new Promise((resolve) => setTimeout(resolve, 3000));
+    // SendGrid + Outlook deliver within ~1s normally; 5s gives clear separation.
+    await new Promise((resolve) => setTimeout(resolve, 5000));
   }
 
   const { data: policyRows } = await supabase

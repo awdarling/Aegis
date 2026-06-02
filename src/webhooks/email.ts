@@ -55,6 +55,25 @@ emailWebhook.post(
       return;
     }
 
+    // SPF/DKIM gate — From: is trivially spoofable without this.
+    // Policy: accept if EITHER SPF or DKIM passes (handles forwarded mail
+    // where one verdict fails). SendGrid Inbound Parse sets these fields.
+    const spf = (body['SPF'] ?? '').trim().toLowerCase();
+    const dkimRaw = (body['dkim'] ?? '').trim();
+    const dkimPassed = dkimRaw.includes(': pass}') || dkimRaw.includes(' pass');
+
+    if (spf !== 'pass' && !dkimPassed) {
+      console.log('[email-auth] rejecting unauthenticated email', {
+        sender,
+        recipient: recipientAddress,
+        spf,
+        dkim: dkimRaw,
+      });
+      return;
+    }
+
+    console.log('[email-auth] authenticated', { sender, spf, dkim: dkimRaw });
+
     const message: InboundMessage = {
       sender,
       recipient: recipientAddress,

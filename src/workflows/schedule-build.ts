@@ -996,6 +996,30 @@ export async function handleBuildSchedule(
   contact: VerifiedContact,
   extracted: Record<string, unknown>
 ): Promise<void> {
+  // Conversational ack on email so the manager sees an immediate in-thread
+  // reply while the build runs. The rich HTML result email follows below
+  // as a separate, non-threaded send.
+  if (message.channel === 'email') {
+    const firstName = contact.name?.trim().split(/\s+/)[0] ?? '';
+    const ackBody = firstName
+      ? `Got it, ${firstName}. Building your schedule now — I'll send the full breakdown over in just a moment.`
+      : `Got it. Building your schedule now — I'll send the full breakdown over in just a moment.`;
+    const ackSubject = message.raw_subject
+      ? `Re: ${message.raw_subject}`
+      : 'Re: Your message to Aegis';
+    await sendEmail({
+      to: message.sender,
+      subject: ackSubject,
+      text: ackBody,
+      company_id: contact.company_id,
+      thread_id: message.thread_id,
+    });
+    console.log('[schedule-build-email] sent acknowledgment reply', {
+      to: message.sender,
+      thread_id: message.thread_id,
+    });
+  }
+
   const { data: policyRows } = await supabase
     .from('policies')
     .select('*')

@@ -17,9 +17,13 @@ emailWebhook.post(
   verifySendGridRequest,
   upload.any(),
   async (req, res) => {
+    console.log('[email-trace] handler entered', { bodyKeys: Object.keys(req.body || {}) });
+
     // Respond immediately — SendGrid will retry on non-2xx
+    console.log('[email-trace] responding', { status: 200 });
     res.status(200).send('ok');
 
+    console.log('[email-trace] body parsing start');
     const body = req.body as Record<string, string>;
 
     const senderRaw = body['from'] ?? body['sender'] ?? '';
@@ -35,8 +39,21 @@ emailWebhook.post(
 
     const sender = extractEmailAddress(senderRaw).toLowerCase();
     const recipientAddress = extractFirstEmailAddress(recipient).toLowerCase();
+    console.log('[email-trace] body parsing complete', {
+      hasSender: !!sender,
+      hasRecipient: !!recipientAddress,
+      hasText: !!text,
+      subjectLen: subject.length,
+    });
 
-    if (!sender || !recipientAddress || !text) return;
+    if (!sender || !recipientAddress || !text) {
+      console.log('[email-trace] returning early — missing required field', {
+        hasSender: !!sender,
+        hasRecipient: !!recipientAddress,
+        hasText: !!text,
+      });
+      return;
+    }
 
     const message: InboundMessage = {
       sender,
@@ -47,11 +64,15 @@ emailWebhook.post(
       thread_id: messageId,
     };
 
+    console.log('[email-trace] calling verifySender', { sender, recipient: recipientAddress });
     const verification = await verifySender(message);
+    console.log('[email-trace] verifySender complete', { ok: verification.ok });
     if (!verification.ok) {
+      console.log('[email-trace] returning early — verification failed');
       return;
     }
 
+    console.log('[email-trace] calling saveConversation', { company_id: verification.contact.company_id });
     await saveConversation({
       company_id: verification.contact.company_id,
       channel: 'email',
@@ -62,8 +83,11 @@ emailWebhook.post(
       subject,
       thread_id: messageId,
     });
+    console.log('[email-trace] saveConversation complete');
 
+    console.log('[email-trace] calling routeIntent');
     await routeIntent(message, verification.contact);
+    console.log('[email-trace] routeIntent complete — handler done');
   }
 );
 

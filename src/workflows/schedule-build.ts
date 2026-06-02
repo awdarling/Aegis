@@ -1,6 +1,6 @@
 import { supabase } from '../db/client';
 import { logActivity } from '../logger/activity-log';
-import { reply } from '../messaging/reply';
+import { reply, sendInThreadAck } from '../messaging/reply';
 import { sendEmail } from '../messaging/email';
 import { sendSms } from '../messaging/sms';
 import { computeWageEstimate } from '../lib/schedule-simulator';
@@ -1001,24 +1001,10 @@ export async function handleBuildSchedule(
   // as a separate, non-threaded send.
   if (message.channel === 'email') {
     const firstName = contact.name?.trim().split(/\s+/)[0] ?? '';
-    const ackBody = firstName
+    const bodyText = firstName
       ? `Got it, ${firstName}. Building your schedule now — I'll send the full breakdown over in just a moment.`
       : `Got it. Building your schedule now — I'll send the full breakdown over in just a moment.`;
-    const ackSubject = message.raw_subject
-      ? `Re: ${message.raw_subject}`
-      : 'Re: Your message to Aegis';
-    await sendEmail({
-      to: message.sender,
-      subject: ackSubject,
-      text: ackBody,
-      company_id: contact.company_id,
-      thread_id: message.thread_id,
-    });
-    console.log('[schedule-build-email] sent acknowledgment reply', {
-      to: message.sender,
-      thread_id: message.thread_id,
-    });
-
+    await sendInThreadAck({ message, contact, bodyText });
     // Brief delay so the ack arrives before the schedule result email.
     // SendGrid + Outlook deliver within ~1s normally; 3s gives clear separation.
     await new Promise((resolve) => setTimeout(resolve, 3000));

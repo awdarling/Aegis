@@ -68,3 +68,31 @@ export async function reply(
     thread_id: originalMessage.thread_id,
   });
 }
+
+// In-thread acknowledgment for email-only intents (no-op on SMS). Callers
+// own the body text and any post-send delay so different intents can tune
+// timing independently.
+export async function sendInThreadAck(params: {
+  message: InboundMessage;
+  contact: VerifiedContact;
+  bodyText: string;
+}): Promise<void> {
+  if (params.message.channel !== 'email') return;
+
+  const subject = params.message.raw_subject
+    ? `Re: ${params.message.raw_subject}`
+    : 'Re: Your message to Aegis';
+
+  await sendEmail({
+    to: params.message.sender,
+    subject,
+    text: params.bodyText,
+    company_id: params.contact.company_id,
+    thread_id: params.message.thread_id,
+  });
+
+  console.log('[ack] sent in-thread reply', {
+    to: params.message.sender,
+    thread_id: params.message.thread_id,
+  });
+}

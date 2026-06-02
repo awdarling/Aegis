@@ -1018,6 +1018,10 @@ export async function handleBuildSchedule(
       to: message.sender,
       thread_id: message.thread_id,
     });
+
+    // Brief delay so the ack arrives before the schedule result email.
+    // SendGrid + Outlook deliver within ~1s normally; 3s gives clear separation.
+    await new Promise((resolve) => setTimeout(resolve, 3000));
   }
 
   const { data: policyRows } = await supabase

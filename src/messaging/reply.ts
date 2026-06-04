@@ -3,6 +3,13 @@ import { sendSms } from './sms';
 import { sendEmail } from './email';
 import type { InboundMessage, VerifiedContact } from '../security/types';
 
+// Collapse any chain of leading "Re:" (case/space-insensitive) to a single
+// "Re: " — clients otherwise stack them on each round-trip ("Re: Re: Re:").
+export function normalizeReSubject(raw: string): string {
+  const stripped = raw.replace(/^(?:\s*re\s*:\s*)+/i, '').trim();
+  return `Re: ${stripped}`;
+}
+
 async function lookupContactEmail(contact: VerifiedContact): Promise<string | null> {
   if (contact.role === 'quria_admin') {
     return contact.quria_staff_email ?? null;
@@ -60,7 +67,7 @@ export async function reply(
   await sendEmail({
     to: originalMessage.sender,
     subject: originalMessage.raw_subject
-      ? `Re: ${originalMessage.raw_subject}`
+      ? normalizeReSubject(originalMessage.raw_subject)
       : 'Re: Your message to Aegis',
     text,
     html,
@@ -80,7 +87,7 @@ export async function sendInThreadAck(params: {
   if (params.message.channel !== 'email') return;
 
   const subject = params.message.raw_subject
-    ? `Re: ${params.message.raw_subject}`
+    ? normalizeReSubject(params.message.raw_subject)
     : 'Re: Your message to Aegis';
 
   await sendEmail({

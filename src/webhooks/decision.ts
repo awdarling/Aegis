@@ -3,6 +3,7 @@ import { supabase } from '../db/client';
 import { logActivity } from '../logger/activity-log';
 import { sendEmail } from '../messaging/email';
 import { sendSms } from '../messaging/sms';
+import { normalizeReSubject } from '../messaging/reply';
 import { executeScheduleSwap } from '../workflows/shift-swap';
 import { computeWageEstimate } from '../lib/schedule-simulator';
 import type { Employee } from '../db/types';
@@ -11,7 +12,10 @@ export const decisionWebhook = Router();
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
-// Time-off token — decision_type is always normalised to 'time_off' on parse
+// Time-off token — decision_type is always normalised to 'time_off' on parse.
+// thread_id/raw_subject carry the inbound email's Message-ID and Subject so
+// the approve/deny notice to the employee threads back into the original
+// conversation. Both are null for SMS submissions.
 interface TimeOffDecisionToken {
   decision_type: 'time_off';
   action: 'approve' | 'deny';
@@ -22,6 +26,8 @@ interface TimeOffDecisionToken {
   employee_channel: 'sms' | 'email';
   employee_contact: string;
   aegis_sms_channel: string | null;
+  thread_id?: string | null;
+  raw_subject?: string | null;
   expires_at: string;
 }
 
@@ -118,11 +124,15 @@ async function notifyEmployee(
       company_id: token.company_id,
     });
   } else if (token.employee_channel === 'email') {
+    const subject = token.raw_subject
+      ? normalizeReSubject(token.raw_subject)
+      : `Your time-off request has been ${verb}`;
     await sendEmail({
       to: token.employee_contact,
-      subject: `Your time-off request has been ${verb}`,
+      subject,
       text: messageText,
       company_id: token.company_id,
+      thread_id: token.thread_id ?? undefined,
     });
   }
 }

@@ -717,6 +717,8 @@ async function notifyManager(
     employee_channel: pending.channel,
     employee_contact: pending.sender,
     aegis_sms_channel: aegisSmsNumber,
+    thread_id: pending.thread_id ?? null,
+    raw_subject: pending.raw_subject ?? null,
     expires_at: tokenExpiry,
   };
 

@@ -90,6 +90,13 @@ interface PendingManagerAvailApproval {
   availability_raw: string;
   employee_sender: string;
   employee_recipient: string;
+  // Channel + threading metadata for the eventual approve/deny notice. Captured
+  // from the employee's inbound YES (handleAvailabilityConfirmResponse) so the
+  // manager-decision reply lands on the same channel + thread as the employee
+  // started on. thread_id/raw_subject are null for SMS submissions.
+  employee_channel: 'sms' | 'email';
+  thread_id?: string | null;
+  raw_subject?: string | null;
   expires_at: string;
 }
 
@@ -1720,6 +1727,9 @@ export async function handleAvailabilityConfirmResponse(
 
   const approval: PendingManagerAvailApproval = {
     ...pending,
+    employee_channel: message.channel,
+    thread_id: message.thread_id ?? null,
+    raw_subject: message.raw_subject ?? null,
     expires_at: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
   };
 
@@ -1806,12 +1816,10 @@ export async function handleManagerAvailabilityApproval(
     });
 
     await reply(contact, message, `${pending.employee_name}'s availability has been updated.`);
-    await sendSms({
-      to: pending.employee_sender,
-      from: pending.employee_recipient,
-      body: `Your availability update has been approved. Your new schedule reflects the change.`,
-      company_id: pending.company_id,
-    });
+    await notifyEmployeeOfAvailabilityDecision(
+      pending,
+      `Your availability update has been approved. Your new schedule reflects the change.`
+    );
   } else {
     await logActivity({
       company_id: contact.company_id,
@@ -1823,13 +1831,39 @@ export async function handleManagerAvailabilityApproval(
     });
 
     await reply(contact, message, `${pending.employee_name}'s availability update has been denied.`);
-    await sendSms({
-      to: pending.employee_sender,
-      from: pending.employee_recipient,
-      body: `Your availability update was not approved. Please speak with your manager directly if you'd like to discuss.`,
-      company_id: pending.company_id,
-    });
+    await notifyEmployeeOfAvailabilityDecision(
+      pending,
+      `Your availability update was not approved. Please speak with your manager directly if you'd like to discuss.`
+    );
   }
+}
+
+// Send the approve/deny notice back to the employee on their original channel.
+// Reconstructs the inbound-message context from the persisted pending row so
+// reply() does the channel branching (sendSms for SMS; threaded sendEmail with
+// normalized Re: subject for email).
+async function notifyEmployeeOfAvailabilityDecision(
+  pending: PendingManagerAvailApproval,
+  bodyText: string
+): Promise<void> {
+  const employeeMessage: InboundMessage = {
+    sender: pending.employee_sender,
+    recipient: pending.employee_recipient,
+    body: '',
+    channel: pending.employee_channel,
+    raw_subject: pending.raw_subject ?? undefined,
+    thread_id: pending.thread_id ?? undefined,
+  };
+  const employeeContact: VerifiedContact = {
+    role: 'employee',
+    company_id: pending.company_id,
+    employee_id: pending.employee_id,
+    user_id: null,
+    name: pending.employee_name,
+    matched_identifier: pending.employee_sender,
+    channel: pending.employee_channel,
+  };
+  await reply(employeeContact, employeeMessage, bodyText);
 }
 
 // ── Proactive expiry (called by scheduler) ────────────────────────────────────

@@ -57,6 +57,7 @@ export interface Database {
           created_at: string;
           individual_wage: number | null;
           is_veteran: boolean | null;
+          aegis_access?: 'manager' | 'employee' | 'blocked' | null;
         };
       };
       availability: {

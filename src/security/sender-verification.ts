@@ -69,7 +69,7 @@ async function lookupContact(
   const [empResult, userResult] = await Promise.all([
     supabase
       .from('employees')
-      .select('id, name, contact_phone, contact_email, company_id, active')
+      .select('id, name, contact_phone, contact_email, company_id, active, aegis_access')
       .eq('company_id', companyId)
       .or(`contact_phone.eq.${sender},contact_email.eq.${sender}`)
       .eq('active', true)
@@ -83,11 +83,17 @@ async function lookupContact(
   ]);
 
   if (empResult.data) {
+    // aegis_access is the Homebase "Aegis Access" dial — source of truth for
+    // Aegis authority, deliberately separate from users.role. Unknown/null
+    // values default to 'employee' (least privilege).
+    const access = empResult.data.aegis_access ?? 'employee';
+    if (access === 'blocked') return null;
+
     return {
-      role: 'employee',
+      role: access === 'manager' ? 'manager' : 'employee',
       company_id: companyId,
       employee_id: empResult.data.id,
-      user_id: null,
+      user_id: userResult.data?.id ?? null,
       name: empResult.data.name,
       matched_identifier: sender,
       channel,

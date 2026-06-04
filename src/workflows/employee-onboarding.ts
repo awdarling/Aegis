@@ -1720,12 +1720,12 @@ export async function handleAvailabilityConfirmResponse(
 
   const aegisSmsChannel = (chData as { channel_value: string } | null)?.channel_value;
 
-  // Channel-aware manager notification. Prefer SMS when the manager has a
-  // phone and the company has an outbound SMS channel (preserves existing
-  // behavior for SMS-using tenants); otherwise fall back to email. Mirrors
-  // time-off's notifyManager pattern — channel selected from what's reachable,
-  // then routed through reply() against a synthetic InboundMessage so the
-  // SMS vs email branching lives in one place.
+  // Channel-aware manager notification. Email-first to match the email-first
+  // launch and the time-off workflow's manager-notify default: prefer email
+  // when manager.email exists, fall back to SMS only when there's no email
+  // but a phone + outbound SMS channel are reachable. Routed through reply()
+  // against a synthetic InboundMessage so SMS vs email branching lives in
+  // one place.
   const smsAvailable = !!(managerPhone && aegisSmsChannel);
   const emailAvailable = !!manager.email;
 
@@ -1766,7 +1766,7 @@ export async function handleAvailabilityConfirmResponse(
     `CURRENT:\n${currentDisplay}\n\nPROPOSED:\n${proposedDisplay}\n\n` +
     `Reply YES to approve or NO to deny.`;
 
-  const managerChannel: 'sms' | 'email' = smsAvailable ? 'sms' : 'email';
+  const managerChannel: 'sms' | 'email' = emailAvailable ? 'email' : 'sms';
   const managerMessage: InboundMessage = {
     sender: managerChannel === 'sms' ? managerPhone! : manager.email,
     recipient: managerChannel === 'sms' ? aegisSmsChannel! : '',

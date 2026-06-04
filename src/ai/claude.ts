@@ -177,6 +177,58 @@ ${companyContext}
 Today's date is ${today} in the company's local timezone.
 All extracted dates must use the current year (${currentYear}) unless the user explicitly specifies a different year. If the user says "June 5", resolve it as ${currentYear}-06-05.
 
+## Time-off vs. availability change — critical disambiguation
+
+"Off" requests can be a one-time time-off request (submit_time_off) or a
+recurring availability change (update_availability). Pick by the date signal:
+
+- submit_time_off — anchored to a SPECIFIC calendar date or near-term occurrence:
+  - explicit date / ordinal: "June 20", "the 20th", "July 3rd", "the 5th"
+  - relative dates: "today", "tomorrow", "this Friday", "next Friday", "next week"
+  - a single upcoming day-of-week: "Friday off" (means the upcoming Friday)
+  - one date or a single contiguous range; informal phrasings count
+- update_availability — RECURRING/PERMANENT change to when the employee can work:
+  - plural day-of-week or day-period: "Tuesdays", "Friday mornings",
+    "Thursday nights", "weekend mornings", "Mondays"
+  - permanence markers: "anymore", "from now on", "for good", "no more",
+    "every", "always", "going forward", "starting next week"
+  - "take me off [day-of-week or day-period]" with NO calendar date
+  - the request describes a pattern, not an event
+
+If a message contains BOTH a specific calendar date AND availability-sounding
+language, the specific date wins → submit_time_off.
+
+## Informal / indirect phrasing
+
+Teen/informal register is common (lowercase, no punctuation, slang). Map:
+- "gimme X off", "im out X", "off X", "out X" → submit_time_off
+- "cant work X", "cant come in X", "cant make it X" → submit_time_off when X is a date
+- "gotta leave early X", "cant come in till Y on X" → partial day-off
+- "im sick", "cant make it today" → submit_time_off for today (${today})
+- "can someone cover", "trade shifts", "swap" → initiate_swap
+- "yeah" / "yep" / "ok" / "sure" by itself → respond_swap_accept
+- "nah" / "no" / "no wait" / "never mind" by itself → respond_swap_decline
+- Indirect partials: when the user states what they CAN do, the rest of the day
+  is the off-window. "busy the morning of June 21st. I can work at night though"
+  → partial, period_label="morning" (NOT "evening").
+
+## Examples
+
+User: "take me off thursday nights"
+{"intent":"update_availability","confidence":"high","extracted":{}}
+
+User: "i cant do tuesday mornings anymore"
+{"intent":"update_availability","confidence":"high","extracted":{}}
+
+User: "gimme june 20 off"
+{"intent":"submit_time_off","confidence":"high","extracted":{"dates":[{"start_date":"${currentYear}-06-20","end_date":"${currentYear}-06-20","time_off_type":"full_day","period_label":null,"start_time":null,"end_time":null}],"reason":null}}
+
+User: "cant work the morning of july 3"
+{"intent":"submit_time_off","confidence":"high","extracted":{"dates":[{"start_date":"${currentYear}-07-03","end_date":"${currentYear}-07-03","time_off_type":"partial","period_label":"morning","start_time":null,"end_time":null}],"reason":null}}
+
+User: "I'm busy the morning of June 21st. I can work at night though"
+{"intent":"submit_time_off","confidence":"high","extracted":{"dates":[{"start_date":"${currentYear}-06-21","end_date":"${currentYear}-06-21","time_off_type":"partial","period_label":"morning","start_time":null,"end_time":null}],"reason":null}}
+
 Respond with ONLY valid JSON in this exact shape — no markdown, no explanation:
 {
   "intent": "<intent_name>",

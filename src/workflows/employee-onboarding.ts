@@ -11,7 +11,7 @@ import { supabase } from '../db/client';
 import { logActivity } from '../logger/activity-log';
 import { sendSms } from '../messaging/sms';
 import { sendEmail } from '../messaging/email';
-import { reply } from '../messaging/reply';
+import { reply, sendInThreadAck } from '../messaging/reply';
 import { env } from '../config/env';
 import { withAnthropicRetry } from '../ai/claude';
 import type { InboundMessage, VerifiedContact } from '../security/types';
@@ -1585,6 +1585,18 @@ export async function handleUpdateAvailability(
   contact: VerifiedContact,
   _extracted: Record<string, unknown>
 ): Promise<void> {
+  // Conversational ack on email so the employee sees an immediate in-thread
+  // reply while the availability parse runs. The YES/NO confirmation follows
+  // in the same thread; delay ensures the ack lands first.
+  if (message.channel === 'email') {
+    const firstName = contact.name?.trim().split(/\s+/)[0] ?? '';
+    const bodyText = firstName
+      ? `Got it, ${firstName}. Looking at your availability update now — back to you in just a moment.`
+      : `Got it. Looking at your availability update now — back to you in just a moment.`;
+    await sendInThreadAck({ message, contact, bodyText });
+    await new Promise((resolve) => setTimeout(resolve, 5000));
+  }
+
   const employeeId = contact.employee_id!;
   const bounds = await loadShiftBounds(contact.company_id);
 

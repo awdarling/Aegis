@@ -106,9 +106,15 @@ export const QURIA_INTENTS = [
 export async function classifyIntent(
   message: string,
   role: 'employee' | 'manager' | 'quria_admin',
-  companyContext: string
+  companyContext: string,
+  companyTimezone: string
 ): Promise<ClassifyResult> {
-  const systemPrompt = buildClassifySystemPrompt(role, companyContext);
+  // Anchor relative-date resolution (e.g. "Friday", "June 5") to today in the
+  // company's local timezone. Without this the model has no reliable date
+  // reference and frequently resolves bare month-day phrases to the prior year.
+  const today = new Intl.DateTimeFormat('en-CA', { timeZone: companyTimezone }).format(new Date());
+  const currentYear = today.slice(0, 4);
+  const systemPrompt = buildClassifySystemPrompt(role, companyContext, today, currentYear);
 
   const response = await withAnthropicRetry(() =>
     client.messages.create({
@@ -152,7 +158,9 @@ export async function generateReply(
 
 function buildClassifySystemPrompt(
   role: 'employee' | 'manager' | 'quria_admin',
-  companyContext: string
+  companyContext: string,
+  today: string,
+  currentYear: string
 ): string {
   const allowedIntents: readonly string[] =
     role === 'quria_admin' ? QURIA_INTENTS :
@@ -165,6 +173,9 @@ The sender is a ${role}. Classify their message into exactly one intent.
 Allowed intents: ${allowedIntents.join(', ')}, unknown
 
 ${companyContext}
+
+Today's date is ${today} in the company's local timezone.
+All extracted dates must use the current year (${currentYear}) unless the user explicitly specifies a different year. If the user says "June 5", resolve it as ${currentYear}-06-05.
 
 Respond with ONLY valid JSON in this exact shape — no markdown, no explanation:
 {

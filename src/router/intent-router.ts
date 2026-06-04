@@ -241,8 +241,8 @@ async function routeIntentInner(
   }
 
   // Classify intent — each role gets its own allowed intent list
-  const companyContext = await loadCompanyContext(contact.company_id);
-  const classification = await classifyIntent(message.body, contact.role, companyContext);
+  const { text: companyContext, timezone: companyTimezone } = await loadCompanyContext(contact.company_id);
+  const classification = await classifyIntent(message.body, contact.role, companyContext, companyTimezone);
 
   console.log('[router] classified', {
     intent: classification.intent,
@@ -408,7 +408,7 @@ async function routeIntentInner(
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-async function loadCompanyContext(companyId: string): Promise<string> {
+async function loadCompanyContext(companyId: string): Promise<{ text: string; timezone: string }> {
   const [companyRes, profileRes] = await Promise.all([
     supabase
       .from('companies')
@@ -425,15 +425,17 @@ async function loadCompanyContext(companyId: string): Promise<string> {
   const company = companyRes.data;
   const profile = profileRes.data;
 
+  const timezone = company?.timezone ?? 'America/New_York';
+
   const lines = [
-    `Company: ${company?.name ?? 'Unknown'} (timezone: ${company?.timezone ?? 'America/New_York'})`,
+    `Company: ${company?.name ?? 'Unknown'} (timezone: ${timezone})`,
   ];
   if (company?.industry) lines.push(`Industry: ${company.industry}`);
   if (profile?.business_type) lines.push(`Business type: ${profile.business_type}`);
   if (profile?.operating_hours) lines.push(`Operating hours: ${profile.operating_hours}`);
   if (profile?.manager_priorities) lines.push(`Manager priorities: ${profile.manager_priorities}`);
 
-  return lines.join('\n');
+  return { text: lines.join('\n'), timezone };
 }
 
 async function logSecurityUnauthorized(

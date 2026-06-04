@@ -209,6 +209,28 @@ If verification rejects legitimate mail at this point → bug, investigate the I
 
 ---
 
+## Phase 6.5 — Email deliverability hardening (DELIV-1)
+
+**Objective**: Outbound email from `aegis.quriasolutions.com` must land in employee inboxes, not spam folders. Discovered during sandbox testing — every first-contact send to Gmail addresses landed in spam.
+
+**Why it matters**: Watermark launch involves a 30-person fan-out via `distribute_schedule`. If most land in spam, employees miss shifts.
+
+### Work
+- [ ] Verify SPF record for `aegis.quriasolutions.com` includes SendGrid sending IPs (DNS lookup)
+- [ ] Verify DKIM signing is configured on outbound — check SendGrid Sender Authentication dashboard
+- [ ] Configure DMARC record (start at `p=none` with reporting, escalate to `p=quarantine` once monitoring confirms clean send pattern)
+- [ ] Set up SendGrid event webhook for delivery/bounce/spam monitoring — log to a `email_events` table for ongoing visibility
+- [ ] Plan sender warm-up for first Watermark fan-out: instead of 30 simultaneous sends, stagger over 24-48 hours OR send to small groups first to build domain reputation
+- [ ] Document the warm-up procedure in this file as a runbook
+
+### Stop and test
+- [ ] Send a test email from sandbox to a fresh Gmail address that has no prior relationship with `aegis.quriasolutions.com`. Verify it lands in inbox, not spam.
+- [ ] Repeat for Outlook/Hotmail, iCloud, Yahoo addresses (cover the four most common providers Watermark employees might use)
+
+**Done when**: ≥80% of first-contact sends to major providers land in primary inbox, not spam.
+
+---
+
 ## Phase 7 — Risky workflow staged validation
 
 **Objective**: Validate the workflows that fan out to real Watermark employees. These cannot be tested in sandbox — they require real production data and real recipients.
@@ -266,6 +288,51 @@ VALUES
 
 Apply this regardless of BUG-1 fix — once BUG-1 is fixed and TOs create successfully, this seed lets us test the simulator and violation flagging end-to-end.
 
+### BUG-3: Wrong Homebase URL in outbound emails — LAUNCH BLOCKER
+
+Discovered June 4 during sandbox TO test. Confirmation email from Aegis to employee contained a link to `https://homebase-liart.vercel.app/` — not the production URL `https://homebase-nine-phi.vercel.app/`. The `liart` URL is almost certainly an old Vercel preview deployment.
+
+**Impact**: every Aegis-outbound email linking to Homebase is broken. Manager Approve/Deny magic-link buttons would 404 in production. Affects Watermark as well as sandbox.
+
+**Investigation**:
+- [ ] Grep `src/` for `homebase-liart`, `homebase-nine-phi`, and `HOMEBASE_URL`
+- [ ] Inspect Railway env: `HOMEBASE_URL` value — likely the source
+- [ ] Identify any hardcoded fallbacks in code
+- [ ] Centralize URL into a single source-of-truth (env var with no fallback, fail loudly if unset in production)
+
+### BUG-4: Employee-facing emails reference Homebase — UX bug
+
+Discovered alongside BUG-3. Employee TO confirmation email contains a "View in Homebase" CTA. Employees do not have Homebase access — this CTA is meaningless and confusing for the employee recipient.
+
+**Design rule** (carry forward to all email work): Homebase references and CTAs belong only in manager-facing email templates. Employee-facing email is conversational, action-oriented, and never points to portal infrastructure they can't access.
+
+**Investigation**:
+- [ ] Grep `src/` for `View in Homebase` or similar phrases
+- [ ] Audit every employee-facing email template (submit_time_off confirmation, time_off approved/denied, schedule distribution, swap requests/responses, emergency coverage outreach, onboarding messages) for Homebase references
+- [ ] Replace with employee-relevant copy ("Your manager will respond shortly" or similar) or remove entirely
+- [ ] Verify manager-facing emails are unaffected — they SHOULD contain Homebase links
+
+Best fixed in the same Claude Code session as BUG-3 since both touch overlapping files (email templates, URL config).
+
+### BUG-5: Stale pending TO blocks new requests silently — UX gap
+
+Discovered during the date-injection diagnostic. When an employee has an unconsumed pending TO confirmation in `aegis_memory` (e.g., from an earlier submission they never confirmed), any new TO submission gets short-circuited: the new submission lands in the router but is dropped because the early-return on `pending_time_off_confirmation` fires.
+
+User-visible effect: employee submits a new TO request → no response from Aegis at all → no log to user that anything is wrong.
+
+Correct behavior options (decide one):
+1. **Auto-cancel stale pending** when a new TO submission arrives, then process the new one.
+2. **Notify the employee**: "You have a pending request from [date]. Reply YES to confirm that one, or START OVER to cancel it and submit a new one."
+3. **Auto-expire pending** after a shorter window (currently 1 hour TTL — maybe shorten to 30 minutes, plus better surfacing).
+
+Recommended: option 2. Most respectful of user intent; no silent state mutation.
+
+#### Work
+- [ ] Locate the `pending_time_off_confirmation` early-return in `src/router/intent-router.ts`
+- [ ] When a `submit_time_off` intent arrives with an existing pending, branch to a notification flow instead of silent return
+- [ ] Send the "you have a pending request" reply
+- [ ] Add an explicit cancellation keyword handler (e.g., "START OVER", "CANCEL PENDING")
+
 ---
 
 ## Tier reference — where each known item stands
@@ -283,7 +350,11 @@ Apply this regardless of BUG-1 fix — once BUG-1 is fixed and TOs create succes
 | All email intents using ack pattern | TODO | Phases 1–3 |
 | End-to-end test every intent | TODO | Phases 2–3 |
 | Tenant-aware outbound From + threading | TODO | Phase 4.5 |
-| TO creation blocked by missing shift_requirements (BUG-1) | TODO | HOTFIX before Phase 4.5 |
+| TO creation blocked by missing shift_requirements (BUG-1) | DONE | Fixed and deployed June 4 |
+| Wrong Homebase URL in outbound emails (BUG-3) | TODO | HOTFIX before launch |
+| Employee emails reference Homebase (BUG-4) | TODO | Fix with BUG-3 |
+| Stale pending TO blocks new requests silently (BUG-5) | TODO | Before Phase 6 smoke |
+| Email deliverability hardening (DELIV-1) | TODO | Phase 6.5 — before Phase 7 fan-out |
 
 ### Tier 2 (nice-to-have, post-launch)
 
@@ -304,6 +375,12 @@ Apply this regardless of BUG-1 fix — once BUG-1 is fixed and TOs create succes
 | Orphan smoke data in `aegis_action_tokens` | `manager-smoke@test.local`, fake schedule UUID |
 | Generalize ack pattern to SMS? | Decision needed — does "Got it, building..." via SMS add value or just double message volume? |
 | Multi-turn email conversations | Aegis remembers context across replies — currently each reply is classified fresh |
+| Multi-TO request feature (TO-R2.5) | One email with N distinct TO requests → N separate TO records, one manager email with N action items each having its own Approve/Deny tokens. 7 sub-changes identified (intent extraction array, pending storage as array, confirmation flow, TO loop insert, manager email per-item rendering, per-item magic-link tokens, per-item violations) |
+| Manager TO violation warning UI (TO-R4) | Homebase Time Off tab: when a manager creates a TO that violates company rules, show warning with override capability. Manager-created TOs bypass enforcement but should surface violations explicitly. |
+| Full TO email regression test cycle (TO-R5) | End-to-end happy path + edge cases test once BUG-3/BUG-4/TENANT-1/BUG-5 are all closed. Covers: submit, confirm, approve, deny, query my TO, multi-day, partial day, rule violations, magic-link expiry. |
+| Test identity creation workflow doc | Document the Supabase Dashboard auth-user creation procedure + employee/manager record setup. Tied to TEST_IDENTITIES.md reference. |
+| Sandbox tenant seeding pattern | When a new tenant onboards (real or test), document the SQL/setup required: company row, company_channels, manager auth user + public.users row, sample employees, shift_requirements seed. |
+| Verify `shift_requirements.accepted_roles` usage | Before starting Role Groups feature work, audit the codebase to determine whether the scheduler already reads `accepted_roles` (column exists ahead of feature). Avoids reimplementing existing logic. |
 
 ---
 
@@ -336,3 +413,7 @@ Reminders carried forward from prior sessions, do not violate during this work:
 - Alexander's work email (awdarling@quriasolutions.com) is quria_admin, not an employee — `submit_time_off` and other employee intents won't work from his address without test setup
 - The "feels like a person" tone bar applies to every Aegis-generated string. No "request received." No "processing intent." No "standby."
 - One Soteria action per response (Homebase rule, but worth remembering — same care applies to email response shape)
+- Always verify column names via `information_schema.columns` before writing any INSERT or UPDATE — reference docs lag behind production schema (see SCHEMA_DRIFT_LOG.md)
+- Claude-driven intent classifiers do NOT know the current date reliably — every classifier system prompt must inject today's date explicitly. Year-drift bugs (e.g., extracting "June 5" as 2025-06-05 instead of 2026-06-05) are a recurring class. Fix pattern: timezone-aware date injection via `Intl.DateTimeFormat('en-CA', { timeZone: companyTimezone })`.
+- Homebase references and CTAs belong only in manager-facing email templates. Employee emails are conversational and never link to portal infrastructure employees can't access.
+- Decision criteria for reference doc refresh sprint (the 6 .docx files in /mnt/project): trigger when (a) Aegis is live with Watermark and a second client onboarding starts, OR (b) SCHEMA_DRIFT_LOG.md exceeds ~15 entries, OR (c) a significant new feature (like Role Groups) requires designing against current schema, OR (d) someone other than Alexander joins the project.

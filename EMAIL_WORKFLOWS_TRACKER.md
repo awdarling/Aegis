@@ -138,6 +138,36 @@ The reply should be processed exactly as a fresh email would be — intent class
 
 ---
 
+## Phase 4.5 — Tenant-aware outbound + reply threading
+
+**Objective**: Outbound emails must use the From address matching the tenant's inbound channel, propagate Reply-To, and maintain email threading via In-Reply-To/References headers so conversations stay in one Gmail/Outlook thread.
+
+**Why now**: Discovered during sandbox testing (June 4). When sandbox-tenant employees reply to Aegis, Gmail auto-fills the From address (aegis@aegis.quriasolutions.com — Watermark's channel). Reply gets rejected because the sender doesn't exist on Watermark. Cross-tenant isolation works correctly, but the From address routes replies to the wrong tenant. Within a single tenant, threading also needs verification — confirmation chains may be breaking out of the original thread.
+
+### Work
+
+- [ ] Audit current `sendEmail()` signature in `src/messaging/email.ts`
+- [ ] Modify signature to accept `companyId` (or precomputed `fromAddress`)
+- [ ] Look up tenant's email channel from `company_channels` (channel_type='email')
+- [ ] Use that address as the `From` header on outbound
+- [ ] Set `Reply-To` header to the same address (belt and suspenders for clients that distinguish)
+- [ ] Verify In-Reply-To and References headers propagate on every outbound reply
+- [ ] Audit every `sendEmail` call site and pass tenant context — handlers, workflows, notification helpers
+- [ ] Verify subject preservation (with "Re:" prefix) for thread continuity
+
+### Stop and test
+
+1. Send a fresh TO request from sandbox employee
+2. Confirm From address on confirmation reply equals `sandbox@aegis.quriasolutions.com`
+3. Reply `yes` via Gmail Reply button (no manual address composition)
+4. Verify webhook receives at `sandbox@...` not `aegis@...`
+5. Verify conversation stays in a single Gmail thread (no thread splitting)
+6. Manager notification arrives in correctly threaded position for that tenant
+
+**Done when**: Sandbox test passes end-to-end using only the Reply button — no manual address composition needed, all messages threaded.
+
+---
+
 ## Phase 5 — Pre-launch cleanup
 
 **Objective**: Strip diagnostic noise and tighten security toggles before going live.
@@ -202,6 +232,42 @@ If verification rejects legitimate mail at this point → bug, investigate the I
 
 ---
 
+## Active Bugs (discovered during sandbox testing)
+
+### BUG-1: Time-off creation blocked when `shift_requirements` is empty — HOTFIX
+
+Discovered June 4. After replying `yes` to a TO confirmation, Aegis responded: "Your request has been noted, but the scheduling system doesn't have shift requirements configured yet. Please ask your manager to set up shift requirements in Homebase before submitting time-off requests."
+
+**Diagnostic confirmed**: no TO row inserted in `time_off_requests`, no manager notification sent. The guard prevents the entire flow.
+
+Time-off requests must be creatable independently of `shift_requirements`. Coverage simulation can be skipped silently if no shifts exist. The TO row must still insert and the manager must still be notified. Any brand-new client trying to submit TO during onboarding (before shifts are configured) hits this wall.
+
+**Priority**: must fix before continuing Phase 3 testing. Blocks all sandbox TO validation.
+
+#### Work
+- [ ] Locate the source of the error string in `handleConfirmPending`, `handleSubmitTimeOff`, or the schedule simulator
+- [ ] Determine whether the guard prevents TO insertion entirely or only blocks the simulator (sounds like the former)
+- [ ] Refactor: TO insertion must run regardless of `shift_requirements` presence
+- [ ] Simulator call should be wrapped: if no shifts exist, skip silently with internal log only, do not surface to user
+- [ ] Manager notification must dispatch regardless
+- [ ] Re-test the sandbox TO chain to confirm fix
+
+### BUG-2: Sandbox has no `shift_requirements` — data gap
+
+Not a code bug. Need to seed sandbox with a representative shift configuration so the simulator can be exercised in tests. Recommended seed:
+
+```sql
+INSERT INTO public.shift_requirements
+  (company_id, shift_name, role, required_count, start_time, end_time, days_active)
+VALUES
+  ('00000000-0000-0000-0000-000000000001', 'PM', 'Lifeguard', 1,
+   '15:00', '21:00', ARRAY[0,1,2,3,4,5,6]);
+```
+
+Apply this regardless of BUG-1 fix — once BUG-1 is fixed and TOs create successfully, this seed lets us test the simulator and violation flagging end-to-end.
+
+---
+
 ## Tier reference — where each known item stands
 
 ### Tier 0 (blocking for relaunch)
@@ -216,6 +282,8 @@ If verification rejects legitimate mail at this point → bug, investigate the I
 | Tighten DKIM regex | TODO | Phase 5 |
 | All email intents using ack pattern | TODO | Phases 1–3 |
 | End-to-end test every intent | TODO | Phases 2–3 |
+| Tenant-aware outbound From + threading | TODO | Phase 4.5 |
+| TO creation blocked by missing shift_requirements (BUG-1) | TODO | HOTFIX before Phase 4.5 |
 
 ### Tier 2 (nice-to-have, post-launch)
 

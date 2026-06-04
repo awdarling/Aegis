@@ -673,8 +673,7 @@ export async function handleInitiateSwap(
   if (!shift) {
     await reply(contact, message,
       `I couldn't find a shift for you on ${formatDisplayDate(shiftDate)}${shiftNameHint ? ` matching "${shiftNameHint}"` : ''}. ` +
-      'Please check that a schedule has been published for that week and that you\'re scheduled to work. ' +
-      'If needed, ask your manager to verify your schedule in Homebase.'
+      "Double-check the date, or reach out to your manager if you think there's a shift missing."
     );
     return;
   }

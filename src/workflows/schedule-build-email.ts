@@ -1,4 +1,5 @@
 import { generateActionToken } from '../lib/aegis-actions/tokens';
+import { getHomebaseUrl } from '../config/urls';
 import type {
   RunScheduleBuildResult,
   ScheduleAssignment,
@@ -32,12 +33,6 @@ export interface BuildScheduleResultEmail {
   subject: string;
   html: string;
   text: string;
-}
-
-const DEFAULT_HOMEBASE_URL = 'https://homebase-nine-phi.vercel.app';
-
-function getHomebaseUrl(): string {
-  return process.env.HOMEBASE_URL ?? DEFAULT_HOMEBASE_URL;
 }
 
 // ── Date helpers (local-time YYYY-MM-DD parsing only) ─────────────────────────

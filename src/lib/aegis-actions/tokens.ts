@@ -1,14 +1,12 @@
 import crypto from 'crypto';
 import { supabase } from '../../db/client';
+import { getHomebaseUrl } from '../../config/urls';
 import type {
   GenerateTokenParams,
   GenerateTokenResult,
 } from './types';
 
 const DEFAULT_TTL_MINUTES = 72 * 60;
-const DEFAULT_HOMEBASE_URL = 'https://homebase-nine-phi.vercel.app';
-
-let warnedMissingHomebaseUrl = false;
 
 export function hashToken(rawToken: string): string {
   return crypto.createHash('sha256').update(rawToken).digest('hex');
@@ -24,15 +22,7 @@ export function generateRawToken(): string {
 }
 
 export function buildActionUrl(rawToken: string): string {
-  const configured = process.env.HOMEBASE_URL;
-  if (!configured && !warnedMissingHomebaseUrl) {
-    warnedMissingHomebaseUrl = true;
-    console.warn(
-      `[aegis-actions] HOMEBASE_URL not set; falling back to ${DEFAULT_HOMEBASE_URL}`
-    );
-  }
-  const homebaseUrl = configured ?? DEFAULT_HOMEBASE_URL;
-  return `${homebaseUrl}/api/aegis-action?token=${encodeURIComponent(rawToken)}`;
+  return `${getHomebaseUrl()}/api/aegis-action?token=${encodeURIComponent(rawToken)}`;
 }
 
 export async function generateActionToken(

@@ -1188,8 +1188,8 @@ export async function handlePendingTimeOffConfirmation(
   await reply(
     contact,
     message,
-    `Your time-off request for ${dateDisplay} has been submitted and is pending manager approval. ` +
-      "You'll be notified once a decision has been made."
+    `Got it — I've sent your time-off for ${dateDisplay} to your manager. ` +
+      "I'll let you know as soon as they decide."
   );
 }
 

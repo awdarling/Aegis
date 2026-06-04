@@ -91,6 +91,13 @@ export async function routeIntent(
   message: InboundMessage,
   contact: VerifiedContact
 ): Promise<void> {
+  console.log('[router] entered', {
+    sender: message.sender,
+    recipient: message.recipient,
+    channel: message.channel,
+    body: message.body.slice(0, 120),
+    role: contact.role,
+  });
   try {
     await routeIntentInner(message, contact);
   } catch (err) {
@@ -124,6 +131,7 @@ async function routeIntentInner(
     const phoneSession = await getOnboardingSessionByPhone(message.sender);
     if (phoneSession) {
       await handleOnboardingResponse(message, contact, phoneSession);
+      console.log('[router] EARLY RETURN', { reason: 'onboarding_phone_session' });
       return;
     }
   }
@@ -135,6 +143,7 @@ async function routeIntentInner(
     const emailSession = await getOnboardingSessionByEmail(message.sender);
     if (emailSession) {
       await handleOnboardingResponse(message, contact, emailSession);
+      console.log('[router] EARLY RETURN', { reason: 'onboarding_email_session' });
       return;
     }
   }
@@ -144,36 +153,42 @@ async function routeIntentInner(
     const pendingTO = await getPendingTimeOff(contact.company_id, contact.employee_id);
     if (pendingTO) {
       await handlePendingTimeOffConfirmation(message, contact, pendingTO);
+      console.log('[router] EARLY RETURN', { reason: 'pending_time_off_confirmation' });
       return;
     }
 
     const activeOutreach = await getActiveOutreach(contact.company_id, contact.employee_id);
     if (activeOutreach) {
       await handleEmployeeCoverageResponse(message, contact, activeOutreach);
+      console.log('[router] EARLY RETURN', { reason: 'coverage_outreach_response' });
       return;
     }
 
     const swapOutreach = await getActiveSwapOutreach(contact.company_id, contact.employee_id);
     if (swapOutreach) {
       await handleSwapOutreachResponse(message, contact, swapOutreach);
+      console.log('[router] EARLY RETURN', { reason: 'swap_outreach_response' });
       return;
     }
 
     const pendingSwap = await getPendingSwap(contact.company_id, contact.employee_id);
     if (pendingSwap) {
       await handleSwapConfirmation(message, contact, pendingSwap);
+      console.log('[router] EARLY RETURN', { reason: 'pending_swap_confirmation' });
       return;
     }
 
     const pendingAvailConfirm = await getPendingAvailConfirm(contact.company_id, contact.employee_id);
     if (pendingAvailConfirm) {
       await handleAvailabilityConfirmResponse(message, contact, pendingAvailConfirm);
+      console.log('[router] EARLY RETURN', { reason: 'availability_confirm_response' });
       return;
     }
 
     const onboardingSession = await getOnboardingSession(contact.company_id, contact.employee_id);
     if (onboardingSession) {
       await handleOnboardingResponse(message, contact, onboardingSession);
+      console.log('[router] EARLY RETURN', { reason: 'onboarding_employee_session' });
       return;
     }
   }
@@ -188,6 +203,7 @@ async function routeIntentInner(
       );
       if (broadcastSession) {
         await handleBroadcastConfirmation(message, contact, broadcastSession);
+        console.log('[router] EARLY RETURN', { reason: 'broadcast_confirmation' });
         return;
       }
     }
@@ -195,18 +211,21 @@ async function routeIntentInner(
     const pendingEdit = await getPendingEdit(contact.company_id, contact.matched_identifier);
     if (pendingEdit) {
       await handleEditConfirmation(message, contact, pendingEdit);
+      console.log('[router] EARLY RETURN', { reason: 'pending_homebase_edit' });
       return;
     }
 
     const session = await getActiveCoverageSession(contact.company_id, contact.matched_identifier);
     if (session && session.state === 'awaiting_names') {
       await handleManagerCoverageReply(message, contact, session);
+      console.log('[router] EARLY RETURN', { reason: 'manager_coverage_reply' });
       return;
     }
 
     const pendingAvailApproval = await getPendingManagerAvailApproval(contact.company_id);
     if (pendingAvailApproval) {
       await handleManagerAvailabilityApproval(message, contact, pendingAvailApproval);
+      console.log('[router] EARLY RETURN', { reason: 'manager_avail_approval' });
       return;
     }
 
@@ -216,6 +235,7 @@ async function routeIntentInner(
     );
     if (pendingFanout) {
       await handleOnboardingFanoutConfirm(message, contact, pendingFanout);
+      console.log('[router] EARLY RETURN', { reason: 'onboarding_fanout_confirm' });
       return;
     }
   }

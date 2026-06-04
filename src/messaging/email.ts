@@ -1,13 +1,16 @@
-// AEGIS_REPLY_TO_EMAIL — env var that sets the Reply-To header on every
-// outbound email so replies thread back through SendGrid Inbound Parse on the
-// dedicated subdomain. Defaults to aegis@aegis.quriasolutions.com when unset.
+// From is always the authenticated apex sender (env.SENDGRID_FROM_EMAIL, e.g.
+// aegis@quriasolutions.com) so SPF/DKIM/DMARC stay aligned for every tenant.
+// Reply-To is per-tenant: company_channels.channel_value when present, else
+// AEGIS_REPLY_TO_EMAIL — that's how replies route back via SendGrid Inbound
+// Parse on the tenant's subdomain.
 import sgMail from '@sendgrid/mail';
 import { env } from '../config/env';
+import { supabase } from '../db/client';
 import { saveConversation } from '../logger/conversation';
 
 sgMail.setApiKey(env.SENDGRID_API_KEY);
 
-const REPLY_TO_EMAIL = process.env.AEGIS_REPLY_TO_EMAIL ?? 'aegis@aegis.quriasolutions.com';
+const FALLBACK_REPLY_TO_EMAIL = process.env.AEGIS_REPLY_TO_EMAIL ?? 'aegis@aegis.quriasolutions.com';
 
 interface EmailOptions {
   to: string;
@@ -16,6 +19,22 @@ interface EmailOptions {
   html?: string;
   company_id: string;
   thread_id?: string;
+}
+
+async function resolveTenantEmailAddress(companyId: string): Promise<string | null> {
+  const { data, error } = await supabase
+    .from('company_channels')
+    .select('channel_value')
+    .eq('company_id', companyId)
+    .eq('channel_type', 'email')
+    .limit(1)
+    .maybeSingle();
+
+  if (error) {
+    console.warn('[email] company_channels lookup error:', error.message);
+    return null;
+  }
+  return (data as { channel_value: string } | null)?.channel_value ?? null;
 }
 
 function escapeHtml(s: string): string {
@@ -39,6 +58,15 @@ export function htmlFromText(text: string): string {
 }
 
 export async function sendEmail(options: EmailOptions): Promise<void> {
+  const tenantReplyTo = await resolveTenantEmailAddress(options.company_id);
+  if (!tenantReplyTo) {
+    console.warn(
+      `[email] no company_channels email row for company_id ${options.company_id}; ` +
+      `falling back to AEGIS_REPLY_TO_EMAIL`
+    );
+  }
+  const replyToAddress = tenantReplyTo ?? FALLBACK_REPLY_TO_EMAIL;
+
   try {
     await sgMail.send({
       to: options.to,
@@ -46,7 +74,7 @@ export async function sendEmail(options: EmailOptions): Promise<void> {
         email: env.SENDGRID_FROM_EMAIL,
         name: env.SENDGRID_FROM_NAME,
       },
-      replyTo: REPLY_TO_EMAIL,
+      replyTo: replyToAddress,
       subject: options.subject,
       text: options.text,
       html: options.html ?? htmlFromText(options.text),

@@ -4,7 +4,7 @@ import { logActivity } from '../logger/activity-log';
 import { reply } from '../messaging/reply';
 import { sendEmail } from '../messaging/email';
 import { sendSms } from '../messaging/sms';
-import { generateReply } from '../ai/claude';
+import { classifyIntent, generateReply } from '../ai/claude';
 import { runSimulation, getWeekBounds, loadTimeOffPolicies as loadAllTimeOffPolicies } from '../lib/schedule-simulator';
 import { computeTimeOffViolations } from '../lib/time-off-policies';
 import { env } from '../config/env';
@@ -969,7 +969,45 @@ export async function handlePendingTimeOffConfirmation(
   contact: VerifiedContact,
   pending: PendingTimeOff
 ): Promise<void> {
-  const body = message.body.trim().toLowerCase();
+  const trimmed = message.body.trim();
+
+  // Explicit cancel must precede the yes/no regex below — "cancel" alone
+  // matches the looser NO regex and would otherwise be funneled into the
+  // restate path instead of getting a distinct "cleared" reply.
+  if (/^\s*(start\s*over|cancel\s+pending)\b/i.test(trimmed)) {
+    await clearPendingTimeOff(contact.company_id, contact.employee_id!);
+    await reply(
+      contact,
+      message,
+      "Cleared that pending one. Send me the new dates whenever you're ready."
+    );
+    return;
+  }
+
+  // Classify before yes/no: a new submit_time_off (e.g. "ok so I need Friday
+  // off") would otherwise match the YES regex on its leading word and silently
+  // consume the OLD pending while dropping the new dates.
+  const { data: companyData } = await supabase
+    .from('companies')
+    .select('timezone')
+    .eq('id', contact.company_id)
+    .single();
+  const companyTimezone =
+    (companyData as { timezone: string | null } | null)?.timezone ?? 'America/New_York';
+  const classification = await classifyIntent(message.body, contact.role, '', companyTimezone);
+
+  if (classification.intent === 'submit_time_off') {
+    const dateDisplay = formatDateRange(pending.start_date, pending.end_date);
+    await reply(
+      contact,
+      message,
+      `Looks like you've already got a time-off request waiting — ${dateDisplay}. ` +
+        `Reply "yes" to send that one over to your manager, or "start over" to cancel it and submit a new one.`
+    );
+    return;
+  }
+
+  const body = trimmed.toLowerCase();
 
   const isYes =
     /^(yes|yeah|yep|y\b|correct|confirmed|confirm|that'?s right|right|ok|okay|sure)/.test(body);
@@ -980,7 +1018,7 @@ export async function handlePendingTimeOffConfirmation(
     await reply(
       contact,
       message,
-      'Please reply "yes" to confirm your time-off request or "no" to resubmit with correct details.'
+      'Reply "yes" to confirm your time-off request, "no" to resubmit with different details, or "start over" to cancel it.'
     );
     return;
   }
@@ -990,7 +1028,7 @@ export async function handlePendingTimeOffConfirmation(
     await reply(
       contact,
       message,
-      'No problem! Please restate your time-off request with the correct dates and reason.'
+      'No problem — go ahead and restate your time-off with the correct dates and reason.'
     );
     return;
   }

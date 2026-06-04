@@ -5,12 +5,14 @@ import { reply } from '../messaging/reply';
 import { sendEmail } from '../messaging/email';
 import { sendSms } from '../messaging/sms';
 import { generateReply } from '../ai/claude';
-import { runSimulation, getWeekBounds, loadTimeOffPolicies } from '../lib/schedule-simulator';
+import { runSimulation, getWeekBounds, loadTimeOffPolicies as loadAllTimeOffPolicies } from '../lib/schedule-simulator';
+import { computeTimeOffViolations } from '../lib/time-off-policies';
 import { env } from '../config/env';
 import { buildTimeOffManagerEmail, type TimeOffRecommendation } from './time-off-manager-email';
 import type { InboundMessage, VerifiedContact } from '../security/types';
 import type { Employee, PartialDayDetail, Policy, TimeOffRequest } from '../db/types';
 import type { SimulationResult } from '../lib/schedule-simulator';
+import type { TimeOffViolations } from '../lib/time-off-policies';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -308,6 +310,27 @@ async function generateTimeOffRecommendation(
 
 // ── Manager email builder ─────────────────────────────────────────────────────
 
+// Returns the bullet lines for the Policy Considerations section, or [] when
+// the section should be omitted entirely (no violations, or no policies set).
+function formatViolationLines(violations: TimeOffViolations | null): string[] {
+  if (!violations) return [];
+  const lines: string[] = [];
+  if (violations.consecutiveDays?.exceeded) {
+    const v = violations.consecutiveDays;
+    lines.push(
+      `Consecutive days off: ${v.totalSpan}-day contiguous block (combined with adjacent approved TOs), exceeding the ${v.limit}-day company limit.`
+    );
+  }
+  if (violations.notice?.insufficient) {
+    const v = violations.notice;
+    const dayWord = (n: number) => `${n} day${n === 1 ? '' : 's'}`;
+    lines.push(
+      `Notice period: Submitted ${dayWord(v.daysGiven)} before start date, less than the ${dayWord(v.daysRequired)} minimum.`
+    );
+  }
+  return lines;
+}
+
 function buildManagerEmail(params: {
   employeeName: string;
   managerName: string;
@@ -320,6 +343,7 @@ function buildManagerEmail(params: {
   approveUrl: string;
   denyUrl: string;
   policies: Policy[];
+  violations: TimeOffViolations | null;
 }): { subject: string; text: string; html: string } {
   const {
     employeeName,
@@ -333,7 +357,9 @@ function buildManagerEmail(params: {
     approveUrl,
     denyUrl,
     policies,
+    violations,
   } = params;
+  const violationLines = formatViolationLines(violations);
 
   const dateDisplay = formatDateRange(startDate, endDate);
   const subject = `Time-Off Request — ${employeeName} (${formatShortDate(startDate)}${startDate !== endDate ? ` – ${formatShortDate(endDate)}` : ''})`;
@@ -344,6 +370,13 @@ function buildManagerEmail(params: {
     '',
     `${employeeName} has submitted a time-off request.`,
     '',
+    ...(violationLines.length > 0
+      ? [
+          '── POLICY CONSIDERATIONS ──',
+          ...violationLines.map(l => `• ${l}`),
+          '',
+        ]
+      : []),
     `Employee:  ${employeeName}`,
     `Dates:     ${dateDisplay}`,
     `Reason:    ${reason}`,
@@ -439,6 +472,15 @@ function buildManagerEmail(params: {
 
 <h2 style="margin:0 0 4px;font-size:20px;">Time-Off Request</h2>
 <p style="margin:0 0 24px;color:#6b7280;font-size:14px;">Submitted by ${employeeName} and reviewed by Aegis</p>
+
+${
+  violationLines.length > 0
+    ? `<div style="background:#fffbeb;border:1px solid #fde68a;border-left:4px solid #d97706;padding:14px 16px;margin:0 0 24px;border-radius:4px;">
+  <p style="margin:0 0 8px;font-weight:bold;font-size:14px;color:#92400e;">&#9888; Policy Considerations</p>
+  <ul style="margin:0;padding-left:20px;color:#92400e;font-size:14px;">${violationLines.map(l => `<li style="margin:2px 0;">${l}</li>`).join('')}</ul>
+</div>`
+    : ''
+}
 
 <table style="width:100%;border-collapse:collapse;margin-bottom:24px;">
   <tr><td style="padding:8px 12px;background:#f9fafb;font-weight:bold;width:100px;border:1px solid #e5e7eb;">Employee</td><td style="padding:8px 12px;border:1px solid #e5e7eb;">${employeeName}</td></tr>
@@ -599,7 +641,8 @@ async function notifyManager(
   pending: PendingTimeOff,
   requestId: string,
   stage1: SimulationResult,
-  stage2: SimulationResult | null
+  stage2: SimulationResult | null,
+  violations: TimeOffViolations | null
 ): Promise<void> {
   // Find first manager/owner for this company
   const { data: managerData } = await supabase
@@ -639,7 +682,7 @@ async function notifyManager(
     (channelData as { channel_value: string } | null)?.channel_value ?? null;
 
   // Load time-off policies for the email
-  const policies = await loadTimeOffPolicies(companyId);
+  const policies = await loadAllTimeOffPolicies(companyId);
 
   // Create decision tokens (approve and deny are separate tokens)
   const approveToken = randomUUID();
@@ -709,6 +752,7 @@ async function notifyManager(
     approveUrl,
     denyUrl,
     policies,
+    violations,
   });
 
   await sendEmail({
@@ -750,7 +794,8 @@ async function notifyManagersByEmail(
   torRow: TimeOffRequest,
   pending: PendingTimeOff,
   stage1: SimulationResult,
-  stage2: SimulationResult | null
+  stage2: SimulationResult | null,
+  violations: TimeOffViolations | null
 ): Promise<{ emailed: number; total_managers: number }> {
   const { data: managersData } = await supabase
     .from('users')
@@ -776,7 +821,7 @@ async function notifyManagersByEmail(
   // network blip), skip the recommendation block instead of blocking the email.
   let recommendation: TimeOffRecommendation | undefined;
   try {
-    const policies = await loadTimeOffPolicies(companyId);
+    const policies = await loadAllTimeOffPolicies(companyId);
     const decision = await generateTimeOffRecommendation(
       employee,
       pending.start_date,
@@ -815,6 +860,7 @@ async function notifyManagersByEmail(
         manager_user_id: manager.id,
         simulation,
         recommendation,
+        violations,
       });
       await sendEmail({
         to: manager.email!,
@@ -1027,6 +1073,22 @@ export async function handlePendingTimeOffConfirmation(
     },
   });
 
+  // Compute advisory policy violations (consecutive-days chain + notice period).
+  // Does NOT block submission — violations are surfaced in the manager email
+  // so they can factor into the approve/deny decision.
+  let violations: TimeOffViolations | null = null;
+  try {
+    violations = await computeTimeOffViolations({
+      employee_id: employee.id,
+      start_date: pending.start_date,
+      end_date: pending.end_date,
+      company_id: contact.company_id,
+    });
+    console.log('[time-off] violations computed', violations);
+  } catch (err) {
+    console.warn('[time-off] violation computation failed; proceeding without:', err);
+  }
+
   // Notify manager (non-blocking — errors are caught and logged).
   // Email-channel submissions get the rich aegis_action_tokens magic-link
   // email; SMS-channel submissions stay on the existing notifyManager path
@@ -1064,10 +1126,11 @@ export async function handlePendingTimeOffConfirmation(
         torRow,
         pending,
         stage1,
-        stage2
+        stage2,
+        violations
       );
     } else {
-      await notifyManager(contact.company_id, employee, pending, requestId, stage1, stage2);
+      await notifyManager(contact.company_id, employee, pending, requestId, stage1, stage2, violations);
     }
   } catch (err) {
     console.error('[time-off] manager notification failed:', err);

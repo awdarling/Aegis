@@ -1,6 +1,7 @@
 import { generateActionToken } from '../lib/aegis-actions/tokens';
 import type { Employee, PartialDayDetail, TimeOffRequest } from '../db/types';
 import type { SimulationResult } from '../lib/schedule-simulator';
+import type { TimeOffViolations } from '../lib/time-off-policies';
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -20,6 +21,7 @@ export interface BuildTimeOffManagerEmailParams {
   manager_user_id?: string;
   simulation?: SimulationResult;
   recommendation?: TimeOffRecommendation;
+  violations?: TimeOffViolations | null;
 }
 
 export interface BuildTimeOffManagerEmail {
@@ -189,6 +191,39 @@ function requestDetailsHtml(
 </div>`;
 }
 
+// Returns the bullet text lines for the Policy Considerations section, or []
+// when nothing should be rendered (null violations, or all checks passed).
+function violationLines(violations: TimeOffViolations | null | undefined): string[] {
+  if (!violations) return [];
+  const out: string[] = [];
+  if (violations.consecutiveDays?.exceeded) {
+    const v = violations.consecutiveDays;
+    out.push(
+      `Consecutive days off: ${v.totalSpan}-day contiguous block (combined with adjacent approved TOs), exceeding the ${v.limit}-day company limit.`
+    );
+  }
+  if (violations.notice?.insufficient) {
+    const v = violations.notice;
+    const dayWord = (n: number) => `${n} day${n === 1 ? '' : 's'}`;
+    out.push(
+      `Notice period: Submitted ${dayWord(v.daysGiven)} before start date, less than the ${dayWord(v.daysRequired)} minimum.`
+    );
+  }
+  return out;
+}
+
+function policyConsiderationsHtml(lines: string[]): string {
+  if (lines.length === 0) return '';
+  const items = lines.map(l => `<li style="margin:0 0 6px;font-size:14px;color:#92400e;">${escapeHtml(l)}</li>`).join('');
+  return `
+<div style="margin:0 0 20px;">
+  <div style="font-size:13px;font-weight:600;color:#92400e;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px;">Policy considerations</div>
+  <div style="padding:14px 16px;background:#fffbeb;border:1px solid #fde68a;border-left:4px solid #d97706;border-radius:6px;">
+    <ul style="margin:0;padding-left:18px;">${items}</ul>
+  </div>
+</div>`;
+}
+
 function coverageImpactHtml(simulation: SimulationResult): string {
   const gaps = simulation.coverage_gaps;
   if (gaps.length === 0) {
@@ -276,6 +311,7 @@ function buildPlainText(params: {
   tor: TimeOffRequest;
   simulation?: SimulationResult;
   recommendation?: TimeOffRecommendation;
+  policyLines: string[];
   approveUrl: string;
   denyUrl: string;
   homebaseUrl: string;
@@ -285,6 +321,14 @@ function buildPlainText(params: {
   lines.push(`Time-off request — ${params.employeeName}`);
   lines.push(`Company: ${params.companyName}`);
   lines.push('');
+
+  if (params.policyLines.length > 0) {
+    lines.push('POLICY CONSIDERATIONS');
+    for (const l of params.policyLines) {
+      lines.push(`- ${l}`);
+    }
+    lines.push('');
+  }
 
   lines.push('REQUEST DETAILS');
   lines.push(`Dates: ${params.dateRange}`);
@@ -386,6 +430,8 @@ export async function buildTimeOffManagerEmail(
 
   const subject = `Time-off request from ${employee.name} — ${dateRange}`;
 
+  const policyLines = violationLines(params.violations);
+
   const html = `<!DOCTYPE html>
 <html><head><meta charset="utf-8"></head>
 <body style="margin:0;padding:0;background:#f3f4f6;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;color:#111827;">
@@ -395,6 +441,7 @@ export async function buildTimeOffManagerEmail(
       <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="640" style="max-width:640px;background:#ffffff;border-radius:8px;padding:28px;border:1px solid #e5e7eb;">
         <tr><td>
           ${headerSectionHtml(employee.name, dateRange)}
+          ${policyConsiderationsHtml(policyLines)}
           ${requestDetailsHtml(tor, dateRange)}
           ${params.simulation ? coverageImpactHtml(params.simulation) : ''}
           ${params.recommendation ? recommendationHtml(params.recommendation) : ''}
@@ -416,6 +463,7 @@ export async function buildTimeOffManagerEmail(
     tor,
     simulation: params.simulation,
     recommendation: params.recommendation,
+    policyLines,
     approveUrl: approveTok.url,
     denyUrl: denyTok.url,
     homebaseUrl,

@@ -224,6 +224,12 @@ async function routeIntentInner(
   const companyContext = await loadCompanyContext(contact.company_id);
   const classification = await classifyIntent(message.body, contact.role, companyContext);
 
+  console.log('[router] classified', {
+    intent: classification.intent,
+    confidence: classification.confidence,
+    extracted: classification.extracted,
+  });
+
   // Authorization: employee attempting a manager-only action
   if (contact.role === 'employee' && MANAGER_ONLY_INTENTS.has(classification.intent)) {
     await logSecurityUnauthorized(message, contact);
@@ -261,87 +267,108 @@ async function routeIntentInner(
   try {
     switch (classification.intent) {
       case 'submit_time_off':
+        console.log('[router] dispatching to handleSubmitTimeOff');
         await handleSubmitTimeOff(message, contact, classification.extracted);
         break;
 
       case 'query_my_time_off':
+        console.log('[router] dispatching to handleQueryMyTimeOff');
         await handleQueryMyTimeOff(message, contact, classification.extracted);
         break;
 
       case 'approve_time_off':
+        console.log('[router] dispatching to handleApproveTimeOff');
         await handleApproveTimeOff(message, contact, classification.extracted);
         break;
 
       case 'deny_time_off':
+        console.log('[router] dispatching to handleDenyTimeOff');
         await handleDenyTimeOff(message, contact, classification.extracted);
         break;
 
       case 'build_schedule':
+        console.log('[router] dispatching to handleBuildSchedule');
         await handleBuildSchedule(message, contact, classification.extracted);
         break;
 
       case 'initiate_swap':
+        console.log('[router] dispatching to handleInitiateSwap');
         await handleInitiateSwap(message, contact, classification.extracted);
         break;
 
       case 'respond_swap_accept':
+        console.log('[router] dispatching to handleRespondSwap (accept)');
         await handleRespondSwap(message, contact, classification.extracted, 'accept');
         break;
 
       case 'respond_swap_decline':
+        console.log('[router] dispatching to handleRespondSwap (decline)');
         await handleRespondSwap(message, contact, classification.extracted, 'decline');
         break;
 
       case 'approve_swap':
+        console.log('[router] dispatching to handleApproveSwap');
         await handleApproveSwap(message, contact, classification.extracted);
         break;
 
       case 'deny_swap':
+        console.log('[router] dispatching to handleDenySwap');
         await handleDenySwap(message, contact, classification.extracted);
         break;
 
       case 'request_emergency_coverage':
+        console.log('[router] dispatching to handleEmergencyCoverage');
         await handleEmergencyCoverage(message, contact, classification.extracted);
         break;
 
       case 'initiate_onboarding':
+        console.log('[router] dispatching to handleInitiateOnboarding');
         await handleInitiateOnboarding(message, contact, classification.extracted);
         break;
 
       case 'update_availability':
+        console.log('[router] dispatching to handleUpdateAvailability');
         await handleUpdateAvailability(message, contact, classification.extracted);
         break;
 
       case 'distribute_schedule':
+        console.log('[router] dispatching to handleDistributeSchedule');
         await handleDistributeSchedule(message, contact, classification.extracted);
         break;
 
       case 'homebase_edit':
+        console.log('[router] dispatching to handleHomebaseEdit');
         await handleHomebaseEdit(message, contact, classification.extracted);
         break;
 
       case 'run_payroll_check':
+        console.log('[router] dispatching to handlePayrollCheck');
         await handlePayrollCheck(message, contact, classification.extracted);
         break;
 
       case 'broadcast_message':
+        console.log('[router] dispatching to handleBroadcast');
         await handleBroadcast(message, contact, classification.extracted);
         break;
 
       case 'notify_day_closure':
+        console.log('[router] dispatching to handleNotifyDayClosure');
         await handleNotifyDayClosure(message, contact, classification.extracted);
         break;
 
       case 'quria_diagnostic':
+        console.log('[router] dispatching to quria_diagnostic (stub)');
         await reply(contact, message, 'Quria diagnostic is not yet implemented.');
         break;
 
       case 'operational_query':
       case 'general_question':
+        console.log('[router] dispatching to handleOperationalQuery');
         await handleOperationalQuery(message, contact, classification.extracted);
         break;
 
       default:
+        console.log('[router] dispatching to default (no matching intent)');
         await reply(
           contact,
           message,

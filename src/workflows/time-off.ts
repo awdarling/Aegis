@@ -337,9 +337,9 @@ function buildManagerEmail(params: {
   startDate: string;
   endDate: string;
   reason: string;
-  stage1: SimulationResult;
+  stage1: SimulationResult | null;
   stage2: SimulationResult | null;
-  recommendation: DecisionRecommendation;
+  recommendation: DecisionRecommendation | null;
   approveUrl: string;
   denyUrl: string;
   policies: Policy[];
@@ -364,7 +364,8 @@ function buildManagerEmail(params: {
   const dateDisplay = formatDateRange(startDate, endDate);
   const subject = `Time-Off Request — ${employeeName} (${formatShortDate(startDate)}${startDate !== endDate ? ` – ${formatShortDate(endDate)}` : ''})`;
 
-  // Plain text version
+  // Plain text version. Sim/alternates/recommendation sections are only
+  // rendered when the simulator ran (stage1 non-null).
   const text = [
     `Hi ${managerName},`,
     '',
@@ -381,39 +382,47 @@ function buildManagerEmail(params: {
     `Dates:     ${dateDisplay}`,
     `Reason:    ${reason}`,
     '',
-    '── STAGE 1: TARGET DAY(S) ──',
-    `Feasible: ${stage1.overall_feasible ? 'YES' : 'NO'}`,
-    `Coverage: ${stage1.coverage_rate_before.toFixed(1)}% → ${stage1.coverage_rate_after.toFixed(1)}%`,
-    stage1.coverage_gaps.length > 0
-      ? `Gaps: ${stage1.coverage_gaps.map(g => `${g.shift_name} (${g.role}) on ${g.date}, short ${g.shortfall}`).join('; ')}`
-      : 'No coverage gaps.',
-    '',
-    stage2
+    ...(stage1
       ? [
-          '── STAGE 2: FULL WEEK ──',
-          `Feasible: ${stage2.overall_feasible ? 'YES' : 'NO'}`,
-          `Coverage: ${stage2.coverage_rate_before.toFixed(1)}% → ${stage2.coverage_rate_after.toFixed(1)}%`,
-          stage2.coverage_gaps.length > 0
-            ? `Gaps: ${stage2.coverage_gaps.map(g => `${g.shift_name} (${g.role}) on ${g.date}, short ${g.shortfall}`).join('; ')}`
+          '── STAGE 1: TARGET DAY(S) ──',
+          `Feasible: ${stage1.overall_feasible ? 'YES' : 'NO'}`,
+          `Coverage: ${stage1.coverage_rate_before.toFixed(1)}% → ${stage1.coverage_rate_after.toFixed(1)}%`,
+          stage1.coverage_gaps.length > 0
+            ? `Gaps: ${stage1.coverage_gaps.map(g => `${g.shift_name} (${g.role}) on ${g.date}, short ${g.shortfall}`).join('; ')}`
             : 'No coverage gaps.',
-        ].join('\n')
-      : '── STAGE 2: NOT RUN (Stage 1 failed) ──',
-    '',
-    stage1.available_alternates.length > 0
-      ? `AVAILABLE ALTERNATES:\n${stage1.available_alternates.map(a => `  ${a.name} — ${a.qualified_roles.join(', ')} — available ${a.available_dates.join(', ')}`).join('\n')}`
-      : 'No alternates identified for affected shifts.',
-    '',
-    stage1.special_notes_affecting_period.length > 0
-      ? `SPECIAL NOTES:\n${stage1.special_notes_affecting_period.map(e => `  ${e.title}${e.staffing_notes ? ': ' + e.staffing_notes : ''}`).join('\n')}`
-      : '',
+          '',
+          stage2
+            ? [
+                '── STAGE 2: FULL WEEK ──',
+                `Feasible: ${stage2.overall_feasible ? 'YES' : 'NO'}`,
+                `Coverage: ${stage2.coverage_rate_before.toFixed(1)}% → ${stage2.coverage_rate_after.toFixed(1)}%`,
+                stage2.coverage_gaps.length > 0
+                  ? `Gaps: ${stage2.coverage_gaps.map(g => `${g.shift_name} (${g.role}) on ${g.date}, short ${g.shortfall}`).join('; ')}`
+                  : 'No coverage gaps.',
+              ].join('\n')
+            : '── STAGE 2: NOT RUN (Stage 1 failed) ──',
+          '',
+          stage1.available_alternates.length > 0
+            ? `AVAILABLE ALTERNATES:\n${stage1.available_alternates.map(a => `  ${a.name} — ${a.qualified_roles.join(', ')} — available ${a.available_dates.join(', ')}`).join('\n')}`
+            : 'No alternates identified for affected shifts.',
+          '',
+          stage1.special_notes_affecting_period.length > 0
+            ? `SPECIAL NOTES:\n${stage1.special_notes_affecting_period.map(e => `  ${e.title}${e.staffing_notes ? ': ' + e.staffing_notes : ''}`).join('\n')}`
+            : '',
+        ]
+      : []),
     policies.length > 0
       ? `COMPANY POLICIES (time-off):\n${policies.map(p => `  ${p.policy_key}: ${p.policy_value}${p.description ? ' — ' + p.description : ''}`).join('\n')}`
       : '',
     '',
-    `RECOMMENDATION: ${recommendation.recommendation.toUpperCase()}`,
-    recommendation.reasoning,
-    recommendation.policy_notes ? `Policy note: ${recommendation.policy_notes}` : '',
-    '',
+    ...(recommendation
+      ? [
+          `RECOMMENDATION: ${recommendation.recommendation.toUpperCase()}`,
+          recommendation.reasoning,
+          recommendation.policy_notes ? `Policy note: ${recommendation.policy_notes}` : '',
+          '',
+        ]
+      : []),
     `APPROVE: ${approveUrl}`,
     `DENY:    ${denyUrl}`,
     '',
@@ -423,8 +432,8 @@ function buildManagerEmail(params: {
     .join('\n');
 
   // HTML version
-  const recColor = recommendation.recommendation === 'approve' ? '#16a34a' : '#dc2626';
-  const recLabel = recommendation.recommendation === 'approve' ? 'APPROVE' : 'DENY';
+  const recColor = recommendation && recommendation.recommendation === 'approve' ? '#16a34a' : '#dc2626';
+  const recLabel = recommendation && recommendation.recommendation === 'approve' ? 'APPROVE' : 'DENY';
 
   const gapRows = (sim: SimulationResult) =>
     sim.coverage_gaps.length === 0
@@ -436,25 +445,28 @@ function buildManagerEmail(params: {
           )
           .join('');
 
-  const alternatesHtml =
-    (stage2 ?? stage1).available_alternates.length > 0
-      ? `<ul style="margin:8px 0;padding-left:20px;">${(stage2 ?? stage1).available_alternates
+  const altSource = stage2 ?? stage1;
+  const alternatesHtml = altSource
+    ? altSource.available_alternates.length > 0
+      ? `<ul style="margin:8px 0;padding-left:20px;">${altSource.available_alternates
           .map(
             a =>
               `<li><strong>${a.name}</strong> — ${a.qualified_roles.join(', ')} — available on ${a.available_dates.map(formatShortDate).join(', ')}</li>`
           )
           .join('')}</ul>`
-      : '<p style="color:#6b7280;">No alternates identified for affected shifts.</p>';
+      : '<p style="color:#6b7280;">No alternates identified for affected shifts.</p>'
+    : '';
 
-  const specialNotesHtml =
-    stage1.special_notes_affecting_period.length > 0
+  const specialNotesHtml = stage1
+    ? stage1.special_notes_affecting_period.length > 0
       ? `<ul style="margin:8px 0;padding-left:20px;">${stage1.special_notes_affecting_period
           .map(
             e =>
               `<li><strong>${e.title}</strong>${e.staffing_notes ? ': ' + e.staffing_notes : e.description ? ': ' + e.description : ''}</li>`
           )
           .join('')}</ul>`
-      : '<p style="color:#6b7280;">None for this period.</p>';
+      : '<p style="color:#6b7280;">None for this period.</p>'
+    : '';
 
   const policiesHtml =
     policies.length > 0
@@ -488,7 +500,9 @@ ${
   <tr><td style="padding:8px 12px;background:#f9fafb;font-weight:bold;border:1px solid #e5e7eb;">Reason</td><td style="padding:8px 12px;border:1px solid #e5e7eb;">${reason}</td></tr>
 </table>
 
-<h3 style="margin:0 0 8px;font-size:15px;border-bottom:2px solid #e5e7eb;padding-bottom:6px;">Stage 1 — Target Day(s)</h3>
+${
+  stage1
+    ? `<h3 style="margin:0 0 8px;font-size:15px;border-bottom:2px solid #e5e7eb;padding-bottom:6px;">Stage 1 — Target Day(s)</h3>
 <p style="margin:4px 0;">Status: <strong style="color:${stage1.overall_feasible ? '#16a34a' : '#dc2626'};">${stage1.overall_feasible ? '&#10003; Staffable' : '&#10007; Cannot cover'}</strong></p>
 <p style="margin:4px 0;color:#6b7280;font-size:13px;">Coverage: ${stage1.coverage_rate_before.toFixed(1)}% &rarr; ${stage1.coverage_rate_after.toFixed(1)}%</p>
 ${gapRows(stage1)}
@@ -506,16 +520,22 @@ ${gapRows(stage2)}`
 ${alternatesHtml}
 
 <h3 style="margin:20px 0 8px;font-size:15px;border-bottom:2px solid #e5e7eb;padding-bottom:6px;">Special Notes / Events</h3>
-${specialNotesHtml}
+${specialNotesHtml}`
+    : ''
+}
 
 <h3 style="margin:20px 0 8px;font-size:15px;border-bottom:2px solid #e5e7eb;padding-bottom:6px;">Time-Off Policies</h3>
 ${policiesHtml}
 
-<div style="background:#f9fafb;border:1px solid #e5e7eb;border-left:4px solid ${recColor};padding:16px;margin:24px 0;border-radius:4px;">
+${
+  recommendation
+    ? `<div style="background:#f9fafb;border:1px solid #e5e7eb;border-left:4px solid ${recColor};padding:16px;margin:24px 0;border-radius:4px;">
   <p style="margin:0 0 6px;font-weight:bold;font-size:15px;color:${recColor};">Aegis Recommendation: ${recLabel}</p>
   <p style="margin:0 0 6px;">${recommendation.reasoning}</p>
   ${recommendation.policy_notes ? `<p style="margin:0;color:#6b7280;font-size:13px;">${recommendation.policy_notes}</p>` : ''}
-</div>
+</div>`
+    : ''
+}
 
 <div style="text-align:center;margin:32px 0;">
   <a href="${approveUrl}" style="background:#16a34a;color:#fff;padding:12px 32px;text-decoration:none;border-radius:6px;font-weight:bold;font-size:15px;margin:0 8px;display:inline-block;">&#10003; Approve</a>
@@ -640,7 +660,7 @@ async function notifyManager(
   employee: Employee,
   pending: PendingTimeOff,
   requestId: string,
-  stage1: SimulationResult,
+  stage1: SimulationResult | null,
   stage2: SimulationResult | null,
   violations: TimeOffViolations | null
 ): Promise<void> {
@@ -719,25 +739,31 @@ async function notifyManager(
   const approveUrl = `${baseUrl}/webhooks/decision?action=approve&requestId=${requestId}&token=${approveToken}`;
   const denyUrl = `${baseUrl}/webhooks/decision?action=deny&requestId=${requestId}&token=${denyToken}`;
 
-  // Generate AI recommendation
-  const recommendation = await generateTimeOffRecommendation(
-    employee,
-    pending.start_date,
-    pending.end_date,
-    pending.reason,
-    stage1,
-    stage2,
-    policies
-  );
+  // Generate AI recommendation only when we have stage-1 coverage data; the
+  // recommendation prompt embeds simulation stats and would fail without them.
+  // When the simulator was skipped (no shift_requirements), the manager email
+  // still goes out — just without the recommendation section.
+  let recommendation: DecisionRecommendation | null = null;
+  if (stage1) {
+    recommendation = await generateTimeOffRecommendation(
+      employee,
+      pending.start_date,
+      pending.end_date,
+      pending.reason,
+      stage1,
+      stage2,
+      policies
+    );
 
-  // Persist recommendation so Homebase can display it
-  await supabase
-    .from('time_off_requests')
-    .update({
-      aegis_recommendation: recommendation.recommendation,
-      aegis_reasoning: recommendation.reasoning,
-    })
-    .eq('id', requestId);
+    // Persist recommendation so Homebase can display it
+    await supabase
+      .from('time_off_requests')
+      .update({
+        aegis_recommendation: recommendation.recommendation,
+        aegis_reasoning: recommendation.reasoning,
+      })
+      .eq('id', requestId);
+  }
 
   // Build and send manager email
   const { subject, text, html } = buildManagerEmail({
@@ -793,7 +819,7 @@ async function notifyManagersByEmail(
   employee: Employee,
   torRow: TimeOffRequest,
   pending: PendingTimeOff,
-  stage1: SimulationResult,
+  stage1: SimulationResult | null,
   stage2: SimulationResult | null,
   violations: TimeOffViolations | null
 ): Promise<{ emailed: number; total_managers: number }> {
@@ -816,36 +842,40 @@ async function notifyManagersByEmail(
     return { emailed: 0, total_managers: managers.length };
   }
 
-  // Generate the Aegis recommendation once. If Claude is unavailable or returns
-  // garbage, the helper has a structural fallback — but if it throws (e.g.
-  // network blip), skip the recommendation block instead of blocking the email.
+  // Generate the Aegis recommendation once, only when stage-1 coverage data
+  // exists — the recommendation prompt embeds simulation stats. When the
+  // simulator was skipped (no shift_requirements), skip the recommendation
+  // block but still send the manager email with everything else.
   let recommendation: TimeOffRecommendation | undefined;
-  try {
-    const policies = await loadAllTimeOffPolicies(companyId);
-    const decision = await generateTimeOffRecommendation(
-      employee,
-      pending.start_date,
-      pending.end_date,
-      pending.reason,
-      stage1,
-      stage2,
-      policies
-    );
-    recommendation = { type: decision.recommendation, reasoning: decision.reasoning };
+  if (stage1) {
+    try {
+      const policies = await loadAllTimeOffPolicies(companyId);
+      const decision = await generateTimeOffRecommendation(
+        employee,
+        pending.start_date,
+        pending.end_date,
+        pending.reason,
+        stage1,
+        stage2,
+        policies
+      );
+      recommendation = { type: decision.recommendation, reasoning: decision.reasoning };
 
-    await supabase
-      .from('time_off_requests')
-      .update({
-        aegis_recommendation: decision.recommendation,
-        aegis_reasoning: decision.reasoning,
-      })
-      .eq('id', torRow.id);
-  } catch (err) {
-    console.warn('[time-off] recommendation generation failed; sending without it:', err);
+      await supabase
+        .from('time_off_requests')
+        .update({
+          aegis_recommendation: decision.recommendation,
+          aegis_reasoning: decision.reasoning,
+        })
+        .eq('id', torRow.id);
+    } catch (err) {
+      console.warn('[time-off] recommendation generation failed; sending without it:', err);
+    }
   }
 
   // Prefer the full-week simulation (more context for the manager); fall back
-  // to the target-day simulation if Stage 2 didn't run.
+  // to the target-day simulation if Stage 2 didn't run. May be null when the
+  // simulator was skipped entirely.
   const simulation = stage2 ?? stage1;
 
   let emailed = 0;
@@ -858,7 +888,7 @@ async function notifyManagersByEmail(
         company_name: companyName,
         manager_email: manager.email!,
         manager_user_id: manager.id,
-        simulation,
+        simulation: simulation ?? undefined,
         recommendation,
         violations,
       });
@@ -986,10 +1016,13 @@ export async function handlePendingTimeOffConfirmation(
     return;
   }
 
-  // Stage 1: simulate the specific requested day(s)
-  let stage1: SimulationResult;
+  // Stage 1: simulate the specific requested day(s). If the company hasn't
+  // configured shift_requirements, the simulator throws NO_SHIFT_REQUIREMENTS;
+  // swallow that case and continue with stage1Result=null so TO creation isn't
+  // gated on scheduling setup. Coverage analysis is advisory, not a precondition.
+  let stage1Result: SimulationResult | null = null;
   try {
-    stage1 = await runSimulation({
+    stage1Result = await runSimulation({
       company_id: contact.company_id,
       period_start: pending.start_date,
       period_end: pending.end_date,
@@ -1002,31 +1035,39 @@ export async function handlePendingTimeOffConfirmation(
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     if (msg === 'NO_SHIFT_REQUIREMENTS') {
-      await reply(
-        contact,
-        message,
-        "Your request has been noted, but the scheduling system doesn't have shift requirements configured yet. " +
-          'Please ask your manager to set up shift requirements in Homebase before submitting time-off requests.'
-      );
-      return;
+      console.log('[time-off] stage-1 simulator skipped — no shift_requirements configured', {
+        company_id: contact.company_id,
+      });
+    } else {
+      throw err;
     }
-    throw err;
   }
 
-  // Stage 2: full week — only runs if Stage 1 passes
-  let stage2: SimulationResult | null = null;
-  if (stage1.overall_feasible) {
+  // Stage 2: full week — only runs if Stage 1 succeeded and is feasible.
+  let stage2Result: SimulationResult | null = null;
+  if (stage1Result && stage1Result.overall_feasible) {
     const { weekStart, weekEnd } = getWeekBounds(pending.start_date, pending.end_date);
-    stage2 = await runSimulation({
-      company_id: contact.company_id,
-      period_start: weekStart,
-      period_end: weekEnd,
-      new_time_off: {
-        employee_id: employee.id,
-        start_date: pending.start_date,
-        end_date: pending.end_date,
-      },
-    });
+    try {
+      stage2Result = await runSimulation({
+        company_id: contact.company_id,
+        period_start: weekStart,
+        period_end: weekEnd,
+        new_time_off: {
+          employee_id: employee.id,
+          start_date: pending.start_date,
+          end_date: pending.end_date,
+        },
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg === 'NO_SHIFT_REQUIREMENTS') {
+        console.log('[time-off] stage-2 simulator skipped — no shift_requirements configured', {
+          company_id: contact.company_id,
+        });
+      } else {
+        throw err;
+      }
+    }
   }
 
   // Log to Homebase — create time_off_request with status: pending
@@ -1066,10 +1107,10 @@ export async function handlePendingTimeOffConfirmation(
     summary: `${employee.name} submitted time-off request: ${pending.start_date} to ${pending.end_date}`,
     metadata: {
       reason: pending.reason,
-      stage1_feasible: stage1.overall_feasible,
-      stage2_feasible: stage2?.overall_feasible ?? null,
-      stage1_coverage_after: stage1.coverage_rate_after,
-      stage2_coverage_after: stage2?.coverage_rate_after ?? null,
+      stage1_feasible: stage1Result?.overall_feasible ?? null,
+      stage2_feasible: stage2Result?.overall_feasible ?? null,
+      stage1_coverage_after: stage1Result?.coverage_rate_after ?? null,
+      stage2_coverage_after: stage2Result?.coverage_rate_after ?? null,
     },
   });
 
@@ -1125,12 +1166,12 @@ export async function handlePendingTimeOffConfirmation(
         employee,
         torRow,
         pending,
-        stage1,
-        stage2,
+        stage1Result,
+        stage2Result,
         violations
       );
     } else {
-      await notifyManager(contact.company_id, employee, pending, requestId, stage1, stage2, violations);
+      await notifyManager(contact.company_id, employee, pending, requestId, stage1Result, stage2Result, violations);
     }
   } catch (err) {
     console.error('[time-off] manager notification failed:', err);

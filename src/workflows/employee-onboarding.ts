@@ -1720,8 +1720,17 @@ export async function handleAvailabilityConfirmResponse(
 
   const aegisSmsChannel = (chData as { channel_value: string } | null)?.channel_value;
 
-  if (!managerPhone || !aegisSmsChannel) {
-    await reply(contact, message, `I couldn't reach your manager via SMS. Please speak with them directly.`);
+  // Channel-aware manager notification. Prefer SMS when the manager has a
+  // phone and the company has an outbound SMS channel (preserves existing
+  // behavior for SMS-using tenants); otherwise fall back to email. Mirrors
+  // time-off's notifyManager pattern — channel selected from what's reachable,
+  // then routed through reply() against a synthetic InboundMessage so the
+  // SMS vs email branching lives in one place.
+  const smsAvailable = !!(managerPhone && aegisSmsChannel);
+  const emailAvailable = !!manager.email;
+
+  if (!smsAvailable && !emailAvailable) {
+    await reply(contact, message, `I couldn't reach your manager. Please speak with them directly.`);
     return;
   }
 
@@ -1752,15 +1761,35 @@ export async function handleAvailabilityConfirmResponse(
       : 'Not on file';
   const proposedDisplay = formatAvailabilityList(pending.proposed_availability);
 
-  await sendSms({
-    to: managerPhone,
-    from: aegisSmsChannel,
-    body:
-      `${pending.employee_name} wants to update their availability.\n\n` +
-      `CURRENT:\n${currentDisplay}\n\nPROPOSED:\n${proposedDisplay}\n\n` +
-      `Reply YES to approve or NO to deny.`,
+  const managerBody =
+    `${pending.employee_name} wants to update their availability.\n\n` +
+    `CURRENT:\n${currentDisplay}\n\nPROPOSED:\n${proposedDisplay}\n\n` +
+    `Reply YES to approve or NO to deny.`;
+
+  const managerChannel: 'sms' | 'email' = smsAvailable ? 'sms' : 'email';
+  const managerMessage: InboundMessage = {
+    sender: managerChannel === 'sms' ? managerPhone! : manager.email,
+    recipient: managerChannel === 'sms' ? aegisSmsChannel! : '',
+    body: '',
+    channel: managerChannel,
+    // Synthetic subject for the email path so the manager sees something
+    // meaningful instead of the reply() fallback ("Re: Your message to
+    // Aegis"). normalizeReSubject collapses the leading "Re:" chain.
+    raw_subject:
+      managerChannel === 'email'
+        ? `Availability update request from ${pending.employee_name}`
+        : undefined,
+  };
+  const managerContact: VerifiedContact = {
+    role: 'manager',
     company_id: contact.company_id,
-  });
+    employee_id: null,
+    user_id: null,
+    name: manager.name,
+    matched_identifier: managerChannel === 'sms' ? managerPhone! : manager.email,
+    channel: managerChannel,
+  };
+  await reply(managerContact, managerMessage, managerBody);
 
   await reply(
     contact,

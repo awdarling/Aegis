@@ -1,7 +1,7 @@
 import { randomUUID } from 'crypto';
 import { supabase } from '../db/client';
 import { logActivity } from '../logger/activity-log';
-import { reply } from '../messaging/reply';
+import { reply, normalizeReSubject } from '../messaging/reply';
 import { sendEmail } from '../messaging/email';
 import { sendSms } from '../messaging/sms';
 import { classifyIntent, generateReply } from '../ai/claude';
@@ -599,11 +599,38 @@ export async function sendDecisionNotification(
   let sent_to: string;
 
   if (employee.contact_email) {
+    // Lookup thread metadata persisted at TO creation so we thread back into
+    // the original submit thread instead of starting a fresh conversation.
+    const { data: metaRow } = await supabase
+      .from('aegis_memory')
+      .select('content')
+      .eq('source', `to_thread:${requestId}`)
+      .maybeSingle();
+    let threadId: string | undefined;
+    let rawSubject: string | undefined;
+    if (metaRow) {
+      try {
+        const meta = JSON.parse((metaRow as { content: string }).content) as {
+          thread_id?: string | null;
+          raw_subject?: string | null;
+        };
+        threadId = meta.thread_id ?? undefined;
+        rawSubject = meta.raw_subject ?? undefined;
+      } catch {
+        // Corrupted side row — proceed without threading.
+      }
+    }
+
+    const subject = rawSubject
+      ? normalizeReSubject(rawSubject)
+      : `Your time-off request has been ${decision}`;
+
     await sendEmail({
       to: employee.contact_email,
-      subject: `Your time-off request has been ${decision}`,
+      subject,
       text,
       company_id: tor.company_id,
+      thread_id: threadId,
     });
     channel = 'email';
     sent_to = employee.contact_email;
@@ -1138,6 +1165,26 @@ export async function handlePendingTimeOffConfirmation(
   }
 
   const requestId = (torData as { id: string }).id;
+
+  // Persist the inbound email's thread metadata so sendDecisionNotification —
+  // invoked by Homebase via /internal/notify-to-decision after a manager
+  // clicks the magic link — can thread the approve/deny email back into the
+  // original conversation. The decision_token (notifyManager / decision.ts)
+  // path carries this via its own payload; this side row is for the
+  // aegis_action_tokens path, which is fired by an external webhook and only
+  // gets requestId + decision. JSON blob in aegis_memory.content — no
+  // migration. Skipped for SMS submissions (no thread metadata to store).
+  if (pending.channel === 'email' && (pending.thread_id || pending.raw_subject)) {
+    await supabase.from('aegis_memory').insert({
+      company_id: contact.company_id,
+      memory_type: 'observation',
+      source: `to_thread:${requestId}`,
+      content: JSON.stringify({
+        thread_id: pending.thread_id ?? null,
+        raw_subject: pending.raw_subject ?? null,
+      }),
+    });
+  }
 
   await logActivity({
     company_id: contact.company_id,

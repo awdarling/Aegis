@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import multer from 'multer';
+import { captureRawBody } from '../middleware/capture-raw-body';
 import { verifySendGridRequest } from '../middleware/verify-signature';
 import { verifySender } from '../security/sender-verification';
 import { routeIntent } from '../router/intent-router';
@@ -14,6 +15,7 @@ export const emailWebhook = Router();
 
 emailWebhook.post(
   '/',
+  captureRawBody,
   verifySendGridRequest,
   upload.any(),
   async (req, res) => {

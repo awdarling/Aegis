@@ -1,5 +1,6 @@
 import type { Request, Response, NextFunction } from 'express';
 import twilio from 'twilio';
+import { EventWebhook } from '@sendgrid/eventwebhook';
 import { env } from '../config/env';
 
 // Twilio signs every webhook with HMAC-SHA1 using the auth token.
@@ -40,22 +41,79 @@ export function verifyTwilioSignature(req: Request, res: Response, next: NextFun
   next();
 }
 
-// SendGrid Inbound Parse is not signed, so we allowlist by source IP.
-// Behind Railway's proxy, req.ip is the proxy's internal IP — the real
-// client IP arrives via x-forwarded-for. Fall back to req.ip when XFF
-// is absent (e.g., local curl tests).
-export function verifySendGridRequest(req: Request, res: Response, next: NextFunction): void {
-  const xff = req.get('x-forwarded-for');
-  const sourceIp = xff ? xff.split(',')[0].trim() : (req.ip || '');
+// SendGrid Inbound Parse exposes the same ECDSA signing scheme as the Event
+// Webhook once you attach a security policy to the Parse setting. Headers
+// are sent under the X-Twilio-Email-Event-Webhook-* namespace; if SendGrid
+// ever publishes Parse-specific header names, swap them here.
+export const SENDGRID_SIGNATURE_HEADER = 'x-twilio-email-event-webhook-signature';
+export const SENDGRID_TIMESTAMP_HEADER = 'x-twilio-email-event-webhook-timestamp';
 
+// Inbound webhook security boundary. Two modes:
+//   1. SENDGRID_WEBHOOK_PUBLIC_KEY is set → require a valid ECDSA signature
+//      against the raw request body. Reject 403 if missing/invalid.
+//   2. SENDGRID_WEBHOOK_PUBLIC_KEY is unset → legacy IP allowlist. Lets us
+//      ship this code before the SendGrid-side security policy is attached.
+// SKIP_SENDGRID_VERIFICATION=true bypasses both for local testing.
+export function verifySendGridRequest(req: Request, res: Response, next: NextFunction): void {
   if (process.env.SKIP_SENDGRID_VERIFICATION === 'true') {
     console.log('[sendgrid-verify] skipped via env var');
     next();
     return;
   }
 
+  const publicKey = env.SENDGRID_WEBHOOK_PUBLIC_KEY;
+
+  if (publicKey) {
+    const signature = req.get(SENDGRID_SIGNATURE_HEADER);
+    const timestamp = req.get(SENDGRID_TIMESTAMP_HEADER);
+
+    if (!signature || !timestamp) {
+      console.warn('[sendgrid-verify] missing signature headers', {
+        hasSignature: !!signature,
+        hasTimestamp: !!timestamp,
+      });
+      res.status(403).send('Forbidden: missing SendGrid signature');
+      return;
+    }
+
+    if (!req.rawBody) {
+      // captureRawBody must run before this middleware on signed routes.
+      console.error('[sendgrid-verify] rawBody missing — captureRawBody not wired');
+      res.status(500).send('Internal error: raw body not captured');
+      return;
+    }
+
+    try {
+      const eventWebhook = new EventWebhook();
+      const ecdsaKey = eventWebhook.convertPublicKeyToECDSA(publicKey);
+      const valid = eventWebhook.verifySignature(ecdsaKey, req.rawBody, signature, timestamp);
+
+      if (!valid) {
+        console.warn('[sendgrid-verify] invalid ECDSA signature', {
+          timestamp,
+          bodyBytes: req.rawBody.length,
+        });
+        res.status(403).send('Forbidden: invalid SendGrid signature');
+        return;
+      }
+
+      console.log('[sendgrid-verify] ECDSA signature verified', { bodyBytes: req.rawBody.length });
+      next();
+      return;
+    } catch (err) {
+      console.error('[sendgrid-verify] signature verification threw', err);
+      res.status(403).send('Forbidden: signature verification failed');
+      return;
+    }
+  }
+
+  // Fallback: SendGrid-side security policy not yet configured. Keep the IP
+  // allowlist so production keeps accepting valid traffic.
+  const xff = req.get('x-forwarded-for');
+  const sourceIp = xff ? xff.split(',')[0].trim() : (req.ip || '');
+
   if (sourceIp.startsWith('159.26.')) {
-    console.log(`[sendgrid-verify] ip allowlisted: ${sourceIp}`);
+    console.log(`[sendgrid-verify] ip allowlisted (no public key configured): ${sourceIp}`);
     next();
     return;
   }

@@ -1687,30 +1687,21 @@ export async function handleAvailabilityConfirmResponse(
     return;
   }
 
-  // Find manager
+  // Notify ALL managers/owners (mirrors the time-off manager fan-out rather
+  // than picking a single arbitrary row).
   const { data: mgrData } = await supabase
     .from('users')
     .select('email, name')
     .eq('company_id', contact.company_id)
-    .in('role', ['manager', 'owner'])
-    .limit(1)
-    .maybeSingle();
+    .in('role', ['manager', 'owner']);
 
-  const manager = mgrData as { email: string; name: string } | null;
-  if (!manager) {
+  const managers = (mgrData ?? []) as { email: string; name: string }[];
+  if (managers.length === 0) {
     await reply(contact, message, `I couldn't locate a manager. Please speak with them directly.`);
     return;
   }
 
-  const { data: mgrEmpData } = await supabase
-    .from('employees')
-    .select('contact_phone')
-    .eq('company_id', contact.company_id)
-    .eq('contact_email', manager.email)
-    .maybeSingle();
-
-  const managerPhone = (mgrEmpData as { contact_phone: string | null } | null)?.contact_phone;
-
+  // Outbound SMS channel — manager-independent, fetch once.
   const { data: chData } = await supabase
     .from('company_channels')
     .select('channel_value')
@@ -1720,20 +1711,9 @@ export async function handleAvailabilityConfirmResponse(
 
   const aegisSmsChannel = (chData as { channel_value: string } | null)?.channel_value;
 
-  // Channel-aware manager notification. Email-first to match the email-first
-  // launch and the time-off workflow's manager-notify default: prefer email
-  // when manager.email exists, fall back to SMS only when there's no email
-  // but a phone + outbound SMS channel are reachable. Routed through reply()
-  // against a synthetic InboundMessage so SMS vs email branching lives in
-  // one place.
-  const smsAvailable = !!(managerPhone && aegisSmsChannel);
-  const emailAvailable = !!manager.email;
-
-  if (!smsAvailable && !emailAvailable) {
-    await reply(contact, message, `I couldn't reach your manager. Please speak with them directly.`);
-    return;
-  }
-
+  // Store the pending approval ONCE, keyed by employee. Any manager who replies
+  // YES consumes this record, so a single shared record is correct even when
+  // multiple managers are notified.
   const approval: PendingManagerAvailApproval = {
     ...pending,
     employee_channel: message.channel,
@@ -1766,30 +1746,50 @@ export async function handleAvailabilityConfirmResponse(
     `CURRENT:\n${currentDisplay}\n\nPROPOSED:\n${proposedDisplay}\n\n` +
     `Reply YES to approve or NO to deny.`;
 
-  const managerChannel: 'sms' | 'email' = emailAvailable ? 'email' : 'sms';
-  const managerMessage: InboundMessage = {
-    sender: managerChannel === 'sms' ? managerPhone! : manager.email,
-    recipient: managerChannel === 'sms' ? aegisSmsChannel! : '',
-    body: '',
-    channel: managerChannel,
-    // Synthetic subject for the email path so the manager sees something
-    // meaningful instead of the reply() fallback ("Re: Your message to
-    // Aegis"). normalizeReSubject collapses the leading "Re:" chain.
-    raw_subject:
-      managerChannel === 'email'
-        ? `Availability update request from ${pending.employee_name}`
-        : undefined,
-  };
-  const managerContact: VerifiedContact = {
-    role: 'manager',
-    company_id: contact.company_id,
-    employee_id: null,
-    user_id: null,
-    name: manager.name,
-    matched_identifier: managerChannel === 'sms' ? managerPhone! : manager.email,
-    channel: managerChannel,
-  };
-  await reply(managerContact, managerMessage, managerBody);
+  // Email-first per manager; SMS only when a manager has no email but has a
+  // phone and an outbound SMS channel exists.
+  let notifiedCount = 0;
+  for (const mgr of managers) {
+    const { data: mgrEmpData } = await supabase
+      .from('employees')
+      .select('contact_phone')
+      .eq('company_id', contact.company_id)
+      .eq('contact_email', mgr.email)
+      .maybeSingle();
+
+    const managerPhone = (mgrEmpData as { contact_phone: string | null } | null)?.contact_phone;
+    const smsAvailable = !!(managerPhone && aegisSmsChannel);
+    const emailAvailable = !!mgr.email;
+    if (!smsAvailable && !emailAvailable) continue;
+
+    const managerChannel: 'sms' | 'email' = emailAvailable ? 'email' : 'sms';
+    const managerMessage: InboundMessage = {
+      sender: managerChannel === 'sms' ? managerPhone! : mgr.email,
+      recipient: managerChannel === 'sms' ? aegisSmsChannel! : '',
+      body: '',
+      channel: managerChannel,
+      raw_subject:
+        managerChannel === 'email'
+          ? `Availability update request from ${pending.employee_name}`
+          : undefined,
+    };
+    const managerContact: VerifiedContact = {
+      role: 'manager',
+      company_id: contact.company_id,
+      employee_id: null,
+      user_id: null,
+      name: mgr.name,
+      matched_identifier: managerChannel === 'sms' ? managerPhone! : mgr.email,
+      channel: managerChannel,
+    };
+    await reply(managerContact, managerMessage, managerBody);
+    notifiedCount++;
+  }
+
+  if (notifiedCount === 0) {
+    await reply(contact, message, `I couldn't reach your manager. Please speak with them directly.`);
+    return;
+  }
 
   await reply(
     contact,

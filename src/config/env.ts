@@ -18,6 +18,11 @@ const envSchema = z.object({
   // SendGrid
   SENDGRID_API_KEY: z.string().min(1),
   SENDGRID_WEBHOOK_VERIFICATION_KEY: z.string().optional(),
+  // PEM-encoded ECDSA public key from the SendGrid Inbound Parse security
+  // policy. When set, the email webhook enforces signature verification and
+  // rejects unsigned/invalid requests. When unset, falls back to the legacy
+  // IP allowlist so production keeps working until the policy is attached.
+  SENDGRID_WEBHOOK_PUBLIC_KEY: z.string().optional(),
   // The domain from which Aegis sends outbound emails, e.g. aegis@mail.yourdomain.com
   SENDGRID_FROM_EMAIL: z.string().email(),
   SENDGRID_FROM_NAME: z.string().default('Aegis'),

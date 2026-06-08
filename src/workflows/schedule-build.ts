@@ -9,7 +9,11 @@ import { resolveAvailabilityForWeek } from '../lib/custom-availability';
 import { buildTOMap, isBlockedByTO, type TOWindow } from '../lib/to-window';
 import { getSpecialNotesForRange } from './special-notes';
 import { parseConstraints } from '../lib/constraints/parser';
-import type { EngineSettings, AttributeMixConstraint } from '../lib/constraints/types';
+import type {
+  EngineSettings,
+  AttributeMixConstraint,
+  ConcurrentCoverageConstraint,
+} from '../lib/constraints/types';
 import { getWeekBounds } from '../lib/engine/week-bounds';
 import { buildCanvas } from '../lib/engine/canvas';
 import {
@@ -23,6 +27,7 @@ import {
 import { rankCandidates } from '../lib/engine/ranker';
 import { resolveBannedPairConflict } from '../lib/engine/cascade';
 import { buildAttributeShortageReason, enforceAttributeMixForShift } from '../lib/engine/attribute-mix';
+import { evaluateSexCoverage } from '../lib/engine/sex-coverage';
 import {
   classifyEmployeeForSlot,
   formatDispositionList,
@@ -84,13 +89,27 @@ export interface ScheduleGap {
   end_time?: string;
 }
 
-export interface FlaggedIssue {
-  type: 'unsatisfied_attribute_mix';
-  date: string;
-  shift_name: string;
-  description: string;
-  metadata: Record<string, unknown>;
-}
+// FlaggedIssue is a discriminated union. The shift-scoped variant carries a
+// `shift_name`; the concurrent-coverage variant carries a time window in its
+// metadata instead and has no shift_name (a coverage gap can straddle shifts).
+export type FlaggedIssue =
+  | {
+      type: 'unsatisfied_attribute_mix';
+      date: string;
+      shift_name: string;
+      description: string;
+      metadata: Record<string, unknown>;
+    }
+  | {
+      type: 'unsatisfied_sex_coverage';
+      date: string;
+      description: string;
+      metadata: {
+        time_window: { start: string; end: string };
+        missing_sex: string;
+        on_duty: Array<{ name: string; role: string; sex: string }>;
+      };
+    };
 
 interface ScheduleData {
   assignments: ScheduleAssignment[];
@@ -414,6 +433,7 @@ interface BuildContext {
   veteranOnlyDates: VeteranOnlyRange[];
   settings: EngineSettings;
   attributeMix: AttributeMixConstraint[];
+  concurrentCoverage: ConcurrentCoverageConstraint[];
 }
 
 interface BuildResult {
@@ -448,7 +468,7 @@ function hasHardBannedPair(
 // (findBestEmployee, ensureVeteranOnShift, computeGapReason inline) is gone;
 // behavior is driven entirely by parsed constraints and module outputs.
 function buildScheduleForWeek(ctx: BuildContext): BuildResult {
-  const { data, weekDates, eventsByDate, veteranMode, veteranOnlyDates, settings, attributeMix } = ctx;
+  const { data, weekDates, eventsByDate, veteranMode, veteranOnlyDates, settings, attributeMix, concurrentCoverage } = ctx;
   const employeeById = new Map(data.employees.map(e => [e.id, e]));
 
   // 1) Build canvas (priority first, then chronological).
@@ -668,6 +688,10 @@ function buildScheduleForWeek(ctx: BuildContext): BuildResult {
     settings,
   };
 
+  // Per-shift attribute_mix enforcement. Receives only non-concurrent_coverage
+  // rules (parser routes concurrent_coverage to evaluateSexCoverage below).
+  // Today this list is empty for Watermark (sex moved to concurrent_coverage);
+  // the loop remains for any future shift-scoped attribute_mix rule.
   for (const group of shiftGroups.values()) {
     const shiftAssigns = group.indices.map(i => weekState.assignments[i]);
     const result = enforceAttributeMixForShift(
@@ -778,6 +802,14 @@ function buildScheduleForWeek(ctx: BuildContext): BuildResult {
     }
   }
 
+  // Concurrent (facility-wide temporal) coverage evaluation. Validate-and-flag
+  // only — runs on the final assignment state, never swaps. Replaces the
+  // per-shift sex enforcement for the sex_coverage rule.
+  for (const cov of concurrentCoverage) {
+    const flags = evaluateSexCoverage(weekState, cov, employeeById);
+    for (const f of flags) weekState.flagged_issues.push(f);
+  }
+
   // After post-fill swaps, refresh gap filled_counts.
   for (const gap of weekState.gaps) {
     gap.filled_count = weekState.assignments.filter(
@@ -833,7 +865,7 @@ export function runScheduleBuild(
     ));
   }
 
-  const attributeMix = parseConstraints(data.policies).hard.attributeMix;
+  const parsedHard = parseConstraints(data.policies).hard;
 
   const result = buildScheduleForWeek({
     data,
@@ -842,7 +874,8 @@ export function runScheduleBuild(
     veteranMode,
     veteranOnlyDates,
     settings,
-    attributeMix,
+    attributeMix: parsedHard.attributeMix,
+    concurrentCoverage: parsedHard.concurrentCoverage,
   });
 
   return {
@@ -1035,6 +1068,7 @@ export async function handleBuildSchedule(
   console.log(
     '[schedule-build] engine settings:', parsed.settings,
     '— attribute_mix rules:', parsed.hard.attributeMix.length,
+    '— concurrent_coverage rules:', parsed.hard.concurrentCoverage.length,
     '— unrecognized policies:', parsed.unrecognized.length
   );
 

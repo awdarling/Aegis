@@ -25,6 +25,18 @@ export interface AttributeMixConstraint {
   scope_target?: string;
 }
 
+// Facility-wide temporal coverage. Evaluated over the day's timeline segmented
+// at shift start/end boundaries, restricted to assignments whose role is in
+// `population_roles`. Validate-and-flag only — never swaps. on_infeasible is
+// reserved for future modes; today only 'flag' is supported.
+export interface ConcurrentCoverageConstraint {
+  type: 'concurrent_coverage';
+  attribute: string;
+  minimums: Record<string, number>;
+  population_roles: string[];
+  on_infeasible: 'flag';
+}
+
 // Engine settings derived from policy rows. Defaults are applied by the
 // parser; downstream code can rely on every field being set.
 export interface EngineSettings {
@@ -39,6 +51,7 @@ export interface EngineSettings {
 export interface ParsedConstraints {
   hard: {
     attributeMix: AttributeMixConstraint[];
+    concurrentCoverage: ConcurrentCoverageConstraint[];
   };
   settings: EngineSettings;
   unrecognized: Array<{ policy_id: string; policy_key: string; reason: string }>;

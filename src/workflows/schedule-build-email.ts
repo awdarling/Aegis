@@ -201,10 +201,18 @@ function closedDatesSectionHtml(closedDates: ClosedDate[]): string {
 </div>`;
 }
 
+function flaggedIssueSubLabel(issue: FlaggedIssue): string {
+  if (issue.type === 'unsatisfied_sex_coverage') {
+    const { start, end } = issue.metadata.time_window;
+    return `${start.slice(0, 5)}–${end.slice(0, 5)} (coverage)`;
+  }
+  return issue.shift_name;
+}
+
 function flaggedIssuesSectionHtml(issues: FlaggedIssue[]): string {
   if (issues.length === 0) return '';
   const cards = issues.map(issue => {
-    const meta = issue.metadata ?? {};
+    const meta = (issue.metadata ?? {}) as Record<string, unknown>;
     const dispositions = (meta.per_employee_dispositions as EmployeeDisposition[] | undefined) ?? [];
     const dispList = dispositions.length > 0
       ? `<ul style="margin:8px 0 0;padding-left:18px;color:#4b5563;font-size:13px;">${dispositions.map(d => `<li style="margin:0 0 2px;">${escapeHtml(d.name)} — ${escapeHtml(dispositionLabel(d.reason))}</li>`).join('')}</ul>`
@@ -212,7 +220,7 @@ function flaggedIssuesSectionHtml(issues: FlaggedIssue[]): string {
     const dateLabel = `${formatWeekdayShort(issue.date)} ${formatShortDate(issue.date)}`;
     return `
 <div style="margin:0 0 12px;padding:14px 16px;background:#fffbeb;border:1px solid #fde68a;border-radius:6px;">
-  <div style="font-size:14px;font-weight:600;color:#92400e;margin-bottom:4px;">${escapeHtml(dateLabel)} — ${escapeHtml(issue.shift_name)}</div>
+  <div style="font-size:14px;font-weight:600;color:#92400e;margin-bottom:4px;">${escapeHtml(dateLabel)} — ${escapeHtml(flaggedIssueSubLabel(issue))}</div>
   <div style="font-size:13px;color:#374151;line-height:1.5;">${escapeHtml(issue.description)}</div>
   ${dispList}
 </div>`;
@@ -408,8 +416,8 @@ function buildPlainText(params: {
     lines.push('FLAGGED ISSUES');
     for (const issue of params.issues) {
       const dateLabel = `${formatWeekdayShort(issue.date)} ${formatShortDate(issue.date)}`;
-      lines.push(`- ${dateLabel} — ${issue.shift_name}: ${issue.description}`);
-      const meta = issue.metadata ?? {};
+      lines.push(`- ${dateLabel} — ${flaggedIssueSubLabel(issue)}: ${issue.description}`);
+      const meta = (issue.metadata ?? {}) as Record<string, unknown>;
       const dispositions = (meta.per_employee_dispositions as EmployeeDisposition[] | undefined) ?? [];
       for (const d of dispositions) {
         lines.push(`    · ${d.name} — ${dispositionLabel(d.reason)}`);

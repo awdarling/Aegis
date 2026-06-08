@@ -2,6 +2,7 @@ import type { Policy } from '../../db/types';
 import {
   DEFAULT_ENGINE_SETTINGS,
   type AttributeMixConstraint,
+  type ConcurrentCoverageConstraint,
   type EngineSettings,
   type ParsedConstraints,
 } from './types';
@@ -59,7 +60,9 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
 
-function parseAttributeMix(value: unknown): AttributeMixConstraint | string {
+type AttributeMixOrCoverage = AttributeMixConstraint | ConcurrentCoverageConstraint;
+
+function parseAttributeMix(value: unknown): AttributeMixOrCoverage | string {
   if (!isPlainObject(value)) return 'value is not an object';
   const attribute = value['attribute'];
   if (typeof attribute !== 'string' || attribute.length === 0) {
@@ -75,6 +78,35 @@ function parseAttributeMix(value: unknown): AttributeMixConstraint | string {
     minimums[k] = Math.floor(v);
   }
   const scopeRaw = value['scope'];
+
+  // concurrent_coverage routes to a separate constraint family — no
+  // scope_target, requires population_roles, evaluated as a temporal flag.
+  if (scopeRaw === 'concurrent_coverage') {
+    const popRaw = value['population_roles'];
+    if (!Array.isArray(popRaw) || popRaw.some(r => typeof r !== 'string' || r.length === 0)) {
+      return 'concurrent_coverage requires `population_roles` as a non-empty array of strings';
+    }
+    const population_roles = (popRaw as string[]).slice();
+    if (population_roles.length === 0) {
+      return 'concurrent_coverage requires at least one role in `population_roles`';
+    }
+    const onInfRaw = value['on_infeasible'];
+    let on_infeasible: ConcurrentCoverageConstraint['on_infeasible'] = 'flag';
+    if (onInfRaw !== undefined && onInfRaw !== null) {
+      if (onInfRaw !== 'flag') {
+        return `concurrent_coverage on_infeasible: only 'flag' is supported (got ${String(onInfRaw)})`;
+      }
+      on_infeasible = onInfRaw;
+    }
+    return {
+      type: 'concurrent_coverage',
+      attribute,
+      minimums,
+      population_roles,
+      on_infeasible,
+    };
+  }
+
   let scope: AttributeMixConstraint['scope'] = 'all_shifts';
   if (typeof scopeRaw === 'string') {
     if (scopeRaw === 'all_shifts' || scopeRaw === 'shift_type' || scopeRaw === 'specific_shift') {
@@ -128,6 +160,7 @@ function parseEnum<T extends string>(value: unknown, allowed: readonly T[]): T |
 // with a list of rows that were recognized but malformed.
 export function parseConstraints(policies: Policy[]): ParsedConstraints {
   const attributeMix: AttributeMixConstraint[] = [];
+  const concurrentCoverage: ConcurrentCoverageConstraint[] = [];
   const settings: EngineSettings = { ...DEFAULT_ENGINE_SETTINGS };
   const unrecognized: Array<{ policy_id: string; policy_key: string; reason: string }> = [];
 
@@ -153,6 +186,8 @@ export function parseConstraints(policies: Policy[]): ParsedConstraints {
       if (typeof parsed === 'string') {
         unrecognized.push({ policy_id: row.id, policy_key: key, reason: parsed });
         console.log('[constraints] invalid attribute_mix policy', row.id, key, '—', parsed);
+      } else if (parsed.type === 'concurrent_coverage') {
+        concurrentCoverage.push(parsed);
       } else {
         attributeMix.push(parsed);
       }
@@ -227,7 +262,7 @@ export function parseConstraints(policies: Policy[]): ParsedConstraints {
   }
 
   return {
-    hard: { attributeMix },
+    hard: { attributeMix, concurrentCoverage },
     settings,
     unrecognized,
   };

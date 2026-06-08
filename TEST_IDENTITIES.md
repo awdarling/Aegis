@@ -6,20 +6,29 @@ Reference for who/what is configured in each tenant. Append-only — when identi
 
 ---
 
-## Watermark Country Club (Production)
+## Watermark Country Club (Production) — LIVE since June 5, 2026
 
 **company_id**: `a1b2c3d4-e5f6-7890-abcd-ef1234567890`
 **Aegis SMS number**: +16167477953
-**Aegis email channel**: aegis@aegis.quriasolutions.com
+**Aegis email channel**: aegis@aegis.quriasolutions.com (inbound ECDSA signature verification live; `SKIP_SENDGRID_VERIFICATION=false`)
 **Timezone**: America/Detroit
 
 ### Managers (Homebase users)
-| Name | Email | Phone | Role |
+| Name | Email | Phone | Role | Notes |
+|---|---|---|---|---|
+| Carolyn Ringler | c45ringler@gmail.com | +16168223809 | manager | production manager |
+| Jack McCorkle | jackmc419@icloud.com | +16165519476 | manager | production manager |
+| Bubba Ganush | lightningmakigga@gmail.com | (see Supabase) | manager | **TEMPORARY** — see note below |
+| Alexander Darling | awdarling@quriasolutions.com | +16163280114 | quria_admin | not an employee; employee intents won't work from this address without test setup |
+
+> **Bubba Ganush status (June 5, 2026):** Bubba's `public.users` row was repointed from the sandbox company to Watermark and set to `manager` so Alexander receives a copy of every TO and availability manager-notification during launch monitoring. Side effect: Bubba is no longer a sandbox manager (one auth user → one `users` row → one company). **Remove this manager row after launch monitoring** (LAUNCH FAST-FOLLOW).
+
+### Test employees on Watermark (CLEANUP after launch)
+| Name / identifier | Email | Role | Notes |
 |---|---|---|---|
-| Carolyn Ringler | c45ringler@gmail.com | +16168223809 | manager |
-| Jack McCorkle | jackmc419@icloud.com | +16165519476 | manager |
-| Bubba Ganush | lightningmakigga@gmail.com | (see Supabase) | manager (also used as sandbox manager — same auth user) |
-| Alexander Darling | awdarling@quriasolutions.com | +16163280114 | quria_admin |
+| aegisscheduler test employee | aegisscheduler@gmail.com | (test) | Set up on Watermark for launch-day end-to-end TO + availability tests (June 5). **Remove from Watermark roster after launch** (FAST-FOLLOW). Also exists as the sandbox employee contact (see below). |
+
+> **Stray pending test TO (CLEANUP):** at least one pending test time-off row exists on Watermark from launch-day testing and is visible to managers in the Time Off tab. Clear the pending test row(s); do NOT delete the legitimate seed/fixture rows (the ~May 22 batch).
 
 ---
 
@@ -32,7 +41,7 @@ Reference for who/what is configured in each tenant. Append-only — when identi
 ### Sandbox managers
 | Name | Email | Notes |
 |---|---|---|
-| Bubba Ganush | lightningmakigga@gmail.com | Same auth user as Watermark; inserted into public.users as manager for sandbox company |
+| Bubba Ganush | lightningmakigga@gmail.com | **No longer the sandbox manager as of June 5, 2026** — his single auth user / `users` row was repointed to Watermark (see Watermark note). A sandbox manager must be re-established (new auth user) before sandbox manager-side testing resumes. |
 
 ### Sandbox employees
 | Name | employee_id | Email | Role | Notes |
@@ -55,6 +64,8 @@ Reference for who/what is configured in each tenant. Append-only — when identi
 2. INSERT into public.users with `id` = the auth user's UUID (from the dashboard), `company_id` = target tenant, `role` = 'manager', `email` and `name` populated
 3. Test login at homebase-nine-phi.vercel.app
 
+> Reminder: `public.users.id` is a FK to `auth.users.id` and is 1:1 — one auth user maps to exactly one `users` row / one company. Re-pointing an existing auth user (as was done with Bubba) moves them between tenants rather than adding a second membership.
+
 ### To add a new test employee
 1. INSERT into public.employees with required fields: name, primary_role, qualified_roles, contact_email and/or contact_phone, active=true, sex (CHECK constraint: 'male' or 'female')
 2. If they will receive email: ensure the company has a row in company_channels for channel_type='email'
@@ -62,10 +73,10 @@ Reference for who/what is configured in each tenant. Append-only — when identi
 
 ### To add a new tenant (sandbox or production)
 1. Create company row in public.companies
-2. Create company_channels row(s) for email and/or SMS routing
+2. Create company_channels row(s) for email and/or SMS routing (column is `channel_value`)
 3. Create at least one manager via the process above
-4. Seed minimum viable shift_requirements (otherwise scheduling won't work — see BUG-2 history)
-5. Set up policies as needed (min/max hours, time off rules, etc.)
+4. Seed minimum viable shift_types AND shift_requirements (otherwise the engine produces no slots — see BUG-2 history; remember `accepted_roles` is NOT NULL)
+5. Set up policies as needed (the engine reads `policy_value_json`; set `week_start_day` if the tenant builds on a non-Sunday)
 6. Configure Stripe billing_model if production tenant
 7. Document in this file
 
@@ -73,4 +84,4 @@ Reference for who/what is configured in each tenant. Append-only — when identi
 
 ## Inactive / retired identities
 
-(none yet)
+(none yet — Bubba's Watermark manager row and the aegisscheduler Watermark test employee are slated for removal post-launch; move them here when removed.)

@@ -14,7 +14,14 @@
       "Bash(sed -i '' \"s|'./src/db/client'|'../src/db/client'|\" scripts/_tmp-query-policies.ts)",
       "Bash(npx tsx *)",
       "Bash(npx ts-node *)",
-      "Bash(python3 -c ' *)"
+      "Bash(python3 -c ' *)",
+      "Bash(git push *)",
+      "Bash(git *)",
+      "Bash(tee /tmp/baseline-run1.log)",
+      "Bash(tee /tmp/baseline-clean.log)",
+      "Bash(npm run *)",
+      "Bash(tee /tmp/tuned-run1.log)",
+      "Bash(tee /tmp/tuned-runs2.log)"
     ]
   }
 }

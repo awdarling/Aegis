@@ -36,42 +36,196 @@ This is the single most important habit. The moment a piece of work is **approve
 ## CURRENT SPRINT — 48-hour priority (started June 8)
 
 ### S1 · ENGINE-1 — Builder skips eligible employees
-**Repo:** Aegis (`src/lib/engine/`) · **Status:** `NOT STARTED`
+**Repo:** Aegis (`src/lib/engine/`) · **Status:** `DIAGNOSED`
 Aaron Barrigan (Headguard, fully available) is never placed. Erin Berigan reported as "can't work" with no custom availability. Suspected systemic, not one-off.
 
 - Diagnosis (fill in before fixing):
-  - [ ] Dry-run built for the affected week; `per_employee_dispositions` dumped for Aaron, Erin, **and full roster**
-  - [ ] Aaron's & Erin's `employees` rows pulled (`primary_role`, `qualified_roles`, `max_weekly_hours`, `active`) + their `availability` rows
-  - [ ] Disposition reason identified (`not_qualified` / `availability_mismatch` / `max_hours_reached` / `eligible_but_unchosen` / …)
-  - [ ] Determined: roster-wide pattern or isolated? (count how many employees show the same reason)
+  - [x] Dry-run built for the affected week; `per_employee_dispositions` dumped for Aaron, Erin, **and full roster**
+  - [x] Aaron's & Erin's `employees` rows pulled (`primary_role`, `qualified_roles`, `max_weekly_hours`, `active`) + their `availability` rows
+  - [x] Disposition reason identified (`not_qualified` / `availability_mismatch` / `max_hours_reached` / `eligible_but_unchosen` / …)
+  - [x] Determined: roster-wide pattern or isolated? (count how many employees show the same reason)
+
+**Findings (2026-06-08 diagnostic pass — dry-run for build week 2026-06-15..21):**
+
+Method: `scripts/dry-run-schedule.ts` (next week) + `scripts/diagnose-s1.ts` (one-off, traces date-level eligibility for every employee × every canvas slot and pulls Aaron/Erin from the live DB). Both ran against live Watermark data with no writes.
+
+1. "Aaron Barrigan" does not exist in employees and is CONFIRMED (Alexander, 2026-06-08) to be a misremembering of Erin Berigan — there is no separate employee. The two named ENGINE-1 cases are therefore ONE case: Erin. Her availability was entered ending 21:00 while the Afternoon shift ends 21:15, locking her out of evenings. Availability extended (data fix) and verified 2026-06-08.
+
+2. **Erin Berigan — exists, active, and IS being placed (4.5h), but is structurally locked out of the dominant evening shift.**
+   - Row: `id=1b868570-1ade-443d-9781-4cbe16a5cf06`, `primary_role=Headguard`, `qualified_roles=["AManager","Headguard","Lifeguard"]`, `max_weekly_hours=40`, `active=true`, `is_veteran=true`.
+   - Availability: 7 rows, every day, **09:00:00–21:00:00**. No `custom_availability`. No approved TO in the build week.
+   - Dry-run placement: **1 shift, Friday AM Weekday Headguard 11:00–15:30 (4.5h)**.
+   - **Why she's shut out of the largest Headguard pool (Afternoon, 7×wk):** the "Afternoon" shift runs **15:00:00–21:15:00**. `isAvailableForShift` (`src/lib/engine/eligibility.ts:17–29`) requires the availability window to **fully contain** the slot: `availStart ≤ slotStart && availEnd ≥ slotEnd`. `21:00:00 < 21:15:00` → mismatch on every Afternoon slot, every day. Disposition code = `availability_mismatch`. This is the literal cause of the manager's "she's marked as can't work" perception — the engine truthfully says she can't cover *any* Afternoon. **Off by 15 minutes is the binding constraint, not a code defect.** A fix is a product decision (15-min grace window? Shorten Afternoon end? Edit Erin's availability to 21:15?), not a code bug per se.
+
+3. **Roster-wide tally (distinct employees ever excluded by a date-level reason, summed across all 70 canvas slots):**
+   - `not_qualified`: **29** (every active employee gets `not_qualified` against at least one slot whose role they don't hold — this counter, on its own, is uninformative. The interesting subset is below.)
+   - `availability_mismatch`: **5** (Kori Baumann, Ally Becker, Erin Berigan, Michael McCorkle, Letizia Cumbo-Nacheli) — same root pattern as Erin worth checking per employee.
+   - `on_time_off`: **3** (Will Roelofs, Miles Holter, Rosa Thornburg).
+   - `inactive`: **0**.
+   - **`eligible_but_unchosen` / `max_hours_reached` / `doubles_blocked` / `in_conflict` — not measured this pass:** the dry-run came in at 70/70, 0 gaps, so the engine never wrote a single `per_employee_dispositions` block (those only generate for unfilled slots). To get slot-level reasons, we need a week with real gaps, or a synthetic stress run.
+
+4. **The real systemic pattern: 4 active employees were NEVER date-level-eligible for ANY slot this week, and the engine never surfaces them.** All four are Junior Lifeguards:
+   - Jenna Stibitz, Cameron Osterhaven, Colin Marvin, Quin Mead — `qualified_roles=["Junior Lifeguard"]`, all available 7d × 00:01–23:59.
+   - Canvas this week has **zero `Junior Lifeguard` slots**. Distinct slot.role values: `Headguard` (14), `Lifeguard` (35), `Manager` (14), `Greeter` (7).
+   - A 5th, Nick Jovanovic (`qualified_roles=["Junior Lifeguard","Greeter"]`), was eligible for the 7 Greeter slots but ranker chose Bennet/Kason instead → 0h.
+   - **These five do not appear in any `per_employee_dispositions` list because no gap exists for the slots they're qualified for.** A manager looking at the schedule sees them silently dropped. This is the "suspected systemic" pattern in the bug report.
+   - Fix is structural (Role Groups — already in Tier 2 backlog as `shift_requirements.accepted_roles`), not a one-line eligibility patch. As a short-term diagnostic, we could surface an "active employees with zero eligible slots this week" flag on every build.
+
+5. **String-mismatch / casing check (this was the original suspicion in the bug report):**
+   - Distinct `slot.role` values in canvas: `"Headguard"`, `"Lifeguard"`, `"Manager"`, `"Greeter"`.
+   - Distinct `qualified_roles` values across active employees: `"AManager"`, `"Greeter"`, `"Headguard"`, `"Junior Lifeguard"`, `"Lifeguard"`, `"Manager"`.
+   - **No casing or whitespace mismatch for any role currently in the canvas.** `isQualifiedForRole` uses exact-string `.includes(role)` (`eligibility.ts:11–13`); it would silently fail on `" Headguard"` or `"headguard"`, but none of those exist in this data. So the bug is **not** roster-wide string normalization.
+   - CORRECTION (2026-06-08): "AManager" in Erin Berigan's and Michael McCorkle's qualified_roles is NOT a typo. Per reference doc 01, AManager = Assistant Manager, a legitimate Watermark role (Erin is the named AManager, "maps to Headguard/Lifeguard in practice"). It is inert only because no shift_requirements carry role='AManager'. DO NOT rewrite it to "Manager" and DO NOT log it as schema drift — it is expected data. Open (low priority): should AManager be its own schedulable slot, or always resolve to Headguard/Lifeguard? Verify Michael McCorkle is in fact an Assistant Manager.
+
+**Plain-English summary:** The bug report's two named cases dissolve under inspection. Aaron isn't in the database — confirm with Alexander whether the name is wrong or the employee just needs adding. Erin is being placed, but is locked out of every Afternoon shift because her availability ends at 21:00 and Afternoon ends at 21:15 — an off-by-15-min data precision issue, not an engine defect. The real systemic miss is structural: four Junior Lifeguards with no matching shift_requirements get silently skipped, and the engine never produces a disposition row for them because their slots don't exist to gap on. The casing/normalization hypothesis was checked and ruled out for this week's roster, but `"AManager"` on two employees confirms free-text `qualified_roles` is a real future risk.
+
 - Fix (only after diagnosis):
-  - [ ] Root cause fixed (data re-tag OR code normalization in `isQualifiedForRole`, per evidence)
-  - [ ] Dry-run re-run confirms the missing people are now placed
+  - [ ] **Decision needed from Alexander before coding:** (a) Is "Aaron Barrigan" a real employee that needs to be added, or a misremembering of Erin Berigan? (b) For Erin's 21:00 vs 21:15 mismatch — grace window in the engine, shorten Afternoon to 21:00, or edit Erin's availability to 21:15? (c) For the four Junior Lifeguards — is this expected (off-roster this week) or should we accelerate Role Groups / fold Junior Lifeguard into Lifeguard `qualified_roles`?
+  - [ ] Add a build-time diagnostic: warn when active employees have zero eligible slots in the week (so the Junior Lifeguard pattern surfaces without needing a manual trace next time).
+  - [ ] Clean up `"AManager"` in Erin's and Michael's `qualified_roles` (data fix, not code).
+  - [ ] Dry-run re-run confirms the missing people are now placed (or are knowingly off-roster).
+  - [ ] DECISION (Alexander, operational): true Afternoon shift end — 21:00 or 21:15? Fix whichever data point is wrong. NOT an engine grace window (rejected — global containment change to mask one data point).
+  - [ ] DECISION (Alexander, domain): are the 4 Junior Lifeguards off-roster this week (expected) or should JL be schedulable (Role Groups / fold into Lifeguard)?
+  - [ ] CODE (greenlit pending): build-time diagnostic warning on active employees with zero eligible slots in the built week.
 - **Done when:** the affected employees are scheduled in a dry-run, and no other employee is being silently dropped for the same reason.
 
+### S1b · ENGINE-2 — Hours not distributing across the roster (suspected fairness)
+**Repo:** Aegis (`src/lib/engine/ranker.ts`, `schedule-build.ts` fill loop) · **Status:** `DIAGNOSED`
+After Erin's evening availability fix, a fresh next-week sample still places her once while a few names repeat (e.g. Audrey Rook, Headguard, 3 afternoons). Expectation: accumulated hours should lower an employee's rank for later slots so hours spread. Symptom suggests hours-fairness may not be accumulating during the fill — NOT yet confirmed. Diagnose-first; do not touch the ranker until a trace names the deciding sort key.
+
+**Findings (2026-06-08 instrumented trace):** NOT a fairness bug. The hours-fairness pipeline is verified intact: rankCandidates is called fresh per slot (schedule-build.ts:500/521), each placement updates weekState.weeklyHoursMap immediately (:596), and the sort key reads it (ranker.ts:48/61/76). Erin's availability fully contains the Afternoon Headguard slot on all 7 days — availability ruled out.
+ROOT CAUSE: enforceAttributeMixForShift runs as a post-fill pass to satisfy an ACTIVE gender_requirement (attribute_mix sex: >=1 male + >=1 female per shift, scope=all_shifts). ~3 swaps/week. When it swaps a ranker-awarded employee OUT, the displaced person is not re-placed, and same-day-doubles that fired during the main fill loop are not re-evaluated — so they lose slots they were blocked from. The hours ledger IS refunded (attribute-mix.ts:284-285); re-placement is what's missing. Net: Erin, Kori, Michael each end at 6.3h (one shift) while Lucas (repeatedly inserted male) hits 26.3h. Headguard distribution bimodal across 6 HGs / 14 slots split 3M/3F.
+TWO PROBLEMS:
+- (A) Engine correctness: post-fill swaps don't reconsider/backfill the displaced employee.
+- (B) Policy decision (Alexander): is '>=1 of each sex on EVERY shift' intended? Options: keep broad / narrow scope / remove. DECIDE FIRST — it sets how much of (A) is needed.
+DOC DISCREPANCY: gender_requirement is documented as DORMANT (doc 04 §2.4, doc 06 §9) but is configured and active. Flag for reference-doc correction and verify in the Homebase Rules tab.
+DECISIONS NEEDED:
+- [ ] (B) Confirm/narrow/remove the gender attribute_mix policy.
+- [ ] (A) After (B): surgical backfill vs structural fold-of-attribute-mix-into-fill-loop. Lean structural if the rule stays broad.
+- **Done when:** displaced employees are reconsidered so Headguard hours flatten, without violating the confirmed gender policy. No fix until (B) is decided.
+
+**Agreed fix direction (2026-06-08):** ENGINE-2 is resolved by REPLACING the gender rule's model, not by patching the swap. The real requirement (Alexander) is facility-wide temporal coverage: ≥1 male + ≥1 female on duty among counted roles at every moment the pool is staffed — NOT per-shift composition. New constraint sex_coverage: attribute=sex, minimums {male:1,female:1}, scope=concurrent_coverage (evaluate over the day's timeline segmented at shift boundaries), population_roles=[Headguard, Lifeguard, AManager] (Greeter + Junior Lifeguard NOT counted; pure Manager pending confirm), on_infeasible=flag. Evaluation = validate-and-FLAG (FlaggedIssue 'unsatisfied_sex_coverage'); NO swap pass. Retiring the per-shift enforceAttributeMixForShift swap eliminates the ENGINE-2 churn and makes Problem A (no backfill) moot. Ship as pure validate-and-flag first; add a forward-looking soft fill-loop coverage bias only if flags prove common. Contract-first (engine before Rules-tab UI), like Role Groups. MIGRATION: remove the current attribute_mix sex scope=all_shifts policy + its swap pass in the same change to avoid double-application.
+Decisions confirmed: JL not counted; presence = guard staff on floor; flag-don't-force; no single-staff open windows (only Greeter/Flex are 1-person shifts). Managers NOT counted (confirmed 2026-06-08). Population FINAL: Headguard, Lifeguard, AManager. sex_coverage implementation spec drafted 2026-06-08; build may run ahead of policy flip, but the policy_value_json migration is held pending Watermark management sign-off on the rule.
+DOC FIX still needed: gender_requirement documented dormant (doc 04 §2.4, doc 06 §9) but is live — correct on next doc pass, and replace the per-shift framing with the concurrent_coverage model.
+
 ### S2 · SCHED-EDIT-1 — Manual schedule edits don't persist
-**Repo:** Homebase (`src/app/(app)/schedule/page.tsx`) · **Status:** `NOT STARTED`
+**Repo:** Homebase (`src/app/(app)/schedule/page.tsx`) · **Status:** `IN REVIEW`
 Moving an employee between shifts updates the displayed card but not `schedules.data.assignments`; distribute then sends the new shift name with stale hours. **This gates safe distribution — no manual-edited schedule may be distributed until this is green.**
 
 - Diagnosis:
-  - [ ] Manual-edit save handler read; determined whether it persists to Supabase at all
-  - [ ] Identified which fields it carries vs drops on a move (`shift_name` vs `start_time`/`end_time`/`role`/`hours`)
+  - [x] Manual-edit save handler read; determined whether it persists to Supabase at all
+  - [x] Identified which fields it carries vs drops on a move (`shift_name` vs `start_time`/`end_time`/`role`/`hours`)
+
+**Findings (2026-06-08 diagnostic pass):**
+
+1. **Move handler (the part that runs when a card is dragged between cells).**
+   File: `src/components/schedule/ScheduleRenderer.tsx`, lines 512–530. Triggered from `handleDragEnd` (lines 555–561), which reads the drop target out of `DroppableCell` props (`shiftName={row.id}`, `date={date}` — lines 641–642).
+
+   ```ts
+   function moveAssignment(source: ScheduleAssignment, targetShift: string, targetDate: string) {
+     if (!onAssignmentChange) return
+     if (source.shift_name === targetShift && source.date === targetDate) return
+
+     let moved = false
+     const next = assignments.map(a => {
+       if (
+         !moved &&
+         a.employee_id === source.employee_id &&
+         a.shift_name === source.shift_name &&
+         a.date === source.date
+       ) {
+         moved = true
+         return { ...a, shift_name: targetShift, date: targetDate }
+       }
+       return a
+     })
+     if (moved) onAssignmentChange(next)
+   }
+   ```
+
+   `onAssignmentChange` is wired to `setPendingAssignments` in `src/app/(app)/schedule/page.tsx` (lines 1394, 1467). So a move only mutates *local React state* (`pendingAssignments`); the renderer itself never touches Supabase.
+
+2. **Persistence to Supabase — does happen, but only on explicit Save in the review panel.**
+   The schedule page does not auto-persist on each move. Persistence runs from `ScheduleReviewPanel.save()` (`src/components/schedule/ScheduleReviewPanel.tsx` lines 188–216), invoked after the user opens the Soteria review drawer and clicks Save Changes:
+
+   ```ts
+   const newData = {
+     ...(schedule.data ?? { assignments: [], gaps: [], summary: '' }),
+     assignments: pendingAssignments,
+   }
+   const { data: saved, error: updateErr } = await supabase
+     .from('schedules')
+     .update({ data: newData, staffing_report: newReport })
+     .eq('id', schedule.id)
+     .select()
+     .single()
+   ```
+
+   So *when* a save happens, the **entire `pendingAssignments` array is written back to `schedules.data.assignments`**, replacing it. Other top-level columns of `schedules` are untouched; inside `data`, only `assignments` is overwritten (other keys — `gaps`, `summary`, `closed_dates`, etc. — are preserved via spread). The `staffing_report` column is recomputed alongside.
+
+   **This means the persistence mechanism itself is fine. The bug is upstream in `moveAssignment`'s reshape of the row, which then gets dutifully persisted.**
+
+3. **Fields on a move — what updates vs goes stale.**
+   `ScheduleAssignment` (`src/lib/types.ts` lines 186–196) has nine fields. After a move, in the pending row that gets persisted:
+
+   | Field            | Updated? | Source on move | Notes |
+   |------------------|----------|----------------|-------|
+   | `date`           | ✅ updated | `over.date` from drop target | correct |
+   | `shift_name`     | ✅ updated | `over.shift_name` = `row.id` of the target `DroppableCell` | correct (RowConfig.id IS the shift_name per `src/lib/types.ts:155–161`) |
+   | `employee_id`    | ✅ preserved | (carried) | correct |
+   | `employee_name`  | ✅ preserved | (carried) | correct |
+   | `employee_photo` | ✅ preserved | (carried) | correct |
+   | **`role`**       | ❌ **stale** | carried from source assignment | wrong when shifts have different roles |
+   | **`start_time`** | ❌ **stale** | carried from source assignment | wrong whenever target shift has different hours |
+   | **`end_time`**   | ❌ **stale** | carried from source assignment | same |
+   | **`hours`**      | ❌ **stale** | carried from source assignment | same — this is the field that drives the email's hour total |
+
+   **Where the target's correct `start_time` / `end_time` / `role` would come from:** `shift_types` (the canonical source per the deprecation notice on `shift_templates` in `src/lib/types.ts:122–140`). The renderer does *not* have `shift_types` data in scope — only `RowConfig` (`id`, `label`, `height`, `visible`, `order`), which carries no time/role information. So `moveAssignment` cannot recompute these locally without a new data dependency. This is the structural reason it doesn't.
+
+4. **Distribute path — confirms exactly what gets sent.**
+   Homebase only sends `{ schedule_id }` to Aegis (`src/lib/aegis-actions/dispatcher.ts:286–289`). Aegis then re-reads the schedules row and reads **`schedules.data.assignments`** — confirmed in `~/Desktop/Aegis/src/workflows/schedule-build.ts:1259–1291`:
+
+   ```ts
+   .from('schedules')
+     .select('id, week_start, week_end, data, status')
+     .eq('id', scheduleId)
+   ...
+   const schedData = scheduleRow.data as unknown as ScheduleData;
+   ...
+   const myShifts = schedData.assignments.filter(a => a.employee_id === emp.id)...
+   ```
+
+   The email/SMS templates render `s.shift_name`, `s.role`, `s.start_time`, `s.end_time`, `s.hours` straight off each assignment (`schedule-build.ts:1303–1331`). No second lookup against `shift_types` to correct the times — whatever sits in `schedules.data.assignments` is what employees receive.
+
+**Net diagnosis:** the manual edit *does* persist to `schedules.data.assignments` (the Save path is whole-array overwrite, not partial). The bug is that `moveAssignment` only patches `shift_name` + `date` and leaves `start_time`/`end_time`/`role`/`hours` set to the *source* shift's values, so the persisted row is internally inconsistent ("new shift name, old hours"). Aegis then distributes that inconsistent row verbatim, producing the reported symptom.
+
+**Fix shape (not implemented yet):** the move handler needs the target shift's authoritative `start_time` / `end_time` / role(s) at the moment of drop. Two viable spots — recompute inside `moveAssignment` (requires passing `shift_types` into `ScheduleRenderer`), or normalize inside `ScheduleReviewPanel.save()` before writing (single chokepoint, also catches `add_shift` paths). Decide on direction before writing the fix.
+
+**Agreed fix approach (2026-06-08):** Shared pure resolver resolveAssignmentForSlot, called at BOTH moveAssignment (live UI correctness) and ScheduleReviewPanel.save() (persist chokepoint). Preserve role (it is NOT stale on a move — corrects finding-3). Resolve start/end by copying from a sibling assignment in the same shift_name+date (engine-authoritative this week); fall back to shift_types only for empty targets. Recompute hours from the resolved window.
+
 - Fix:
   - [ ] A move recomputes the **full** assignment object from the target slot and persists the complete `ScheduleData`
   - [ ] Verified: edit → reload → DB shows corrected hours → a (test) distribute reads correct hours
 - **Done when:** a manual move round-trips to the DB with all fields correct and distribute reflects it.
 
+Session recap (2026-06-08) reports S2 implemented (4 files + 2 helpers, claimed tsc clean) but NOT yet diff-reviewed by Alexander. PENDING: read full diff; run npx tsc --noEmit independently; verify the empty-target fallback time source (shift_types vs shift_requirements — original S1 PART 3, still unconfirmed). Common-case sibling-copy path is fine; the fallback is the risk.
+
+Implemented (uncommitted, 2026-06-08): new helpers src/lib/schedule/resolveAssignment.ts + hours.ts; edits to ScheduleRenderer, ScheduleReviewPanel, plus UNREQUESTED edits to GapResolverPanel + ManualScheduleBuilder (likely shared-hours dedup — verify behavior unchanged). PENDING Alexander: read all diffs incl. the two unscoped files; independent npx tsc --noEmit; verify resolveAssignment empty-target fallback time source (shift_types vs shift_requirements, still unconfirmed). tsconfig.tsbuildinfo should not be tracked.
+
 ### S3 · Manual TO approval in Homebase doesn't notify the employee
-**Repo:** Homebase Time Off tab → Aegis notify bridge · **Status:** `NOT STARTED`
+**Repo:** Homebase Time Off tab → Aegis notify bridge · **Status:** `DIAGNOSED`
 The email magic-link approval notifies the employee; the in-tab Homebase approval does not. Also set `decided_by`, and have Aegis acknowledge the acting manager.
 
 - Diagnosis:
-  - [ ] In-tab approve/deny path read; Aegis employee-notification function (used by the magic-link path) located
+  - [x] In-tab approve/deny path read; Aegis employee-notification function (used by the magic-link path) located
 - Fix:
   - [ ] In-tab approval fires the same employee notification
   - [ ] `decided_by` set on the in-tab path
   - [ ] Manager gets a "got it — change made and employee notified" acknowledgment
 - **Done when:** approving a TO in Homebase notifies the employee and the manager, and `decided_by` is populated.
+
+**Findings (2026-06-08):** In-tab TimeOffTab.handleDecision (TimeOffTab.tsx:230-241) updates status + decided_at, logs activity, refetches — and stops. Missing vs magic-link path: employee notification, decided_by, race guard (.eq('status','pending')), manager acknowledgment. Notification primitive postToAegisInternal('/internal/notify-to-decision') exists in Homebase (aegis-internal.ts) but needs server env vars; TimeOffTab is a client component so it can't call it directly.
+Agreed fix approach: extract shared decideTimeOffRequest helper (guarded update w/ decided_by from server auth cookie, activity log, fire-and-tolerate notify, return manager-facing message); add server route POST /api/time-off-decision; refactor magic-link dispatcher to call the same helper; TimeOffTab calls the route and surfaces the message (toast). Pre-fix checks: grep src/ for other client-side time_off_requests.update({status}) callers; confirm AEGIS_URL + AEGIS_INTERNAL_SECRET set on Vercel. Out of scope: cross-notify other managers (fast-follow).
 
 > **Out of this sprint (deliberately):** cross-notify the *other* managers when one acts ("no action needed") — moderate build, near-term fast-follow.
 
@@ -128,3 +282,18 @@ The email magic-link approval notifies the employee; the in-tab Homebase approva
 - Logged two live bugs: ENGINE-1 (engine skips eligible employees) and SCHED-EDIT-1 (manual edits don't persist).
 - Defined the 48-hour sprint: S1 ENGINE-1, S2 SCHED-EDIT-1, S3 manual-approval-notify. All diagnose-first.
 - **Next session:** run the three diagnostic prompts (S1 dry-run + disposition dump in Aegis; S2 save-handler read in Homebase; S3 approve-path read). Fill in each item's Diagnosis section here before writing any fix.
+
+### 2026-06-08 (cont.) — availability fix + fairness question
+- Confirmed Erin's availability ended 21:00 vs Afternoon 21:15; extended availability (data fix), verified.
+- Post-fix sample still schedules Erin once; repeat names observed. Opened ENGINE-2 (S1b) as DIAGNOSING — suspected hours-fairness not distributing load, four competing hypotheses, instrumented dry-run pending.
+- Corrected agent error: AManager is a real role, not a typo (no cleanup, no drift entry).
+
+### 2026-06-08 (cont. 2) — ENGINE-2 root cause + S3 diagnosed
+- ENGINE-2 is NOT a fairness bug. Fairness pipeline verified intact. Root cause = enforceAttributeMixForShift post-fill swaps (active gender_requirement, 1M+1F/shift, all shifts) displacing ranker picks without backfill; same-day-doubles not re-evaluated. Erin/Kori/Michael starved to 6.3h, Lucas 26.3h. Two problems: (A) engine no-backfill, (B) policy decision. gender_requirement documented dormant but is LIVE — doc correction needed (04 §2.4, 06 §9).
+- S3 diagnosed: in-tab TO approval does ~1/3 of magic-link path; shared-helper + server-route fix approach agreed; build held.
+- S2 reported implemented by recap; IN REVIEW pending Alexander's diff read + tsc + fallback time-source check.
+- No engine/Homebase fixes authorized this session — all hold on decisions above.
+
+### 2026-06-08 (cont. 3) — gender rule reframed to temporal coverage
+- Real requirement clarified: facility-wide 1M+1F at every staffed moment among counted guard roles (Headguard/Lifeguard/AManager; Greeter + Junior LG excluded; Manager TBD), guard-staff-on-floor, flag-don't-force, no single-staff windows. This becomes the ENGINE-2 fix: new sex_coverage constraint (scope=concurrent_coverage, validate-and-flag, no swap), retiring the per-shift attribute_mix swap that caused the inequity. Contract-first; spec pending Manager-counts confirm.
+- S2 found implemented but uncommitted/unreviewed; expanded scope to GapResolverPanel + ManualScheduleBuilder. IN REVIEW pending Alexander's diff read + tsc + fallback check.

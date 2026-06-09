@@ -89,7 +89,7 @@ Every employee at a client company. Separate from `users` — employees may not 
 | individual_wage | number \| null | **column is `individual_wage`, not `wage`**; overrides role rate when set |
 | is_veteran | boolean \| null | veteran-preference scheduling |
 | aegis_access | 'manager' / 'employee' / 'blocked' \| null | the employee's permission level when *messaging* Aegis — NOT the same as being a notification-receiving manager |
-| sex | 'male' / 'female' | **present in DB (Migration 011), read by the engine's `attribute_mix` constraint, but MISSING from `src/db/types.ts`** |
+| sex | 'male' / 'female' | **present in DB (Migration 011), but MISSING from `src/db/types.ts`.** Read by the engine's sex/coverage rule. As of the ENGINE-2 rework this is consumed by the **live `concurrent_coverage` (`sex_coverage`) constraint** (facility-wide validate-and-flag), not the per-shift `attribute_mix` swap — see the Aegis reference §2.4. |
 
 ### 1.4 availability **[verified]**
 
@@ -393,13 +393,29 @@ interface ScheduleGap {
   end_time?: string;
 }
 
-interface FlaggedIssue {
-  type: 'unsatisfied_attribute_mix';
-  date: string;
-  shift_name: string;
-  description: string;
-  metadata: Record<string, unknown>;
-}
+// FlaggedIssue is a DISCRIMINATED UNION (since ENGINE-2 / the sex_coverage
+// rework). The shift-scoped variant carries `shift_name`; the concurrent-
+// coverage variant has NO shift_name and carries its time window in metadata
+// (a coverage gap can straddle shifts). Defined in Aegis
+// `src/workflows/schedule-build.ts`; mirrored in Homebase `src/lib/types.ts`.
+type FlaggedIssue =
+  | {
+      type: 'unsatisfied_attribute_mix';   // LEGACY (per-shift attribute_mix swap)
+      date: string;
+      shift_name: string;
+      description: string;
+      metadata: Record<string, unknown>;   // { value, actual, required, attribute, per_employee_dispositions[] }
+    }
+  | {
+      type: 'unsatisfied_sex_coverage';     // CURRENT (facility-wide concurrent_coverage, validate-and-flag)
+      date: string;
+      description: string;
+      metadata: {
+        time_window: { start: string; end: string };
+        missing_sex: string;
+        on_duty: Array<{ name: string; role: string; sex: string }>;
+      };
+    }
 
 type DispositionReasonCode =
   | 'not_qualified' | 'on_time_off' | 'max_hours_reached'
@@ -414,6 +430,8 @@ interface EmployeeDisposition {
 ```
 
 *`per_employee_dispositions` on each gap names every qualified candidate and why they were not placed — the primary diagnostic for "why was X not scheduled?" questions.*
+
+> **Two `flagged_issues` formats coexist in `schedules.data` (live caveat).** Schedules built **after** the ENGINE-2 / gender-rule rework carry the `unsatisfied_sex_coverage` variant; schedules built **before** it (historical rows, e.g. `week_start 2026-06-01`) still carry the legacy `unsatisfied_attribute_mix` variant. Both shapes are valid and remain in the table. Homebase's `CoverageFlags` component renders **only** `unsatisfied_sex_coverage`; it filters rather than switches, so legacy entries simply don't render (harmless, no crash). Any future *exhaustive* switch on `FlaggedIssue.type` must handle or ignore the legacy variant (or a migration must normalize old rows). This entry is an intentionally-live caveat in `SCHEMA_DRIFT_LOG.md`.
 
 ---
 

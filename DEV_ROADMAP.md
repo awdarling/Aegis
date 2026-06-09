@@ -4,7 +4,7 @@
 
 This is the operational source of truth for active development. It is meant to be read and updated by Claude (Claude Code / Cowork) every session.
 
-> **PUSH STATE (top-of-file banner — read every session):** Aegis is pushed and live (`46eaa70`). **Homebase is pushed and live (`29ed00e`).** **48-hour sprint COMPLETE (2026-06-09):** ENGINE-2/gender rule, S2/SCHED-EDIT-1, S3/in-tab TO notify all DONE and live-verified; S1/ENGINE-1 closed-as-diagnosed (no engine bug; JL residual routed to Role Groups; two product decisions pending — Afternoon end-time, JL scheduling). Next: Cowork operating model, then forward plan (`PRIORITY2_ANALYSIS.md` A/B/C).
+> **PUSH STATE (top-of-file banner — read every session):** Aegis is pushed and live (`46eaa70`). **Homebase is pushed and live (`29ed00e`).** **48-hour sprint COMPLETE (2026-06-09):** ENGINE-2/gender rule, S2/SCHED-EDIT-1, S3/in-tab TO notify all DONE and live-verified; S1/ENGINE-1 closed-as-diagnosed (no engine bug; JL residual routed to Role Groups; two product decisions pending — Afternoon end-time, JL scheduling). Next: the **Forward Build Sequence (Phases 1–4)** — see the section below (it supersedes the `PRIORITY2_ANALYSIS.md` A/B/C option framing). Reference docs + trackers aligned to this direction 2026-06-09.
 
 ---
 
@@ -253,33 +253,79 @@ Verified: independent `npx tsc --noEmit` = **0 errors**; full diffs reviewed. NO
 
 ---
 
+## Forward Build Sequence (Phases 1–4)
+
+The post-sprint direction (set 2026-06-09). This is the **north-star sequencing** for everything after the 48-hour sprint; it supersedes the A/B/C option framing in `PRIORITY2_ANALYSIS.md` §5 (those options are now folded into this phased plan). Effort tags: `[S]` small, `[M]` medium, `[L]` large. Lane tags: ⚙️ = fully Cowork-safe-lane (reads / sandbox / branch work); 🔒 = has human-gated steps (main push, prod write, prod env/policy, or messaging real employees). Most items below already exist in the Active backlog or the bug board — the **Note-map** column ties each to its source note and existing item so nothing is duplicated; only genuinely new items are marked **NEW**.
+
+**End-state vision (product north-star — also in doc 01):** Once Phases 1–4 land, Aegis is a genuinely conversational AI assistant manager running the entire employee side of workforce ops over email (SMS once A2P clears) — compliant onboarding, availability, time-off, swaps, emergency coverage, weekly distribution (each employee gets their own shifts plus the full schedule) — in a human-feeling voice, backed by a deterministic engine that builds fair, rule-driven schedules and surfaces real coverage gaps with suggested fixes instead of silently overworking staff. Homebase is the manager command center: data + rules that actually drive the engine (fairness/conflicts/coverage/doubles wired), schedules that persist and download cleanly, one-click TO/availability approval, coverage flags with suggested swaps, and natural-language admin via Soteria. Thesis: config-over-code multi-tenancy (a new client is a data operation, not an engineering project), a deterministic auditable engine, and a flag-don't-force model that keeps humans in final authority while the AI does the legwork — with security solid enough to sell.
+
+### Phase 1 — Harden & fix the live product
+| Item | Effort | Lane | Note-map / existing item |
+|---|---|---|---|
+| **Security audit + hardening** — audit all Homebase `/api/*` for missing auth; wax-seal replay/timestamp window; remove dead IP-allowlist fallback; RLS + secrets review. | [M] | ⚙️/🔒 | Notes 0 + 4. Existing: Tier-2 "Dedicated security track" + Tier-2 "audit Homebase `/api/*`" + the wax-seal/IP-allowlist fast-follows (§6.3 / EMAIL tracker). |
+| **Schedule download working** — `xlsx → exceljs` + a PDF that matches the built schedule. | [S–M] | ⚙️ | Note 7. Existing: Tier-3 "Schedule download format should match the builder" + Tier-2 "`xlsx → exceljs`". |
+| **Email deliverability / DELIV-1** — SPF/DKIM/DMARC + sender warm-up; gates the 30-person fan-out. | [M] | 🔒 | (security/deliverability). Existing: Tier-2 DELIV-1 + EMAIL tracker Phase 6.5. |
+
+### Phase 2 — Complete the comms loop
+| Item | Effort | Lane | Note-map / existing item |
+|---|---|---|---|
+| **All email workflows up & verified** — finish + test employee (swap, emergency coverage, query), manager (beyond `build_schedule`), and onboarding. | [L] | 🔒 | Note 9a. Existing: EMAIL tracker Phase 7 (risky fan-outs) + all TODO/UNTESTED intents (now tagged Phase 2 in that tracker). |
+| **Two deliverables on distribute** — per-employee shifts message + a full-schedule email. | [M] | 🔒 | Note 2. **NEW** (full-schedule email is new; per-employee shifts already exist in `distribute_schedule`). |
+| **Availability approval in Homebase** — magic-link buttons + Homebase backstop, mirroring TO. | [M] | ⚙️ | Note 10. Existing: Tier-1 "Availability approval buttons (mirror TO magic-link) + Homebase backstop". |
+| **Route notify-assignment through Aegis** — kill the Homebase→Twilio direct path; all employee comms go through Aegis compliance/opt-in. | [M] | ⚙️ | Note 1. Existing: Tier-2 "Homebase `notify-assignment` should route through Aegis". |
+
+### Phase 3 — Configurable, correct rules
+| Item | Effort | Lane | Note-map / existing item |
+|---|---|---|---|
+| **Rules actually apply** — wire `conflict_resolution_preference`, fairness weight, doubles emergency handling. | [M] | ⚙️ | Note 6. Existing: §6.4 "`conflict_resolution_preference` wiring" + doc 06 §9 banked items (`doubles_policy='emergency_only'` behaves like `never`). |
+| **Role Groups** — `accepted_roles` eligibility + role-preference rule; engine before UI. | [L] | ⚙️ | (existing high-pri). Existing: Tier-2 "Role Groups". Also the structural resolution path for ENGINE-1's Junior-Lifeguard 0h miss. |
+| **Rules-tab UI + configurable rules** — TO-rules-as-policy, rule/attribute create-edit UI. | [L] | ⚙️ | Note 5. Existing: Tier-2 "TO-rules-as-policy program" (rule/attribute create+edit UI) + doc 03/06 "Rules-tab UI build-out" open item. |
+| **Coverage-flag resolver** — manager-assisted swap suggestions. | [M] | ⚙️ | Note 8. Existing: Tier-2 "Coverage-flag resolver (engine helper + Homebase UI)". |
+| **Decide the inert per-shift swap** — keep-as-capability-+-guardrail vs remove (`enforceAttributeMixForShift`). | [S] | ⚙️ | (this session's logged decision). Existing: Tier-2 "Decide the fate of the retired per-shift attribute-mix swap". |
+
+### Phase 4 — Experience & leverage
+| Item | Effort | Lane | Note-map / existing item |
+|---|---|---|---|
+| **Aegis personability pass** — voice across every Aegis string. | [M] | ⚙️ | Note 3. Existing: the "feels like a person" standing principle + Tier-1 tone-pass note. |
+| **Soteria fully operational** — NL control of all Homebase + schedule editing. | [L] | ⚙️ | Note 11. Existing: Tier-2 "Soteria fully operational". |
+| **User guides** — two deliverables per user type for Watermark to hand staff. | [S] | ⚙️ | Note 9b. **NEW** (user-guide deliverables not previously tracked). |
+
+**Source-note ledger (the 11 notes → where they live):** 0/4 → Phase 1 security; 1 → Phase 2 notify-assignment-through-Aegis; 2 → Phase 2 two-deliverables (full-schedule email NEW); 3 → Phase 4 personability; 5 → Phase 3 Rules-tab/configurable rules; 6 → Phase 3 rules-actually-apply; 7 → Phase 1 schedule-download; 8 → Phase 3 coverage-flag resolver; 9a → Phase 2 all-workflows-via-email, 9b → Phase 4 user guides (NEW); 10 → Phase 2 availability approval in Homebase; 11 → Phase 4 Soteria. Genuinely new vs the pre-existing backlog: **note 2's full-schedule email** and **note 9b's user guides**; everything else dedupes onto an item already tracked above.
+
+---
+
 ## Active backlog
 
+> **Phase tags** below (`[P1]`–`[P4]`) map each backlog item onto the Forward Build Sequence above. Untagged items are launch-cleanup / polish that sit outside the four-phase arc.
+
 ### Tier 1 — near-term fast-follows
-- Cross-notify managers on TO/availability action ("no action needed").
+- `[P2]` Cross-notify managers on TO/availability action ("no action needed").
 - **Access page: can't revoke Homebase access for Bubba** — fix; then execute launch cleanup (remove Bubba's manager row, `aegisscheduler` test employee, stray pending test TO, sandbox/test activity).
-- Availability approval **buttons** (mirror TO magic-link) + Homebase backstop — also the fix for "communications feel robotic / yes-no reply bs" (do a tone pass in the same pass).
+- `[P2]` Availability approval **buttons** (mirror TO magic-link) + Homebase backstop — also the fix for "communications feel robotic / yes-no reply bs" (do a tone pass in the same pass — `[P4]` personability).
 - Undo action button.
 - Expand doc 03's Access Management section (docs gap).
 
 ### Tier 2 — significant builds (contract-first: engine/parser before UI)
-- **TO-rules-as-policy program** (one program): move TO rules into the same `policy_value_json`/constraint-vocabulary system the schedule engine uses; attribute classifier so workflows know what to pull; Rules/Attribute creation+edit UI that updates everywhere; Soteria + Aegis can read/write. Includes the "new UI and engine for TO rule policies" and "attribute edit/creation page" notes.
-- **Role Groups** — `shift_requirements.accepted_roles` (exists, NOT read yet); structural fix for Headguard coverage gaps **and** the resolution path for ENGINE-1's Junior-Lifeguard structural miss (4 employees with 0h because no JL slots exist). Engine eligibility before UI. (Distinct from ENGINE-1 as a bug class: ENGINE-1 is `DIAGNOSED` and the JL portion is structurally owned here.)
-- **Coverage-flag resolver (engine helper + Homebase UI)** — when a schedule carries an unsatisfied_sex_coverage flag (all slots filled, but the concurrent-coverage mix is unmet — e.g. no male guard 11:00-21:15), Homebase displays the flag but offers no way to act on it. Build a manager-assisted resolver, analogous to the gap resolver: an engine helper computes candidate swaps that would satisfy the flagged window without creating a new gap/conflict/coverage hole; Homebase surfaces them as suggestions; the manager applies one via the manual-edit path. Manager-driven, NOT an automatic swap — the assisted version of the per-shift swap retired in ENGINE-2 (preserves flag-don't-force + config-over-code). Two stages: (1) read-only — name the missing sex and list qualified, available employees who could cover; (2) one-click apply-a-swap. Dependencies: gate on SCHED-EDIT-1 verified; needs an engine swap-suggestion helper (shares eligibility/ranking infra with the gap resolver and the retired attribute-mix logic). Sequence after SCHED-EDIT-1; overlaps with gap-resolver / Role Groups work.
-- **Decide the fate of the retired per-shift attribute-mix swap (`enforceAttributeMixForShift`, schedule-build.ts:707).** ENGINE-2 retired the per-shift gender swap by *configuration* — flipping Watermark's policy from attribute_mix → concurrent_coverage — not by removing code. The swap (and its `unsatisfied_attribute_mix` flag) still exists and still fires for any policy with an attribute_mix-shape policy_value_json. Inert for Watermark today (the flipped policy feeds the concurrent_coverage path, so hard.attributeMix is empty — confirmed by the 6/15 build: flat hours, only sex_coverage flags). Footgun: re-adding an attribute_mix-shape policy to Watermark would resurrect the displacing bimodal-hours behavior. Decide: (a) KEEP it as a generic multi-tenant capability + add a guardrail so Watermark can't accidentally acquire an attribute_mix policy; or (b) REMOVE the per-shift swap if committing to concurrent_coverage as the only sex/attribute model. Leaning (a) on config-over-code grounds; needs an explicit call. Low urgency (inert today); logged so it isn't forgotten.
-- **Soteria fully operational** — natural-language control of all of Homebase + can edit the schedule.
-- **Manual builder recommends employees with engine-level efficacy** — surface the engine ranking in the manual builder.
-- **Dedicated security track** (for client acquisition) — `/api/*` auth audit, wax-seal replay/timestamp window, RLS review, secrets hygiene, remove dead IP-allowlist fallback.
-- **DELIV-1** — SPF/DKIM/DMARC + sender warm-up; gates the 30-person `distribute_schedule` fan-out.
+- `[P3]` **TO-rules-as-policy program** (one program): move TO rules into the same `policy_value_json`/constraint-vocabulary system the schedule engine uses; attribute classifier so workflows know what to pull; Rules/Attribute creation+edit UI that updates everywhere; Soteria + Aegis can read/write. Includes the "new UI and engine for TO rule policies" and "attribute edit/creation page" notes. (Note 5.)
+- `[P3]` **Role Groups** — `shift_requirements.accepted_roles` (exists, NOT read yet); structural fix for Headguard coverage gaps **and** the resolution path for ENGINE-1's Junior-Lifeguard structural miss (4 employees with 0h because no JL slots exist). Engine eligibility before UI. (Distinct from ENGINE-1 as a bug class: ENGINE-1 is `DIAGNOSED` and the JL portion is structurally owned here.)
+- `[P3]` **Coverage-flag resolver (engine helper + Homebase UI)** — when a schedule carries an unsatisfied_sex_coverage flag (all slots filled, but the concurrent-coverage mix is unmet — e.g. no male guard 11:00-21:15), Homebase displays the flag but offers no way to act on it. Build a manager-assisted resolver, analogous to the gap resolver: an engine helper computes candidate swaps that would satisfy the flagged window without creating a new gap/conflict/coverage hole; Homebase surfaces them as suggestions; the manager applies one via the manual-edit path. Manager-driven, NOT an automatic swap — the assisted version of the per-shift swap retired in ENGINE-2 (preserves flag-don't-force + config-over-code). Two stages: (1) read-only — name the missing sex and list qualified, available employees who could cover; (2) one-click apply-a-swap. Dependencies: gate on SCHED-EDIT-1 verified; needs an engine swap-suggestion helper (shares eligibility/ranking infra with the gap resolver and the retired attribute-mix logic). Sequence after SCHED-EDIT-1; overlaps with gap-resolver / Role Groups work.
+- `[P3]` **Decide the fate of the retired per-shift attribute-mix swap (`enforceAttributeMixForShift`, schedule-build.ts:707).** ENGINE-2 retired the per-shift gender swap by *configuration* — flipping Watermark's policy from attribute_mix → concurrent_coverage — not by removing code. The swap (and its `unsatisfied_attribute_mix` flag) still exists and still fires for any policy with an attribute_mix-shape policy_value_json. Inert for Watermark today (the flipped policy feeds the concurrent_coverage path, so hard.attributeMix is empty — confirmed by the 6/15 build: flat hours, only sex_coverage flags). Footgun: re-adding an attribute_mix-shape policy to Watermark would resurrect the displacing bimodal-hours behavior. Decide: (a) KEEP it as a generic multi-tenant capability + add a guardrail so Watermark can't accidentally acquire an attribute_mix policy; or (b) REMOVE the per-shift swap if committing to concurrent_coverage as the only sex/attribute model. Leaning (a) on config-over-code grounds; needs an explicit call. Low urgency (inert today); logged so it isn't forgotten.
+- `[P4]` **Soteria fully operational** — natural-language control of all of Homebase + can edit the schedule. (Note 11.)
+- `[P3]` **Manual builder recommends employees with engine-level efficacy** — surface the engine ranking in the manual builder.
+- `[P1]` **Dedicated security track** (for client acquisition) — `/api/*` auth audit, wax-seal replay/timestamp window, RLS review, secrets hygiene, remove dead IP-allowlist fallback. (Notes 0 + 4.)
+- `[P1]` **DELIV-1** — SPF/DKIM/DMARC + sender warm-up; gates the 30-person `distribute_schedule` fan-out.
+- `[P2]` **Two deliverables on distribute** — per-employee shifts message **plus a full-schedule email** (the full-schedule email is the new piece). (Note 2.)
+- `[P2]` **Route Homebase `notify-assignment` through Aegis** — kill the direct Homebase→Twilio path so all employee comms pass Aegis compliance/opt-in. (Note 1. Also listed in the Tier-2 EMAIL-tracker carry-over below.)
+- `[P4]` **User guides** — two deliverables per user type (manager + employee) for Watermark to hand staff. (Note 9b — new.)
 
 ### Tier 3 — polish / smaller fixes
 - `saveTemplate id:''` bug in `TemplateEditorPanel` (before any client edits a template).
 - Hour rounding in the schedule tab for contributors.
-- Schedule download format should match the schedule builder (ties to `xlsx → exceljs`).
+- `[P1]` Schedule download format should match the schedule builder (ties to `xlsx → exceljs` + matching PDF — Note 7).
 - Orange glow around each rule (Rules tab UI).
 - Quria-admin-only: delete activity logs; delete old schedules (gated destructive actions).
 - **Strip committed `node_modules` from Aegis history** (~142MB across 2 historical commits — surfaced during the 2026-06-09 secret-scrub audit). Confirm `node_modules` is in `.gitignore`. Safe to force-push the rewrite later (solo repo).
-- **Reference-doc refresh** — items surfaced in `PRIORITY2_ANALYSIS.md` §3 / SCHEMA_DRIFT_LOG: docs 02/04/06 still describe the gender rule as **dormant per-shift `attribute_mix`** with a **single-variant `FlaggedIssue`** — reality is `sex_coverage` (scope=`concurrent_coverage`) + a discriminated union (incl. `unsatisfied_sex_coverage`); docs 05/06 carry the ruled-out ENGINE-1 hypothesis (`qualified_roles` miscased / `max_weekly_hours` null) — real cause was availability precision + the JL structural miss; doc 03 §7 cites a Homebase `src/db/types.ts` that doesn't exist (types live in `src/lib/types.ts`); SCHED-EDIT-1 and in-tab `decided_by` are described as open but have shipped fixes. Reconcile on the next doc pass.
+- **Reference-doc refresh** — **DONE 2026-06-09** (this doc-alignment pass). Reconciled docs 01–06 + trackers to post-sprint reality and the Phase 1–4 direction: gender rule corrected from dormant per-shift `attribute_mix` to live `sex_coverage` (scope=`concurrent_coverage`); `FlaggedIssue` documented as the discriminated union (incl. `unsatisfied_sex_coverage`); the two coexisting `schedules.data` flag formats noted; the ruled-out ENGINE-1 hypothesis replaced with the real cause (availability precision + the JL structural miss); doc 03 §7 corrected (Homebase types live in `src/lib/types.ts`; `src/db/types.ts` is an Aegis path); SCHED-EDIT-1 + in-tab `decided_by` marked resolved; CoverageFlags + its three mount views documented; Phase 1–4 sequence added to docs 05/01. (Original items surfaced in `PRIORITY2_ANALYSIS.md` §3 / SCHEMA_DRIFT_LOG.)
 
 ### Business / ops (non-dev — tracked, not on the build timeline)
 - Fix Quria landing page: add SME AI-integration consulting service line.
@@ -380,3 +426,16 @@ Theme: cleanup + drift reconcile + finish sex_coverage. Posture: fix-now if safe
 - Sandbox corrected: created a dedicated sandbox manager login (the 'Bubba = sandbox manager' claim was wrong — 1:1 auth↔users↔company). Documented Test Guard A/B; seeded transient test TO 13759531.
 - Watermark live on concurrent_coverage gender rule, persistent manual edits, notifying in-tab TO approvals.
 - Next: Cowork operating model; then forward plan (PRIORITY2_ANALYSIS options A/B/C).
+
+### 2026-06-09 (session 4) — doc alignment + Forward Build Sequence
+Documentation-only pass (no code touched, no build run). Brought all six reference docs (01–06) + the live trackers to post-sprint reality and recorded the new forward direction.
+- **Forward Build Sequence (Phases 1–4)** transcribed into this roadmap as its own section (Phase 1 harden/fix · Phase 2 comms loop · Phase 3 configurable rules · Phase 4 experience/leverage), with effort `[S/M/L]` and lane (⚙️ safe-lane / 🔒 human-gated) tags. It supersedes the A/B/C option framing in `PRIORITY2_ANALYSIS.md` §5. The end-state product vision was added here and to doc 01.
+- **11 source notes folded in, deduped.** ~9 of 11 map onto items already in the Active backlog or bug board (note-map column ties each one); only **note 2's full-schedule email** and **note 9b's user guides** are genuinely new — both added to the backlog. Existing backlog items tagged `[P1]`–`[P4]`.
+- **EMAIL_WORKFLOWS_TRACKER.md:** noted that the remaining TODO/UNTESTED intents + risky fan-outs belong to **Forward Build Sequence Phase 2**; refreshed the stale ENGINE-1 entry (was OPEN with the ruled-out hypothesis) to the closed-as-diagnosed reality.
+- **Reference docs:** 01 end-state vision + Watermark-live facts; 02 `FlaggedIssue` → discriminated union + two coexisting `schedules.data` formats + gender rule now live concurrent_coverage; 03 §7 types path corrected (`src/lib/types.ts`; `src/db/types.ts` is an Aegis path) + CoverageFlags and its three mount views documented + SCHED-EDIT-1/in-tab `decided_by` marked resolved; 04 constraint vocabulary updated (`sex_coverage`/`concurrent_coverage` validate-and-flag, gender rule LIVE, `enforceAttributeMixForShift` retained-but-inert, email renderer handles both variants); 05 §6 active state rewritten (ENGINE-1/SCHED-EDIT-1/S3/ENGINE-2 all resolved) + Phase 1–4 + per-shift-swap decision + Cowork model reflected; 06 §9 limitations (gender_requirement live, ENGINE-1 resolution, per-shift swap inert/decision-pending) + new sex-coverage internals (`evaluateSexCoverage`, concurrent_coverage timeline segmentation, contiguous-flag coalescing).
+- **CLAUDE.md (both repos):** confirmed the Cowork operating model is present; added a brief "design north-star" pointer (Phase 1–4 + end-state vision). Refreshed stale SCHED-EDIT-1 "OPEN" mentions in the Homebase CLAUDE.md to DONE.
+- **SCHEMA_DRIFT_LOG.md:** marked the "Stale reference-doc sections" entries (gender_requirement dormant→live; Soteria attribute_mix model) RESOLVED 2026-06-09, entries left in place. **Did NOT touch** the live "two FlaggedIssue formats coexist" caveat.
+- **Tier-3 "Reference-doc refresh" backlog item → DONE** (this pass).
+- **Committed locally per repo, NOT pushed** (Aegis: `docs: align reference docs + roadmap to post-sprint reality and Phase 1–4 direction`; Homebase: `docs(claude): design north-star + operating model alignment`). Left for Alexander's review.
+- **Flagged for human review:** the Soteria system-prompt's attribute_mix vocabulary (`homebase/src/app/api/soteria/route.ts`) still documents only per-shift scopes — a *code* change, out of scope for a docs pass, left for a Phase 3 Rules build. doc 04 §1.2 and §6 still call the wax-seal replay-window + IP-allowlist removal a "fast-follow"; they are now Phase 1 security work (cross-referenced, not rewritten).
+- **Next:** Alexander reviews the two doc commits; begin Phase 1 (security audit, schedule download, DELIV-1).

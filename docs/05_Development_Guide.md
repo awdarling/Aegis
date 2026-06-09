@@ -68,7 +68,9 @@ For larger builds, split into a read-only **audit session** then a **build sessi
 
 ---
 
-## 6. Active State — June 8, 2026
+## 6. Active State — June 9, 2026 (post-sprint)
+
+The 48-hour post-launch sprint **closed 2026-06-09**: ENGINE-2 (gender rule), S2/SCHED-EDIT-1, and S3 (in-tab TO notify) are all DONE and live-verified; S1/ENGINE-1 is closed-as-diagnosed (no engine bug). The next direction is the **Forward Build Sequence (Phases 1–4)** — see §6.6.
 
 ### 6.1 Shipped & verified
 
@@ -77,14 +79,18 @@ For larger builds, split into a read-only **audit session** then a **build sessi
 - **Availability email workflow** — full chain verified (submit → confirm → fan-out to all managers → reply-YES approve → `availability` updated → employee notified).
 - **Inbound signature verification** ("wax seal") — live, `SKIP_SENDGRID_VERIFICATION=false`.
 - **Schedule Engine V2 (2.0.0)** — deployed, dry-run + cascade + banned-pair validated.
+- **ENGINE-2 / gender rule (DONE, live).** The bimodal-Headguard-hours cause — the per-shift `attribute_mix` sex swap displacing ranker picks without backfill — was replaced by the facility-wide `sex_coverage` (`scope=concurrent_coverage`, validate-and-flag, no swap). Policy `policy_value_json` flipped; the 6/15 build flattened hours (Lucas 26.3h→15.3h, Erin 6.3h→10.8h) and surfaced a coalesced `unsatisfied_sex_coverage` flag in both the manager email and Homebase `CoverageFlags`.
+- **SCHED-EDIT-1 (DONE, Homebase `f28cb30`, live-verified).** Manual schedule moves now persist corrected hours to `schedules.data.assignments` via the shared `resolveAssignment` + `hours` helpers (move handler + save chokepoint).
+- **S3 / in-tab TO approval (DONE, Homebase `f8e2505`, sandbox-verified).** In-tab approve/deny now notifies the employee, sets `decided_by`, and toasts the manager — via the shared `decideTimeOffRequest` helper + `POST /api/time-off-decision`; the magic-link path delegates to the same helper.
 - Fixed: BUG-1 (TO without shift_requirements), BUG-3 (wrong Homebase URL in outbound), availability manager-notify fan-out (was `.limit(1)`), classifier TO-vs-availability disambiguation.
 
 ### 6.2 Open bugs
 
 | ID | Status | Summary |
 |---|---|---|
-| ENGINE-1 | OPEN | Engine V2 silently skips eligible employee (Aaron Barrigan, Headguard). Eligibility-filter bug; check `qualified_roles`/`max_weekly_hours` via gap dispositions. |
-| SCHED-EDIT-1 | OPEN | Manual Schedule-page edits don't persist to `schedules.data.assignments` → distribute sends stale hours. UI-to-data write gap. |
+| ENGINE-1 | CLOSED-AS-DIAGNOSED (not an engine bug) | "Aaron Barrigan" = Erin Berigan (one employee); her exclusion was a 15-min availability-precision issue (data-fixed). Residual — 4 Junior Lifeguards at 0h — is **structural** (no JL shift_requirements/canvas slots) and routes to **Role Groups**, not an engine fix. Two product decisions pending: Afternoon shift end-time; whether Watermark schedules Junior Lifeguards. (Full detail in `DEV_ROADMAP.md` S1 + doc 06 §9.) |
+| SCHED-EDIT-1 | DONE (Homebase `f28cb30`, live-verified 2026-06-09) | Manual moves now persist corrected hours to `schedules.data.assignments` (shared `resolveAssignment` + `hours` helpers). |
+| ENGINE-2 | DONE (live 2026-06-09) | Per-shift `attribute_mix` sex swap replaced by `sex_coverage` (`concurrent_coverage`, validate-and-flag); hours flattened, flag renders in email + Homebase. |
 | BUG-4 | OPEN (rule firm) | Audit every employee-facing email template for Homebase CTAs (swap, emergency coverage, onboarding, distribution) and scrub. |
 | BUG-5 | OPEN | Stale unconfirmed pending TO silently blocks a new TO submission. Recommended: notify employee + cancel keyword. |
 | TENANT-1 | OPEN | Outbound `From` not tenant-aware (apex address + Reply-To works for single-tenant Watermark; breaks at second tenant). |
@@ -96,11 +102,26 @@ Remove the Bubba Ganush manager row after rollout monitoring; clear the stray pe
 
 ### 6.4 Deferred features
 
-**Role Groups** (high priority — structural fix for Afternoon Headguard gaps; `accepted_roles` exists; build contract-first, engine before UI); `distribute_schedule` / `initiate_onboarding` fan-outs (need DELIV-1 + Carolyn/Jack coordination); Rules-tab UI + Watermark policy migration (incl. `week_start_day='monday'`); max-consecutive-days constraint; `conflict_resolution_preference` wiring; cascade 5-hop/hours-aware paths; TO-R2.5 (multi-request-per-email — now unblocked), TO-R4 (Homebase TO violation UI), TO-R5 (full TO regression cycle); dormant `gender_requirement` policy.
+**Role Groups** (high priority — structural fix for Afternoon Headguard gaps **and** the resolution path for ENGINE-1's Junior-Lifeguard 0h miss; `accepted_roles` exists; build contract-first, engine before UI); `distribute_schedule` / `initiate_onboarding` fan-outs (need DELIV-1 + Carolyn/Jack coordination); Rules-tab UI + Watermark policy migration (incl. `week_start_day='monday'`); max-consecutive-days constraint; `conflict_resolution_preference` wiring; cascade 5-hop/hours-aware paths; TO-R2.5 (multi-request-per-email — now unblocked), TO-R4 (Homebase TO violation UI), TO-R5 (full TO regression cycle). *(The `gender_requirement` policy is no longer dormant — it is live as `sex_coverage`/`concurrent_coverage`; see doc 04 §2.4.)*
 
 ### 6.5 Tier-2 backlog
 
-`resolveCompanyId` sole-company fallback footgun; `company_channels` exact-match lookup; `decided_by` not set on in-tab TO approvals; Stripe webhook middleware verification; legacy SMS TO-token migration to `aegis_action_tokens`; audit Homebase `/api/*` for missing auth; Outlook DKIM CNAMEs; `xlsx → exceljs` for schedule download cell coloring; route Homebase `notify-assignment` through Aegis; mass-fan-out manager gate; multi-turn email context; sandbox seeding-pattern doc.
+`resolveCompanyId` sole-company fallback footgun; `company_channels` exact-match lookup; ~~`decided_by` not set on in-tab TO approvals~~ (**DONE via S3** — shared `decideTimeOffRequest` helper + `POST /api/time-off-decision` set `decided_by` on the in-tab path); Stripe webhook middleware verification; legacy SMS TO-token migration to `aegis_action_tokens`; audit Homebase `/api/*` for missing auth (→ Phase 1 security); Outlook DKIM CNAMEs; `xlsx → exceljs` for schedule download cell coloring (→ Phase 1 download); route Homebase `notify-assignment` through Aegis (→ Phase 2); mass-fan-out manager gate; multi-turn email context; sandbox seeding-pattern doc; **decide the fate of the inert per-shift `attribute_mix` swap** (`enforceAttributeMixForShift` — keep-as-capability-+-guardrail vs remove; → Phase 3).
+
+### 6.6 Forward Build Sequence (Phases 1–4)
+
+The post-sprint direction (set 2026-06-09; full transcription + 11-note mapping + effort/lane tags live in `DEV_ROADMAP.md`). It supersedes the A/B/C option framing in `PRIORITY2_ANALYSIS.md`.
+
+- **Phase 1 — Harden & fix the live product:** security audit + hardening (Homebase `/api/*` auth, wax-seal replay/timestamp window, remove dead IP-allowlist fallback, RLS + secrets); schedule download working (`xlsx → exceljs` + matching PDF); email deliverability / DELIV-1 (SPF/DKIM/DMARC + warm-up, gates the 30-person fan-out).
+- **Phase 2 — Complete the comms loop:** all email workflows up & verified (employee swap/emergency/query, manager beyond `build_schedule`, onboarding); two deliverables on distribute (per-employee shifts **+ full-schedule email**); availability approval in Homebase (magic-link buttons + backstop); route `notify-assignment` through Aegis.
+- **Phase 3 — Configurable, correct rules:** rules actually apply (`conflict_resolution_preference`, fairness weight, doubles emergency); Role Groups (`accepted_roles` eligibility + role-preference, engine before UI); Rules-tab UI + configurable rules (TO-rules-as-policy, rule/attribute create-edit); coverage-flag resolver (manager-assisted swap suggestions); decide the inert per-shift swap.
+- **Phase 4 — Experience & leverage:** Aegis personability pass; Soteria fully operational (NL control of all Homebase + schedule editing); user guides (two per user type).
+
+**Per-shift-swap decision (Phase 3, logged):** ENGINE-2 retired the per-shift gender swap by *configuration* (flipping Watermark's policy to `concurrent_coverage`), not by removing code. `enforceAttributeMixForShift` still exists and still fires for any tenant with an `attribute_mix`-shape policy — inert for Watermark today, but a footgun (re-adding an `attribute_mix` policy to Watermark would resurrect the bimodal-hours behavior). Decide: (a) keep as a generic capability + a guardrail, or (b) remove if committing to `concurrent_coverage` as the only sex/attribute model.
+
+### 6.7 Cowork autonomous operating model
+
+Development now runs partly through Cowork agents as well as Claude Code, under an explicit operating model (the canonical statement is in both repos' `CLAUDE.md`): a **safe lane** an agent may run unattended (reads of any kind, sandbox-tenant writes, feature-branch code + `tsc` + PR) and **human-gated** actions that always queue for Alexander (merge/push to `main`, any production/Watermark write, prod env-var or policy changes incl. Supabase policy flips, and anything that messages a real employee). Autonomy and credential power trade off — unattended work stays read-only / sandbox-scoped / least-privilege. **DONE-rule: committed ≠ done** — a change is `DONE` only when committed *and* live-verified end-to-end; committed-but-unpushed or pushed-but-unverified is `IN REVIEW`.
 
 ---
 

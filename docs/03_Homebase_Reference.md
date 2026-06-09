@@ -43,7 +43,7 @@ Table columns: Employee (name/avatar, active badge), Veteran badge, Custom-Avail
 
 Filter by All/Pending/Approved/Denied. Each request shows employee, role, dates, reason, partial summary, Aegis recommendation badge, Approve/Deny (or status) + delete. Partial requests show an orange summary; multi-day per-day variations expand. The "Log Request" modal supports single/multi day, full/partial, by-shift or custom-hours, per-day config, and a reason.
 
-*The Aegis assessment block shows the coverage recommendation. Policy-rule violations (notice period, consecutive days) are computed and shown in the Aegis manager **email**, but are **not yet surfaced in this tab's UI** (TO-R4). `decided_by` is populated on the magic-link approval path; the in-tab approve path does not yet set it (Tier-2 fix).*
+*The Aegis assessment block shows the coverage recommendation. Policy-rule violations (notice period, consecutive days) are computed and shown in the Aegis manager **email**, but are **not yet surfaced in this tab's UI** (TO-R4). **As of the sprint close (2026-06-09) the in-tab approve/deny path now matches the magic-link path:** both go through the shared `decideTimeOffRequest` helper (`src/lib/time-off/decide.ts`) via `POST /api/time-off-decision` — a guarded pending-only update that sets `decided_by` (from the server auth cookie), notifies the employee, and surfaces a manager-facing toast acknowledgment. The earlier gap (in-tab approvals didn't notify or set `decided_by`) is resolved.*
 
 ### 2.3 Roles / Shifts / Conflicts / Wage Rates / Swaps
 
@@ -65,7 +65,7 @@ Lists employees without a completed onboarding session; "Onboard Selected/All" t
 
 ## 3. Rules Tab
 
-Manages the `policies` table — the structured rules Engine V2 reads. Rules are grouped by `policy_type`; the engine-readable value lives in `policy_value_json` (the engine ignores the legacy `policy_value` scalar and ignores `policy_type` for parsing). Add/edit/delete with activity logging. This is where Watermark's `week_start_day = 'monday'` and any `attribute_mix` (e.g. gender) minimums are configured. See the Aegis reference §2.4 for the full constraint vocabulary and accepted `policy_key` aliases.
+Manages the `policies` table — the structured rules Engine V2 reads. Rules are grouped by `policy_type`; the engine-readable value lives in `policy_value_json` (the engine ignores the legacy `policy_value` scalar and ignores `policy_type` for parsing). Add/edit/delete with activity logging. This is where Watermark's `week_start_day = 'monday'` and any attribute/coverage minimums are configured — Watermark's gender rule is now the facility-wide `sex_coverage` (`scope=concurrent_coverage`, validate-and-flag), having replaced the old per-shift `attribute_mix` swap. See the Aegis reference §2.4 for the full constraint vocabulary and accepted `policy_key` aliases.
 
 *Rules-tab UI build-out and the Watermark policy migration remain open roadmap items.*
 
@@ -79,11 +79,13 @@ Two modes: viewing Engine-V2-built schedules and manual building.
 
 Shows current/next week. Each day lists filled `assignments` and any `gaps` (each gap carries `per_employee_dispositions` explaining why each qualified employee wasn't placed). Status badges: draft / published (distribution is tracked by `distributed_at`, not a status value). Day closure: a manager can close/reopen a day (confirmation modal) → triggers per-employee Aegis closure notifications.
 
+**Coverage flags (`CoverageFlags`, `src/components/schedule/CoverageFlags.tsx`).** Renders the engine's `unsatisfied_sex_coverage` flags from `schedule.data.flagged_issues` as a "Coverage to review" list of manager action items — each showing the date, time window, which sex is missing, and who was on duty. Unlike a gap (an unfilled slot), a coverage flag is a *fully-staffed* schedule that still leaves a window with no guard of a required sex on the floor, so there is no single slot to "fill" — it surfaces as a review item, the safety mechanism for the flag-don't-force `sex_coverage` model. The component **only** renders `unsatisfied_sex_coverage` (it filters, so legacy `unsatisfied_attribute_mix` flags don't render — harmless, no crash). It is mounted in **three** views in `schedule/page.tsx`: the **HistoryReportDetail** (past-schedule report), the **current-week view**, and the **UpcomingCard preview** (the next-week Preview & Edit). The same coalesced flag also renders in the Aegis manager schedule-preview email.
+
 ### 4.2 Manual builder
 
-Managers can assign employees to slots by hand — the workaround while engine gaps (e.g. ENGINE-1) are open.
+Managers can assign employees to slots by hand — the workaround while engine gaps (e.g. ENGINE-1's structural Junior-Lifeguard miss) are open.
 
-> **SCHED-EDIT-1 (live bug):** moving an employee between shifts in the editor updates the displayed card but does **not** persist the corrected `shift_name`/`start_time`/`end_time` into `schedules.data.assignments`. `distribute_schedule` then reads the stale (pre-move) shift details and emails wrong hours. A UI-to-data write gap to fix before relying on manual edits + distribute.
+> **SCHED-EDIT-1 — RESOLVED (2026-06-09, Homebase `f28cb30`, live-verified).** Previously, moving an employee between shifts updated the displayed card but did not persist the corrected `shift_name`/`start_time`/`end_time` into `schedules.data.assignments`, so `distribute_schedule` read stale hours. The fix introduces a shared pure resolver (`src/lib/schedule/resolveAssignment.ts` + `hours.ts`) called at both the move handler (live UI correctness) and the `ScheduleReviewPanel.save()` persist chokepoint: a move now recomputes the full assignment from the target slot (sibling-copy within the same shift_name+date; fall back to **`shift_types`** for empty targets — confirmed to match `buildCanvas`) and recomputes hours. A manual move now round-trips the corrected hours to `schedules.data.assignments`. (Live `distribute` against real data remains gated by distribution rules + DELIV-1, but the data axis is correct.)
 
 ### 4.3 Download & delete
 
@@ -110,4 +112,4 @@ Floating assistant on every page. Reads employees/availability/TO/shifts/policie
 - **RLS:** a missing `public.users` row, or `users.id` not exactly matching `auth.users.id`, returns empty everywhere → infinite loading. Diagnostic: join `auth.users`↔`public.users` on email and compare ids.
 - **Dates:** never `new Date('YYYY-MM-DD')` for display (UTC-midnight shifts the date back a day in US tz) — use `split('-')` + `new Date(y, m-1, d)`.
 - **Env:** after changing Vercel env vars, redeploy manually. `AEGIS_URL` must be the Railway production URL; outbound Homebase→Aegis links must point at `homebase-nine-phi.vercel.app`.
-- **Schema:** verify column names against `information_schema` before writes — `src/db/types.ts` is incomplete (missing `employees.sex`, `shift_requirements.accepted_roles`).
+- **Schema / types:** Homebase's TypeScript types live in **`src/lib/types.ts`**. There is **no `src/db/types.ts` in this repo** — that path is the *Aegis* engine's generated types file (and it is itself incomplete: it omits `employees.sex` and `shift_requirements.accepted_roles`). Don't trust any types file as the schema of record; verify column names against `information_schema` before writes. `src/lib/types.ts` also holds the consumer copy of `FlaggedIssue` (the discriminated union mirrored from Aegis — keep the two in lockstep) and `ScheduleData`.

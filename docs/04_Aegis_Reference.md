@@ -83,14 +83,15 @@ After identity verification, Claude classifies the message. Returns JSON with `i
 
 | File | Purpose |
 |---|---|
-| `src/workflows/schedule-build.ts` | Orchestrator: load data, parse target week, apply shift overrides, call `runScheduleBuild`, persist the `schedules` row, dispatch manager-facing results. Defines `ScheduleAssignment`/`ScheduleGap`/`FlaggedIssue`/`ScheduleData`. |
+| `src/workflows/schedule-build.ts` | Orchestrator: load data, parse target week, apply shift overrides, call `runScheduleBuild`, persist the `schedules` row, dispatch manager-facing results. Defines `ScheduleAssignment`/`ScheduleGap`/`ScheduleData` and the **`FlaggedIssue` discriminated union** (`unsatisfied_attribute_mix` \| `unsatisfied_sex_coverage`). |
 | `src/lib/engine/types.ts` | Engine-internal types: `CanvasSlot`, `CandidatePool`, `WeekState`. |
 | `src/lib/engine/week-bounds.ts` | `getWeekBounds(offset, weekStartDay)` — derives the 7-day window. |
 | `src/lib/engine/canvas.ts` | `buildCanvas(...)` — one `CanvasSlot` per required head per requirement per active date; honors closures; orders priority-first then date/time ASC. |
 | `src/lib/engine/eligibility.ts` | Date-level `buildEligibility` + predicates `isQualifiedForRole`, `isAvailableForShift`, `isBlockedByTOForSlot`, `isVeteranOnlyDate`, `shiftsOverlap`, `sameDayDoubleReason`. |
 | `src/lib/engine/ranker.ts` | `rankCandidates(...)` — sorted-pool selection. |
 | `src/lib/engine/cascade.ts` | `resolveBannedPairConflict(...)` — swap-first / cascade-fallback for hard banned pairs (depth ≤ `MAX_CASCADE_HOPS = 5`). |
-| `src/lib/engine/attribute-mix.ts` | `enforceAttributeMixForShift(...)` + `buildAttributeShortageReason(...)` — post-fill attribute-mix swap pass; emits `FlaggedIssue`s. |
+| `src/lib/engine/attribute-mix.ts` | `enforceAttributeMixForShift(...)` + `buildAttributeShortageReason(...)` — post-fill per-shift attribute-mix swap pass; emits `unsatisfied_attribute_mix` flags. **Inert for Watermark** (no `attribute_mix` constraint under the flipped policy); retained as a generic capability, fate pending (see §2.4). |
+| `src/lib/engine/sex-coverage.ts` | `evaluateSexCoverage(...)` — facility-wide **concurrent_coverage** evaluator. Validate-and-flag only (never mutates `weekState`): per date, segments the timeline at shift boundaries over `population_roles`, flags any required attribute value absent from each on-duty block, and coalesces time-contiguous same-missing-value segments into one `unsatisfied_sex_coverage` flag. |
 | `src/lib/engine/dispositions.ts` | `classifyEmployeeForSlot`, `formatDispositionList`, `REASON_LABELS`, `REASON_ORDER` — per-candidate "why not placed" classifier shared by gap diagnostics and attribute-mix reasons. |
 | `src/lib/constraints/parser.ts` | `parseConstraints(policies)` → `ParsedConstraints` (hard constraints + `EngineSettings` + dropped/malformed list). |
 | `src/lib/constraints/types.ts` | Constraint vocabulary + `EngineSettings` + `DEFAULT_ENGINE_SETTINGS`. |
@@ -104,11 +105,12 @@ Pure engine entry point (`src/workflows/schedule-build.ts:819`):
 1. **Canvas** — `buildCanvas` enumerates slots from `shift_types` (outer, named shift per active day) × `shift_requirements` (inner, one slot per required head per role). Closure events drop whole dates. Priority dates (from event `staffing_notes` / certain `event_type`s) sort first.
 2. **Fill loop** — per slot, `buildEligibility` applies the **date-level** hard filter; then a **slot-level** filter; then `rankCandidates(...)[0]` chooses.
 3. **Cascade** — hard banned-pair conflicts (`employee_conflicts.severity='never'`) trigger `resolveBannedPairConflict` (swap first, then hop-limited cascade ≤ 5).
-4. **Attribute mix** — `enforceAttributeMixForShift` runs a post-fill swap pass to satisfy `attribute_mix` minimums (e.g. gender minimums); unmet → `FlaggedIssue`.
+4. **Attribute mix (per-shift, conditional)** — `enforceAttributeMixForShift` runs a post-fill swap pass to satisfy any `attribute_mix` minimums; unmet → `unsatisfied_attribute_mix` flag. **Empty/inert for Watermark** under the flipped sex policy (no `attribute_mix` constraint produced).
 5. **Veteran swap** — `at_least_one` mode swaps in a veteran when none present.
-6. **Gap recount** — unfilled heads become `ScheduleGap`s, each carrying `per_employee_dispositions` (every qualified candidate + why they weren't placed).
+6. **Concurrent coverage (validate-and-flag)** — `evaluateSexCoverage` runs on the *final* assignment state for each `concurrent_coverage` constraint; emits coalesced `unsatisfied_sex_coverage` flags. No swap. (This is Watermark's live sex rule.)
+7. **Gap recount** — unfilled heads become `ScheduleGap`s, each carrying `per_employee_dispositions` (every qualified candidate + why they weren't placed).
 
-Output `ScheduleData { assignments, gaps, flagged_issues? }` is written to `schedules.data` (canonical key `assignments`).
+Output `ScheduleData { assignments, gaps, flagged_issues? }` is written to `schedules.data` (canonical key `assignments`). `flagged_issues` is the `FlaggedIssue` discriminated union; the manager-facing email renderer (`schedule-build-email.ts`) handles **both** variants — the current `unsatisfied_sex_coverage` (renders date / time window / missing sex / on-duty) and the legacy `unsatisfied_attribute_mix` — so historical and current schedules both render.
 
 ### 2.3 Eligibility (the "why was X not scheduled?" path)
 
@@ -124,7 +126,8 @@ The parser reads **only** `policies.policy_key` and `policies.policy_value_json`
 
 | Constraint | Accepted `policy_key` aliases | `policy_value_json` shape | Engine destination |
 |---|---|---|---|
-| attribute_mix | attribute_mix, minimum_attribute_mix, gender_requirement, minimum_gender_requirement, sex_requirement | `{ attribute, minimums: {value:number}, scope: 'all_shifts'|'shift_type'|'specific_shift', scope_target? }` | `hard.attributeMix[]` → `enforceAttributeMixForShift` |
+| attribute_mix (per-shift) | attribute_mix, minimum_attribute_mix, gender_requirement, minimum_gender_requirement, sex_requirement | `{ attribute, minimums: {value:number}, scope: 'all_shifts'|'shift_type'|'specific_shift', scope_target? }` | `hard.attributeMix[]` → `enforceAttributeMixForShift` (post-fill swap). **Inert for Watermark today** — see note below. |
+| **concurrent_coverage** (facility-wide, validate-and-flag) | same `policy_key` aliases as attribute_mix, distinguished by **`scope: 'concurrent_coverage'`** in `policy_value_json` (the parser routes on the `scope` value) | `{ attribute, minimums: {value:number}, scope: 'concurrent_coverage', population_roles: string[], on_infeasible: 'flag' }` | `hard.concurrentCoverage[]` → `evaluateSexCoverage` (no swap; emits `unsatisfied_sex_coverage` flags) |
 | hours_fairness_weight | hours_fairness_weight, fairness_weight | number in [0,1] (or `{value}`) | `EngineSettings.hoursFairnessWeight` (fairness sort key) |
 | partial_shifts_allowed | partial_shifts_allowed, allow_partial_shifts | boolean (or `{value}`) | `EngineSettings.partialShiftsAllowed` |
 | veteran_preference_default | veteran_preference_default, veteran_default | 'none'\|'prioritize'\|'at_least_one'\|'only' | `EngineSettings.veteranPreferenceDefault` (fallback when manager omits) |
@@ -132,7 +135,11 @@ The parser reads **only** `policies.policy_key` and `policies.policy_value_json`
 | conflict_resolution_preference | conflict_resolution_preference, conflict_resolution | 'fairness_first'\|'minimize_disruption' | `EngineSettings.conflictResolution` (parsed, not yet consulted) |
 | week_start_day | week_start_day, first_day_of_week | 'sunday'\|'monday' | `EngineSettings.weekStartDay` → `getWeekBounds` |
 
-`DEFAULT_ENGINE_SETTINGS`: `hoursFairnessWeight 0.7`, `partialShiftsAllowed false`, `veteranPreferenceDefault 'none'`, `doublesPolicy 'never'`, `conflictResolution 'fairness_first'`, `weekStartDay 'sunday'`. Watermark sets `weekStartDay='monday'` via the Rules tab. The `gender_requirement` row exists with `policy_value_json = null` (dormant until configured) and `emergency_only` currently behaves like `never` (no emergency context in the build path).
+`DEFAULT_ENGINE_SETTINGS`: `hoursFairnessWeight 0.7`, `partialShiftsAllowed false`, `veteranPreferenceDefault 'none'`, `doublesPolicy 'never'`, `conflictResolution 'fairness_first'`, `weekStartDay 'sunday'`. Watermark sets `weekStartDay='monday'` via the Rules tab. `emergency_only` currently behaves like `never` (no emergency context in the build path).
+
+**Watermark gender rule — LIVE as `concurrent_coverage` (not dormant).** Earlier docs described `gender_requirement` as a dormant per-shift `attribute_mix` with `policy_value_json = null`. That is no longer the case. The ENGINE-2 rework **flipped** the policy to the facility-wide `sex_coverage` model: `scope=concurrent_coverage`, `attribute=sex`, `minimums {male:1, female:1}`, `population_roles=[Headguard, Lifeguard, AManager]` (Greeter, Junior Lifeguard, and pure Manager are NOT counted), `on_infeasible=flag`. It is **validate-and-flag only** — it evaluates the day's timeline (segmented at shift boundaries, restricted to `population_roles`) and emits `unsatisfied_sex_coverage` `FlaggedIssue`s where a required sex is absent from the on-duty set; it never swaps. This eliminated the bimodal-hours churn the old per-shift swap caused. The flag is the safety mechanism (flag-don't-force) and surfaces in both the Aegis manager email and Homebase's `CoverageFlags`. See the Supplemental reference §5/§9 for the `evaluateSexCoverage` internals.
+
+**`enforceAttributeMixForShift` — retained but inert (decision pending).** The old per-shift `attribute_mix` swap pass (`schedule-build.ts:707`, `attribute-mix.ts`) still exists and still fires for any tenant whose policy yields a `hard.attributeMix[]` constraint. For Watermark it is **inert** — the flipped policy feeds the `concurrent_coverage` path, so the parser yields no sex `attribute_mix` and `hard.attributeMix` is empty (confirmed by the 6/15 build: flat hours, only `sex_coverage` flags). A pending decision (`DEV_ROADMAP.md` Tier-2 / Phase 3) is whether to **keep** it as a generic multi-tenant capability behind a guardrail or **remove** it in favor of `concurrent_coverage` as the only sex/attribute model.
 
 Non-policy hard constraints the engine also consults: `employee_conflicts` (`never` hard / `avoid` soft), `events` (`closure` drops dates; other types mark priority), and approved `time_off_requests`.
 

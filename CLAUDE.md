@@ -14,6 +14,9 @@ Aegis is Quria Solutions' AI assistant manager: a Node/Express/TypeScript servic
 - Deep reference (read the relevant one before working in that area): `docs/04_Aegis_Reference.md`, `docs/02_Database_Schema.md`, `docs/06_Supplemental_Reference.md`.
 - Live trackers (update them when state changes): `EMAIL_WORKFLOWS_TRACKER.md`, `SCHEMA_DRIFT_LOG.md`, `TEST_IDENTITIES.md`.
 
+## Design north-star (self-align to this)
+The post-sprint direction is the **Forward Build Sequence (Phases 1–4)** in `DEV_ROADMAP.md`: (1) harden & fix the live product, (2) complete the comms loop, (3) configurable correct rules, (4) experience & leverage. **End-state vision:** Aegis is a conversational AI assistant manager running the entire employee side of workforce ops over email (SMS once A2P clears) — onboarding, availability, time-off, swaps, emergency coverage, weekly distribution — in a human-feeling voice, backed by a deterministic engine that builds fair schedules and *flags* real coverage gaps instead of silently overworking staff; Homebase is the manager command center (rules that drive the engine, schedules that persist & download, one-click approvals, coverage flags with suggested swaps, Soteria NL admin). Thesis: config-over-code multi-tenancy, a deterministic auditable engine, flag-don't-force with humans in final authority — secure enough to sell. Full statement in `docs/01_Business_Overview.md` §1.5.
+
 ## Hard rules (do not violate)
 - **Diagnose before fixing.** Show the evidence and explain the plan in plain English BEFORE editing. No blind fixes.
 - **Verify column names against `information_schema` before any INSERT/UPDATE.** `src/db/types.ts` is INCOMPLETE — it omits `employees.sex` and `shift_requirements.accepted_roles` (both exist, NOT NULL). Never trust the types file as the schema of record. Log new findings in `SCHEMA_DRIFT_LOG.md`.

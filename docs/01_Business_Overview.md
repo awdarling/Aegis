@@ -34,6 +34,16 @@ B2B SaaS to service businesses (country clubs, hospitality, recreation). Per-com
 | Website | quriasolutions.com (Netlify) |
 | Privacy / Terms / SMS Consent | quriasolutions.com/privacy, /terms, /sms-consent |
 
+### 1.5 Product north-star (end-state vision)
+
+The development direction is a four-phase Forward Build Sequence (harden the live product → complete the comms loop → configurable correct rules → experience & leverage; tracked in `DEV_ROADMAP.md`). Once those phases land, the product is:
+
+**Aegis** is a genuinely conversational AI assistant manager running the entire employee side of workforce operations over email — and over SMS once A2P clears: compliant onboarding, availability, time-off, swaps, emergency coverage, and weekly distribution (each employee gets their own shifts *plus* the full schedule), all in a human-feeling voice. It is backed by a deterministic engine that builds fair, rule-driven schedules and surfaces real coverage gaps with suggested fixes rather than silently overworking staff.
+
+**Homebase** is the manager command center: data and rules that actually drive the engine (fairness, conflicts, coverage, doubles all wired), schedules that persist and download cleanly, one-click time-off / availability approval, coverage flags with suggested swaps, and natural-language admin via Soteria.
+
+**The thesis:** config-over-code multi-tenancy (a new client is a *data* operation, not an engineering project), a deterministic auditable engine, and a flag-don't-force model that keeps humans in final authority while the AI does the legwork — with security solid enough to sell.
+
 ---
 
 ## 2. Products
@@ -52,7 +62,7 @@ B2B SaaS to service businesses (country clubs, hospitality, recreation). Per-com
 |---|---|
 | Company ID | a1b2c3d4-e5f6-7890-abcd-ef1234567890 |
 | Location / Industry | Grand Rapids, Michigan area / country club (swim facility) |
-| Status | **Live** — email workflows (time off, availability) in production use |
+| Status | **Live** — email workflows (time off, availability) in production use. Post-launch sprint (closed 2026-06-09) put three more capabilities live: the facility-wide **concurrent-coverage gender rule** (`sex_coverage`, validate-and-flag — replaced the old per-shift swap; hours now flatten and a coverage flag surfaces), **persistent manual schedule edits** (a manual move round-trips corrected hours to `schedules.data`), and **notifying in-tab time-off approvals** (an in-tab approve notifies the employee, sets `decided_by`, and acknowledges the manager). |
 | Billing | one_time, $2,117 (211700 cents), status paid |
 | Managers | Carolyn Ringler (c45ringler@gmail.com, +16168223809), Jack McCorkle (jackmc419@icloud.com, +16165519476) |
 | Aegis SMS / email | +16167477953 / aegis@aegis.quriasolutions.com |

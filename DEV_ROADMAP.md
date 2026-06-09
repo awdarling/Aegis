@@ -4,7 +4,7 @@
 
 This is the operational source of truth for active development. It is meant to be read and updated by Claude (Claude Code / Cowork) every session.
 
-> **PUSH STATE (top-of-file banner — read every session):** Aegis is pushed and live (`46eaa70`). **Homebase is pushed and live (`29ed00e`).** Go-live verified on the 6/15 Watermark build: ENGINE-2 hours flat + `unsatisfied_sex_coverage` flag rendering in BOTH the manager schedule-preview email AND the Homebase Preview & Edit view; SCHED-EDIT-1 round-trip persisting corrected hours. Open gate: S3 sandbox approve-TO round-trip (Vercel env confirmed; runs manually).
+> **PUSH STATE (top-of-file banner — read every session):** Aegis is pushed and live (`46eaa70`). **Homebase is pushed and live (`29ed00e`).** **48-hour sprint COMPLETE (2026-06-09):** ENGINE-2/gender rule, S2/SCHED-EDIT-1, S3/in-tab TO notify all DONE and live-verified; S1/ENGINE-1 closed-as-diagnosed (no engine bug; JL residual routed to Role Groups; two product decisions pending — Afternoon end-time, JL scheduling). Next: Cowork operating model, then forward plan (`PRIORITY2_ANALYSIS.md` A/B/C).
 
 ---
 
@@ -35,10 +35,12 @@ This is the single most important habit. The moment a piece of work is **approve
 
 ---
 
-## CURRENT SPRINT — 48-hour priority (started June 8)
+## CURRENT SPRINT — 48-hour priority (started June 8) — **COMPLETE 2026-06-09**
+
+All four sprint items closed: ENGINE-2/gender rule, S2/SCHED-EDIT-1, S3/in-tab TO notify shipped and live-verified; S1/ENGINE-1 closed-as-diagnosed (no engine bug — JL residual is structural, routed to Role Groups; two product decisions pending — see S1 entry). Next focus: Cowork operating model, then the forward plan (`PRIORITY2_ANALYSIS.md` A/B/C).
 
 ### S1 · ENGINE-1 — Builder skips eligible employees
-**Repo:** Aegis (`src/lib/engine/`) · **Status:** `DIAGNOSED` (ruled out as an engine bug — see post-sprint determination)
+**Repo:** Aegis (`src/lib/engine/`) · **Status:** `CLOSED-AS-DIAGNOSED` (no engine bug; JL residual routed to Role Groups; two product decisions pending)
 Aaron Barrigan (Headguard, fully available) is never placed. Erin Berigan reported as "can't work" with no custom availability. Suspected systemic, not one-off.
 
 **Post-sprint determination (2026-06-09):** ENGINE-1 is **not** an engine code bug. The two named cases dissolved under diagnosis: "Aaron Barrigan" = Erin Berigan (one employee, not two), and Erin's exclusion was a 15-min availability-precision issue (data fix, applied + verified). The remaining systemic miss — **4 Junior Lifeguards (Jenna Stibitz, Cameron Osterhaven, Colin Marvin, Quin Mead) get 0h because no `Junior Lifeguard` shift_requirements / canvas slots exist this week** — is **structural** and is **routed to Role Groups** (Tier 2). It is NOT an ENGINE-1 code fix. ENGINE-1 stays `DIAGNOSED` (not `DONE`) and is **blocked on two Alexander/manager decisions**: (a) true Afternoon shift end — 21:00 or 21:15? (b) does Watermark schedule Junior Lifeguards at all (off-roster vs Role Groups / fold into Lifeguard)?
@@ -224,7 +226,7 @@ Implemented (uncommitted, 2026-06-08): new helpers src/lib/schedule/resolveAssig
 **RESIDUAL RESOLVED (2026-06-09):** All three PENDING items above are now cleared. (1) The fix is committed in Homebase as `f28cb30` (not uncommitted) — `resolveAssignment.ts` + `hours.ts` + edits to ScheduleRenderer/ScheduleReviewPanel/GapResolverPanel/ManualScheduleBuilder; `tsconfig.tsbuildinfo` is now gitignored. (2) **Empty-target fallback time source = shift_types — CONFIRMED CORRECT, matches the engine.** `buildCanvas` (Aegis `src/lib/engine/canvas.ts:89,100-105`) sources a slot's `start_time`/`end_time`/`hours` from the **shift_type** (`st.start_time`/`st.end_time`); only `role` comes from the shift_requirement (`req.role`). The Homebase fallback (`resolveAssignment.ts:24-27`) looks up `shiftTypes` by name and copies `st.start_time`/`st.end_time` — same source. Note: `shift_requirements` *has* its own `start_time`/`end_time` columns, but `buildCanvas` ignores them — shift_types is authoritative. The save-time backstop (`ScheduleReviewPanel.save()` lines 193-201) fetches real `shift_types` from Supabase and re-resolves every pending row, so even an empty-target move normalizes against shift_types before persisting. (3) Independent `npx tsc --noEmit` on Homebase = **0 errors**. (4) The two unscoped files (GapResolverPanel, ManualScheduleBuilder) are pure dedup — they delete byte-identical local `computeHours` definitions and import the shared `@/lib/schedule/hours`; behavior unchanged. (5) **CLOSED 2026-06-09:** Homebase pushed (`29ed00e`) and the live edit→reload round-trip verified — a manual move persists the corrected hours to `schedules.data.assignments`. Status flipped to DONE.
 
 ### S3 · Manual TO approval in Homebase doesn't notify the employee
-**Repo:** Homebase Time Off tab → Aegis notify bridge · **Status:** `IN REVIEW` — committed (`f8e2505`), Homebase pushed (`29ed00e`), `AEGIS_URL` / `AEGIS_INTERNAL_SECRET` on Vercel **confirmed**; `decided_by` set on the in-tab path. **Only gate left:** sandbox approve-TO round-trip (employee notify + `decided_by` write + manager toast) verified end-to-end. Do NOT flip to `DONE` until that round-trip is observed.
+**Repo:** Homebase Time Off tab → Aegis notify bridge · **Status:** `DONE` — committed (`f8e2505`), Homebase pushed (`29ed00e`), Vercel env confirmed, **sandbox approve-TO round-trip verified 2026-06-09**: in-tab Approve fired the employee notification, `decided_by` was written, and the manager-facing toast surfaced the "got it — change made and employee notified" acknowledgment. Magic-link path delegates to the same shared helper.
 The email magic-link approval notifies the employee; the in-tab Homebase approval does not. Also set `decided_by`, and have Aegis acknowledge the acting manager.
 
 - Diagnosis:
@@ -372,3 +374,9 @@ Theme: cleanup + drift reconcile + finish sex_coverage. Posture: fix-now if safe
 - Schema drift logged (3f57b30): two FlaggedIssue formats coexist in schedules.data.
 - New Tier-2 item: decide fate of the inert per-shift attribute-mix swap.
 - Remaining to close sprint: S3 round-trip, then S3 -> DONE.
+
+### 2026-06-09 (cont.) — 48-hour sprint CLOSED
+- S3 verified in sandbox (notify + decided_by + toast) -> DONE. All sprint items closed: ENGINE-2/gender rule, S2/SCHED-EDIT-1, S3 DONE; S1/ENGINE-1 closed-as-diagnosed.
+- Sandbox corrected: created a dedicated sandbox manager login (the 'Bubba = sandbox manager' claim was wrong — 1:1 auth↔users↔company). Documented Test Guard A/B; seeded transient test TO 13759531.
+- Watermark live on concurrent_coverage gender rule, persistent manual edits, notifying in-tab TO approvals.
+- Next: Cowork operating model; then forward plan (PRIORITY2_ANALYSIS options A/B/C).

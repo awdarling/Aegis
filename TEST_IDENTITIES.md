@@ -21,7 +21,7 @@ Reference for who/what is configured in each tenant. Append-only — when identi
 | Bubba Ganush | lightningmakigga@gmail.com | (see Supabase) | manager | **TEMPORARY** — see note below |
 | Alexander Darling | awdarling@quriasolutions.com | +16163280114 | quria_admin | not an employee; employee intents won't work from this address without test setup |
 
-> **Bubba Ganush status (June 5, 2026):** Bubba's `public.users` row was repointed from the sandbox company to Watermark and set to `manager` so Alexander receives a copy of every TO and availability manager-notification during launch monitoring. Side effect: Bubba is no longer a sandbox manager (one auth user → one `users` row → one company). **Remove this manager row after launch monitoring** (LAUNCH FAST-FOLLOW).
+> **Bubba Ganush status (June 5, 2026; corrected 2026-06-09):** Bubba's `public.users` row sits on Watermark with `role=manager` so Alexander receives a copy of every TO and availability manager-notification during launch monitoring. The earlier phrasing ("repointed from the sandbox company") implied he had been the sandbox manager — he hadn't. `public.users.id` is 1:1 with `auth.users.id`, so this single auth user has always pointed at exactly one company; the sandbox simply never had its own manager row until 2026-06-09 (see Sandbox section). **Remove this manager row after launch monitoring** (LAUNCH FAST-FOLLOW); a dedicated sandbox manager now exists, so Bubba's row can stay on Watermark until removal without breaking sandbox testing.
 
 ### Test employees on Watermark (CLEANUP after launch)
 | Name / identifier | Email | Role | Notes |
@@ -38,21 +38,26 @@ Reference for who/what is configured in each tenant. Append-only — when identi
 **Aegis email channel**: sandbox@aegis.quriasolutions.com
 **Purpose**: end-to-end testing of email/SMS workflows without touching production Watermark data
 
+> **Correction (2026-06-09):** earlier docs implied Bubba Ganush had been the sandbox manager and was "repointed" to Watermark. That framing is wrong. `public.users.id` is 1:1 with `auth.users.id` — one auth user, one `users` row, one company. The sandbox simply never had its own manager `users` row; Bubba's single row has always lived on whichever company it was last set to. As of 2026-06-09 the sandbox has a dedicated manager (below), so Bubba's row can stay on Watermark and sandbox manager-side testing works without juggling the same auth user between tenants.
+
 ### Sandbox managers
-| Name | Email | Notes |
-|---|---|---|
-| Bubba Ganush | lightningmakigga@gmail.com | **No longer the sandbox manager as of June 5, 2026** — his single auth user / `users` row was repointed to Watermark (see Watermark note). A sandbox manager must be re-established (new auth user) before sandbox manager-side testing resumes. |
+| Name | Email | Role | Notes |
+|---|---|---|---|
+| Sandbox Manager | sandbox-manager@quriasolutions.com | manager | Dedicated sandbox manager login established 2026-06-09 (own auth user / own `users` row). Used to verify S3 in-tab TO approval round-trip in the sandbox tenant. |
 
 ### Sandbox employees
 | Name | employee_id | Email | Role | Notes |
 |---|---|---|---|---|
 | Shmubba Sploosh | e1684385-ab46-472d-82b8-9009cd705bde | aegisscheduler@gmail.com | Lifeguard | Primary test employee for TO/availability/swap flows |
+| Test Guard A | aaaa1111-0000-0000-0000-000000000001 | testguarda@example.com | Lifeguard | Added 2026-06-09 for sandbox engine + workflow tests. Safe to use in any sandbox harness; do NOT email a real inbox. |
+| Test Guard B | bbbb2222-0000-0000-0000-000000000002 | testguardb@example.com | Lifeguard | Added 2026-06-09 alongside Test Guard A. Same usage notes. |
 
 ### Sandbox seed data
 | Table | Notes |
 |---|---|
 | shift_requirements | PM Lifeguard 15:00-21:00 all days, accepted_roles=ARRAY['Lifeguard'] (seeded June 4 for BUG-2) |
 | time_off_requests | Pre-existing seed: employee 00000000-0000-0000-0000-000000000010, dates 2026-07-15 to 2026-07-17, status approved (unknown origin, test fixture data) |
+| time_off_requests | **Transient test fixture** — request id `13759531-86fe-43fa-a200-dfb9b2bf3339` (Shmubba Sploosh, 2026-06-20) seeded 2026-06-09 to verify S3 in-tab approve round-trip. Safe to clean up at any time. |
 | policies | max_consecutive_days_off=7, min_notice_period_days=7 (TO-R1 setup) |
 
 ---

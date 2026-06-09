@@ -85,6 +85,27 @@ All of the following are now reflected in the refreshed docs. Entries left in pl
 
 ---
 
+## June 9, 2026 — cross-repo type drift audit (PART B) + type reconciles
+
+Audit of shared shapes defined in BOTH repos (Aegis `src/workflows/schedule-build.ts` producer vs Homebase `src/lib/types.ts` consumer). Note: this is *code type* drift, not DB-vs-docs drift, but logged here as the running drift record. No live `information_schema` read this session — sandbox has no network egress to Supabase (verified: `fetch failed`).
+
+### Reconciled NOW (Homebase, tsc-clean)
+- **`FlaggedIssue`** — Homebase had `{type:string, severity, message, metadata?}`; Aegis emits a discriminated union (`unsatisfied_attribute_mix` | `unsatisfied_sex_coverage`) with `date` + `description` and NO `severity`/`message`. The coverage variant has no `shift_name` and carries `time_window`/`missing_sex`/`on_duty` in metadata. Homebase's type **replaced with a mirror of Aegis's union** (safe — nothing consumed the old shape). Keep the two in lockstep.
+- **`ScheduleData.summary`** — was required `string` in Homebase, but the Aegis engine writes `{assignments, gaps, flagged_issues?}` and never sets `summary` (only Homebase's Soteria-review save path does). Made **optional**; the lone reader already null-guards.
+- **`ScheduleGap`** — Homebase modelled only 6 core fields; the engine also writes `description`, `start_time`, `end_time` (and `per_employee_dispositions`). Added `description?`/`start_time?`/`end_time?` (optional) to Homebase. `per_employee_dispositions` deliberately NOT ported (needs the `EmployeeDisposition` type from Aegis — do when a disposition UI is built).
+
+### Found, NOT yet reconciled (present for go / defer)
+- **`src/db/types.ts` STILL omits `employees.sex` (NOT NULL CHECK 'male'|'female') and `shift_requirements.accepted_roles` (NOT NULL text[]).** Confirmed this session. The targeted 2-column add to the `Row` types is correct but **ripples into ~15 `smoke.ts` engine-test fixtures** (object literals would need the new required fields) → tsc fails. Left as-is to keep the repo green; the add + fixture update is presented for Alexander's go (don't sweep db/types blind). Engine currently reads `employees.sex` via a `readAttr` cast that works around the missing type.
+- **`StaffingReport` has no shared type.** Aegis `buildStaffingReport` returns an inline object typed `Record<string, unknown>`; Homebase defines the `StaffingReport` interface and consumes specific fields. Shapes AGREE on the consumed fields (coverage_rate, top_contributors, overtime_risk, gap_summary, special_notes_applied, aegis_notes), so no active bug — but the producer additionally emits `closed_dates` + `shift_override_mismatches` (not in Homebase's type), and Homebase declares `bottom_contributors?` (not produced by Aegis). Recommend a shared `StaffingReport` contract. Medium effort — deferred, present for go.
+- **`ScheduleAssignment`** — Homebase has optional `employee_photo?`; Aegis omits it. Benign (optional; engine never produces it, Homebase enriches on its side). No action.
+- **Homebase has NO `src/db/types.ts`** — all types live in `src/lib/types.ts`. The Homebase `CLAUDE.md` previously cited the nonexistent path; corrected this session. Engine-only types (`CanvasSlot`, `WeekState`, `EmployeeDisposition`, `DispositionReasonCode`) are NOT duplicated in Homebase — bounds the drift surface.
+
+### Stale reference-doc sections (for the next doc-refresh — STOP-and-present, not swept)
+- `gender_requirement` documented DORMANT (doc 04 §2.4, doc 06 §9) but is LIVE and being replaced by the `sex_coverage` concurrent_coverage model. Update on next doc pass.
+- The Soteria system prompt (`homebase/src/app/api/soteria/route.ts` ~§attribute_mix) documents only the per-shift `attribute_mix` model (scope all_shifts/shift_type/specific_shift); add the `concurrent_coverage` scope once the policy flip lands.
+
+---
+
 ## How to use this log
 
 When the post-launch doc-refresh sprint runs:

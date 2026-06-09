@@ -2,6 +2,12 @@
 
 Aegis is Quria Solutions' AI assistant manager: a Node/Express/TypeScript service on Railway that talks to employees and managers over SMS (Twilio) and email (SendGrid), classifies intent with Claude, and runs a deterministic **Schedule Engine V2**. Supabase (service-role key — bypasses RLS) is the database. First and only live client: Watermark Country Club (launched June 5, 2026).
 
+## Session protocol (do this every session — non-negotiable)
+1. **At session start, read first:** `DEV_ROADMAP.md` (live sprint + Logging Protocol) and the trackers — `EMAIL_WORKFLOWS_TRACKER.md`, `SCHEMA_DRIFT_LOG.md`, `TEST_IDENTITIES.md`. Self-brief from these before touching anything.
+2. **Fix-now bias:** if a fix is in scope and safe — diagnosed, surgical, `tsc`-clean, and not a production write/push/deploy — do it this session. Don't log it for "later".
+3. **Defer only with a logged reason:** when a fix is unsafe to do now (rippling/large change, needs Alexander's decision, or writes production / deploys), say why in plain English and log it in the right doc. Never silently drop it, and never sweep a large change blind.
+4. **At session end, write it all back:** every finding, decision, new bug, and schema surprise goes into the right doc — roadmap status + Session Log entry, the trackers, `SCHEMA_DRIFT_LOG.md`, and the `docs/` reference when behavior changed. **If it wasn't logged, it isn't done.**
+
 ## Read before you act
 @DEV_ROADMAP.md
 - That import is the live sprint + how-to-use. It loads automatically — treat its Current Sprint as the priority and follow its rules.
@@ -16,6 +22,7 @@ Aegis is Quria Solutions' AI assistant manager: a Node/Express/TypeScript servic
 - **Employee-facing emails NEVER contain a "View in Homebase" CTA.** Homebase links are manager-only.
 - Every Aegis-generated string meets the "feels like a person" bar — no "request received", "processing intent", "standby".
 - **No orphan outputs:** every write lands as valid, visible state a manager can see.
+- **Configuration over code:** the engine/platform is generic and multi-tenant; client behavior is driven by their Supabase data + the constraint vocabulary, never by client-specific code. Accommodating a client is a data/config operation, not an engine change. Per-client rules are toggleable (e.g. sex_coverage on/off). If a client needs something the vocabulary can't express, that's a product conversation — never a quiet engine patch.
 - Compile clean: `npx tsc --noEmit`, zero errors. **Show the full diff of every changed file before any push.**
 
 ## Engine V2 quick map (`src/lib/engine`, `src/lib/constraints`)

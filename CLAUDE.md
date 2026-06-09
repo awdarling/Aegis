@@ -46,5 +46,13 @@ Aegis is Quria Solutions' AI assistant manager: a Node/Express/TypeScript servic
 - Never print or commit secrets (Twilio, SendGrid, Supabase keys live in Railway env vars).
 - `awdarling@quriasolutions.com` is quria_admin, NOT an employee — employee intents won't work from it without test setup.
 
+## Cowork / autonomous operating model
+- **SAFE LANE — an agent may do these unattended.** Reads of any kind (DB reads, dry-runs, the verify harness, build/deploy logs). Writes against the SANDBOX tenant only (`company_id = 00000000-0000-0000-0000-000000000001`). Code on a feature branch, `tsc`, open a PR. **Prefer the read-only DB role (`cowork_ro`) for reads when available** — least-privilege by default, not the service-role key.
+- **HUMAN-GATED — never autonomous; queue for Alexander.** Merge/push to `main` (= deploy to live Watermark). Any write to PRODUCTION / Watermark data. Production env-var or policy changes (incl. Supabase policy flips). Anything that messages a real employee (`distribute_schedule`, onboarding fan-out, real notifications).
+- **Principle: autonomy and credential power trade off.** Unattended work runs read-only / sandbox-scoped. Privileged actions need a human. Safety comes from constraining the environment (branch-not-main, sandbox-not-prod, least-privilege creds), not from real-time watching.
+- **Never exfiltrate data via MCP, Chrome, or network egress.** Reads stay in-repo / in-DB; output lands in the session, the PR, or the logged docs.
+- **DONE-rule: committed ≠ done.** A change is `DONE` only when committed AND live-verified end-to-end. Committed-but-unpushed or pushed-but-unverified = `IN REVIEW`. Don't flip statuses on the strength of a clean `tsc` or a green PR alone.
+- **Logging routing (additive to the Session protocol).** Apply enumerated status changes / decisions / findings exactly as the working note states — don't independently re-judge them. Route by topic: bugs / workflows → `EMAIL_WORKFLOWS_TRACKER.md`; schema surprises → `SCHEMA_DRIFT_LOG.md`; tenants / test identities → `TEST_IDENTITIES.md`. If it changed and wasn't logged, it isn't done.
+
 ## When you finish — follow the Logging Protocol
 Work is not done until the project's memory is updated. Follow the **Logging Protocol** at the top of `DEV_ROADMAP.md`: update the roadmap status + append a Session Log entry, mirror bug changes into `EMAIL_WORKFLOWS_TRACKER.md`, append any schema finding to `SCHEMA_DRIFT_LOG.md`, update `TEST_IDENTITIES.md`, and update the relevant `docs/` reference doc when the change alters how the system works. Never end a session without it — the next agent self-briefs from these files.

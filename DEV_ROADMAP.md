@@ -1,8 +1,10 @@
 # QURIA — Development Roadmap & Progress Tracker
 
-**Living document. Last updated: June 8, 2026.**
+**Living document. Last updated: June 9, 2026.**
 
 This is the operational source of truth for active development. It is meant to be read and updated by Claude (Claude Code / Cowork) every session.
+
+> **PUSH STATE (top-of-file banner — read every session):** Aegis is pushed and live (`46eaa70`). **Homebase is ahead 8 commits and UNPUSHED.** Until Homebase is pushed: SCHED-EDIT-1 (S2) cannot live-verify, S3 cannot live-verify (and lacks `AEGIS_URL` / `AEGIS_INTERNAL_SECRET` on Vercel), and the `CoverageFlags` renderer is dark — which is why the `unsatisfied_sex_coverage` flag now appears in the manager schedule-preview email but **not** in the Homebase schedule view. Pushing Homebase is the universal next gate.
 
 ---
 
@@ -36,8 +38,10 @@ This is the single most important habit. The moment a piece of work is **approve
 ## CURRENT SPRINT — 48-hour priority (started June 8)
 
 ### S1 · ENGINE-1 — Builder skips eligible employees
-**Repo:** Aegis (`src/lib/engine/`) · **Status:** `DIAGNOSED`
+**Repo:** Aegis (`src/lib/engine/`) · **Status:** `DIAGNOSED` (ruled out as an engine bug — see post-sprint determination)
 Aaron Barrigan (Headguard, fully available) is never placed. Erin Berigan reported as "can't work" with no custom availability. Suspected systemic, not one-off.
+
+**Post-sprint determination (2026-06-09):** ENGINE-1 is **not** an engine code bug. The two named cases dissolved under diagnosis: "Aaron Barrigan" = Erin Berigan (one employee, not two), and Erin's exclusion was a 15-min availability-precision issue (data fix, applied + verified). The remaining systemic miss — **4 Junior Lifeguards (Jenna Stibitz, Cameron Osterhaven, Colin Marvin, Quin Mead) get 0h because no `Junior Lifeguard` shift_requirements / canvas slots exist this week** — is **structural** and is **routed to Role Groups** (Tier 2). It is NOT an ENGINE-1 code fix. ENGINE-1 stays `DIAGNOSED` (not `DONE`) and is **blocked on two Alexander/manager decisions**: (a) true Afternoon shift end — 21:00 or 21:15? (b) does Watermark schedule Junior Lifeguards at all (off-roster vs Role Groups / fold into Lifeguard)?
 
 - Diagnosis (fill in before fixing):
   - [x] Dry-run built for the affected week; `per_employee_dispositions` dumped for Aaron, Erin, **and full roster**
@@ -90,7 +94,9 @@ Method: `scripts/dry-run-schedule.ts` (next week) + `scripts/diagnose-s1.ts` (on
 - **Done when:** the affected employees are scheduled in a dry-run, and no other employee is being silently dropped for the same reason.
 
 ### S1b · ENGINE-2 — Hours not distributing across the roster (suspected fairness)
-**Repo:** Aegis (`src/lib/engine/ranker.ts`, `schedule-build.ts` fill loop) · **Status:** `DIAGNOSED`
+**Repo:** Aegis (`src/lib/engine/ranker.ts`, `schedule-build.ts` fill loop, `src/lib/engine/sex-coverage.ts`) · **Status:** `DONE`
+
+**Resolution (2026-06-09, live-verified):** Per-shift `attribute_mix` sex swap — the real cause of the bimodal Headguard hours — has been **replaced** with `sex_coverage` (scope=`concurrent_coverage`, validate-and-flag, no swap). The policy `policy_value_json` has been **flipped** to the new model. **Live-verified by a Watermark build:** Lucas 26.3h → 15.3h, Erin 6.3h → 10.8h; the `unsatisfied_sex_coverage` flag renders in the manager schedule-preview email (coalesced contiguous segments). The post-fill swap pass is now dormant (the parser yields no sex `attribute_mix` under the new json). **Caveat:** Homebase **display** of the same flag (`CoverageFlags` renderer) is committed but ships with the pending Homebase push — until then, managers see the flag in email only, not in the Homebase schedule view.
 After Erin's evening availability fix, a fresh next-week sample still places her once while a few names repeat (e.g. Audrey Rook, Headguard, 3 afternoons). Expectation: accumulated hours should lower an employee's rank for later slots so hours spread. Symptom suggests hours-fairness may not be accumulating during the fill — NOT yet confirmed. Diagnose-first; do not touch the ranker until a trace names the deciding sort key.
 
 **Findings (2026-06-08 instrumented trace):** NOT a fairness bug. The hours-fairness pipeline is verified intact: rankCandidates is called fresh per slot (schedule-build.ts:500/521), each placement updates weekState.weeklyHoursMap immediately (:596), and the sort key reads it (ranker.ts:48/61/76). Erin's availability fully contains the Afternoon Headguard slot on all 7 days — availability ruled out.
@@ -112,7 +118,7 @@ DECISION 2026-06-08 (Alexander): NO Phase 2 soft coverage bias — rejected to k
 **UPDATE 2026-06-09:** (a) DONE — Homebase `FlaggedIssue` reconciled to the Aegis union, and new `CoverageFlags` component renders `unsatisfied_sex_coverage` as a "Coverage to review" manager action item (date, time window, missing sex, on-duty) in the schedule view + history report detail. (b) DONE — `sex-coverage.ts` now coalesces time-contiguous same-missing-sex segments into one flag (verified by a synthetic check: 3 contiguous segments → 1 flag 11:00–18:00; a satisfied middle window correctly stays 2 flags). (c) STILL PENDING — needs management sign-off + the policy_value_json flip (exact SQL prepared this session, presented to Alexander to run in Supabase; NOT executed by the agent). Live-roster verify harness (hours-flatten + real flags) could NOT run from the agent sandbox (no network egress to Supabase) — run `scripts/verify-sex-coverage.ts` where the DB is reachable. The flip retires the per-shift attribute_mix swap automatically: once the sex policy's json is scope=concurrent_coverage, the parser yields a concurrentCoverage constraint and no sex attribute_mix, so the swap pass has nothing to act on.
 
 ### S2 · SCHED-EDIT-1 — Manual schedule edits don't persist
-**Repo:** Homebase (`src/app/(app)/schedule/page.tsx`) · **Status:** `IN REVIEW`
+**Repo:** Homebase (`src/app/(app)/schedule/page.tsx`) · **Status:** `IN REVIEW` — fix committed (`f28cb30`), code-verified; **gated on Homebase push + the live edit→reload→distribute round-trip** before flipping to `DONE`.
 Moving an employee between shifts updates the displayed card but not `schedules.data.assignments`; distribute then sends the new shift name with stale hours. **This gates safe distribution — no manual-edited schedule may be distributed until this is green.**
 
 - Diagnosis:
@@ -218,7 +224,7 @@ Implemented (uncommitted, 2026-06-08): new helpers src/lib/schedule/resolveAssig
 **RESIDUAL RESOLVED (2026-06-09):** All three PENDING items above are now cleared. (1) The fix is committed in Homebase as `f28cb30` (not uncommitted) — `resolveAssignment.ts` + `hours.ts` + edits to ScheduleRenderer/ScheduleReviewPanel/GapResolverPanel/ManualScheduleBuilder; `tsconfig.tsbuildinfo` is now gitignored. (2) **Empty-target fallback time source = shift_types — CONFIRMED CORRECT, matches the engine.** `buildCanvas` (Aegis `src/lib/engine/canvas.ts:89,100-105`) sources a slot's `start_time`/`end_time`/`hours` from the **shift_type** (`st.start_time`/`st.end_time`); only `role` comes from the shift_requirement (`req.role`). The Homebase fallback (`resolveAssignment.ts:24-27`) looks up `shiftTypes` by name and copies `st.start_time`/`st.end_time` — same source. Note: `shift_requirements` *has* its own `start_time`/`end_time` columns, but `buildCanvas` ignores them — shift_types is authoritative. The save-time backstop (`ScheduleReviewPanel.save()` lines 193-201) fetches real `shift_types` from Supabase and re-resolves every pending row, so even an empty-target move normalizes against shift_types before persisting. (3) Independent `npx tsc --noEmit` on Homebase = **0 errors**. (4) The two unscoped files (GapResolverPanel, ManualScheduleBuilder) are pure dedup — they delete byte-identical local `computeHours` definitions and import the shared `@/lib/schedule/hours`; behavior unchanged. Only the live edit→reload→distribute round-trip remains (gated by distribution rules) before flipping to DONE.
 
 ### S3 · Manual TO approval in Homebase doesn't notify the employee
-**Repo:** Homebase Time Off tab → Aegis notify bridge · **Status:** `built, uncommitted — pending Alexander diff review + Vercel env confirm + live test`
+**Repo:** Homebase Time Off tab → Aegis notify bridge · **Status:** `IN REVIEW` — committed (`f8e2505`), tsc clean, `decided_by` set on the in-tab path; **gated on Homebase push + `AEGIS_URL` / `AEGIS_INTERNAL_SECRET` on Vercel + sandbox round-trip** before flipping to `DONE`.
 The email magic-link approval notifies the employee; the in-tab Homebase approval does not. Also set `decided_by`, and have Aegis acknowledge the acting manager.
 
 - Diagnosis:
@@ -256,7 +262,8 @@ Verified: independent `npx tsc --noEmit` = **0 errors**; full diffs reviewed. NO
 
 ### Tier 2 — significant builds (contract-first: engine/parser before UI)
 - **TO-rules-as-policy program** (one program): move TO rules into the same `policy_value_json`/constraint-vocabulary system the schedule engine uses; attribute classifier so workflows know what to pull; Rules/Attribute creation+edit UI that updates everywhere; Soteria + Aegis can read/write. Includes the "new UI and engine for TO rule policies" and "attribute edit/creation page" notes.
-- **Role Groups** — `shift_requirements.accepted_roles` (exists, NOT read yet); structural fix for Headguard coverage gaps. Engine eligibility before UI. (Distinct from ENGINE-1: that's a bug, this is a feature.)
+- **Role Groups** — `shift_requirements.accepted_roles` (exists, NOT read yet); structural fix for Headguard coverage gaps **and** the resolution path for ENGINE-1's Junior-Lifeguard structural miss (4 employees with 0h because no JL slots exist). Engine eligibility before UI. (Distinct from ENGINE-1 as a bug class: ENGINE-1 is `DIAGNOSED` and the JL portion is structurally owned here.)
+- **Coverage-flag resolver (engine helper + Homebase UI)** — when a schedule carries an unsatisfied_sex_coverage flag (all slots filled, but the concurrent-coverage mix is unmet — e.g. no male guard 11:00-21:15), Homebase displays the flag but offers no way to act on it. Build a manager-assisted resolver, analogous to the gap resolver: an engine helper computes candidate swaps that would satisfy the flagged window without creating a new gap/conflict/coverage hole; Homebase surfaces them as suggestions; the manager applies one via the manual-edit path. Manager-driven, NOT an automatic swap — the assisted version of the per-shift swap retired in ENGINE-2 (preserves flag-don't-force + config-over-code). Two stages: (1) read-only — name the missing sex and list qualified, available employees who could cover; (2) one-click apply-a-swap. Dependencies: gate on SCHED-EDIT-1 verified; needs an engine swap-suggestion helper (shares eligibility/ranking infra with the gap resolver and the retired attribute-mix logic). Sequence after SCHED-EDIT-1; overlaps with gap-resolver / Role Groups work.
 - **Soteria fully operational** — natural-language control of all of Homebase + can edit the schedule.
 - **Manual builder recommends employees with engine-level efficacy** — surface the engine ranking in the manual builder.
 - **Dedicated security track** (for client acquisition) — `/api/*` auth audit, wax-seal replay/timestamp window, RLS review, secrets hygiene, remove dead IP-allowlist fallback.
@@ -268,6 +275,8 @@ Verified: independent `npx tsc --noEmit` = **0 errors**; full diffs reviewed. NO
 - Schedule download format should match the schedule builder (ties to `xlsx → exceljs`).
 - Orange glow around each rule (Rules tab UI).
 - Quria-admin-only: delete activity logs; delete old schedules (gated destructive actions).
+- **Strip committed `node_modules` from Aegis history** (~142MB across 2 historical commits — surfaced during the 2026-06-09 secret-scrub audit). Confirm `node_modules` is in `.gitignore`. Safe to force-push the rewrite later (solo repo).
+- **Reference-doc refresh** — items surfaced in `PRIORITY2_ANALYSIS.md` §3 / SCHEMA_DRIFT_LOG: docs 02/04/06 still describe the gender rule as **dormant per-shift `attribute_mix`** with a **single-variant `FlaggedIssue`** — reality is `sex_coverage` (scope=`concurrent_coverage`) + a discriminated union (incl. `unsatisfied_sex_coverage`); docs 05/06 carry the ruled-out ENGINE-1 hypothesis (`qualified_roles` miscased / `max_weekly_hours` null) — real cause was availability precision + the JL structural miss; doc 03 §7 cites a Homebase `src/db/types.ts` that doesn't exist (types live in `src/lib/types.ts`); SCHED-EDIT-1 and in-tab `decided_by` are described as open but have shipped fixes. Reconcile on the next doc pass.
 
 ### Business / ops (non-dev — tracked, not on the build timeline)
 - Fix Quria landing page: add SME AI-integration consulting service line.
@@ -344,3 +353,12 @@ Theme: cleanup + drift reconcile + finish sex_coverage. Posture: fix-now if safe
 - **Push is a FAST-FORWARD (no force needed):** the SID scaffold commit was never on origin (it lived in the unpushed range), so the rewrite produced new commits atop the unchanged origin base. `git push origin main` works normally for both.
 - **PART 2:** added a "no secrets/sensitive identifiers in committed files — reference docs included" hard rule to BOTH `CLAUDE.md`.
 - **Standing action for Alexander:** decide whether to also strip the committed `node_modules` from Aegis history (separate rewrite) before pushing.
+
+### 2026-06-09 — Sprint go-live (in progress) + ENGINE-2 + secret scrub
+- Aegis pushed & live (46eaa70) after a GitHub secret-scan block; Twilio SIDs scrubbed from history (docs 01/04), no .env ever committed, no rotation. node_modules committed in 2 Aegis commits (~142MB) — flagged, deferred.
+- ENGINE-2: bimodal Headguard hours root-caused to the post-fill per-shift attribute_mix swap (not a fairness bug); replaced with sex_coverage (validate-and-flag). Policy flipped; confirmed live (hours flattened + flag in manager email).
+- S1/ENGINE-1 ruled out as engine bug (Erin availability fixed; JL-zero-hours is structural -> Role Groups; 2 decisions pending).
+- S2 (f28cb30) and S3 (f8e2505) committed, IN REVIEW pending Homebase push + live verify.
+- Homebase ahead 8, UNPUSHED — S2/S3/CoverageFlags renderer/type reconcile/CLAUDE.md rule all dark until pushed (why the flag shows in email but not the Homebase schedule view).
+- New goal logged: coverage-flag resolver (Tier 2).
+- Next: push Homebase -> verify S2/S3 + flag display -> confirm Vercel env -> doc refresh; ENGINE-1 residual + forward-plan A/B/C await Alexander's call.

@@ -117,3 +117,8 @@ When the post-launch doc-refresh sprint runs:
 ## When to append
 
 Any time a future Claude Code session or live debugging surfaces a difference between the docs and the database. Two-minute task. Format:
+
+## 2026-06-09 — two FlaggedIssue formats coexist in schedules.data
+- NEW (post-ENGINE-2): { type:'unsatisfied_sex_coverage', date, metadata:{on_duty[], missing_sex, time_window}, description }
+- LEGACY (pre-ENGINE-2 builds, e.g. week_start 2026-06-01): { type:'unsatisfied_attribute_mix', shift_name, metadata:{value, actual, required, attribute, per_employee_dispositions[]}, description }
+- The discriminated-union type + Homebase CoverageFlags handle only 'unsatisfied_sex_coverage'; legacy entries silently don't render (harmless for past schedules, no crash — component filters rather than switches). Caution: any future exhaustive switch on FlaggedIssue.type must handle/ignore the legacy variant, or normalize old rows in a migration. Low priority.

@@ -23,6 +23,7 @@ Aegis is Quria Solutions' AI assistant manager: a Node/Express/TypeScript servic
 - Every Aegis-generated string meets the "feels like a person" bar — no "request received", "processing intent", "standby".
 - **No orphan outputs:** every write lands as valid, visible state a manager can see.
 - **Configuration over code:** the engine/platform is generic and multi-tenant; client behavior is driven by their Supabase data + the constraint vocabulary, never by client-specific code. Accommodating a client is a data/config operation, not an engine change. Per-client rules are toggleable (e.g. sex_coverage on/off). If a client needs something the vocabulary can't express, that's a product conversation — never a quiet engine patch.
+- **No secrets or sensitive identifiers in committed files — reference docs included.** Names and architecture only. Real credential VALUES (API keys, auth tokens, Supabase keys) AND sensitive identifiers (Twilio Account/Messaging-Service SIDs, project refs) never go in any tracked file. Use placeholders (`AC••• — see Railway env / password manager`); real values live in env vars / the password manager. GitHub push-protection will block the push if you violate this (it happened — see the 2026-06-09 Session Log).
 - Compile clean: `npx tsc --noEmit`, zero errors. **Show the full diff of every changed file before any push.**
 
 ## Engine V2 quick map (`src/lib/engine`, `src/lib/constraints`)

@@ -1,10 +1,11 @@
 # BUILD_NOTES — `feature/max-consecutive-days` (Aegis)
 
-Recovery build, attended session. Branch state at the start: 7 docs-only commits
-ahead of `origin/main`, 3 engine files modified but uncommitted (plumbing only,
-no enforcement), `tsc` red with 2 errors, no tests. Branch state at the end:
-plumbing preserved, `tsc` clean, enforcement implemented in the fill loop,
-2 new tests + existing engine smoke all green.
+Recovery build + verification + enforcement-gap fix, attended sessions. Branch
+state at the start of the recovery: 7 docs-only commits ahead of `origin/main`,
+3 engine files modified but uncommitted (plumbing only, no enforcement), `tsc`
+red with 2 errors, no tests. Branch state at the end: all 5 assignment-mutation
+sites enforce the cap, 4 new test fixtures (regression + enforcement + cascade
++ attribute-mix) plus a parser-chain smoke addition, all gates green.
 
 Off-by-default. NOT pushed, NOT merged.
 
@@ -211,16 +212,112 @@ Off-by-default. NOT pushed, NOT merged, NOT deployed.
 
 ---
 
+## Enforcement-gap fix (2026-06-10) — all 5 sites now covered
+
+The verification pass found 2 silent cap-bypass paths. Both are now closed.
+
+### Site coverage — final
+
+| # | Site                                       | Cap enforced? |
+|---|--------------------------------------------|---------------|
+| 1 | `schedule-build.ts:630` (main fill `push`)  | ✅ COVERED — `slotEligible` + `blockedByConflictOnly` filters |
+| 2 | `schedule-build.ts:615` (cascade apply)     | ✅ COVERED — via `cascade.ts:legalToPlace` cap check |
+| 3 | `schedule-build.ts:784` (veteran swap)      | ✅ COVERED — candidate filter cap check |
+| 4 | `attribute-mix.ts:286` (attribute-mix swap) | ✅ COVERED — `replacement` filter cap check |
+| 5 | `cascade.ts:194` (cascade clone mutation)   | ✅ COVERED — `legalToPlace` gates every internal move |
+
+### Diffs
+
+`cascade.ts` — added `consecutiveDaysRunIncluding` to the imports and a single
+short-circuit in `legalToPlace`, mirroring the existing `max_weekly_hours`
+check. The cap check uses the same `viewState` (displaced-row hidden) that the
+function already builds for `sameDayDoubleReason`. Null setting → no-op.
+
+`attribute-mix.ts` — added `consecutiveDaysRunIncluding` to the imports and a
+single short-circuit inside the `replacement` filter, between the
+`max_weekly_hours` check and the `sameDayDoubleReason` check. Uses the
+already-built `viewState` (displaced row hidden). Null setting → no-op.
+
+### Test fixtures — what they prove
+
+**(c) Cascade — direct unit test of `resolveBannedPairConflict`.** Setup tuned
+so the resolver iterates two viable swap candidates: i=0 Mon-M (would extend
+emp-X's run to 3 via Mon-Tue-Wed under the conservative `viewState`), and i=1
+Fri-N (run length 2). With cap=null the resolver picks i=0 (first viable).
+With cap=2 the cap check inside `legalToPlace` rejects i=0 and the resolver
+picks i=1 — DIFFERENT moves, captured pasted below.
+
+> The cascade swap branch's `legalToPlace` is intentionally over-conservative:
+> it does NOT hide the partner row in `viewState`, so the cap check for
+> moverEmp counts the partner's date as part of moverEmp's worked set. This
+> over-predicts run length and rejects some swaps that wouldn't actually
+> exceed the cap post-application. Direction is safe (over-reject, never
+> under-reject). The fixture exploits this conservatism to demonstrate the
+> cap check fires deterministically.
+
+Asserts (5):
+- cap=null returns a non-null op with ≥1 move (path entered + resolved).
+- cap=2 also returns a non-null op (cap-respecting fallback exists).
+- **cap=null vs cap=2 produce DIFFERENT moves** — proves the cap check
+  rejected the natural pick.
+- MUST-PASS invariant after applying the cap=2 op: no employee exceeds 2
+  consecutive days.
+- cap=null deterministic re-run (off-by-default).
+
+**(d) Attribute-mix — direct unit test of `enforceAttributeMixForShift`.**
+Setup: Mon shift required_count=2, pre-filled with two females, rule needs
+≥1 male. Two male candidates available — `maleAdjacent` (already on Tue +
+Wed) at the head of the employee list, and `maleFresh` (no rows). With
+cap=null, `find` picks `maleAdjacent` first → his run becomes Mon-Tue-Wed = 3.
+With cap=2, the `replacement` filter rejects `maleAdjacent` (run would be 3)
+and picks `maleFresh` → run = 1.
+
+Asserts (10):
+- cap=null swap pass fires + applies a swap (path entered).
+- cap=null picks `maleAdjacent` (confirms iteration order).
+- cap=null makes `maleAdjacent` run = 3.
+- cap=2 swap pass also resolves (with `maleFresh` instead).
+- cap=2 picks `maleFresh` (cap check rejected `maleAdjacent`).
+- MUST-PASS invariant: no employee exceeds cap=2 in final state.
+- **DIFFERENT swap targets** between cap=null and cap=2 — direct evidence
+  the cap-fix changed behavior.
+
+**Plus the existing two fixtures** (regression default-null, single-employee
+enforcement) and a new parser-chain smoke block in `smoke.ts` (4 asserts:
+happy-path =5, fraction rejected, 0/8 out-of-range rejected).
+
+### Final gate output (verbatim)
+
+`npx tsc --noEmit` → exit 0, no output.
+
+`ts-node src/lib/engine/__tests__/max-consecutive-days.ts` → 28 ✓ / 0 ✗.
+The differentiating assertion (c) trace:
+```
+    cap=null moves: ["0->emp-X","4->emp-M"]
+    cap=2   moves: ["1->emp-X","4->emp-N"]
+✓ (c) cap-fix DIFFERENTIATING: cap=null vs cap=2 produce DIFFERENT swap moves
+```
+The differentiating assertion (d) trace:
+```
+✓ (d) cap=null vs cap=2 produce DIFFERENT swap targets
+       null='emp-m-adj', cap=2='emp-m-fresh'
+```
+
+`ts-node src/lib/engine/__tests__/smoke.ts` → 71 ✓ / 0 ✗ (was 67; +4 parser
+asserts for `max_consecutive_days_worked`).
+
+---
+
 ## Open / follow-up
 
 - ~~Confirm the run semantic~~ **CLOSED 2026-06-10** — Semantic A (resets on
-  any day off) DECIDED; Semantic B (weekly cap) explicitly out of scope. See
-  the discrepancy section above.
+  any day off) DECIDED; Semantic B (weekly cap) explicitly out of scope.
+- ~~Two uncovered cap-bypass paths~~ **CLOSED 2026-06-10** — cascade
+  `legalToPlace` and attribute-mix `replacement` filter both check the cap
+  now; tests verify both with binding differentiating assertions.
 - Prior-week consecutive-day carryover (`TODO` in `types.ts` and
-  `eligibility.ts`).
+  `eligibility.ts`). Still out of scope.
 - No production policy row exists for this constraint yet — the parser will
   pick up any of `max_consecutive_days_worked`, `max_consecutive_days`, or
   `max_consecutive_work_days` policy keys (integer 1..7), but no tenant has
   one configured today, so behavior on prod is unchanged.
-- Doc / tracker updates: `DEV_ROADMAP.md` will be corrected in an additive
-  commit (step 8) so the prior optimistic-progress lines are explicit.

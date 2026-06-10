@@ -120,7 +120,7 @@ passed in alongside `weekState`).
 
 ---
 
-## Discrepancy between the step-4 brief and the step-3 spec — flagged
+## Discrepancy between the step-4 brief and the step-3 spec — RESOLVED
 
 The step-4 test brief reads:
 
@@ -133,15 +133,22 @@ NOT 7; it's 1, because day 6 was not placed. The spec-correct outcome is:
 day 1–5 assigned, day 6 gap (`max_consecutive_days_reached`), day 7 ASSIGNED
 (fresh run of 1, within the cap).
 
-The implementation follows the spec. The test asserts the spec-correct
-outcome and includes an explicit assertion that day 7 is placed — so the
-"run-reset semantic" is itself locked in by the test, not just produced as a
-side effect. A comment in the test file points this out.
+**DECISION (2026-06-10) — Semantic A is confirmed.** "Max consecutive days
+worked" = a run of consecutive worked days that **RESETS on any day off**.
+Work 5, off 1, work again = allowed; the cap blocks only the (cap+1)th
+consecutive day. This is exactly what the implementation does, and the
+step-4 brief's "days 6–7 both gap" expectation was the error, not the
+implementation. The test locks in this semantic with an explicit assertion
+that day 7 is placed.
 
-If the step-4 outcome was the real intent (a "post-cap lockout for the
-remainder of the week" semantic), the helper signature and the fill-loop
-checks would need to change — that would be a different rule, not a tweak.
-Flagging it here so the right call can be made before merge.
+**Semantic B (a weekly worked-days cap — e.g. "at most 5 days worked per
+week, regardless of pattern") is explicitly OUT OF SCOPE.** If a tenant ever
+wants that, it is a separate, separately-named constraint (e.g.
+`max_worked_days_per_week`) with its own policy key, helper, and
+disposition code — not a tweak to this one. Rationale: the two rules answer
+different questions (consecutive vs. cumulative); coupling them under one
+key would silently change behavior for any tenant that's already on
+Semantic A.
 
 ---
 
@@ -206,8 +213,9 @@ Off-by-default. NOT pushed, NOT merged, NOT deployed.
 
 ## Open / follow-up
 
-- Confirm the run semantic (consecutive-run-including-candidate vs.
-  post-cap-rest-of-week lockout) — see the discrepancy section above.
+- ~~Confirm the run semantic~~ **CLOSED 2026-06-10** — Semantic A (resets on
+  any day off) DECIDED; Semantic B (weekly cap) explicitly out of scope. See
+  the discrepancy section above.
 - Prior-week consecutive-day carryover (`TODO` in `types.ts` and
   `eligibility.ts`).
 - No production policy row exists for this constraint yet — the parser will

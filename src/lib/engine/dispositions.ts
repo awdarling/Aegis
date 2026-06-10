@@ -1,7 +1,7 @@
 import type { Availability, Employee, EmployeeConflict } from '../../db/types';
 import type { EngineSettings } from '../constraints/types';
 import type { TOWindow } from '../to-window';
-import { isAvailableForShift, isBlockedByTOForSlot, sameDayDoubleReason } from './eligibility';
+import { consecutiveDaysRunIncluding, isAvailableForShift, isBlockedByTOForSlot, sameDayDoubleReason } from './eligibility';
 import type { CanvasSlot, WeekState } from './types';
 
 // Shared per-candidate disposition vocabulary. Attribute-mix shortage
@@ -99,6 +99,13 @@ export function classifyEmployeeForSlot(emp: Employee, ctx: DispositionContext):
   if (isBlockedByTOForSlot(emp, ctx.slot, ctx.deps.toMap)) return 'on_time_off';
   if ((ctx.weekState.weeklyHoursMap.get(emp.id) ?? 0) + ctx.slot.hours > emp.max_weekly_hours) {
     return 'max_hours_reached';
+  }
+  if (
+    ctx.deps.settings.maxConsecutiveDaysWorked != null &&
+    consecutiveDaysRunIncluding(emp.id, ctx.slot.date, ctx.weekState)
+      > ctx.deps.settings.maxConsecutiveDaysWorked
+  ) {
+    return 'max_consecutive_days_reached';
   }
   if (sameDayDoubleReason(emp.id, ctx.slot, ctx.weekState, ctx.deps.settings) !== null) {
     return 'doubles_blocked';

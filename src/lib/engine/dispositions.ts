@@ -11,6 +11,7 @@ export type DispositionReasonCode =
   | 'not_qualified'
   | 'on_time_off'
   | 'max_hours_reached'
+  | 'max_consecutive_days_reached'
   | 'in_conflict'
   | 'availability_mismatch'
   | 'doubles_blocked'

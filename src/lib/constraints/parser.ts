@@ -46,6 +46,12 @@ const WEEK_START_KEYS = new Set([
   'first_day_of_week',
 ]);
 
+const MAX_CONSECUTIVE_DAYS_KEYS = new Set([
+  'max_consecutive_days_worked',
+  'max_consecutive_days',
+  'max_consecutive_work_days',
+]);
+
 const ALL_RECOGNIZED = new Set<string>([
   ...ATTRIBUTE_MIX_KEYS,
   ...HOURS_FAIRNESS_KEYS,
@@ -54,6 +60,7 @@ const ALL_RECOGNIZED = new Set<string>([
   ...DOUBLES_POLICY_KEYS,
   ...CONFLICT_RES_KEYS,
   ...WEEK_START_KEYS,
+  ...MAX_CONSECUTIVE_DAYS_KEYS,
 ]);
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
@@ -137,6 +144,16 @@ function parseNumberInRange(value: unknown, min: number, max: number): number | 
     return parseNumberInRange(value['value'], min, max);
   }
   return 'not a number';
+}
+
+// Same shape as parseNumberInRange but rejects non-integers. Used by the
+// max_consecutive_days_worked parser — a fractional cap is meaningless on a
+// per-day counter.
+function parseIntegerInRange(value: unknown, min: number, max: number): number | string {
+  const n = parseNumberInRange(value, min, max);
+  if (typeof n === 'string') return n;
+  if (!Number.isInteger(n)) return 'not an integer';
+  return n;
 }
 
 function parseBool(value: unknown): boolean | string {
@@ -245,6 +262,20 @@ export function parseConstraints(policies: Policy[]): ParsedConstraints {
         console.log('[constraints] invalid conflict_resolution_preference', row.id, '—', parsed);
       } else {
         settings.conflictResolution = parsed as EngineSettings['conflictResolution'];
+      }
+      continue;
+    }
+
+    if (MAX_CONSECUTIVE_DAYS_KEYS.has(key)) {
+      // Bound: 1..7 — a build week is 7 days, and a value of 0 would mean
+      // "nobody can work any day," which is a configuration error not a
+      // policy. Fractional values are rejected.
+      const parsed = parseIntegerInRange(valJson, 1, 7);
+      if (typeof parsed === 'string') {
+        unrecognized.push({ policy_id: row.id, policy_key: key, reason: parsed });
+        console.log('[constraints] invalid max_consecutive_days_worked', row.id, '—', parsed);
+      } else {
+        settings.maxConsecutiveDaysWorked = parsed;
       }
       continue;
     }

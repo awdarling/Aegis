@@ -97,6 +97,7 @@ function dispositionLabel(reason: EmployeeDisposition['reason']): string {
     case 'not_qualified': return 'not qualified for the role';
     case 'on_time_off': return 'on approved time off';
     case 'max_hours_reached': return 'at maximum weekly hours';
+    case 'max_consecutive_days_reached': return 'at maximum consecutive worked days';
     case 'in_conflict': return 'has a hard conflict with assigned staff';
     case 'availability_mismatch': return 'not available for this shift time';
     case 'doubles_blocked': return 'blocked by the doubles policy';

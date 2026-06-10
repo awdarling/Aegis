@@ -48,6 +48,7 @@ export interface DispositionContext {
 export const REASON_LABELS: Record<DispositionReasonCode, string> = {
   on_time_off: 'on approved time off',
   max_hours_reached: 'at max weekly hours',
+  max_consecutive_days_reached: 'at max consecutive worked days',
   doubles_blocked: 'already working another shift today (doubles not allowed)',
   in_conflict: 'in hard conflict with assigned staff',
   availability_mismatch: 'unavailable per regular availability',
@@ -61,6 +62,7 @@ export const REASON_LABELS: Record<DispositionReasonCode, string> = {
 export const REASON_ORDER: DispositionReasonCode[] = [
   'on_time_off',
   'max_hours_reached',
+  'max_consecutive_days_reached',
   'doubles_blocked',
   'in_conflict',
   'availability_mismatch',

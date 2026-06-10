@@ -2,7 +2,12 @@ import type { Availability, Employee, EmployeeConflict } from '../../db/types';
 import type { EngineSettings } from '../constraints/types';
 import type { TOWindow } from '../to-window';
 import type { ScheduleAssignment } from '../../workflows/schedule-build';
-import { buildEligibility, sameDayDoubleReason, type VeteranOnlyRange } from './eligibility';
+import {
+  buildEligibility,
+  consecutiveDaysRunIncluding,
+  sameDayDoubleReason,
+  type VeteranOnlyRange,
+} from './eligibility';
 import type { CanvasSlot, WeekState } from './types';
 
 export interface SwapOperation {
@@ -91,6 +96,18 @@ function legalToPlace(
 
   const currentHours = weekState.weeklyHoursMap.get(emp.id) ?? 0;
   if (currentHours + slot.hours > emp.max_weekly_hours) return false;
+
+  // Consecutive-days cap. Mirrors the slot-eligible filter in schedule-build.
+  // Uses `viewState` (displaced-row hidden) so that when this candidate is
+  // moving *back into* a slot, their own about-to-be-vacated assignment
+  // doesn't inflate the run. For pure cascade hops (candidate has no row at
+  // the ignored index) viewState == weekState in the way that matters.
+  if (
+    deps.settings.maxConsecutiveDaysWorked != null &&
+    consecutiveDaysRunIncluding(emp.id, slot.date, viewState) > deps.settings.maxConsecutiveDaysWorked
+  ) {
+    return false;
+  }
 
   return true;
 }

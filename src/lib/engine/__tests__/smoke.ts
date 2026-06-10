@@ -1301,6 +1301,31 @@ function runParserUnknownKeySmoke(): void {
     result.hard.attributeMix.length === 1,
     `Parser unknown: known gender_requirement still parsed alongside (got ${result.hard.attributeMix.length})`,
   );
+
+  // max_consecutive_days_worked — happy path, fraction rejected, out-of-range
+  // rejected. Verifies the parser chain end-to-end (policy_value_json →
+  // EngineSettings.maxConsecutiveDaysWorked) without a runtime build.
+  const mkMaxConsec = (v: unknown, id: string): Policy => ({
+    id, company_id: COMPANY_ID, policy_key: 'max_consecutive_days_worked',
+    policy_value: String(v), policy_value_json: v as Policy['policy_value_json'],
+    policy_type: 'scheduling', description: null, version: 1, created_at: '2026-01-01T00:00:00Z',
+  });
+  expect(
+    parseConstraints([mkMaxConsec(5, 'pol-mc-5')]).settings.maxConsecutiveDaysWorked === 5,
+    `Parser max_consecutive_days_worked happy: =5 yields settings.maxConsecutiveDaysWorked === 5`,
+  );
+  expect(
+    parseConstraints([mkMaxConsec(3.5, 'pol-mc-frac')]).settings.maxConsecutiveDaysWorked === null,
+    `Parser max_consecutive_days_worked fraction rejected: =3.5 yields settings stays null`,
+  );
+  expect(
+    parseConstraints([mkMaxConsec(0, 'pol-mc-zero')]).settings.maxConsecutiveDaysWorked === null,
+    `Parser max_consecutive_days_worked out-of-range (0) rejected: settings stays null`,
+  );
+  expect(
+    parseConstraints([mkMaxConsec(8, 'pol-mc-eight')]).settings.maxConsecutiveDaysWorked === null,
+    `Parser max_consecutive_days_worked out-of-range (8) rejected: settings stays null`,
+  );
 }
 
 // Task 5 — wage estimate flags employees whose rate falls back to $0 and

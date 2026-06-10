@@ -19,7 +19,9 @@ Reference for who/what is configured in each tenant. Append-only — when identi
 | Carolyn Ringler | c45ringler@gmail.com | +16168223809 | manager | production manager |
 | Jack McCorkle | jackmc419@icloud.com | +16165519476 | manager | production manager |
 | Bubba Ganush | lightningmakigga@gmail.com | (see Supabase) | manager | **TEMPORARY** — see note below |
-| Alexander Darling | awdarling@quriasolutions.com | +16163280114 | quria_admin | not an employee; employee intents won't work from this address without test setup |
+| Alexander Darling | awdarling@quriasolutions.com | +16163280114 | quria | not an employee; employee intents won't work from this address without test setup |
+
+> **Role value note (2026-06-10):** Alexander's `users.role` is **`quria`** (the platform-admin value; the live enum is `'quria' | 'owner' | 'manager'`). `'quria_admin'` is a SEPARATE label used only for `activity_log.actor` and the Aegis `ContactRole` (inbound-sender classification) — it is NOT a `users.role` value. (Previously listed here as `quria_admin`; corrected.)
 
 > **Bubba Ganush status (June 5, 2026; corrected 2026-06-09):** Bubba's `public.users` row sits on Watermark with `role=manager` so Alexander receives a copy of every TO and availability manager-notification during launch monitoring. The earlier phrasing ("repointed from the sandbox company") implied he had been the sandbox manager — he hadn't. `public.users.id` is 1:1 with `auth.users.id`, so this single auth user has always pointed at exactly one company; the sandbox simply never had its own manager row until 2026-06-09 (see Sandbox section). **Remove this manager row after launch monitoring** (LAUNCH FAST-FOLLOW); a dedicated sandbox manager now exists, so Bubba's row can stay on Watermark until removal without breaking sandbox testing.
 

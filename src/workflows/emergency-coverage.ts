@@ -2,6 +2,7 @@ import { supabase } from '../db/client';
 import { logActivity } from '../logger/activity-log';
 import { reply } from '../messaging/reply';
 import { sendSms } from '../messaging/sms';
+import { greeting } from '../messaging/greeting';
 import { generateReply } from '../ai/claude';
 import { getSpecialNotes } from './special-notes';
 import type { InboundMessage, VerifiedContact } from '../security/types';
@@ -677,7 +678,7 @@ export async function dispatchOutreach(params: {
     to: employee.contact_phone,
     from: aegisSmsNumber,
     body:
-      `Hi ${employee.name.split(' ')[0]}, this is Aegis. ` +
+      `${greeting(employee.name)} this is Aegis. ` +
       `${session.callout_employee_name} is out and we need coverage for the ` +
       `${si.shift_name} shift (${si.start_time}–${si.end_time}, ${si.role}) on ${dateStr}. ` +
       `Can you come in?\n\nReply YES to accept or NO to decline.`,
@@ -716,7 +717,7 @@ async function notifyEmployeeShiftFilled(
   await sendSms({
     to: employee.contact_phone,
     from: outreach.aegis_sms_channel,
-    body: `Hi ${employee.name.split(' ')[0]}, the ${outreach.shift_info.shift_name} shift on ${formatShortDate(outreach.shift_date)} has been filled — no response needed. Thanks!`,
+    body: `${greeting(employee.name)} the ${outreach.shift_info.shift_name} shift on ${formatShortDate(outreach.shift_date)} has been filled — no response needed. Thanks!`,
     company_id: outreach.company_id,
   });
 }

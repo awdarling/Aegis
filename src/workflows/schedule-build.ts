@@ -2,6 +2,7 @@ import { supabase } from '../db/client';
 import { logActivity } from '../logger/activity-log';
 import { reply, sendInThreadAck } from '../messaging/reply';
 import { sendEmail, type EmailAttachment } from '../messaging/email';
+import { greeting } from '../messaging/greeting';
 import { sendSms } from '../messaging/sms';
 import { computeWageEstimate } from '../lib/schedule-simulator';
 import { buildScheduleResultEmail } from './schedule-build-email';
@@ -1479,7 +1480,7 @@ export async function distributeScheduleCore(
 
     if (emp.contact_email) {
       try {
-        const firstName = emp.name.split(' ')[0];
+        const greetingLine = greeting(emp.name);
         const shiftCount = myShifts.length;
 
         // Warm, person-like framing. Leads with the day, then the position the
@@ -1517,7 +1518,7 @@ export async function distributeScheduleCore(
 
         const html = `<!DOCTYPE html><html><body style="font-family:Arial,Helvetica,sans-serif;max-width:600px;margin:0 auto;padding:24px;color:#111827;">
 <h2 style="margin:0 0 12px;font-size:20px;">Your shifts for ${weekLabel}</h2>
-<p style="margin:0 0 16px;line-height:1.5;">Hi ${firstName},</p>
+<p style="margin:0 0 16px;line-height:1.5;">${greetingLine}</p>
 <p style="margin:0 0 18px;line-height:1.5;color:#374151;">${intro}</p>
 ${shiftTable}
 <p style="margin:0 0 4px;line-height:1.5;color:#374151;">If anything here doesn't look right, just reply to this email or reach out to your manager — we'll get it fixed.</p>
@@ -1525,10 +1526,10 @@ ${shiftTable}
 </body></html>`;
 
         const text = hasShifts
-          ? `Hi ${firstName},\n\n${intro}\n\n` +
+          ? `${greetingLine}\n\n${intro}\n\n` +
             myShifts.map(s => `• ${formatDisplayDate(s.date)} — ${s.role} (${s.shift_name}), ${formatTime(s.start_time)}–${formatTime(s.end_time)}, ${s.hours}h`).join('\n') +
             `\n\nThat's ${totalHours}h across the week.\n\nIf anything here doesn't look right, just reply to this email or reach out to your manager — we'll get it fixed.\n\nSee you this week,\n${companyName}`
-          : `Hi ${firstName},\n\n${intro}\n\nSee you soon,\n${companyName}`;
+          : `${greetingLine}\n\n${intro}\n\nSee you soon,\n${companyName}`;
 
         await sendEmail({
           to: emp.contact_email,

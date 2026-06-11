@@ -12,6 +12,7 @@ import { logActivity } from '../logger/activity-log';
 import { sendSms } from '../messaging/sms';
 import { sendEmail } from '../messaging/email';
 import { reply, sendInThreadAck } from '../messaging/reply';
+import { greeting } from '../messaging/greeting';
 import { env } from '../config/env';
 import { withAnthropicRetry } from '../ai/claude';
 import type { InboundMessage, VerifiedContact } from '../security/types';
@@ -1782,7 +1783,7 @@ export async function handleAvailabilityConfirmResponse(
       matched_identifier: managerChannel === 'sms' ? managerPhone! : mgr.email,
       channel: managerChannel,
     };
-    await reply(managerContact, managerMessage, managerBody);
+    await reply(managerContact, managerMessage, `${greeting(mgr.name)}\n\n${managerBody}`);
     notifiedCount++;
   }
 
@@ -1794,7 +1795,7 @@ export async function handleAvailabilityConfirmResponse(
   await reply(
     contact,
     message,
-    `Hi ${contact.name.split(' ')[0]},\n\nYour availability request has been sent to your manager for approval. You'll hear back soon.`
+    `${greeting(contact.name)}\n\nYour availability request has been sent to your manager for approval. You'll hear back soon.`
   );
 }
 
@@ -1892,8 +1893,7 @@ async function notifyEmployeeOfAvailabilityDecision(
     matched_identifier: pending.employee_sender,
     channel: pending.employee_channel,
   };
-  const firstName = pending.employee_name.split(' ')[0];
-  await reply(employeeContact, employeeMessage, `Hi ${firstName},\n\n${bodyText}`);
+  await reply(employeeContact, employeeMessage, `${greeting(pending.employee_name)}\n\n${bodyText}`);
 }
 
 // ── Proactive expiry (called by scheduler) ────────────────────────────────────

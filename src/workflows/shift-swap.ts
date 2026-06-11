@@ -4,6 +4,7 @@ import { logActivity } from '../logger/activity-log';
 import { reply } from '../messaging/reply';
 import { sendSms } from '../messaging/sms';
 import { sendEmail } from '../messaging/email';
+import { greeting } from '../messaging/greeting';
 import { generateReply } from '../ai/claude';
 import { computeWageEstimate } from '../lib/schedule-simulator';
 import { env } from '../config/env';
@@ -528,7 +529,7 @@ async function sendManagerSwapApprovalRequest(params: {
   const subject = `Swap Request — ${requester.name} ↔ ${receiver.name} (${formatShortDate(shift_date)})`;
 
   const text =
-    `Hi ${manager.name},\n\n` +
+    `${greeting(manager.name)}\n\n` +
     `${requester.name} and ${receiver.name} have agreed to swap a shift.\n\n` +
     `Shift:      ${shift_name} (${role}) on ${dateStr}\n` +
     `Time:       ${shift_start}–${shift_end}\n` +
@@ -539,6 +540,7 @@ async function sendManagerSwapApprovalRequest(params: {
     'These links expire in 7 days. — Aegis';
 
   const html = `<!DOCTYPE html><html lang="en"><body style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;padding:24px;">
+<p style="margin:0 0 16px;font-size:15px;">${greeting(manager.name)}</p>
 <h2 style="margin:0 0 4px;">Shift Swap Request</h2>
 <p style="color:#6b7280;margin:0 0 20px;">Both employees have agreed — your approval is needed.</p>
 <table style="width:100%;border-collapse:collapse;margin-bottom:24px;">
@@ -621,14 +623,14 @@ async function executeSwapNow(params: {
     role: 'employee', company_id, employee_id: requester.id, user_id: null,
     name: requester.name, matched_identifier: params.requester_sender, channel: params.requester_channel,
   };
-  await reply(requesterContact, requesterMsg, `Your swap has been confirmed! ${receiver.name} will cover your ${shiftDesc}.`);
+  await reply(requesterContact, requesterMsg, `${greeting(requester.name)} your swap has been confirmed! ${receiver.name} will cover your ${shiftDesc}.`);
 
   // Notify receiver via SMS
   if (receiver.contact_phone && params.aegis_sms_channel) {
     await sendSms({
       to: receiver.contact_phone,
       from: params.aegis_sms_channel,
-      body: `Hi ${receiver.name.split(' ')[0]}, your swap with ${requester.name} is confirmed. You're covering the ${shiftDesc}.`,
+      body: `${greeting(receiver.name)} your swap with ${requester.name} is confirmed. You're covering the ${shiftDesc}.`,
       company_id,
     });
   }
@@ -864,7 +866,7 @@ export async function handleSwapConfirmation(
       to: receiver.contact_phone,
       from: aegisSmsNumber,
       body:
-        `Hi ${receiver.name.split(' ')[0]}, this is Aegis. ` +
+        `${greeting(receiver.name)} this is Aegis. ` +
         `${contact.name} would like to swap their ${pending.shift_name} shift (${pending.shift_start}–${pending.shift_end}, ${pending.role}) ` +
         `on ${formatDisplayDate(pending.shift_date)} with you. Can you take this shift? Reply YES or NO.`,
       company_id: contact.company_id,
@@ -945,7 +947,7 @@ export async function handleSwapConfirmation(
       to: firstCandidate.contact_phone,
       from: aegisSmsNumber,
       body:
-        `Hi ${firstCandidate.name.split(' ')[0]}, this is Aegis. ` +
+        `${greeting(firstCandidate.name)} this is Aegis. ` +
         `${contact.name} is looking for someone to take their ${pending.shift_name} shift ` +
         `(${pending.shift_start}–${pending.shift_end}, ${pending.role}) on ${formatDisplayDate(pending.shift_date)}. ` +
         'Would you like to take this shift? Reply YES or NO.',
@@ -1036,7 +1038,7 @@ export async function handleSwapOutreachResponse(
       to: nextEmp.contact_phone,
       from: outreach.aegis_sms_channel,
       body:
-        `Hi ${nextEmp.name.split(' ')[0]}, this is Aegis. ` +
+        `${greeting(nextEmp.name)} this is Aegis. ` +
         `${outreach.requester_name} is looking for someone to take their ${outreach.shift_name} shift ` +
         `(${outreach.shift_start}–${outreach.shift_end}, ${outreach.role}) on ${formatDisplayDate(outreach.shift_date)}. ` +
         'Would you like to take this shift? Reply YES or NO.',

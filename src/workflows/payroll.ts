@@ -260,6 +260,7 @@ async function loadScheduledShifts(
     .from('schedules')
     .select('data, week_start, week_end')
     .eq('company_id', companyId)
+    .is('deleted_at', null)
     .eq('status', 'published')
     .lte('week_start', periodEnd)
     .gte('week_end', periodStart);

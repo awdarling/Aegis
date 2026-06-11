@@ -1314,6 +1314,7 @@ export async function distributeScheduleCore(
     .select('id, week_start, week_end, data, status')
     .eq('id', scheduleId)
     .eq('company_id', companyId)
+    .is('deleted_at', null)
     .single();
   if (schedError || !schedRowData) {
     throw new Error(`schedule ${scheduleId} not found for company ${companyId}: ${schedError?.message ?? 'no row'}`);
@@ -1486,7 +1487,7 @@ export async function handleDistributeSchedule(
   let scheduleRow: ScheduleRow | null = null;
 
   const { data: pubData } = await supabase
-    .from('schedules').select('id')
+    .from('schedules').select('id').is('deleted_at', null)
     .eq('company_id', contact.company_id).eq('status', 'published')
     .order('generated_at', { ascending: false }).limit(1).maybeSingle();
 
@@ -1494,7 +1495,7 @@ export async function handleDistributeSchedule(
     scheduleRow = pubData as ScheduleRow;
   } else {
     const { data: draftData } = await supabase
-      .from('schedules').select('id')
+      .from('schedules').select('id').is('deleted_at', null)
       .eq('company_id', contact.company_id).eq('status', 'draft')
       .order('generated_at', { ascending: false }).limit(1).maybeSingle();
     if (draftData) scheduleRow = draftData as ScheduleRow;

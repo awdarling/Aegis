@@ -35,6 +35,69 @@ This is the single most important habit. The moment a piece of work is **approve
 
 ---
 
+## NOW / NEXT — current priority plan (set 2026-06-10)
+
+This is the current Now/Next ordering for active work. It sits **above** the (now-closed) 48-hour sprint and the Forward Build Sequence — those remain the structural plan; this is what's being worked next. The three items are ordered **#1 → #2 → #3**; do not start #3 until #1 and #2 are at least in fix-shape. All three are diagnose-first (no blind fixes).
+
+### #1 · SCHED-DELETE-1 — Delete-schedule button for managers + owners only (Homebase) — **NEW**
+**Repo:** Homebase · **Status:** `OPEN, not started` · **Phase tag:** `[P1]` (live-product hardening + UX gap)
+
+There is no delete-schedule control today; managers / owners need one. Build it role-gated end-to-end, not just hidden in the UI. Diagnose-first scope to capture:
+- **Route-level authz.** A delete must be enforced server-side, not by hiding the button. **Mirror the SEC-1 `create-user` pattern** (Homebase `security/create-user-authz`): sign-in gate → role gate (`owner` / `manager` / `quria` only; the `'quria'` literal — `'quria_admin'` is an activity_log/ContactRole label only) → company-binding (owner is forced to own `company_id`; the body cannot override it; `quria` may target any company). Add a route-level test alongside the existing 22-case `security-authz.test.ts` pattern.
+- **Hard vs soft delete given FK references off the `schedules` row.** Same FK hazard as `DELETE-USER` (Phase 1 above): `schedules.id` is referenced by at least `activity_log` rows and likely other tables; the default `ON DELETE NO ACTION/RESTRICT` will block a hard delete and a swallowed error will silently no-op. Before building: query `information_schema` / `pg_constraint` for every FK targeting `schedules.id`, and read the actual `ON DELETE` clause on each. Then pick the model — soft-delete (`deleted_at` timestamp + filter on the list view) is the lower-risk default; hard delete requires explicit `ON DELETE CASCADE` (or `SET NULL` on the FKs) plus a service-role route. **Do NOT touch prod DDL from an agent — gated.**
+- **Confirmation UX.** Hard-to-reverse destructive action → require an explicit confirm step (type the week_start, or a typed phrase) before the route fires; surface the server error in the UI (don't swallow it — same trap as `DELETE-USER`'s `handleRevoke`).
+- **Already-distributed schedules.** If `status='distributed'` or the schedule has already been emailed to employees, what happens on delete? Two acceptable shapes: (a) refuse and surface "this schedule was already distributed — soft-archive instead?"; or (b) allow but log/notify and clearly mark in `activity_log`. Decision pending; do not silently delete distributed schedules.
+- **Data shape reminder.** `schedules.data` is JSONB keyed by `id` (Aegis reads it verbatim in `src/workflows/schedule-build.ts:1259-1291`). Delete must clean up `schedules.data` along with the row, and any soft-delete must hide the row from BOTH the Homebase list view AND any Aegis lookup that resolves a schedule by id.
+
+**Done when:** anon/manager-cross-company/owner-cross-company calls → 403; same-company owner/manager → success (or refused-with-message on distributed); FK constraints handled deliberately (soft-delete or explicit cascade); confirmation step in UI; route-level test added; visible in `activity_log`.
+
+### #2 · AEGIS-EMAIL-1 — Every Aegis email-action workflow works end-to-end + carries a test — **NEW**
+**Repo:** Aegis + Homebase · **Status:** `OPEN, not started` · **Phase tag:** `[P2]` (Forward Build Sequence Phase 2 — Complete the comms loop)
+
+Verify + fix + **test** every email-action workflow end-to-end: inbound email → magic-link issued → manager clicks link → action consumed via Homebase `/api/aegis-action` → correct DB effect (and, where applicable, employee notified). The token layer itself is already audited sound (SEC-4: 256-bit CSPRNG, SHA-256 hash-stored, atomic TTL + single-use enforcement). **This item is the workflows themselves**, not the crypto.
+
+The set to cover (the `ActionType` union in `src/lib/aegis-actions/types.ts`):
+
+| Action | Symptom if broken | Test shape |
+|---|---|---|
+| `approve_to` | manager click → TO row not set to `approved` OR `decided_by` empty OR employee not notified | sandbox TO request → approve via magic link → assert row + activity log + notify-call |
+| `deny_to` | as above for denial | same shape with `deny_to` |
+| `approve_availability` | manager approves availability update → `availability` row not written OR window not applied | sandbox availability request → approve → assert `availability` rows match |
+| `deny_availability` | as above for denial | same |
+| `accept_emergency_coverage` | employee clicks accept → shift not reassigned OR no flag cleared | sandbox EC request → accept → assert `schedules.data.assignments` update + notify |
+| `decline_emergency_coverage` | as above for decline | same |
+| `confirm_distribution` | manager click → distribution doesn't fire / fires partially / not idempotent on re-click | sandbox build → click confirm → assert distribution log + idempotent on second click |
+| `request_additional_batch` | manager click → no follow-up batch issued / batch issued but wrong context | sandbox build → click → assert next batch issued with correct payload |
+
+Plus any sibling/follow-up workflows surfaced during this pass (e.g. swap-accept/decline, onboarding fan-out steps) — log them in `EMAIL_WORKFLOWS_TRACKER.md` as they come up rather than expanding this list speculatively.
+
+**Test runner constraint.** Homebase has NO test runner yet (tracked Tier-3 — `vitest` exists only on the throwaway `test/security-verify` branch). "Tested" here may mean standing up the runner first (vitest config + `test` script + first commit on Homebase) AND porting the existing 22-case `security-authz.test.ts` over before the workflow tests land. Aegis has a working harness in `src/lib/engine/__tests__/` (vitest) — workflow tests on the Aegis side can reuse it.
+
+**Track per-workflow status in `EMAIL_WORKFLOWS_TRACKER.md`.** Each row above gets a tracker entry that flips through `OPEN → DIAGNOSED → FIXING → IN REVIEW → DONE (test green + sandbox round-trip green)`. The tracker already has Phase 7 ("risky fan-outs") and the TODO/UNTESTED intents — fold AEGIS-EMAIL-1 above those as the umbrella for the per-workflow verification + test pass.
+
+**Done when:** all 8 `ActionType`s have (a) a sandbox end-to-end round-trip that produces the expected DB effect and notification, AND (b) a committed automated test that exercises the route + asserts the effect. `EMAIL_WORKFLOWS_TRACKER.md` per-workflow rows all show `DONE`.
+
+### #3 · TEMPLATE-EDIT-1 — Schedule template edits persist AND re-render the current schedule — **RE-PRIORITIZED behind #1 + #2**
+**Repo:** Homebase · **Status:** `OPEN, queued behind #1 + #2` · **Phase tag:** `[P1]` (live-product gap)
+
+Previously a Tier-3 polish item; promoted here because on-site managers can't actually save template edits. **Expanded scope (2026-06-10):** the fix must (a) make template edits actually persist to `schedule_templates`, AND (b) re-render the currently-viewed schedule against the edited template so the manager sees the effect of their edit without manually rebuilding. Today neither happens.
+
+**Banked leads (do not redo the diagnosis; carry forward):**
+- **Distinct path from SCHED-EDIT-1.** Schedule edits flow through `ScheduleReviewPanel.save()` → `schedules.data` (JSONB keyed by id). Template edits flow through `useScheduleTemplate()` (`src/lib/hooks/useScheduleTemplate.ts`) → `schedule_templates` table. **No shared code; fixing one does not fix the other.**
+- **Strongest behavioral lead:** `useScheduleTemplate.ts:67` — `if (!error && data) { setTemplate(data) }`. The error branch does NOTHING. `TemplateEditorPanel.handleSave` (`TemplateEditorPanel.tsx:186-191`) `await`s `saveTemplate(local)` and calls `onClose()` regardless. **On-site symptom ("edits don't take effect / won't save, no error shown") matches this exactly** — fix is to surface the error to the user AND not close the panel on failure.
+- **Verify before the fix lands:** `.upsert(payload, { onConflict: 'company_id' })` requires a UNIQUE (or PK-component) constraint on `schedule_templates.company_id`. Query `information_schema.table_constraints` + `key_column_usage` for `schedule_templates` on prod (or Supabase Dashboard) — if the constraint is missing, the upsert silently inserts a duplicate row and no edit ever appears to take. See `SCHEMA_DRIFT_LOG.md` 2026-06-10 entry.
+- **Sibling Tier-3 entry:** `saveTemplate id:''` bug — the id-strip is OK (`id ? next : rest` correctly handles `id === ''` → uses `rest`); the failure is downstream of that. Worth a single pass alongside this fix.
+- **(b) Re-render the current schedule against the edited template.** Currently editing the template doesn't reflect on the actively-viewed schedule's structure (shifts/rows). Decide the contract: on template-save success, either trigger a re-render of the current week's view against the new template (cheaper UX, no DB write), or offer a "rebuild this week against the updated template" action (clearer, but heavier and rewrites the schedule). Lean toward the lighter re-render-only-the-view option unless rule-driven slot changes require an actual rebuild — needs the diagnosis pass.
+
+**Done when:** a template edit (a) round-trips to `schedule_templates` with the change persisted and reloadable, (b) surfaces any save error to the user (panel does NOT close on failure), (c) the actively-viewed schedule re-renders to reflect the new template, and (d) carries a test on the route + the hook.
+
+### Ordering
+**Strict order: #1 → #2 → #3.** SCHED-DELETE-1 first (small, well-scoped, clears a manager UX gap and pattern-tests the SEC-1 authz approach on a second route). AEGIS-EMAIL-1 second (the comms-loop verification + tests are the highest-leverage thing for Phase-2 confidence). TEMPLATE-EDIT-1 third (queued behind because it's larger, on-site-only verifiable, and the banked lead is strong enough that picking it up after the test runner is stood up — which AEGIS-EMAIL-1 may do — makes the fix + test cheaper).
+
+**IDs note.** `SCHED-DELETE-1` and `AEGIS-EMAIL-1` are new in the project; no collision with existing IDs (`ENGINE-1/2`, `SCHED-EDIT-1`, `TEMPLATE-EDIT-1`, `DOWNLOAD-500`, `DELETE-USER`, `SEC-1..4`, `DELIV-1`, `BUG-5`, `CASCADE-1/2`, `SANDBOX-SEED-1`, `POLICY-JSON-SHAPE-1`).
+
+---
+
 ## CURRENT SPRINT — 48-hour priority (started June 8) — **COMPLETE 2026-06-09**
 
 All four sprint items closed: ENGINE-2/gender rule, S2/SCHED-EDIT-1, S3/in-tab TO notify shipped and live-verified; S1/ENGINE-1 closed-as-diagnosed (no engine bug — JL residual is structural, routed to Role Groups; two product decisions pending — see S1 entry). Next focus: Cowork operating model, then the forward plan (`PRIORITY2_ANALYSIS.md` A/B/C).

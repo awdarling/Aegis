@@ -680,3 +680,7 @@ Docs-only pass, no code. Triggered by `feature/max-consecutive-days` merging to 
 ### 2026-06-11 — SCHED-DELETE-1 diagnosed + decisions locked
 - Read-only diagnosis: delete already live but UI-only; RLS permits DELETE for any same-company user; zero FKs ref `schedules.id`; `users.role` is `quria` not `quria_admin`.
 - Gate is temporal: managers delete current+upcoming, owner/quria also past. Soft delete confirmed. Distributed warning preserved. Build issued (branch off origin/main; DDL apply, RLS apply, and main merge are human-gated).
+
+### 2026-06-11 — Environment + branch-base note
+- ~/Desktop is a fuse mount that blocks unlink; git ops that unlink (reset --hard, checkout <branch>, lock cleanup) fail. Use no-unlink ops.
+- origin/main did NOT carry the NOW/NEXT sprint block (SCHED-DELETE-1, AEGIS-EMAIL-1); it lived on docs/sec-3-status-update. Diagnosis was stacked on that branch, so merging docs/sched-delete-1-diagnosis brings both in.

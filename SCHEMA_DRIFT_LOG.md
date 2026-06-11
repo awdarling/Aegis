@@ -170,3 +170,15 @@ Any time a future Claude Code session or live debugging surfaces a difference be
 
 ### public.users.role enum drift
 - Live values: `quria | owner | manager`. `quria_admin` is an `activity_log` ACTOR label only, NOT a `users.role` value. `02_Database_Schema.docx` §1.2 ("quria_admin / owner / manager") is wrong; gate on `role==='quria'`. Live: 4 manager, 1 quria, 0 owner.
+
+---
+
+## June 11, 2026 — AEGIS-EMAIL-1 diagnostic
+
+### `public.schedules.status` — `'distributed'` legal but never persisted
+- CHECK constraint allows `('draft','published','distributed')`; Aegis `distributeScheduleCore` writes `'published'` after fan-out and overwrites the magic-link path's transient `'distributed'`. **0 rows ever hold `status='distributed'`** in production. The real "distributed" signal is `status='published' AND distributed_at IS NOT NULL`.
+- Implication: any guard or report that filters on `status='distributed'` will silently match nothing. The `confirm_distribution` magic-link path's re-distribution guard was effectively defeated by this clobber (re-clicking the link would re-fan-out because the status check could never see `'distributed'`).
+- Cross-ref: AEGIS-EMAIL-1 work list #2 (drop the magic-link `confirm_distribution` path; fix the re-distribution guard to key on `distributed_at`, not `status`).
+
+### `public.aegis_action_tokens.issued_at` — DB-defaulted, never app-set
+- Column is `timestamptz NOT NULL`; Aegis `generateActionToken` does NOT set it on insert (relies on the DB `DEFAULT now()`). In practice `issued_at` always equals row-insert time — fine, but worth knowing that any audit logic that needs "when did the email mint this token" should read `issued_at` rather than expect an explicitly-passed value. No bug; documenting for the next builder.

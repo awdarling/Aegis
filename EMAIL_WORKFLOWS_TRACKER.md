@@ -2,13 +2,28 @@
 
 **Goal**: All Aegis email workflows ready for live client use at Watermark Country Club.
 
-**Status**: **LAUNCHED June 5, 2026.** Time-off and availability email workflows are live and verified end-to-end on the Watermark production tenant. Inbound signature verification is live. Remaining work is fast-follows, deferred risky fan-outs, and the two newly-surfaced scheduling/Homebase bugs.
+**Status**: **LAUNCHED June 5, 2026.** Inbound signature verification is live. The **time-off** email round-trip (employee submit → confirm → manager fan-out → manager approve via magic-link button → employee notified) is verified end-to-end on the Watermark production tenant. The **availability** path is **partially verified**: the employee→manager NOTIFY fan-out is live and verified (Phase 4 + the June-5 fan-out fix), but the manager-side **approve/deny magic-link buttons are NOT built** — those handlers are dead stubs that return a fake success page and no email mints availability tokens today. The current manager-approval path for availability is the fragile reply-YES + Homebase-tab path; the magic-link buttons are scoped under AEGIS-EMAIL-1. Remaining work is fast-follows, deferred risky fan-outs, the two newly-surfaced scheduling/Homebase bugs, and the AEGIS-EMAIL-1 umbrella.
 
 **Last updated**: June 9, 2026.
 
 > **Push state (top-of-file):** Aegis is pushed and live (`46eaa70`). Homebase is pushed and live (`29ed00e`). **48-hour sprint COMPLETE (2026-06-09):** SCHED-EDIT-1 round-trip persists corrected hours; `unsatisfied_sex_coverage` flag renders in BOTH the manager schedule-preview email AND the Homebase Preview & Edit view; S3 in-tab TO approval verified in sandbox (notify fired, `decided_by` written, manager toast).
 
 > **AEGIS-EMAIL-1 umbrella (set 2026-06-10) — current Now/Next #2 in `DEV_ROADMAP.md`.** Verify + fix + **test** every Aegis email-action workflow end-to-end (email → magic-link → `/api/aegis-action` → correct DB effect + notify): the 8 `ActionType`s in `src/lib/aegis-actions/types.ts` — `approve_to`, `deny_to`, `approve_availability`, `deny_availability`, `accept_emergency_coverage`, `decline_emergency_coverage`, `confirm_distribution`, `request_additional_batch`. Per-workflow status to be tracked below as each is exercised; each `DONE` requires (a) a sandbox round-trip producing the expected DB effect + notification AND (b) a committed automated test. Homebase has no test runner yet (tracked Tier-3) — standing one up may be a prerequisite. Token layer itself is sound (SEC-4 verified); this is the workflows themselves.
+
+### AEGIS-EMAIL-1 — email-action status grid (set 2026-06-11)
+
+Per-action status of the 8 `ActionType`s in `src/lib/aegis-actions/types.ts`. Drives the AEGIS-EMAIL-1 work list in `DEV_ROADMAP.md`. **3 of 8 wired end-to-end; 5 are dead stubs** (handlers return a fake success page; no email mints these tokens). Re-prioritized direction: `confirm_distribution`'s magic-link path is being **retired** (distribute moves to conversational command + Homebase button), so it won't graduate from this grid — it gets removed.
+
+| Action | Status | Notes |
+|---|---|---|
+| `approve_to` | **WORKING (prod-verified)** | 21 Watermark consumptions; email → magic-link → DB update + employee notify. |
+| `deny_to` | **BUILT, email-button UNVERIFIED** | In-app Time Off tab deny works (S3 / `decideTimeOffRequest`); the email-button path has not been observed consumed. Alexander testing 2026-06-11. |
+| `confirm_distribution` | **SANDBOX-ONLY + status-clobber bug** | Cross-repo conflict: Homebase writes `status='distributed'`, Aegis overwrites to `'published'`, defeating the re-distribution guard. **To be reworked: command + Homebase button; drop the magic-link path entirely** (per AEGIS-EMAIL-1 work list #2). |
+| `approve_availability` | **STUB** | Handler returns fake success; no email mints availability tokens. Real handler + mint = AEGIS-EMAIL-1 work-list #3. |
+| `deny_availability` | **STUB** | Same as above. |
+| `accept_emergency_coverage` | **STUB** | Fake success; never minted by any email. |
+| `decline_emergency_coverage` | **STUB** | Fake success; never minted by any email. |
+| `request_additional_batch` | **STUB** | Fake success; never minted by any email. |
 
 ---
 
@@ -146,3 +161,16 @@ Outbound from `aegis.quriasolutions.com` must inbox, not spam. First-contact sen
 ## Note on `tracker_update.md`
 
 The standalone `tracker_update.md` scratch file (Phase 4.5 scoping + BUG-1/BUG-2) is **superseded** — its content is folded into this tracker (Phase 4.5 above, BUG-1/BUG-2 DONE). Safe to archive/delete from the repo root.
+
+---
+
+### 2026-06-11 — Distribute redesign + Aegis personability (built on branch feat/distribute-email-redesign)
+- Distribute email rebuilt: warm per-employee copy + full-week all-staff schedule attached
+  (Aegis self-renders HTML from schedules.data — option D; no Homebase call, no new deps).
+- Aegis email attachments enabled (EmailOptions.attachments → SendGrid).
+- Personability pass: shared greeting helper + automated check (scripts/check-greeting.ts);
+  greetings across all employee- and manager-facing messages (each by own first name); manager
+  CTAs/magic-links preserved; opt-in/TCPA, compliance, general_query excluded.
+- Findings: no Homebase Distribute button today (distribution = magic-link + SMS reply);
+  /download/pdf returns HTML not PDF (03 §4.3 drift).
+- Status: built on branch, tsc clean, greeting check green; NOT merged/live-verified.

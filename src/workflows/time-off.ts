@@ -590,10 +590,11 @@ export async function sendDecisionNotification(
   const employee = empData as { id: string; name: string; contact_email: string | null; contact_phone: string | null };
 
   const dateRange = formatDateRange(tor.start_date, tor.end_date);
+  const firstName = employee.name.split(' ')[0];
   const text =
     decision === 'approved'
-      ? `Your time-off request for ${dateRange} has been approved. Enjoy your time off!`
-      : `Your time-off request for ${dateRange} has been denied. Please contact your manager if you have questions or would like to discuss alternatives.`;
+      ? `Hi ${firstName},\n\nYour time-off request for ${dateRange} has been approved. Enjoy your time off!`
+      : `Hi ${firstName},\n\nYour time-off request for ${dateRange} has been denied. Please contact your manager if you have questions or would like to discuss alternatives.`;
 
   let channel: 'email' | 'sms';
   let sent_to: string;
@@ -1275,7 +1276,7 @@ export async function handlePendingTimeOffConfirmation(
   await reply(
     contact,
     message,
-    `Got it — I've sent your time-off for ${dateDisplay} to your manager. ` +
+    `Hi ${contact.name.split(' ')[0]},\n\nGot it — I've sent your time-off for ${dateDisplay} to your manager. ` +
       "I'll let you know as soon as they decide."
   );
 }

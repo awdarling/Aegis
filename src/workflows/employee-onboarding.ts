@@ -1794,7 +1794,7 @@ export async function handleAvailabilityConfirmResponse(
   await reply(
     contact,
     message,
-    `Your availability request has been sent to your manager for approval. You'll hear back soon.`
+    `Hi ${contact.name.split(' ')[0]},\n\nYour availability request has been sent to your manager for approval. You'll hear back soon.`
   );
 }
 
@@ -1892,7 +1892,8 @@ async function notifyEmployeeOfAvailabilityDecision(
     matched_identifier: pending.employee_sender,
     channel: pending.employee_channel,
   };
-  await reply(employeeContact, employeeMessage, bodyText);
+  const firstName = pending.employee_name.split(' ')[0];
+  await reply(employeeContact, employeeMessage, `Hi ${firstName},\n\n${bodyText}`);
 }
 
 // ── Proactive expiry (called by scheduler) ────────────────────────────────────

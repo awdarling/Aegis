@@ -1,7 +1,7 @@
 import { supabase } from '../db/client';
 import { logActivity } from '../logger/activity-log';
 import { reply, sendInThreadAck } from '../messaging/reply';
-import { sendEmail } from '../messaging/email';
+import { sendEmail, type EmailAttachment } from '../messaging/email';
 import { sendSms } from '../messaging/sms';
 import { computeWageEstimate } from '../lib/schedule-simulator';
 import { buildScheduleResultEmail } from './schedule-build-email';
@@ -1303,6 +1303,117 @@ export interface DistributeScheduleResult {
 // Loads the schedule, fans out per-employee summaries, marks the schedule
 // published + distributed_at, logs per-send + aggregate activity. Throws on
 // schedule-not-found so callers can surface the error.
+// ── Full all-staff schedule attachment ─────────────────────────────────────────
+//
+// Self-contained HTML rendering of the WHOLE week for EVERY employee — the same
+// file attaches to every distribution email so each person sees the full picture
+// (who's on, which positions, where the gaps are) without any Homebase login.
+// Aegis builds this purely from data it already loaded (schedules.data), so there
+// is no Homebase call and no exceljs/PDF dependency. Rows are distinct shifts
+// ordered by start_time; columns are the 7 days of the target week.
+function buildFullScheduleAttachmentHtml(args: {
+  schedData: ScheduleData;
+  weekStart: string;
+  weekEnd: string;
+  companyName: string;
+  weekLabel: string;
+}): string {
+  const { schedData, weekStart, weekEnd, companyName, weekLabel } = args;
+  const assignments = schedData.assignments ?? [];
+  const gaps = (schedData.gaps ?? []).filter(g => g.required_count > g.filled_count);
+  // closed_dates may ride along in the persisted data even though the in-repo
+  // ScheduleData type doesn't list it — read it defensively.
+  const closedDates = (schedData as { closed_dates?: ClosedDate[] }).closed_dates ?? [];
+  const closedByDate = new Map(closedDates.map(c => [c.date, c.event_title]));
+
+  const days = getDatesInRange(weekStart, weekEnd);
+
+  // Distinct shifts, with a representative start_time for ordering. Prefer an
+  // assignment's start_time; fall back to a gap's. Order rows by start_time.
+  const shiftStart = new Map<string, string>();
+  for (const a of assignments) {
+    if (!shiftStart.has(a.shift_name)) shiftStart.set(a.shift_name, a.start_time);
+  }
+  for (const g of gaps) {
+    if (!shiftStart.has(g.shift_name)) shiftStart.set(g.shift_name, g.start_time ?? '99:99');
+  }
+  const shiftNames = [...shiftStart.keys()].sort((x, y) =>
+    (shiftStart.get(x) ?? '99:99').localeCompare(shiftStart.get(y) ?? '99:99')
+  );
+
+  // Fast cell lookups, keyed by `${shift_name}||${date}`.
+  const asgByKey = new Map<string, ScheduleAssignment[]>();
+  for (const a of assignments) {
+    const k = `${a.shift_name}||${a.date}`;
+    (asgByKey.get(k) ?? asgByKey.set(k, []).get(k)!).push(a);
+  }
+  const gapByKey = new Map<string, ScheduleGap[]>();
+  for (const g of gaps) {
+    const k = `${g.shift_name}||${g.date}`;
+    (gapByKey.get(k) ?? gapByKey.set(k, []).get(k)!).push(g);
+  }
+
+  const esc = (s: string): string =>
+    s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+  const headerCells = days.map(d => {
+    const closure = closedByDate.get(d);
+    const sub = closure
+      ? `<div style="font-size:11px;color:#b91c1c;font-weight:600;">CLOSED${closure ? ` — ${esc(closure)}` : ''}</div>`
+      : '';
+    return `<th style="padding:8px 10px;border:1px solid #d1d5db;background:#1f2937;color:#f9fafb;text-align:left;font-size:12px;min-width:120px;">${esc(formatWeekday(d))}<div style="font-weight:400;color:#cbd5e1;font-size:11px;">${esc(formatShortDate(d))}</div>${sub}</th>`;
+  }).join('');
+
+  const bodyRows = shiftNames.map(shiftName => {
+    const cells = days.map(d => {
+      if (closedByDate.has(d)) {
+        return `<td style="padding:8px 10px;border:1px solid #e5e7eb;background:#f3f4f6;color:#9ca3af;font-size:12px;text-align:center;">—</td>`;
+      }
+      const key = `${shiftName}||${d}`;
+      const asgs = (asgByKey.get(key) ?? []).slice().sort((a, b) =>
+        (a.employee_name ?? '').localeCompare(b.employee_name ?? '')
+      );
+      const cellGaps = gapByKey.get(key) ?? [];
+      const lines: string[] = [];
+      for (const a of asgs) {
+        lines.push(`<div style="margin:2px 0;"><strong>${esc(a.employee_name ?? '')}</strong> <span style="color:#6b7280;">${esc(a.role)}</span></div>`);
+      }
+      for (const g of cellGaps) {
+        const missing = g.required_count - g.filled_count;
+        for (let i = 0; i < missing; i++) {
+          lines.push(`<div style="margin:2px 0;color:#b91c1c;font-weight:600;">UNFILLED — ${esc(g.role)}</div>`);
+        }
+      }
+      const inner = lines.length > 0 ? lines.join('') : `<span style="color:#d1d5db;">·</span>`;
+      return `<td style="padding:8px 10px;border:1px solid #e5e7eb;font-size:12px;vertical-align:top;">${inner}</td>`;
+    }).join('');
+    const startLabel = shiftStart.get(shiftName);
+    const sub = startLabel && startLabel !== '99:99'
+      ? `<div style="font-weight:400;color:#6b7280;font-size:11px;">${esc(formatTime(startLabel))}</div>`
+      : '';
+    return `<tr><th style="padding:8px 10px;border:1px solid #d1d5db;background:#f9fafb;text-align:left;font-size:12px;vertical-align:top;white-space:nowrap;">${esc(shiftName)}${sub}</th>${cells}</tr>`;
+  }).join('');
+
+  const emptyNote = shiftNames.length === 0
+    ? `<p style="color:#6b7280;">No shifts are on the schedule for this week.</p>`
+    : '';
+
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${esc(companyName)} Schedule — ${esc(weekLabel)}</title></head>
+<body style="font-family:Arial,Helvetica,sans-serif;margin:0;padding:20px;color:#111827;background:#ffffff;">
+<h1 style="font-size:20px;margin:0 0 4px;">${esc(companyName)} — Full Schedule</h1>
+<p style="margin:0 0 16px;color:#6b7280;font-size:14px;">Week of ${esc(weekLabel)} · everyone, every position</p>
+${emptyNote}
+<div style="overflow-x:auto;">
+<table style="border-collapse:collapse;width:100%;min-width:680px;">
+<thead><tr><th style="padding:8px 10px;border:1px solid #d1d5db;background:#1f2937;color:#f9fafb;text-align:left;font-size:12px;">Shift</th>${headerCells}</tr></thead>
+<tbody>${bodyRows}</tbody>
+</table>
+</div>
+<p style="margin:16px 0 0;color:#9ca3af;font-size:12px;">Positions in grey next to each name. <span style="color:#b91c1c;font-weight:600;">UNFILLED</span> marks an open slot. — ${esc(companyName)}</p>
+</body></html>`;
+}
+
 export async function distributeScheduleCore(
   scheduleId: string,
   companyId: string
@@ -1332,6 +1443,22 @@ export async function distributeScheduleCore(
   const companyName = (companyRes.data as { name: string } | null)?.name ?? 'Your Company';
   const aegisSmsChannel = (channelRes.data as { channel_value: string } | null)?.channel_value ?? null;
   const employees = (empRes.data ?? []) as Pick<Employee, 'id' | 'name' | 'contact_email' | 'contact_phone'>[];
+
+  // Full all-staff week grid, rendered once and attached to every employee's
+  // email so each person can see the whole week, not just their own shifts.
+  const fullScheduleHtml = buildFullScheduleAttachmentHtml({
+    schedData,
+    weekStart: scheduleRow.week_start,
+    weekEnd: scheduleRow.week_end,
+    companyName,
+    weekLabel,
+  });
+  const scheduleAttachment: EmailAttachment = {
+    filename: `Schedule_${scheduleRow.week_start}.html`,
+    content: fullScheduleHtml,
+    type: 'text/html',
+    disposition: 'attachment',
+  };
 
   let emailed = 0;
   let texted = 0;
@@ -1409,6 +1536,7 @@ ${shiftTable}
           text,
           html,
           company_id: companyId,
+          attachments: [scheduleAttachment],
         });
         emailed++;
         empEmailed = true;

@@ -12,6 +12,18 @@ sgMail.setApiKey(env.SENDGRID_API_KEY);
 
 const FALLBACK_REPLY_TO_EMAIL = process.env.AEGIS_REPLY_TO_EMAIL ?? 'aegis@aegis.quriasolutions.com';
 
+// A single file to attach. `content` is the raw (un-encoded) file body; sendEmail
+// base64-encodes it before handing it to SendGrid. `type` is the MIME type
+// (e.g. 'text/html', 'application/pdf'); `disposition` defaults to 'attachment'.
+export interface EmailAttachment {
+  filename: string;
+  content: string | Buffer;
+  type?: string;
+  disposition?: 'attachment' | 'inline';
+  /** Required by SendGrid only for inline images referenced via cid: in the HTML. */
+  content_id?: string;
+}
+
 interface EmailOptions {
   to: string;
   subject: string;
@@ -19,6 +31,7 @@ interface EmailOptions {
   html?: string;
   company_id: string;
   thread_id?: string;
+  attachments?: EmailAttachment[];
 }
 
 async function resolveTenantEmailAddress(companyId: string): Promise<string | null> {
@@ -67,6 +80,18 @@ export async function sendEmail(options: EmailOptions): Promise<void> {
   }
   const replyToAddress = tenantReplyTo ?? FALLBACK_REPLY_TO_EMAIL;
 
+  // Map our EmailAttachment shape onto SendGrid's. SendGrid expects the file
+  // body as a base64 string, so we encode here — callers pass raw text/Buffer.
+  const sgAttachments = options.attachments?.map((a) => ({
+    filename: a.filename,
+    content: Buffer.isBuffer(a.content)
+      ? a.content.toString('base64')
+      : Buffer.from(a.content, 'utf-8').toString('base64'),
+    type: a.type ?? 'application/octet-stream',
+    disposition: a.disposition ?? 'attachment',
+    ...(a.content_id ? { content_id: a.content_id } : {}),
+  }));
+
   try {
     await sgMail.send({
       to: options.to,
@@ -78,6 +103,9 @@ export async function sendEmail(options: EmailOptions): Promise<void> {
       subject: options.subject,
       text: options.text,
       html: options.html ?? htmlFromText(options.text),
+      ...(sgAttachments && sgAttachments.length > 0
+        ? { attachments: sgAttachments }
+        : {}),
       ...(options.thread_id
         ? {
             headers: {

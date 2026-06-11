@@ -2,7 +2,9 @@
 
 **Features, Capabilities & Workflows**
 
-**Version 3.0 — June 8, 2026**
+**Version 3.1 — June 10, 2026**
+
+> **v3.1 changelog (2026-06-10):** §4.3 `xlsx → exceljs` swap is DONE (styled Excel + PDF both render via shared `buildScheduleGrid`) — removed from the Tier-2 "nice-to-have" framing; new open item logged for a download FORMAT rework + template-builder polish. §5 records the live create-user authz fix (owner/quria only, owner pinned to own `company_id`, role capped at creator's privilege; four `/api/*` routes now carry the standard cookie+`company_id` guard) and adds a KNOWN BUG: revoking/deleting a PRE-EXISTING user silently fails (FK-blocked).
 
 ---
 
@@ -89,7 +91,11 @@ Managers can assign employees to slots by hand — the workaround while engine g
 
 ### 4.3 Download & delete
 
-Excel (`/api/schedule/download/excel`) and PDF/print (`/api/schedule/download/pdf`). Delete is quria_admin/owner only (permanent).
+Excel (`/api/schedule/download/excel`) and PDF/print (`/api/schedule/download/pdf`). Both walk the same shared `buildScheduleGrid`, so the two outputs stay in lockstep. Delete is `quria`/`owner` only (permanent).
+
+> **`xlsx → exceljs` swap — DONE 2026-06-09.** The previous SheetJS community build silently dropped cell styles (only the text reached the file); the renderer is now `exceljs`-based and styling (dark header, red `UNFILLED` gap cells, grey merged `CLOSED` column, frozen panes) reaches the produced `.xlsx`. The earlier Tier-2 "nice-to-have" item is closed; the work is in production via PR-merge (Homebase `main` is protected — see Dev Guide §4). **Live-data verification gated by `DOWNLOAD-500`** (Excel AND PDF currently 500 on real Watermark data — the throw is in the *shared* `buildScheduleGrid`, prime suspect a null/empty `employee_name` likely produced by a SCHED-EDIT-1-era manual edit; PRE-EXISTING, separate bug — see `DEV_ROADMAP.md` Phase 1).
+>
+> **Open follow-up (this doc; logged 2026-06-10):** **download FORMAT rework + template-builder polish (single effort)** — the produced grid should match the schedule builder's visual layout (headers, role grouping, color treatment) and the template editor should be polished alongside (the two are coupled — same column/row model). This is the layout/UX pass, distinct from the renderer swap.
 
 ---
 
@@ -97,6 +103,9 @@ Excel (`/api/schedule/download/excel`) and PDF/print (`/api/schedule/download/pd
 
 - **Activity** — full audit trail with actor/action/date filters and natural-language before/after diffs (employee edits, wage/policy changes, TO events, availability changes, schedule built/distributed, opt-in events).
 - **Access** — managers view users (read-only) and manage Aegis access for employees; owners can revoke manager access; managers cannot add/remove users or change roles.
+  - **Create-user authz (SEC-1, live 2026-06-10).** The `/api/create-user` route is now gated server-side: only `owner` or `quria` may create users (managers get 403); `owner` is **pinned to their own `company_id`** (a body-supplied `company_id` is ignored — no cross-tenant create); `quria` may target any company; the new user's `role` is **capped at the creator's privilege** (`quria` > `owner` > `manager`). Sole caller is the signed-in Access UI, so the sign-in gate breaks no automated path.
+  - **Also live (2026-06-10):** four previously-unguarded `/api/*` routes now carry the standard cookie + `company_id` guard — `soteria-validate-assignment`, `soteria-validate-schedule`, `payroll/test-payroll-provider`, `payroll/test-timeclock`. Per-endpoint table in `SECURITY_AUDIT_API.md` (Homebase branch `security/api-auth-audit`, merged via PR).
+  - **KNOWN BUG — DELETE-USER (DIAGNOSED 2026-06-10, NOT YET FIXED):** revoking/deleting a **pre-existing** user from the Access page silently fails. `handleRevoke` uses the anon/browser client, **swallows the returned error**, and deletes only `public.users`. *New* users delete fine (no linked rows); *old* users are blocked by FK constraints referencing `users.id` — notably `schedules.generated_by` (NOT NULL), `time_off_requests.decided_by`, and `activity_log` — so with the default `ON DELETE NO ACTION/RESTRICT` the delete fails and the UI appears to do nothing. (Even a successful delete leaves the `auth.users` row — no `auth.admin.deleteUser` call — so the email can't be re-added.) **Needs a soft-delete-vs-reassign decision** (the NOT-NULL `schedules.generated_by` can't be `SET NULL`) + a server route (service-role) that surfaces the error and handles the linked records deliberately, plus `auth.admin.deleteUser`. Full diagnosis in `DEV_ROADMAP.md` Phase 1. Caveat (logged in `SCHEMA_DRIFT_LOG.md` 2026-06-10): the exact `ON DELETE` clauses were inferred from column nullability + Postgres defaults — confirm against `information_schema` / `pg_constraint` before building.
 - **Billing** — Stripe; behavior keyed on `companies.billing_model`. Watermark is `one_time` (price `211700` cents = $2,117.00, status `paid` → "Payment Complete", no renewal/cancel). Subscription tenants get start/manage/cancel. Webhook at `/api/stripe/webhook` (branches on session mode); amounts in cents; test-mode customers/prices do not exist in live mode.
 
 ---

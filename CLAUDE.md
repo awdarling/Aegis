@@ -44,10 +44,23 @@ The post-sprint direction is the **Forward Build Sequence (Phases 1–4)** in `D
 - Harnesses: `scripts/dry-run-schedule.ts`, `scripts/test-cascade.ts`.
 
 ## Deploy & danger zones
-- Push to `main` → Railway auto-deploys. Read the actual diff before pushing.
-- **NEVER** trigger `distribute_schedule` against real Watermark data without manager coordination (Carolyn, Jack) — it emails ~30 real employees. And not while **SCHED-EDIT-1** (Homebase) is open: distributed hours may be stale.
+- **Aegis (this repo):** push to `main` → Railway auto-deploys. Read the actual diff before pushing.
+- **Homebase deploy flow (different repo — PR-gated).** As of 2026-06-10, Homebase `main` is **GitHub branch-protected** — direct pushes are rejected. The flow is **feature branch → PR → merge → Vercel auto-deploy on merge**. Exact sequence (run from `~/Desktop/homebase`):
+  ```bash
+  find .git -name "*.lock" -delete
+  git fetch origin
+  git checkout <branch>
+  npm install
+  npm run build          # must be green
+  git push -u origin <branch>
+  # then on GitHub: open PR, review diff, merge — Vercel deploys on merge
+  ```
+- **NEVER** trigger `distribute_schedule` against real Watermark data without manager coordination (Carolyn, Jack) — it emails ~30 real employees.
 - Never print or commit secrets (Twilio, SendGrid, Supabase keys live in Railway env vars).
-- `awdarling@quriasolutions.com` is quria_admin, NOT an employee — employee intents won't work from it without test setup.
+- `awdarling@quriasolutions.com` is `quria` (the platform-admin `users.role`), NOT an employee — employee intents won't work from it without test setup. (`'quria_admin'` is an `activity_log.actor` / Aegis `ContactRole` label only — never a `users.role` value.)
+
+## Remote Control (launch a session you can steer from your phone)
+Claude Code's Remote Control lets the Claude mobile app attach to a running laptop session — useful for long verifies/builds you're away from. Requires **Claude Code v2.1.51+** (v2.1.110+ for push notifications) and sign-in via **claude.ai** (`/login`); **API keys are unsupported** — `unset ANTHROPIC_API_KEY` if it's exported. Enable per-session with `claude --rc`, or for all sessions via `/config` → "Enable Remote Control for all sessions". On mobile: install the Claude app, sign in with the same account, enable push in `/config`, attach from the Code tab. **Gotchas:** the laptop must stay awake and online (`caffeinate -dimsu`; >~10 min offline ends the session); leave **sandboxing OFF** (the default — enabling it recreates the git-lock / `npm run build` / font failures); **merge-to-live always stays a human gate** — Remote Control does not relax the safety model.
 
 ## Cowork / autonomous operating model
 - **SAFE LANE — an agent may do these unattended.** Reads of any kind (DB reads, dry-runs, the verify harness, build/deploy logs). Writes against the SANDBOX tenant only (`company_id = 00000000-0000-0000-0000-000000000001`). Code on a feature branch, `tsc`, open a PR. **Prefer the read-only DB role (`cowork_ro`) for reads when available** — least-privilege by default, not the service-role key.

@@ -2,7 +2,12 @@ import type { Availability, Employee, EmployeeConflict } from '../../db/types';
 import type { TOWindow } from '../to-window';
 import type { ScheduleAssignment } from '../../workflows/schedule-build';
 import type { AttributeMixConstraint, EngineSettings } from '../constraints/types';
-import { buildEligibility, sameDayDoubleReason, type VeteranOnlyRange } from './eligibility';
+import {
+  buildEligibility,
+  consecutiveDaysRunIncluding,
+  sameDayDoubleReason,
+  type VeteranOnlyRange,
+} from './eligibility';
 import {
   classifyEmployeeForSlot,
   formatDispositionList,
@@ -267,6 +272,17 @@ export function enforceAttributeMixForShift(
             if (hardConflict(e.id, cohabIds, deps.conflicts)) return false;
             const cur = weekState.weeklyHoursMap.get(e.id) ?? 0;
             if (cur + removableSlot.hours > e.max_weekly_hours) return false;
+            // Consecutive-days cap. Use viewState (displaced row hidden) so a
+            // candidate already on this date in another row isn't blocked by
+            // their own about-to-be-vacated assignment when the swap happens
+            // in-place. Mirrors the slot-eligible filter in schedule-build.
+            if (
+              deps.settings.maxConsecutiveDaysWorked != null &&
+              consecutiveDaysRunIncluding(e.id, removableSlot.date, viewState)
+                > deps.settings.maxConsecutiveDaysWorked
+            ) {
+              return false;
+            }
             if (sameDayDoubleReason(e.id, removableSlot, viewState, deps.settings) !== null) return false;
             return true;
           });

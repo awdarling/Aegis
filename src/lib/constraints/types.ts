@@ -11,7 +11,8 @@ export type ConstraintType =
   | 'partial_shifts_allowed'
   | 'veteran_preference_default'
   | 'doubles_policy'
-  | 'conflict_resolution_preference';
+  | 'conflict_resolution_preference'
+  | 'max_consecutive_days_worked';
 
 // Hard constraint: at least N employees with a given attribute value must be
 // present on each shift in scope. `attribute` is the employee field (e.g.
@@ -46,6 +47,12 @@ export interface EngineSettings {
   doublesPolicy: 'never' | 'emergency_only' | 'allow';
   conflictResolution: 'fairness_first' | 'minimize_disruption';
   weekStartDay: 'sunday' | 'monday';
+  // null = no cap (policy absent). When set, the fill loop rejects a
+  // candidate for a slot if assigning them that date would push their
+  // consecutive-worked-day run within the build week past this value.
+  // TODO: counting consecutive days from the PRIOR week is out of scope —
+  // the run is computed strictly from assignments made in this build.
+  maxConsecutiveDaysWorked: number | null;
 }
 
 export interface ParsedConstraints {
@@ -64,4 +71,5 @@ export const DEFAULT_ENGINE_SETTINGS: EngineSettings = {
   doublesPolicy: 'never',
   conflictResolution: 'fairness_first',
   weekStartDay: 'sunday',
+  maxConsecutiveDaysWorked: null,
 };

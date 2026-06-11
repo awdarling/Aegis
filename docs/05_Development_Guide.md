@@ -2,7 +2,9 @@
 
 **Patterns, Active State & Backlog**
 
-**Version 3.0 — June 8, 2026**
+**Version 3.1 — June 10, 2026**
+
+> **v3.1 changelog (2026-06-10):** §4 Deployment corrected — Homebase `main` is **protected**; the real flow is branch → PR → merge → Vercel auto-deploy (the old "push to `main`" line was wrong as of 2026-06-10). Added a NEW §4.1 with the exact terminal sequence. NEW §9 "Remote Control (run/steer a session from your phone)" documents Claude Code v2.1.51+ remote-control setup, sign-in requirements, gotchas (laptop awake/online, sandboxing OFF).
 
 ---
 
@@ -39,9 +41,26 @@ For larger builds, split into a read-only **audit session** then a **build sessi
 
 ## 4. Deployment
 
-- **Homebase (Vercel):** push to `main` → auto-deploy; after env-var changes, redeploy manually (`git commit --allow-empty -m 'redeploy' && git push` forces it).
-- **Aegis (Railway):** push to `main` → auto-deploy.
+- **Homebase (Vercel):** **`main` is GitHub branch-protected as of 2026-06-10 — direct pushes are rejected.** The real flow is **push a feature branch → open a PR → merge the PR on GitHub → Vercel auto-deploys on merge.** After env-var changes on Vercel, redeploy manually (`git commit --allow-empty -m 'redeploy' && git push` on the feature branch, then re-merge — or use Vercel's "Redeploy" button on the latest deployment).
+- **Aegis (Railway):** push to `main` → Railway auto-deploys. (Aegis is not currently behind branch protection; treat protected-`main` as the eventual standard and read the diff before pushing either way.)
 - **Migrations:** run manually in the Supabase SQL Editor; `ADD COLUMN IF NOT EXISTS`; service role bypasses RLS.
+
+### 4.1 Homebase deploy — exact terminal sequence
+
+The protected-`main` flow, end-to-end. Run from the Homebase repo (`~/Desktop/homebase`); for an Aegis branch the same shape applies minus the PR/merge step (push goes straight to `main`).
+
+```bash
+find .git -name "*.lock" -delete       # clear stale git lock files (common after a previous crash)
+git fetch origin                       # sync remote refs
+git checkout <branch>                  # or: git checkout -b <branch>
+npm install                            # bring deps up to date
+npm run build                          # MUST be green — Vercel will fail the same way
+git push -u origin <branch>            # publish the feature branch
+# then on GitHub: open PR, review the diff, merge.
+# Vercel auto-deploys on merge — verify the deployment in the Vercel dashboard.
+```
+
+**Gotchas:** `npm run build` failures here will fail on Vercel — fix locally first. **Never force-push to `main`** (the protection rejects it; the underlying rule against force-pushing protected branches stands). After a merge, your local `main` will lag origin/`main` until you `git checkout main && git pull` — this is normal, not a problem to fix on the feature branch.
 
 ## 5. File structure
 
@@ -136,3 +155,32 @@ Development now runs partly through Cowork agents as well as Claude Code, under 
 Smoke tests must not hit production SendGrid. Read the actual diff before approving a push. Clicking Distribute on a real Watermark schedule fans out to ~30 real employees — never without manager coordination (Carolyn `c45ringler@gmail.com`, Jack `jackmc419@icloud.com`). Alexander's `awdarling@quriasolutions.com` is quria_admin, not an employee — employee intents won't work from it without test setup. Every Aegis-generated string meets the "feels like a person" bar — no "request received", "processing intent", "standby". Verify column names before any write. Keep `SCHEMA_DRIFT_LOG.md` current.
 
 **Doc-refresh trigger** (this v3.0 set was produced under it): refresh when (a) Aegis is live and a second client onboards, (b) `SCHEMA_DRIFT_LOG.md` exceeds ~15 entries, (c) a significant feature like Role Groups needs designing against current schema, or (d) someone other than Alexander joins.
+
+---
+
+## 9. Remote Control (run/steer a session from your phone)
+
+Launch and steer a Claude Code session on the laptop from the Claude mobile app — useful when a long-running build, verify, or research task is mid-flight and you're away from the desk.
+
+**Requirements**
+
+- Claude Code **v2.1.51+** (v2.1.110+ for **push notifications** from the laptop session back to your phone). Upgrade with the same channel you installed from.
+- Signed in via **claude.ai** (`/login` inside Claude Code; pick the claude.ai sign-in option). **API keys are not supported** for Remote Control — if `ANTHROPIC_API_KEY` is set in your shell environment, **unset it** for the session: `unset ANTHROPIC_API_KEY` (and remove it from `~/.zshrc`/`~/.bashrc` if it's exported there, so future sessions don't silently fall back to the API-key path).
+- Same claude.ai account on the laptop and on the mobile app.
+
+**Enable Remote Control**
+
+- **Per-session:** start the CLI with `claude --rc`.
+- **For all sessions:** open `/config` inside Claude Code → **Enable Remote Control for all sessions** → confirm.
+
+**Mobile setup**
+
+- Install the **Claude** mobile app from the App Store / Google Play; sign in with the same claude.ai account.
+- Inside Claude Code, run `/config` → enable push notifications. The mobile app will receive a notification when the laptop session needs input or finishes a long-running task.
+- Open the mobile app → **Code** tab → select the running laptop session to attach and steer it (send messages, approve tools, read output).
+
+**Gotchas — these will bite if ignored**
+
+- **The laptop must stay awake and on the network.** Mac default sleep, lid-closed sleep, and network-drop-during-sleep all end the remote session. Use `caffeinate -dimsu` in another terminal to keep the machine awake for the duration. **>~10 minutes offline ends the session** — reconnecting from the phone won't recover it; you have to start a new one.
+- **Leave sandboxing OFF (the default).** Enabling sandboxing for the session recreates the same failure modes we hit during the Cowork pass: git lock files that can't be cleaned, `npm run build` font/asset errors, network-egress restrictions. Sandboxing OFF is the working configuration.
+- **Merge-to-live always stays a human gate.** Remote Control lets you message the session from your phone — it does *not* relax the safety model. Merging a PR to `main` (= deploy to live Watermark) is still a deliberate, on-laptop action you take after reviewing the diff; do not script around it from the phone.

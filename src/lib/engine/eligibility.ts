@@ -94,6 +94,42 @@ export function sameDayDoubleReason(
   return null;
 }
 
+// Length of the consecutive-worked-day run that would INCLUDE `date` for
+// `empId`, computed strictly from assignments already made in this build's
+// weekState (plus a hypothetical placement on `date`). A "worked day" = the
+// employee has at least one assignment with that date — multiple shifts the
+// same day still count as one worked day.
+//
+// TODO: counting consecutive days from the PRIOR week is out of scope — the
+// run is computed strictly from assignments made in this build.
+export function consecutiveDaysRunIncluding(
+  empId: string,
+  date: string,
+  weekState: WeekState,
+): number {
+  const worked = new Set<string>();
+  for (const a of weekState.assignments) {
+    if (a.employee_id === empId) worked.add(a.date);
+  }
+  worked.add(date);
+
+  const DAY_MS = 24 * 60 * 60 * 1000;
+  const anchor = new Date(`${date}T12:00:00Z`).getTime();
+
+  let length = 1;
+  for (let i = 1; i < 8; i++) {
+    const iso = new Date(anchor - i * DAY_MS).toISOString().slice(0, 10);
+    if (worked.has(iso)) length++;
+    else break;
+  }
+  for (let i = 1; i < 8; i++) {
+    const iso = new Date(anchor + i * DAY_MS).toISOString().slice(0, 10);
+    if (worked.has(iso)) length++;
+    else break;
+  }
+  return length;
+}
+
 // Applies all date-level hard filters and returns the eligible pool plus a
 // map of removal reasons keyed by employee_id. Slot-level filters (already
 // assigned today, hours cap, conflicts with co-assigned staff) are applied by

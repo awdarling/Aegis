@@ -18,6 +18,7 @@ import { getWeekBounds } from '../lib/engine/week-bounds';
 import { buildCanvas } from '../lib/engine/canvas';
 import {
   buildEligibility,
+  consecutiveDaysRunIncluding,
   isAvailableForShift as engineIsAvailable,
   isBlockedByTOForSlot,
   isVeteranOnlyDate as engineIsVeteranOnlyDate,
@@ -531,6 +532,12 @@ function buildScheduleForWeek(ctx: BuildContext): BuildResult {
       if (shiftAssignmentIds.includes(e.id)) return false;
       if (sameDayDoubleReason(e.id, slot, weekState, settings) !== null) return false;
       if ((weekState.weeklyHoursMap.get(e.id) ?? 0) + slot.hours > e.max_weekly_hours) return false;
+      if (
+        settings.maxConsecutiveDaysWorked != null &&
+        consecutiveDaysRunIncluding(e.id, slot.date, weekState) > settings.maxConsecutiveDaysWorked
+      ) {
+        return false;
+      }
       if (hasHardBannedPair(e.id, shiftAssignmentIds, data.conflicts)) return false;
       return true;
     });
@@ -548,6 +555,12 @@ function buildScheduleForWeek(ctx: BuildContext): BuildResult {
         if (shiftAssignmentIds.includes(e.id)) return false;
         if (sameDayDoubleReason(e.id, slot, weekState, settings) !== null) return false;
         if ((weekState.weeklyHoursMap.get(e.id) ?? 0) + slot.hours > e.max_weekly_hours) return false;
+        if (
+          settings.maxConsecutiveDaysWorked != null &&
+          consecutiveDaysRunIncluding(e.id, slot.date, weekState) > settings.maxConsecutiveDaysWorked
+        ) {
+          return false;
+        }
         return hasHardBannedPair(e.id, shiftAssignmentIds, data.conflicts);
       });
 
@@ -754,6 +767,12 @@ function buildScheduleForWeek(ctx: BuildContext): BuildResult {
           if (cohabIds.includes(e.id)) return false;
           if (hasHardBannedPair(e.id, cohabIds, data.conflicts)) return false;
           if ((weekState.weeklyHoursMap.get(e.id) ?? 0) + slot.hours > e.max_weekly_hours) return false;
+          if (
+            settings.maxConsecutiveDaysWorked != null &&
+            consecutiveDaysRunIncluding(e.id, slot.date, viewState) > settings.maxConsecutiveDaysWorked
+          ) {
+            return false;
+          }
           if (sameDayDoubleReason(e.id, slot, viewState, settings) !== null) return false;
           return true;
         });

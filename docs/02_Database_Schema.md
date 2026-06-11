@@ -1,8 +1,10 @@
 # QURIA SOLUTIONS — Database Schema Reference
 
-**Version 3.0 — June 8, 2026 — Supabase PostgreSQL**
+**Version 3.1 — June 10, 2026 — Supabase PostgreSQL**
 
 *Reflects Schedule Engine V2, the Watermark production launch (June 5, 2026), and all SCHEMA_DRIFT_LOG findings through June 4, 2026.*
+
+> **v3.1 changelog (2026-06-10):** §1.2 `users.role` admin value corrected from `'quria_admin'` to `'quria'` (the live enum is `'quria' | 'owner' | 'manager'`); `'quria_admin'` is documented as an `activity_log.actor` / Aegis `ContactRole` label only, never a `users.role` value.
 
 ---
 
@@ -56,7 +58,7 @@ One row per client business. All tenant-scoped tables reference this via `compan
 
 ### 1.2 users **[carried-forward]**
 
-Homebase login accounts (managers/owners/quria_admin). **`id` is both the primary key and a foreign key to `auth.users.id`** — you cannot insert a `users` row without first creating the matching Supabase Auth user, and the relationship is 1:1 (one `users` row per auth user, therefore one company per auth login).
+Homebase login accounts (managers/owners/platform admins). **`id` is both the primary key and a foreign key to `auth.users.id`** — you cannot insert a `users` row without first creating the matching Supabase Auth user, and the relationship is 1:1 (one `users` row per auth user, therefore one company per auth login).
 
 | Column | Type | Notes |
 |---|---|---|
@@ -64,11 +66,13 @@ Homebase login accounts (managers/owners/quria_admin). **`id` is both the primar
 | company_id | uuid | FK → companies |
 | email | text | login email |
 | name | text | display name |
-| role | text | quria_admin / owner / manager |
+| role | text | **`'quria'` / `'owner'` / `'manager'`** (live enum). The platform-admin value is **`'quria'`** — NOT `'quria_admin'`. |
 | avatar_url | text | optional |
 | created_at | timestamptz | |
 
 *Manager email notifications (time-off, availability) fan out by querying THIS table for `role IN ('manager','owner')` — not the `employees` table.*
+
+> **Role-value clarification (corrected 2026-06-10).** The live `users.role` admin value is **`'quria'`**. `'quria_admin'` is a *separate* label used only as the `activity_log.actor` value for platform-admin actions and as the Aegis `ContactRole` (inbound-sender classification) — it is **never** stored in `users.role`. Every authz check in both repos compares against `'quria'` (Homebase `src/middleware.ts`, `getCompanyServer.ts`, `access/page.tsx`; Aegis `src/db/types.ts` enum `'quria' | 'owner' | 'manager'`). Do not conflate the two.
 
 ### 1.3 employees **[verified]**
 

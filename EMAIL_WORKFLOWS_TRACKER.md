@@ -8,6 +8,8 @@
 
 > **Push state (top-of-file):** Aegis is pushed and live (`46eaa70`). Homebase is pushed and live (`29ed00e`). **48-hour sprint COMPLETE (2026-06-09):** SCHED-EDIT-1 round-trip persists corrected hours; `unsatisfied_sex_coverage` flag renders in BOTH the manager schedule-preview email AND the Homebase Preview & Edit view; S3 in-tab TO approval verified in sandbox (notify fired, `decided_by` written, manager toast).
 
+> **AEGIS-EMAIL-1 umbrella (set 2026-06-10) — current Now/Next #2 in `DEV_ROADMAP.md`.** Verify + fix + **test** every Aegis email-action workflow end-to-end (email → magic-link → `/api/aegis-action` → correct DB effect + notify): the 8 `ActionType`s in `src/lib/aegis-actions/types.ts` — `approve_to`, `deny_to`, `approve_availability`, `deny_availability`, `accept_emergency_coverage`, `decline_emergency_coverage`, `confirm_distribution`, `request_additional_batch`. Per-workflow status to be tracked below as each is exercised; each `DONE` requires (a) a sandbox round-trip producing the expected DB effect + notification AND (b) a committed automated test. Homebase has no test runner yet (tracked Tier-3) — standing one up may be a prerequisite. Token layer itself is sound (SEC-4 verified); this is the workflows themselves.
+
 ---
 
 ## Where we are now

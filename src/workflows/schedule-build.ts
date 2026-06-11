@@ -1352,39 +1352,56 @@ export async function distributeScheduleCore(
 
     if (emp.contact_email) {
       try {
+        const firstName = emp.name.split(' ')[0];
+        const shiftCount = myShifts.length;
+
+        // Warm, person-like framing. Leads with the day, then the position the
+        // employee is working, the time, and the hours — the four things they
+        // actually need. The shift name rides along as a quiet secondary label
+        // so context (e.g. "PM Lifeguard") is preserved without a noisy column.
+        const intro = hasShifts
+          ? `You're on for ${shiftCount} shift${shiftCount === 1 ? '' : 's'} this week — ${totalHours}h in total. Here's how your week looks:`
+          : `You're not on the schedule this week, so enjoy the time off. If you were expecting shifts, just reply to this email or check with your manager and we'll get it sorted.`;
+
         const shiftRows = hasShifts
           ? myShifts.map(s =>
-              `<tr><td style="padding:6px 12px;border:1px solid #e5e7eb;">${formatDisplayDate(s.date)}</td>` +
-              `<td style="padding:6px 12px;border:1px solid #e5e7eb;">${s.shift_name}</td>` +
-              `<td style="padding:6px 12px;border:1px solid #e5e7eb;">${s.role}</td>` +
-              `<td style="padding:6px 12px;border:1px solid #e5e7eb;">${formatTime(s.start_time)}–${formatTime(s.end_time)}</td>` +
-              `<td style="padding:6px 12px;border:1px solid #e5e7eb;">${s.hours}h</td></tr>`
+              `<tr>` +
+              `<td style="padding:10px 12px;border:1px solid #e5e7eb;">${formatDisplayDate(s.date)}</td>` +
+              `<td style="padding:10px 12px;border:1px solid #e5e7eb;">${s.role}` +
+                `<br><span style="color:#9ca3af;font-size:12px;">${s.shift_name}</span></td>` +
+              `<td style="padding:10px 12px;border:1px solid #e5e7eb;white-space:nowrap;">${formatTime(s.start_time)} – ${formatTime(s.end_time)}</td>` +
+              `<td style="padding:10px 12px;border:1px solid #e5e7eb;text-align:right;">${s.hours}h</td>` +
+              `</tr>`
             ).join('')
-          : `<tr><td colspan="5" style="padding:12px;text-align:center;color:#6b7280;">You are not scheduled this week.</td></tr>`;
+          : '';
 
-        const html = `<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:24px;">
-<h2 style="margin:0 0 4px;">Your Schedule — ${weekLabel}</h2>
-<p style="color:#6b7280;margin:0 0 20px;">Hi ${emp.name.split(' ')[0]},</p>
-<table style="width:100%;border-collapse:collapse;margin-bottom:16px;">
+        const shiftTable = hasShifts
+          ? `<table style="width:100%;border-collapse:collapse;margin:4px 0 18px;font-size:14px;">
 <thead><tr style="background:#f9fafb;">
-<th style="padding:8px 12px;border:1px solid #e5e7eb;text-align:left;">Date</th>
-<th style="padding:8px 12px;border:1px solid #e5e7eb;text-align:left;">Shift</th>
-<th style="padding:8px 12px;border:1px solid #e5e7eb;text-align:left;">Role</th>
+<th style="padding:8px 12px;border:1px solid #e5e7eb;text-align:left;">Day</th>
+<th style="padding:8px 12px;border:1px solid #e5e7eb;text-align:left;">Position</th>
 <th style="padding:8px 12px;border:1px solid #e5e7eb;text-align:left;">Time</th>
-<th style="padding:8px 12px;border:1px solid #e5e7eb;text-align:left;">Hours</th>
+<th style="padding:8px 12px;border:1px solid #e5e7eb;text-align:right;">Hours</th>
 </tr></thead>
 <tbody>${shiftRows}</tbody>
 </table>
-${hasShifts ? `<p style="color:#374151;">Total: <strong>${totalHours}h</strong> this week</p>` : ''}
-<p style="color:#6b7280;font-size:13px;">Questions? Contact your manager directly.</p>
-<p style="color:#9ca3af;font-size:12px;">— ${companyName}</p>
+<p style="margin:0 0 20px;color:#374151;">That's <strong>${totalHours}h</strong> across the week.</p>`
+          : '';
+
+        const html = `<!DOCTYPE html><html><body style="font-family:Arial,Helvetica,sans-serif;max-width:600px;margin:0 auto;padding:24px;color:#111827;">
+<h2 style="margin:0 0 12px;font-size:20px;">Your shifts for ${weekLabel}</h2>
+<p style="margin:0 0 16px;line-height:1.5;">Hi ${firstName},</p>
+<p style="margin:0 0 18px;line-height:1.5;color:#374151;">${intro}</p>
+${shiftTable}
+<p style="margin:0 0 4px;line-height:1.5;color:#374151;">If anything here doesn't look right, just reply to this email or reach out to your manager — we'll get it fixed.</p>
+<p style="margin:18px 0 0;color:#6b7280;">See you this week,<br>${companyName}</p>
 </body></html>`;
 
         const text = hasShifts
-          ? `Hi ${emp.name.split(' ')[0]},\n\nYour schedule for ${weekLabel}:\n\n` +
-            myShifts.map(s => `${formatDisplayDate(s.date)}: ${s.shift_name} (${formatTime(s.start_time)}–${formatTime(s.end_time)}, ${s.role})`).join('\n') +
-            `\n\nTotal: ${totalHours}h\n\nQuestions? Contact your manager.`
-          : `Hi ${emp.name.split(' ')[0]},\n\nYou are not scheduled for the week of ${weekLabel}.\n\n— ${companyName}`;
+          ? `Hi ${firstName},\n\n${intro}\n\n` +
+            myShifts.map(s => `• ${formatDisplayDate(s.date)} — ${s.role} (${s.shift_name}), ${formatTime(s.start_time)}–${formatTime(s.end_time)}, ${s.hours}h`).join('\n') +
+            `\n\nThat's ${totalHours}h across the week.\n\nIf anything here doesn't look right, just reply to this email or reach out to your manager — we'll get it fixed.\n\nSee you this week,\n${companyName}`
+          : `Hi ${firstName},\n\n${intro}\n\nSee you soon,\n${companyName}`;
 
         await sendEmail({
           to: emp.contact_email,

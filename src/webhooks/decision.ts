@@ -189,7 +189,7 @@ async function handleSwapDecision(
 
   if (action === 'approve') {
     // Find the schedule covering this shift date
-    const { data: schedRow } = await supabase.from('schedules').select('id, data')
+    const { data: schedRow } = await supabase.from('schedules').select('id, data').is('deleted_at', null)
       .eq('company_id', token.company_id).eq('status', 'published')
       .lte('week_start', token.shift_date).gte('week_end', token.shift_date)
       .order('generated_at', { ascending: false }).limit(1).maybeSingle();

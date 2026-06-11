@@ -201,7 +201,7 @@ async function findEmployeeByName(companyId: string, name: string): Promise<Empl
 }
 
 async function getReceiverWeeklyHours(companyId: string, receiverId: string, shiftDate: string): Promise<number> {
-  const { data } = await supabase.from('schedules').select('data')
+  const { data } = await supabase.from('schedules').select('data').is('deleted_at', null)
     .eq('company_id', companyId).eq('status', 'published')
     .lte('week_start', shiftDate).gte('week_end', shiftDate)
     .order('generated_at', { ascending: false }).limit(1).maybeSingle();
@@ -218,7 +218,7 @@ async function findSchedule(
   companyId: string,
   date: string
 ): Promise<{ id: string; data: ScheduleData } | null> {
-  const base = supabase.from('schedules').select('id, data')
+  const base = supabase.from('schedules').select('id, data').is('deleted_at', null)
     .eq('company_id', companyId).lte('week_start', date).gte('week_end', date)
     .order('generated_at', { ascending: false }).limit(1);
 
@@ -251,7 +251,7 @@ export async function executeScheduleSwap(
   receiverName: string
 ): Promise<void> {
   const { data: schedRow } = await supabase.from('schedules').select('id, data, staffing_report')
-    .eq('id', scheduleId).single();
+    .eq('id', scheduleId).is('deleted_at', null).single();
   if (!schedRow) return;
 
   const row = schedRow as { id: string; data: ScheduleData; staffing_report: Record<string, unknown> | null };
@@ -369,7 +369,7 @@ async function buildSwapCandidates(params: {
     supabase.from('time_off_requests').select('employee_id')
       .eq('company_id', company_id).eq('status', 'approved')
       .lte('start_date', shift_date).gte('end_date', shift_date),
-    supabase.from('schedules').select('data')
+    supabase.from('schedules').select('data').is('deleted_at', null)
       .eq('company_id', company_id).eq('status', 'published')
       .lte('week_start', shift_date).gte('week_end', shift_date)
       .order('generated_at', { ascending: false }).limit(1).maybeSingle(),

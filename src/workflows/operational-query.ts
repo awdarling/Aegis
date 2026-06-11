@@ -605,7 +605,7 @@ async function executeEdit(pending: PendingEdit, companyId: string): Promise<voi
   // For schedule assignment edits: recompute wages
   if (pending.table === 'schedules' && pending.schedule_id) {
     const { data: schedRow } = await supabase.from('schedules').select('data, staffing_report')
-      .eq('id', pending.schedule_id).single();
+      .eq('id', pending.schedule_id).is('deleted_at', null).single();
     if (schedRow) {
       const row = schedRow as { data: { assignments?: unknown[] }; staffing_report: Record<string, unknown> | null };
       const assignments = (row.data.assignments ?? []) as Array<{

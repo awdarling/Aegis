@@ -63,6 +63,7 @@ internalRouter.post('/distribute-schedule', async (req: Request, res: Response) 
       .from('schedules')
       .select('company_id')
       .eq('id', scheduleId)
+      .is('deleted_at', null)
       .single();
     if (schedErr || !schedRow) {
       serverError(res, `schedule ${scheduleId} not found: ${schedErr?.message ?? 'no row'}`);

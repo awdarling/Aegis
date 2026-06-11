@@ -14,6 +14,7 @@ export async function getCurrentWageEstimate(
     .select('data')
     .eq('id', scheduleId)
     .eq('company_id', companyId)
+    .is('deleted_at', null)
     .maybeSingle();
 
   const row = data as { data: { assignments?: unknown[] } | null } | null;

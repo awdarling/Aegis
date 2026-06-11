@@ -271,7 +271,7 @@ function parseEmployeeResponse(body: string): 'yes' | 'no' | 'unclear' {
 // ── Data loading ──────────────────────────────────────────────────────────────
 
 async function findSchedule(companyId: string, date: string): Promise<ScheduleData | null> {
-  const query = supabase.from('schedules').select('data')
+  const query = supabase.from('schedules').select('data').is('deleted_at', null)
     .eq('company_id', companyId)
     .lte('week_start', date)
     .gte('week_end', date)

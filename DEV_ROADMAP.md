@@ -40,7 +40,20 @@ This is the single most important habit. The moment a piece of work is **approve
 This is the current Now/Next ordering for active work. It sits **above** the (now-closed) 48-hour sprint and the Forward Build Sequence — those remain the structural plan; this is what's being worked next. The three items are ordered **#1 → #2 → #3**; do not start #3 until #1 and #2 are at least in fix-shape. All three are diagnose-first (no blind fixes).
 
 ### #1 · SCHED-DELETE-1 — Delete-schedule button for managers + owners only (Homebase) — **NEW**
-**Repo:** Homebase · **Status:** `OPEN, not started` · **Phase tag:** `[P1]` (live-product hardening + UX gap)
+**Repo:** Homebase · **Status:** `DIAGNOSED` · **Phase tag:** `[P1]` (live-product hardening + UX gap)
+
+**Findings (read-only diagnosis 2026-06-11):** delete already live but UI-only (`page.tsx:969` + `confirmDeleteSchedule` client-side delete, no route); `schedules` RLS permits DELETE for any same-company user (security gap); zero FKs ref `schedules.id` (hard delete FK-safe); no soft-delete column. `03 §4.3` is correct; "no delete control today" and the FK-hazard note are stale/wrong; Tier 3 understates scope.
+
+**Reframed scope:** SECURITY FIX + feature — server route (mirror SEC-1) + RLS DELETE lockdown (load-bearing) + temporal/role gate + soft delete (gated DDL) + read-site sweep (Homebase AND Aegis).
+
+**Product decisions (confirmed 2026-06-11):**
+- **(a) Temporal gate, computed server-side in company tz:**
+  - current+upcoming (`week_end >= today`): manager, owner, quria
+  - past (`week_end < today`): owner, quria (managers excluded)
+  - tenant-bound for manager/owner; quria may cross-company. Distributed-schedule warning (type-to-confirm + "emails are not recalled") preserved regardless of role.
+- **(b) Soft delete (`deleted_at`)** — required by the cross-Homebase Undo (Tier-1) goal.
+- Note: RLS lockdown (client `FOR DELETE USING false`) closes the irreversible hard-delete hole; soft delete runs as a service-role UPDATE via the route. Residual: client could set `deleted_at` via direct UPDATE (low severity, reversible) — backlogged.
+
 
 There is no delete-schedule control today; managers / owners need one. Build it role-gated end-to-end, not just hidden in the UI. Diagnose-first scope to capture:
 - **Route-level authz.** A delete must be enforced server-side, not by hiding the button. **Mirror the SEC-1 `create-user` pattern** (Homebase `security/create-user-authz`): sign-in gate → role gate (`owner` / `manager` / `quria` only; the `'quria'` literal — `'quria_admin'` is an activity_log/ContactRole label only) → company-binding (owner is forced to own `company_id`; the body cannot override it; `quria` may target any company). Add a route-level test alongside the existing 22-case `security-authz.test.ts` pattern.
@@ -663,3 +676,7 @@ Docs-only pass, no code. Triggered by `feature/max-consecutive-days` merging to 
 - **Stray `PRIORITY2_ANALYSIS.md`** in the working tree was left untouched per instructions (still untracked).
 - **No merge, no Vercel touch, no Supabase touch.** Force-with-lease push only because the reset rewrote branch history; updates the existing `docs/sec-3-status-update` PR safely.
 - **Next:** human review + Squash-merge the existing `docs/sec-3-status-update` PR; live-verify SEC-3 on the Stripe dashboard after deploy + confirm `STRIPE_WEBHOOK_SECRET` on Vercel prod (then SEC-3 → DONE); SEC-4 TTL product decision when convenient.
+
+### 2026-06-11 — SCHED-DELETE-1 diagnosed + decisions locked
+- Read-only diagnosis: delete already live but UI-only; RLS permits DELETE for any same-company user; zero FKs ref `schedules.id`; `users.role` is `quria` not `quria_admin`.
+- Gate is temporal: managers delete current+upcoming, owner/quria also past. Soft delete confirmed. Distributed warning preserved. Build issued (branch off origin/main; DDL apply, RLS apply, and main merge are human-gated).

@@ -154,3 +154,19 @@ Any time a future Claude Code session or live debugging surfaces a difference be
 - **Risk if absent in prod:** upsert may fail (constraint not matching `onConflict`) OR silently insert a second row for the same company; either way, template edits would never appear to take effect — which is the on-site TEMPLATE-EDIT-1 symptom ("edits don't take effect / won't save").
 - **Action before TEMPLATE-EDIT-1 fix lands:** query `information_schema.table_constraints` + `key_column_usage` for `schedule_templates` on prod (or query Supabase Dashboard) to confirm the `company_id` UNIQUE constraint exists. If missing, that's part of the TEMPLATE-EDIT-1 fix scope. Do NOT touch prod env / DDL from an agent — gated.
 - **Related:** the strongest behavioral lead for TEMPLATE-EDIT-1 is the silently-swallowed save error at `useScheduleTemplate.ts:67` (`if (!error && data) { setTemplate(data) }` — error branch does NOTHING; panel closes regardless via `TemplateEditorPanel.tsx:188-190`). Tracked in `DEV_ROADMAP.md` (Session Log 2026-06-10 + Tier-3 `TEMPLATE-EDIT-1`).
+
+## June 11, 2026 — SCHED-DELETE-1 diagnosis (read-only)
+
+### public.schedules — no soft-delete column
+- No `deleted_at` / `is_deleted` / `archived`. `status` is free text (not enum), default `'draft'`; live values draft/published, code also writes `'distributed'` (dispatcher.ts:154) and `'approved'`. Soft delete needs gated DDL (`ADD COLUMN deleted_at timestamptz`).
+
+### FK references TO schedules.id — NONE (enforced)
+- `pg_constraint` `contype='f'` targeting `schedules` = `[]`. Hard DELETE is referentially safe. `activity_log.entity_id` is a loose uuid (no FK). `aegis_action_tokens` references a schedule only inside `payload` jsonb (`payload->>'schedule_id'`, dispatcher.ts:138) — no column, no FK.
+- Corrects the earlier inferred-FK note (clauses were inferred, not read).
+
+### public.schedules RLS — DELETE not role-gated (SECURITY)
+- Single permissive policy "Company schedules access", `cmd=ALL`, `USING ((company_id = get_my_company_id()) OR (get_my_role()='quria'))`, `with_check=null`.
+- DELETE allowed for ANY authenticated same-company user; owner/quria limit is enforced ONLY by the hidden UI button (page.tsx:969). Fix: deny client DELETE via RLS + route all deletes through a service-role server route.
+
+### public.users.role enum drift
+- Live values: `quria | owner | manager`. `quria_admin` is an `activity_log` ACTOR label only, NOT a `users.role` value. `02_Database_Schema.docx` §1.2 ("quria_admin / owner / manager") is wrong; gate on `role==='quria'`. Live: 4 manager, 1 quria, 0 owner.

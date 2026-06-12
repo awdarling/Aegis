@@ -176,3 +176,10 @@ The standalone `tracker_update.md` scratch file (Phase 4.5 scoping + BUG-1/BUG-2
 - Status: built on branch, tsc clean, greeting check green; NOT merged/live-verified.
 
 Distribute email redesign + inline full-schedule + Aegis personability — DONE (PR #5/#6, deploy 7c7f158e). .html attachments don't render in Gmail → grid is inline.
+
+---
+
+### 2026-06-12 — distribute_schedule week-selection + special notes (MERGED)
+- distribute now extracts `target_week` (this|next) and selects by `week_start` match (was: latest schedule → wrong week). No schedule for requested week → clear reply.
+- Distribute email gains a "This week:" events/special-notes section (closures, parties, holidays, staffing notes) above the full-week grid.
+- Tz caveat: `getWeekBounds` is server-local, not company-tz — see DEV_ROADMAP Tier-1 fast-follow.

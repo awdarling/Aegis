@@ -413,6 +413,7 @@ The post-sprint direction (set 2026-06-09). This is the **north-star sequencing*
 - `[P2]` Availability approval **buttons** (mirror TO magic-link) + Homebase backstop — also the fix for "communications feel robotic / yes-no reply bs" (do a tone pass in the same pass — `[P4]` personability).
 - Undo action button.
 - Expand doc 03's Access Management section (docs gap).
+- **`getWeekBounds` is NOT company-timezone-aware** — uses server-local `new Date()` (UTC on Railway), so this/next-week resolution can be wrong near week boundaries for non-UTC tenants (Watermark = `America/Detroit`). Affects `build_schedule` AND `distribute_schedule`. `06_Supplemental` §8 claims week bounds are "computed in local tz" — code contradicts the doc. Fix: resolve "today" via `Intl.DateTimeFormat('en-CA', { timeZone: companyTimezone })`; flag 06 §8 for correction at next doc refresh.
 
 ### Tier 2 — significant builds (contract-first: engine/parser before UI)
 - `[P3]` **TO-rules-as-policy program** (one program): move TO rules into the same `policy_value_json`/constraint-vocabulary system the schedule engine uses; attribute classifier so workflows know what to pull; Rules/Attribute creation+edit UI that updates everywhere; Soteria + Aegis can read/write. Includes the "new UI and engine for TO rule policies" and "attribute edit/creation page" notes. (Note 5.)
@@ -426,6 +427,11 @@ The post-sprint direction (set 2026-06-09). This is the **north-star sequencing*
 - `[P2]` **Two deliverables on distribute** — per-employee shifts message **plus a full-schedule email** (the full-schedule email is the new piece). (Note 2.)
 - `[P2]` **Route Homebase `notify-assignment` through Aegis** — kill the direct Homebase→Twilio path so all employee comms pass Aegis compliance/opt-in. (Note 1. Also listed in the Tier-2 EMAIL-tracker carry-over below.)
 - `[P4]` **User guides** — two deliverables per user type (manager + employee) for Watermark to hand staff. (Note 9b — new.)
+- **Unified schedule rendering — template as single source of truth (contract-first, cross-repo).** The schedule TEMPLATE (`schedule_templates`, edited in `TemplateEditorPanel`) must be the single source of truth for every surface that renders a schedule: the on-screen Homebase render, the Excel/PDF download, and the Aegis distribute email. Today they diverge. Build contract-first; the "resolved cell appearance" (template-first → role-color fallback) is the contract.
+  - **Piece 1 (Homebase):** extract cell-appearance resolution into ONE shared resolver used by both the on-screen render and the download renderers (`renderScheduleGridXlsx` + `renderScheduleGridHtml`). Its output IS the contract.
+  - **Piece 2 (Homebase):** fix the `saveTemplate` bug (`TemplateEditorPanel`) and wire the saved template into the shared resolver so editing the template visibly changes the on-screen schedule (keystone).
+  - **Piece 3 (cross-repo):** snapshot the resolved appearance onto the schedule at build/save (`schedules.data` or a `template_snapshot` field); Aegis distribute renders its grid from that snapshot — no Homebase call at fan-out, no forked renderer. Same contract, persisted.
+  Order 1→2→3. Subsumes the Tier-3 "`saveTemplate` bug" and "download should match the builder" items.
 
 ### Tier 3 — polish / smaller fixes
 - `saveTemplate id:''` bug in `TemplateEditorPanel` (before any client edits a template).
@@ -772,3 +778,10 @@ on a real phone (AirDrop) and deemed acceptable; a day-by-day stacked fallback w
 
 Local-env note: local .env SENDGRID_API_KEY is stale (401) while prod is valid — refresh before
 running local send harnesses.
+
+### 2026-06-12 — download 500 fix, distribute week+outputs, template-unification defined
+- Fix #1 (Homebase, MERGED): schedule download 500 for BOTH Excel + PDF. Root cause: `shift_types.days_active` is `number[]` but `buildScheduleGrid`'s `ShiftMeta` typed it `string[]` and `compactDaysLabel` called `.toLowerCase()` → TypeError swallowed by both routes. Fixed `compactDaysLabel` + retyped `ShiftMeta`; added a `number[]` regression case to the download smoke (old fixture used strings → why it shipped). `deleted_at` sweep ruled out.
+- Fix #2 (Aegis, MERGED): `distribute_schedule` sent the wrong week. Root cause: classifier extraction spec was `{}` AND handler did `void extracted` + picked the latest schedule. Fixed: classifier extracts `target_week` (this|next, default next); handler resolves via `parseTargetWeek` → `getWeekBounds`, selects by `week_start` match (no schedule for that week → clear reply); ack/result/already-distributed name the actual week. PART B: distribute email gains a "This week:" special-notes/events section above the full grid.
+- Finding: download rendered all-blue, not matching screen/template → Piece 1 of template-unification.
+- Finding: `getWeekBounds` not company-tz-aware (Tier-1 fast-follow).
+- Defined the unified-schedule-rendering initiative (Tier-2).

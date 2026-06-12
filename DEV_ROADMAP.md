@@ -77,7 +77,7 @@ There is no delete-schedule control today; managers / owners need one. Build it 
 - **Design rule:** notification-RESPONSE actions (approve/deny TO + availability) = buttons in the email; manager-INITIATED actions (distribute, build, coverage, queries) = conversational commands (+ Homebase button for distribute). Employee emails never carry Homebase CTAs; attachments fine.
 
 **WORK LIST (priority order):**
-1. **Distribute email redesign** — per-employee shifts/positions + attach the full week's all-staff schedule (reuse the Homebase schedule-grid renderer). (built on branch `feat/distribute-email-redesign` — warm copy + option-D attachment done; pending review/merge/verify)
+1. **Distribute email redesign** — per-employee shifts/positions + attach the full week's all-staff schedule (reuse the Homebase schedule-grid renderer). DONE (merged PR #5/#6, deployed Railway 7c7f158e, live-verified preview desktop+phone)
 2. **Remove the magic-link `confirm_distribution` path**; distribute via Homebase button + command; fix the re-distribution guard to key on `distributed_at`, not `status`.
 3. **Build availability approve/deny magic-link buttons** (mirror TO) — real handlers + mint tokens in the availability notification email.
 4. **Verify `deny_to` email-button path** (in progress).
@@ -754,3 +754,21 @@ Built (on branch):
 Next: Homebase Distribute button + remove the magic-link confirm_distribution path + key the
 re-distribution guard on distributed_at (kills the status-clobber re-fan-out bug); then
 availability approve/deny buttons.
+
+### 2026-06-12 — AEGIS-EMAIL-1 distribute redesign + personability: DONE
+Merged PR #5 (feat/distribute-email-redesign) + PR #6 (fix/distribute-inline-grid). Deployed
+Railway 7c7f158e [SUCCESS], commit 6d02665. Live-verified via rendered preview (desktop + phone
+via AirDrop). DONE.
+
+Shipped: warm per-employee distribute email + "Hi {first}," greeting; full-week all-staff schedule
+shown INLINE in the email body (email-safe table); Aegis personability pass — shared greeting helper
+(src/messaging/greeting.ts) + automated check (scripts/check-greeting.ts, 6 cases) + greetings on all
+employee- and manager-facing messages.
+
+Finding: .html email ATTACHMENTS don't render in Gmail (clients show raw source / force download),
+so the full schedule moved from an .html attachment to an INLINE body table. Generic
+EmailOptions.attachments infra (PART 1) kept but unused for distribution. Inline grid was assessed
+on a real phone (AirDrop) and deemed acceptable; a day-by-day stacked fallback was speced, not needed.
+
+Local-env note: local .env SENDGRID_API_KEY is stale (401) while prod is valid — refresh before
+running local send harnesses.

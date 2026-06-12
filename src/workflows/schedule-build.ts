@@ -1,7 +1,8 @@
 import { supabase } from '../db/client';
 import { logActivity } from '../logger/activity-log';
 import { reply, sendInThreadAck } from '../messaging/reply';
-import { sendEmail } from '../messaging/email';
+import { sendEmail, type EmailAttachment } from '../messaging/email';
+import { greeting } from '../messaging/greeting';
 import { sendSms } from '../messaging/sms';
 import { computeWageEstimate } from '../lib/schedule-simulator';
 import { buildScheduleResultEmail } from './schedule-build-email';
@@ -1303,6 +1304,117 @@ export interface DistributeScheduleResult {
 // Loads the schedule, fans out per-employee summaries, marks the schedule
 // published + distributed_at, logs per-send + aggregate activity. Throws on
 // schedule-not-found so callers can surface the error.
+// ── Full all-staff schedule attachment ─────────────────────────────────────────
+//
+// Self-contained HTML rendering of the WHOLE week for EVERY employee — the same
+// file attaches to every distribution email so each person sees the full picture
+// (who's on, which positions, where the gaps are) without any Homebase login.
+// Aegis builds this purely from data it already loaded (schedules.data), so there
+// is no Homebase call and no exceljs/PDF dependency. Rows are distinct shifts
+// ordered by start_time; columns are the 7 days of the target week.
+function buildFullScheduleAttachmentHtml(args: {
+  schedData: ScheduleData;
+  weekStart: string;
+  weekEnd: string;
+  companyName: string;
+  weekLabel: string;
+}): string {
+  const { schedData, weekStart, weekEnd, companyName, weekLabel } = args;
+  const assignments = schedData.assignments ?? [];
+  const gaps = (schedData.gaps ?? []).filter(g => g.required_count > g.filled_count);
+  // closed_dates may ride along in the persisted data even though the in-repo
+  // ScheduleData type doesn't list it — read it defensively.
+  const closedDates = (schedData as { closed_dates?: ClosedDate[] }).closed_dates ?? [];
+  const closedByDate = new Map(closedDates.map(c => [c.date, c.event_title]));
+
+  const days = getDatesInRange(weekStart, weekEnd);
+
+  // Distinct shifts, with a representative start_time for ordering. Prefer an
+  // assignment's start_time; fall back to a gap's. Order rows by start_time.
+  const shiftStart = new Map<string, string>();
+  for (const a of assignments) {
+    if (!shiftStart.has(a.shift_name)) shiftStart.set(a.shift_name, a.start_time);
+  }
+  for (const g of gaps) {
+    if (!shiftStart.has(g.shift_name)) shiftStart.set(g.shift_name, g.start_time ?? '99:99');
+  }
+  const shiftNames = [...shiftStart.keys()].sort((x, y) =>
+    (shiftStart.get(x) ?? '99:99').localeCompare(shiftStart.get(y) ?? '99:99')
+  );
+
+  // Fast cell lookups, keyed by `${shift_name}||${date}`.
+  const asgByKey = new Map<string, ScheduleAssignment[]>();
+  for (const a of assignments) {
+    const k = `${a.shift_name}||${a.date}`;
+    (asgByKey.get(k) ?? asgByKey.set(k, []).get(k)!).push(a);
+  }
+  const gapByKey = new Map<string, ScheduleGap[]>();
+  for (const g of gaps) {
+    const k = `${g.shift_name}||${g.date}`;
+    (gapByKey.get(k) ?? gapByKey.set(k, []).get(k)!).push(g);
+  }
+
+  const esc = (s: string): string =>
+    s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+  const headerCells = days.map(d => {
+    const closure = closedByDate.get(d);
+    const sub = closure
+      ? `<div style="font-size:11px;color:#b91c1c;font-weight:600;">CLOSED${closure ? ` — ${esc(closure)}` : ''}</div>`
+      : '';
+    return `<th style="padding:8px 10px;border:1px solid #d1d5db;background:#1f2937;color:#f9fafb;text-align:left;font-size:12px;min-width:120px;">${esc(formatWeekday(d))}<div style="font-weight:400;color:#cbd5e1;font-size:11px;">${esc(formatShortDate(d))}</div>${sub}</th>`;
+  }).join('');
+
+  const bodyRows = shiftNames.map(shiftName => {
+    const cells = days.map(d => {
+      if (closedByDate.has(d)) {
+        return `<td style="padding:8px 10px;border:1px solid #e5e7eb;background:#f3f4f6;color:#9ca3af;font-size:12px;text-align:center;">—</td>`;
+      }
+      const key = `${shiftName}||${d}`;
+      const asgs = (asgByKey.get(key) ?? []).slice().sort((a, b) =>
+        (a.employee_name ?? '').localeCompare(b.employee_name ?? '')
+      );
+      const cellGaps = gapByKey.get(key) ?? [];
+      const lines: string[] = [];
+      for (const a of asgs) {
+        lines.push(`<div style="margin:2px 0;"><strong>${esc(a.employee_name ?? '')}</strong> <span style="color:#6b7280;">${esc(a.role)}</span></div>`);
+      }
+      for (const g of cellGaps) {
+        const missing = g.required_count - g.filled_count;
+        for (let i = 0; i < missing; i++) {
+          lines.push(`<div style="margin:2px 0;color:#b91c1c;font-weight:600;">UNFILLED — ${esc(g.role)}</div>`);
+        }
+      }
+      const inner = lines.length > 0 ? lines.join('') : `<span style="color:#d1d5db;">·</span>`;
+      return `<td style="padding:8px 10px;border:1px solid #e5e7eb;font-size:12px;vertical-align:top;">${inner}</td>`;
+    }).join('');
+    const startLabel = shiftStart.get(shiftName);
+    const sub = startLabel && startLabel !== '99:99'
+      ? `<div style="font-weight:400;color:#6b7280;font-size:11px;">${esc(formatTime(startLabel))}</div>`
+      : '';
+    return `<tr><th style="padding:8px 10px;border:1px solid #d1d5db;background:#f9fafb;text-align:left;font-size:12px;vertical-align:top;white-space:nowrap;">${esc(shiftName)}${sub}</th>${cells}</tr>`;
+  }).join('');
+
+  const emptyNote = shiftNames.length === 0
+    ? `<p style="color:#6b7280;">No shifts are on the schedule for this week.</p>`
+    : '';
+
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${esc(companyName)} Schedule — ${esc(weekLabel)}</title></head>
+<body style="font-family:Arial,Helvetica,sans-serif;margin:0;padding:20px;color:#111827;background:#ffffff;">
+<h1 style="font-size:20px;margin:0 0 4px;">${esc(companyName)} — Full Schedule</h1>
+<p style="margin:0 0 16px;color:#6b7280;font-size:14px;">Week of ${esc(weekLabel)} · everyone, every position</p>
+${emptyNote}
+<div style="overflow-x:auto;">
+<table style="border-collapse:collapse;width:100%;min-width:680px;">
+<thead><tr><th style="padding:8px 10px;border:1px solid #d1d5db;background:#1f2937;color:#f9fafb;text-align:left;font-size:12px;">Shift</th>${headerCells}</tr></thead>
+<tbody>${bodyRows}</tbody>
+</table>
+</div>
+<p style="margin:16px 0 0;color:#9ca3af;font-size:12px;">Positions in grey next to each name. <span style="color:#b91c1c;font-weight:600;">UNFILLED</span> marks an open slot. — ${esc(companyName)}</p>
+</body></html>`;
+}
+
 export async function distributeScheduleCore(
   scheduleId: string,
   companyId: string
@@ -1333,6 +1445,22 @@ export async function distributeScheduleCore(
   const aegisSmsChannel = (channelRes.data as { channel_value: string } | null)?.channel_value ?? null;
   const employees = (empRes.data ?? []) as Pick<Employee, 'id' | 'name' | 'contact_email' | 'contact_phone'>[];
 
+  // Full all-staff week grid, rendered once and attached to every employee's
+  // email so each person can see the whole week, not just their own shifts.
+  const fullScheduleHtml = buildFullScheduleAttachmentHtml({
+    schedData,
+    weekStart: scheduleRow.week_start,
+    weekEnd: scheduleRow.week_end,
+    companyName,
+    weekLabel,
+  });
+  const scheduleAttachment: EmailAttachment = {
+    filename: `Schedule_${scheduleRow.week_start}.html`,
+    content: fullScheduleHtml,
+    type: 'text/html',
+    disposition: 'attachment',
+  };
+
   let emailed = 0;
   let texted = 0;
   let sent = 0;
@@ -1352,39 +1480,56 @@ export async function distributeScheduleCore(
 
     if (emp.contact_email) {
       try {
+        const greetingLine = greeting(emp.name);
+        const shiftCount = myShifts.length;
+
+        // Warm, person-like framing. Leads with the day, then the position the
+        // employee is working, the time, and the hours — the four things they
+        // actually need. The shift name rides along as a quiet secondary label
+        // so context (e.g. "PM Lifeguard") is preserved without a noisy column.
+        const intro = hasShifts
+          ? `You're on for ${shiftCount} shift${shiftCount === 1 ? '' : 's'} this week — ${totalHours}h in total. Here's how your week looks:`
+          : `You're not on the schedule this week, so enjoy the time off. If you were expecting shifts, just reply to this email or check with your manager and we'll get it sorted.`;
+
         const shiftRows = hasShifts
           ? myShifts.map(s =>
-              `<tr><td style="padding:6px 12px;border:1px solid #e5e7eb;">${formatDisplayDate(s.date)}</td>` +
-              `<td style="padding:6px 12px;border:1px solid #e5e7eb;">${s.shift_name}</td>` +
-              `<td style="padding:6px 12px;border:1px solid #e5e7eb;">${s.role}</td>` +
-              `<td style="padding:6px 12px;border:1px solid #e5e7eb;">${formatTime(s.start_time)}–${formatTime(s.end_time)}</td>` +
-              `<td style="padding:6px 12px;border:1px solid #e5e7eb;">${s.hours}h</td></tr>`
+              `<tr>` +
+              `<td style="padding:10px 12px;border:1px solid #e5e7eb;">${formatDisplayDate(s.date)}</td>` +
+              `<td style="padding:10px 12px;border:1px solid #e5e7eb;">${s.role}` +
+                `<br><span style="color:#9ca3af;font-size:12px;">${s.shift_name}</span></td>` +
+              `<td style="padding:10px 12px;border:1px solid #e5e7eb;white-space:nowrap;">${formatTime(s.start_time)} – ${formatTime(s.end_time)}</td>` +
+              `<td style="padding:10px 12px;border:1px solid #e5e7eb;text-align:right;">${s.hours}h</td>` +
+              `</tr>`
             ).join('')
-          : `<tr><td colspan="5" style="padding:12px;text-align:center;color:#6b7280;">You are not scheduled this week.</td></tr>`;
+          : '';
 
-        const html = `<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:24px;">
-<h2 style="margin:0 0 4px;">Your Schedule — ${weekLabel}</h2>
-<p style="color:#6b7280;margin:0 0 20px;">Hi ${emp.name.split(' ')[0]},</p>
-<table style="width:100%;border-collapse:collapse;margin-bottom:16px;">
+        const shiftTable = hasShifts
+          ? `<table style="width:100%;border-collapse:collapse;margin:4px 0 18px;font-size:14px;">
 <thead><tr style="background:#f9fafb;">
-<th style="padding:8px 12px;border:1px solid #e5e7eb;text-align:left;">Date</th>
-<th style="padding:8px 12px;border:1px solid #e5e7eb;text-align:left;">Shift</th>
-<th style="padding:8px 12px;border:1px solid #e5e7eb;text-align:left;">Role</th>
+<th style="padding:8px 12px;border:1px solid #e5e7eb;text-align:left;">Day</th>
+<th style="padding:8px 12px;border:1px solid #e5e7eb;text-align:left;">Position</th>
 <th style="padding:8px 12px;border:1px solid #e5e7eb;text-align:left;">Time</th>
-<th style="padding:8px 12px;border:1px solid #e5e7eb;text-align:left;">Hours</th>
+<th style="padding:8px 12px;border:1px solid #e5e7eb;text-align:right;">Hours</th>
 </tr></thead>
 <tbody>${shiftRows}</tbody>
 </table>
-${hasShifts ? `<p style="color:#374151;">Total: <strong>${totalHours}h</strong> this week</p>` : ''}
-<p style="color:#6b7280;font-size:13px;">Questions? Contact your manager directly.</p>
-<p style="color:#9ca3af;font-size:12px;">— ${companyName}</p>
+<p style="margin:0 0 20px;color:#374151;">That's <strong>${totalHours}h</strong> across the week.</p>`
+          : '';
+
+        const html = `<!DOCTYPE html><html><body style="font-family:Arial,Helvetica,sans-serif;max-width:600px;margin:0 auto;padding:24px;color:#111827;">
+<h2 style="margin:0 0 12px;font-size:20px;">Your shifts for ${weekLabel}</h2>
+<p style="margin:0 0 16px;line-height:1.5;">${greetingLine}</p>
+<p style="margin:0 0 18px;line-height:1.5;color:#374151;">${intro}</p>
+${shiftTable}
+<p style="margin:0 0 4px;line-height:1.5;color:#374151;">If anything here doesn't look right, just reply to this email or reach out to your manager — we'll get it fixed.</p>
+<p style="margin:18px 0 0;color:#6b7280;">See you this week,<br>${companyName}</p>
 </body></html>`;
 
         const text = hasShifts
-          ? `Hi ${emp.name.split(' ')[0]},\n\nYour schedule for ${weekLabel}:\n\n` +
-            myShifts.map(s => `${formatDisplayDate(s.date)}: ${s.shift_name} (${formatTime(s.start_time)}–${formatTime(s.end_time)}, ${s.role})`).join('\n') +
-            `\n\nTotal: ${totalHours}h\n\nQuestions? Contact your manager.`
-          : `Hi ${emp.name.split(' ')[0]},\n\nYou are not scheduled for the week of ${weekLabel}.\n\n— ${companyName}`;
+          ? `${greetingLine}\n\n${intro}\n\n` +
+            myShifts.map(s => `• ${formatDisplayDate(s.date)} — ${s.role} (${s.shift_name}), ${formatTime(s.start_time)}–${formatTime(s.end_time)}, ${s.hours}h`).join('\n') +
+            `\n\nThat's ${totalHours}h across the week.\n\nIf anything here doesn't look right, just reply to this email or reach out to your manager — we'll get it fixed.\n\nSee you this week,\n${companyName}`
+          : `${greetingLine}\n\n${intro}\n\nSee you soon,\n${companyName}`;
 
         await sendEmail({
           to: emp.contact_email,
@@ -1392,6 +1537,7 @@ ${hasShifts ? `<p style="color:#374151;">Total: <strong>${totalHours}h</strong> 
           text,
           html,
           company_id: companyId,
+          attachments: [scheduleAttachment],
         });
         emailed++;
         empEmailed = true;

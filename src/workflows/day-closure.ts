@@ -2,6 +2,7 @@ import { supabase } from '../db/client';
 import { logActivity } from '../logger/activity-log';
 import { sendSms } from '../messaging/sms';
 import { sendEmail } from '../messaging/email';
+import { greeting } from '../messaging/greeting';
 import { reply } from '../messaging/reply';
 import type { InboundMessage, VerifiedContact } from '../security/types';
 
@@ -37,7 +38,7 @@ export async function handleNotifyDayClosure(
   const formattedDate = formatClosureDate(date);
   const shiftPhrase = shiftName ? `${shiftName} shift` : 'shift';
   const body =
-    `Hi ${employeeName}, ${companyName} will be closed on ${formattedDate}. ` +
+    `${greeting(employeeName)} ${companyName} will be closed on ${formattedDate}. ` +
     `Your ${shiftPhrase} has been cancelled. We'll see you for your next scheduled shift. — Aegis`;
 
   if (employeePhone) {

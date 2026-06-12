@@ -40,7 +40,9 @@ This is the single most important habit. The moment a piece of work is **approve
 This is the current Now/Next ordering for active work. It sits **above** the (now-closed) 48-hour sprint and the Forward Build Sequence — those remain the structural plan; this is what's being worked next. The three items are ordered **#1 → #2 → #3**; do not start #3 until #1 and #2 are at least in fix-shape. All three are diagnose-first (no blind fixes).
 
 ### #1 · SCHED-DELETE-1 — Delete-schedule button for managers + owners only (Homebase) — **NEW**
-**Repo:** Homebase · **Status:** `DIAGNOSED` · **Phase tag:** `[P1]` (live-product hardening + UX gap)
+**Repo:** Homebase · **Status:** `DONE` (live-verified 2026-06-11) · **Phase tag:** `[P1]` (live-product hardening + UX gap)
+
+**Resolution (2026-06-11):** Migration 014 applied — `schedules.deleted_at` column added + per-command RLS (incl. `FOR DELETE USING (false)` so the client can no longer hard-delete). Both repos merged + deployed to prod (Homebase server route `/api/schedule/delete` + Aegis read-site sweep filtering `deleted_at IS NULL`). Verified live: soft-delete sets `deleted_at`; schedule disappears from the schedule page, dashboard, and downloads; row preserved and reversible via `deleted_at = NULL`. Actor binary (manager vs owner) per convention; owner audit-granularity backlogged.
 
 **Findings (read-only diagnosis 2026-06-11):** delete already live but UI-only (`page.tsx:969` + `confirmDeleteSchedule` client-side delete, no route); `schedules` RLS permits DELETE for any same-company user (security gap); zero FKs ref `schedules.id` (hard delete FK-safe); no soft-delete column. `03 §4.3` is correct; "no delete control today" and the FK-hazard note are stale/wrong; Tier 3 understates scope.
 
@@ -65,7 +67,23 @@ There is no delete-schedule control today; managers / owners need one. Build it 
 **Done when:** anon/manager-cross-company/owner-cross-company calls → 403; same-company owner/manager → success (or refused-with-message on distributed); FK constraints handled deliberately (soft-delete or explicit cascade); confirmation step in UI; route-level test added; visible in `activity_log`.
 
 ### #2 · AEGIS-EMAIL-1 — Every Aegis email-action workflow works end-to-end + carries a test — **NEW**
-**Repo:** Aegis + Homebase · **Status:** `OPEN, not started` · **Phase tag:** `[P2]` (Forward Build Sequence Phase 2 — Complete the comms loop)
+**Repo:** Aegis + Homebase · **Status:** `DIAGNOSED` (2026-06-11) · **Phase tag:** `[P2]` (Forward Build Sequence Phase 2 — Complete the comms loop)
+
+**AEGIS-EMAIL-1 — Status: DIAGNOSED (2026-06-11).** 8 action types defined; only 3 wired end-to-end (`approve_to`, `deny_to`, `confirm_distribution`); 5 are dead stubs that return a fake success page and are never minted by any email (`approve_availability`, `deny_availability`, `accept_emergency_coverage`, `decline_emergency_coverage`, `request_additional_batch`). `approve_to` is prod-verified (21 Watermark consumptions); `deny_to` is built but the email-button path was never consumed (in-app Time Off tab deny works; email button unverified — Alexander testing 2026-06-11); `confirm_distribution` is sandbox-only and had a cross-repo status-clobber bug (HB writes `status='distributed'`, AG overwrites to `'published'`) that defeated the re-distribution guard.
+
+**TARGET STATE (assistant experience; launch is email-first — bring all flows to email parity):**
+- **Manager** — distribute schedule (conversational command + Homebase button, NOT a magic-link email button); approve/deny time off (magic-link buttons in the TO email); approve/deny availability (magic-link buttons — to build, mirror TO); request a build (command); request emergency coverage (command); operational inquiries (conversational Q&A).
+- **Employee** — ask about upcoming shifts; receive shifts (redesigned distribution email); submit time off; update availability; initiate a swap with a target.
+- **Design rule:** notification-RESPONSE actions (approve/deny TO + availability) = buttons in the email; manager-INITIATED actions (distribute, build, coverage, queries) = conversational commands (+ Homebase button for distribute). Employee emails never carry Homebase CTAs; attachments fine.
+
+**WORK LIST (priority order):**
+1. **Distribute email redesign** — per-employee shifts/positions + attach the full week's all-staff schedule (reuse the Homebase schedule-grid renderer). (built on branch `feat/distribute-email-redesign` — warm copy + option-D attachment done; pending review/merge/verify)
+2. **Remove the magic-link `confirm_distribution` path**; distribute via Homebase button + command; fix the re-distribution guard to key on `distributed_at`, not `status`.
+3. **Build availability approve/deny magic-link buttons** (mirror TO) — real handlers + mint tokens in the availability notification email.
+4. **Verify `deny_to` email-button path** (in progress).
+5. **Verify emergency coverage (email) + operational inquiries (email).**
+6. **Verify/build employee "ask about my shifts" + swap-over-email.**
+7. **Remove or properly handle the remaining dead stubs** (currently return fake success).
 
 Verify + fix + **test** every email-action workflow end-to-end: inbound email → magic-link issued → manager clicks link → action consumed via Homebase `/api/aegis-action` → correct DB effect (and, where applicable, employee notified). The token layer itself is already audited sound (SEC-4: 256-bit CSPRNG, SHA-256 hash-stored, atomic TTL + single-use enforcement). **This item is the workflows themselves**, not the crypto.
 
@@ -684,3 +702,55 @@ Docs-only pass, no code. Triggered by `feature/max-consecutive-days` merging to 
 ### 2026-06-11 — Environment + branch-base note
 - ~/Desktop is a fuse mount that blocks unlink; git ops that unlink (reset --hard, checkout <branch>, lock cleanup) fail. Use no-unlink ops.
 - origin/main did NOT carry the NOW/NEXT sprint block (SCHED-DELETE-1, AEGIS-EMAIL-1); it lived on docs/sec-3-status-update. Diagnosis was stacked on that branch, so merging docs/sched-delete-1-diagnosis brings both in.
+
+### 2026-06-11 — SCHED-DELETE-1 DONE
+- Live-verified: /api/schedule/delete soft-deletes; deleted_at set; schedule hidden from all
+  Homebase surfaces; reversible. Migration 014 applied. Both repos merged + deployed. RLS
+  FOR DELETE USING(false) live — client can no longer hard-delete.
+- Lesson: first attempt was pushed-not-merged — prod served old code while the new RLS lock
+  was live, causing silent delete failure. Always confirm the prod deploy reflects the MERGE
+  commit on main, not just a branch preview.
+
+### 2026-06-11 — AEGIS-EMAIL-1 diagnosed + comms target state set
+- 3 of 8 email-actions wired; 5 dead stubs; approve_to prod-verified, deny_to email-path
+  unverified, confirm_distribution sandbox-only + status-clobber bug.
+- Target state set: distribute = command + Homebase button (no magic link); availability gets
+  approve/deny buttons; distribution email redesign. Decision: drop the magic-link distribute
+  path (resolves the status conflict). Findings logged to EMAIL_WORKFLOWS_TRACKER + SCHEMA_DRIFT_LOG.
+
+### 2026-06-11 — AEGIS-EMAIL-1: distribute redesign + Aegis personability pass (built on branch)
+Branch feat/distribute-email-redesign (commits 19a815b, c3e749b, 3ef9dbd). tsc clean,
+greeting check green. NOT merged, NOT live-verified — pending review/merge/verify (DONE-rule).
+
+Decisions:
+- AEGIS-EMAIL-1 design rule: notification-RESPONSE actions (approve/deny TO + availability) =
+  magic-link buttons; manager-INITIATED actions (distribute, build, coverage, queries) =
+  conversational commands. Distribute becomes a command + a (net-new) Homebase button, NOT a
+  magic link.
+- Full-schedule attachment = OPTION D: Aegis self-renders a full-week all-staff HTML grid from
+  schedules.data (assignments + gaps) it already loads — no Homebase call, no exceljs/PDF dep,
+  no renderer fork. Chosen over (c) internal Homebase route (couples distribution to Homebase
+  uptime at the 30-person fan-out) and (b) replicate-renderer (forks the canonical grid → drift).
+
+Findings (build audit):
+- No Homebase "Distribute" button exists — distribution fires only via the magic-link
+  confirm_distribution email + the SMS-reply path. Building one is NET-NEW (work-list item 2).
+- /api/schedule/download/pdf returns HTML, not a real PDF (no PDF lib). Doc drift vs
+  03_Homebase_Reference §4.3 — fold the correction in at the next doc refresh.
+- Homebase download routes are session-gated (Supabase auth.getUser) — no server-to-server path
+  (the reason option D beat option C).
+- Aegis sendEmail/EmailOptions had no attachments field — now added (generic SendGrid attachments).
+
+Built (on branch):
+- Distribute email: warm per-employee copy + the option-D full-week all-staff HTML grid attached
+  to every employee email (gaps "UNFILLED — {role}", closures greyed).
+- Aegis personability pass: shared greeting seam src/messaging/greeting.ts (firstName/greeting;
+  full name → first token; null/empty → "there"); automated check scripts/check-greeting.ts
+  (npx tsx scripts/check-greeting.ts — 6 cases, green) replaces eyeballing. Greetings now on ALL
+  employee-facing messages and ALL manager notifications (each by their own first name); manager
+  Homebase CTAs / magic-links preserved. Excluded: opt-in/onboarding (TCPA), HELP/INFO/STOP
+  compliance, general_query.
+
+Next: Homebase Distribute button + remove the magic-link confirm_distribution path + key the
+re-distribution guard on distributed_at (kills the status-clobber re-fan-out bug); then
+availability approve/deny buttons.

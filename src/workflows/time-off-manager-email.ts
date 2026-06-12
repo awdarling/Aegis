@@ -1,4 +1,5 @@
 import { generateActionToken } from '../lib/aegis-actions/tokens';
+import { greeting } from '../messaging/greeting';
 import { getHomebaseUrl } from '../config/urls';
 import type { Employee, PartialDayDetail, TimeOffRequest } from '../db/types';
 import type { SimulationResult } from '../lib/schedule-simulator';
@@ -20,6 +21,8 @@ export interface BuildTimeOffManagerEmailParams {
   company_name: string;
   manager_email: string;
   manager_user_id?: string;
+  /** Manager's name for the greeting line; falls back to "there" when absent. */
+  manager_name?: string;
   simulation?: SimulationResult;
   recommendation?: TimeOffRecommendation;
   violations?: TimeOffViolations | null;
@@ -435,6 +438,7 @@ export async function buildTimeOffManagerEmail(
     <td align="center">
       <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="640" style="max-width:640px;background:#ffffff;border-radius:8px;padding:28px;border:1px solid #e5e7eb;">
         <tr><td>
+          <p style="margin:0 0 16px;font-size:15px;color:#111827;">${escapeHtml(greeting(params.manager_name))}</p>
           ${headerSectionHtml(employee.name, dateRange)}
           ${policyConsiderationsHtml(policyLines)}
           ${requestDetailsHtml(tor, dateRange)}
@@ -451,7 +455,7 @@ export async function buildTimeOffManagerEmail(
 </table>
 </body></html>`;
 
-  const text = buildPlainText({
+  const text = `${greeting(params.manager_name)}\n\n` + buildPlainText({
     employeeName: employee.name,
     companyName: params.company_name,
     dateRange,

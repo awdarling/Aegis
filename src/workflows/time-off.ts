@@ -4,6 +4,7 @@ import { logActivity } from '../logger/activity-log';
 import { reply, normalizeReSubject } from '../messaging/reply';
 import { sendEmail } from '../messaging/email';
 import { sendSms } from '../messaging/sms';
+import { greeting } from '../messaging/greeting';
 import { classifyIntent, generateReply } from '../ai/claude';
 import { runSimulation, getWeekBounds, loadTimeOffPolicies as loadAllTimeOffPolicies } from '../lib/schedule-simulator';
 import { computeTimeOffViolations } from '../lib/time-off-policies';
@@ -367,7 +368,7 @@ function buildManagerEmail(params: {
   // Plain text version. Sim/alternates/recommendation sections are only
   // rendered when the simulator ran (stage1 non-null).
   const text = [
-    `Hi ${managerName},`,
+    greeting(managerName),
     '',
     `${employeeName} has submitted a time-off request.`,
     '',
@@ -482,6 +483,7 @@ function buildManagerEmail(params: {
 <html lang="en">
 <body style="font-family:Arial,sans-serif;max-width:620px;margin:0 auto;padding:24px;color:#111;">
 
+<p style="margin:0 0 16px;font-size:15px;">${greeting(managerName)}</p>
 <h2 style="margin:0 0 4px;font-size:20px;">Time-Off Request</h2>
 <p style="margin:0 0 24px;color:#6b7280;font-size:14px;">Submitted by ${employeeName} and reviewed by Aegis</p>
 
@@ -590,10 +592,11 @@ export async function sendDecisionNotification(
   const employee = empData as { id: string; name: string; contact_email: string | null; contact_phone: string | null };
 
   const dateRange = formatDateRange(tor.start_date, tor.end_date);
+  const greetingLine = greeting(employee.name);
   const text =
     decision === 'approved'
-      ? `Your time-off request for ${dateRange} has been approved. Enjoy your time off!`
-      : `Your time-off request for ${dateRange} has been denied. Please contact your manager if you have questions or would like to discuss alternatives.`;
+      ? `${greetingLine}\n\nYour time-off request for ${dateRange} has been approved. Enjoy your time off!`
+      : `${greetingLine}\n\nYour time-off request for ${dateRange} has been denied. Please contact your manager if you have questions or would like to discuss alternatives.`;
 
   let channel: 'email' | 'sms';
   let sent_to: string;
@@ -825,7 +828,7 @@ async function notifyManager(
       to: managerPhone,
       from: aegisSmsNumber,
       body:
-        `${employee.name} submitted a time-off request for ${dateDisplay}. ` +
+        `${greeting(manager.name)} ${employee.name} submitted a time-off request for ${dateDisplay}. ` +
         `Full details and approval options are in your email from Aegis.`,
       company_id: companyId,
     });
@@ -917,6 +920,7 @@ async function notifyManagersByEmail(
         company_name: companyName,
         manager_email: manager.email!,
         manager_user_id: manager.id,
+        manager_name: manager.name,
         simulation: simulation ?? undefined,
         recommendation,
         violations,
@@ -987,7 +991,7 @@ export async function handleSubmitTimeOff(
   await reply(
     contact,
     message,
-    `Got it — you're requesting ${summary} off for ${reason}. Is that correct? (Reply "yes" to confirm or "no" to restate.)`
+    `${greeting(contact.name)}\n\nGot it — you're requesting ${summary} off for ${reason}. Is that correct? (Reply "yes" to confirm or "no" to restate.)`
   );
 }
 
@@ -1275,7 +1279,7 @@ export async function handlePendingTimeOffConfirmation(
   await reply(
     contact,
     message,
-    `Got it — I've sent your time-off for ${dateDisplay} to your manager. ` +
+    `${greeting(contact.name)}\n\nGot it — I've sent your time-off for ${dateDisplay} to your manager. ` +
       "I'll let you know as soon as they decide."
   );
 }
@@ -1342,7 +1346,7 @@ export async function handleQueryMyTimeOff(
     await reply(
       contact,
       message,
-      "You don't have any approved time off coming up. You can request time off by texting me the dates you need."
+      `${greeting(contact.name)}\n\nYou don't have any approved time off coming up. You can request time off by texting me the dates you need.`
     );
     return;
   }
@@ -1392,5 +1396,5 @@ export async function handleQueryMyTimeOff(
       ? 'You have 1 approved time off period coming up:'
       : `You have ${rows.length} approved time off periods coming up:`;
 
-  await reply(contact, message, `${header}\n\n${lines.join('\n')}`);
+  await reply(contact, message, `${greeting(contact.name)}\n\n${header}\n\n${lines.join('\n')}`);
 }

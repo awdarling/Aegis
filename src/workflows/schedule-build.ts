@@ -3,6 +3,7 @@ import { logActivity } from '../logger/activity-log';
 import { reply, sendInThreadAck } from '../messaging/reply';
 import { sendEmail } from '../messaging/email';
 import { greeting } from '../messaging/greeting';
+import { isAlreadyDistributed } from '../lib/distribute-guard';
 import { sendSms } from '../messaging/sms';
 import { computeWageEstimate } from '../lib/schedule-simulator';
 import { buildScheduleResultEmail } from './schedule-build-email';
@@ -1295,6 +1296,11 @@ export interface DistributeScheduleResult {
   texted: number;
   no_contact: string[];
   week_label: string;
+  // Set when the re-distribution guard refused the fan-out because the schedule
+  // was already distributed (and `force` was not passed). When true, ZERO
+  // messages were sent and `distributed_at` is the prior send timestamp.
+  already_distributed?: boolean;
+  distributed_at?: string | null;
 }
 
 // Pure callable used by both the SMS/email intent handler and the
@@ -1407,13 +1413,14 @@ function buildFullScheduleGridHtml(args: {
 
 export async function distributeScheduleCore(
   scheduleId: string,
-  companyId: string
+  companyId: string,
+  force = false
 ): Promise<DistributeScheduleResult> {
-  type ScheduleRow = { id: string; week_start: string; week_end: string; data: ScheduleData; status: string };
+  type ScheduleRow = { id: string; week_start: string; week_end: string; data: ScheduleData; status: string; distributed_at: string | null };
 
   const { data: schedRowData, error: schedError } = await supabase
     .from('schedules')
-    .select('id, week_start, week_end, data, status')
+    .select('id, week_start, week_end, data, status, distributed_at')
     .eq('id', scheduleId)
     .eq('company_id', companyId)
     .is('deleted_at', null)
@@ -1424,6 +1431,25 @@ export async function distributeScheduleCore(
   const scheduleRow = schedRowData as unknown as ScheduleRow;
   const schedData = scheduleRow.data as unknown as ScheduleData;
   const weekLabel = `${formatShortDate(scheduleRow.week_start)}–${formatShortDate(scheduleRow.week_end)}`;
+
+  // Re-distribution guard: a non-null distributed_at means this schedule's
+  // ~30-person fan-out already went out. Refuse to re-send (sending ZERO
+  // messages) unless the caller explicitly forces it. This protects all three
+  // triggers — the SMS/email intent, the /internal endpoint, and the future
+  // Homebase button — since they all route through here.
+  if (isAlreadyDistributed(scheduleRow, force)) {
+    return {
+      sent: 0,
+      total_employees: 0,
+      errors: [],
+      emailed: 0,
+      texted: 0,
+      no_contact: [],
+      week_label: weekLabel,
+      already_distributed: true,
+      distributed_at: scheduleRow.distributed_at,
+    };
+  }
 
   const [companyRes, channelRes, empRes] = await Promise.all([
     supabase.from('companies').select('name').eq('id', companyId).single(),
@@ -1641,6 +1667,17 @@ export async function handleDistributeSchedule(
   }
 
   const result = await distributeScheduleCore(scheduleRow.id, contact.company_id);
+
+  // Guard tripped: schedule already distributed — no messages were sent.
+  if (result.already_distributed) {
+    const when = result.distributed_at
+      ? new Date(result.distributed_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
+      : 'earlier';
+    await reply(contact, message,
+      `That schedule was already sent on ${when}. To re-send, use Distribute in Homebase.`
+    );
+    return;
+  }
 
   const lines = [`Schedule for ${result.week_label} has been sent.`];
   lines.push(`${result.emailed} employee${result.emailed !== 1 ? 's' : ''} emailed, ${result.texted} notified by SMS.`);

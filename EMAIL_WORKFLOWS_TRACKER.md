@@ -174,3 +174,5 @@ The standalone `tracker_update.md` scratch file (Phase 4.5 scoping + BUG-1/BUG-2
 - Findings: no Homebase Distribute button today (distribution = magic-link + SMS reply);
   /download/pdf returns HTML not PDF (03 §4.3 drift).
 - Status: built on branch, tsc clean, greeting check green; NOT merged/live-verified.
+
+Distribute email redesign + inline full-schedule + Aegis personability — DONE (PR #5/#6, deploy 7c7f158e). .html attachments don't render in Gmail → grid is inline.

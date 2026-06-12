@@ -274,7 +274,10 @@ Respond with ONLY valid JSON in this exact shape — no markdown, no explanation
     //   veteran_only_dates: specific date ranges where ONLY veteran employees can be scheduled. Non-veterans are excluded from those dates entirely.
     //     Example: "veterans only Memorial Day weekend" → veteran_only_dates: [{ "start_date": "2026-05-23", "end_date": "2026-05-25" }].
     //     null or omitted if no date-bounded veteran-only restriction is mentioned.
-    // For distribute_schedule: {}
+    // For distribute_schedule: { "target_week": "this" | "next" }
+    //   Same mapping as build_schedule: "this week"/"current week" → "this";
+    //   "next week"/"upcoming week"/"the week after" → "next". Default "next" if
+    //   unspecified. Never emit a calendar date — you do not know today's date.
     // For homebase_edit: { "entity_type": "employee|event|policy|wage_rate|shift_type", "entity_name": "...", "field": "...", "new_value": "..." }
     // For initiate_onboarding: { "employee_name": "..." } if targeting one employee, or {} for all
     // For update_availability: {}

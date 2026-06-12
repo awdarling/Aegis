@@ -51,6 +51,9 @@ internalRouter.post('/notify-to-decision', async (req: Request, res: Response) =
 internalRouter.post('/distribute-schedule', async (req: Request, res: Response) => {
   const body = (req.body ?? {}) as Record<string, unknown>;
   const scheduleId = body.schedule_id;
+  // Optional re-send override (default false). The future Homebase "Distribute"
+  // button passes force=true to deliberately re-distribute an already-sent week.
+  const force = body.force === true;
 
   if (typeof scheduleId !== 'string' || scheduleId.length === 0) {
     badRequest(res, 'schedule_id is required');
@@ -71,12 +74,14 @@ internalRouter.post('/distribute-schedule', async (req: Request, res: Response) 
     }
     const companyId = (schedRow as { company_id: string }).company_id;
 
-    const result = await distributeScheduleCore(scheduleId, companyId);
+    const result = await distributeScheduleCore(scheduleId, companyId, force);
     res.json({
       ok: true,
       sent: result.sent,
       total_employees: result.total_employees,
       errors: result.errors,
+      already_distributed: result.already_distributed ?? false,
+      distributed_at: result.distributed_at ?? null,
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

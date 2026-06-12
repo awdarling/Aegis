@@ -3,6 +3,7 @@ import { logActivity } from '../logger/activity-log';
 import { reply, sendInThreadAck } from '../messaging/reply';
 import { sendEmail } from '../messaging/email';
 import { greeting } from '../messaging/greeting';
+import { isAlreadyDistributed } from '../lib/distribute-guard';
 import { sendSms } from '../messaging/sms';
 import { computeWageEstimate } from '../lib/schedule-simulator';
 import { buildScheduleResultEmail } from './schedule-build-email';
@@ -1295,6 +1296,11 @@ export interface DistributeScheduleResult {
   texted: number;
   no_contact: string[];
   week_label: string;
+  // Set when the re-distribution guard refused the fan-out because the schedule
+  // was already distributed (and `force` was not passed). When true, ZERO
+  // messages were sent and `distributed_at` is the prior send timestamp.
+  already_distributed?: boolean;
+  distributed_at?: string | null;
 }
 
 // Pure callable used by both the SMS/email intent handler and the
@@ -1405,15 +1411,56 @@ function buildFullScheduleGridHtml(args: {
 </table>`;
 }
 
+// ── "This week" special-notes / events section (email-safe inline fragment) ────
+//
+// Surfaces the company's events table rows for the target week (holidays,
+// parties, closures, staffing notes) so each employee sees what's going on. Like
+// the grid, this is an inline-styled fragment (no <style>/<head> wrapper).
+function buildWeekEventsHtml(events: Event[]): string {
+  if (events.length === 0) return '';
+  const esc = (s: string): string =>
+    s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const rows = events.map(e => {
+    const start = e.date ?? null;
+    const label = start
+      ? (e.end_date && e.end_date !== start
+          ? `${formatShortDate(start)}–${formatShortDate(e.end_date)}`
+          : formatShortDate(start))
+      : 'This week';
+    const closed = e.event_type === 'closure' ? ' <span style="color:#b91c1c;font-weight:bold;">(closed)</span>' : '';
+    const note = e.staffing_notes
+      ? `<div style="color:#6b7280;font-size:13px;">${esc(e.staffing_notes)}</div>`
+      : '';
+    return `<li style="margin:0 0 8px;"><strong>${esc(label)}</strong> — ${esc(e.title)}${closed}${note}</li>`;
+  }).join('');
+  return `<h3 style="margin:24px 0 8px;font-size:16px;color:#111827;">This week:</h3>
+<ul style="margin:0 0 4px;padding-left:20px;font-size:14px;line-height:1.5;color:#374151;">${rows}</ul>`;
+}
+
+function buildWeekEventsText(events: Event[]): string {
+  if (events.length === 0) return '';
+  const lines = events.map(e => {
+    const start = e.date ?? null;
+    const label = start
+      ? (e.end_date && e.end_date !== start ? `${formatShortDate(start)}–${formatShortDate(e.end_date)}` : formatShortDate(start))
+      : 'This week';
+    const closed = e.event_type === 'closure' ? ' (closed)' : '';
+    const note = e.staffing_notes ? ` — ${e.staffing_notes}` : '';
+    return `• ${label}: ${e.title}${closed}${note}`;
+  });
+  return `This week:\n${lines.join('\n')}`;
+}
+
 export async function distributeScheduleCore(
   scheduleId: string,
-  companyId: string
+  companyId: string,
+  force = false
 ): Promise<DistributeScheduleResult> {
-  type ScheduleRow = { id: string; week_start: string; week_end: string; data: ScheduleData; status: string };
+  type ScheduleRow = { id: string; week_start: string; week_end: string; data: ScheduleData; status: string; distributed_at: string | null };
 
   const { data: schedRowData, error: schedError } = await supabase
     .from('schedules')
-    .select('id, week_start, week_end, data, status')
+    .select('id, week_start, week_end, data, status, distributed_at')
     .eq('id', scheduleId)
     .eq('company_id', companyId)
     .is('deleted_at', null)
@@ -1425,10 +1472,30 @@ export async function distributeScheduleCore(
   const schedData = scheduleRow.data as unknown as ScheduleData;
   const weekLabel = `${formatShortDate(scheduleRow.week_start)}–${formatShortDate(scheduleRow.week_end)}`;
 
-  const [companyRes, channelRes, empRes] = await Promise.all([
+  // Re-distribution guard: a non-null distributed_at means this schedule's
+  // ~30-person fan-out already went out. Refuse to re-send (sending ZERO
+  // messages) unless the caller explicitly forces it. This protects all three
+  // triggers — the SMS/email intent, the /internal endpoint, and the future
+  // Homebase button — since they all route through here.
+  if (isAlreadyDistributed(scheduleRow, force)) {
+    return {
+      sent: 0,
+      total_employees: 0,
+      errors: [],
+      emailed: 0,
+      texted: 0,
+      no_contact: [],
+      week_label: weekLabel,
+      already_distributed: true,
+      distributed_at: scheduleRow.distributed_at,
+    };
+  }
+
+  const [companyRes, channelRes, empRes, weekEvents] = await Promise.all([
     supabase.from('companies').select('name').eq('id', companyId).single(),
     supabase.from('company_channels').select('channel_value').eq('company_id', companyId).eq('channel_type', 'sms').maybeSingle(),
     supabase.from('employees').select('id, name, contact_email, contact_phone').eq('company_id', companyId).eq('active', true),
+    getSpecialNotesForRange(companyId, scheduleRow.week_start, scheduleRow.week_end),
   ]);
 
   const companyName = (companyRes.data as { name: string } | null)?.name ?? 'Your Company';
@@ -1444,6 +1511,10 @@ export async function distributeScheduleCore(
     weekStart: scheduleRow.week_start,
     weekEnd: scheduleRow.week_end,
   });
+  // "This week:" special-notes / events block (holidays, parties, closures,
+  // staffing notes) — empty string when the week has no events.
+  const weekEventsHtml = buildWeekEventsHtml(weekEvents);
+  const weekEventsText = buildWeekEventsText(weekEvents);
 
   let emailed = 0;
   let texted = 0;
@@ -1505,6 +1576,7 @@ export async function distributeScheduleCore(
 <p style="margin:0 0 16px;line-height:1.5;">${greetingLine}</p>
 <p style="margin:0 0 18px;line-height:1.5;color:#374151;">${intro}</p>
 ${shiftTable}
+${weekEventsHtml}
 <h3 style="margin:26px 0 10px;font-size:16px;color:#111827;">Here's the whole team's week:</h3>
 ${teamGridHtml}
 <p style="margin:8px 0 0;line-height:1.5;color:#9ca3af;font-size:12px;">Positions are in grey next to each name. <span style="color:#b91c1c;font-weight:bold;">UNFILLED</span> marks an open slot.</p>
@@ -1512,11 +1584,12 @@ ${teamGridHtml}
 <p style="margin:18px 0 0;color:#6b7280;">See you this week,<br>${companyName}</p>
 </body></html>`;
 
+        const eventsBlock = weekEventsText ? `\n\n${weekEventsText}` : '';
         const text = hasShifts
           ? `${greetingLine}\n\n${intro}\n\n` +
             myShifts.map(s => `• ${formatDisplayDate(s.date)} — ${s.role} (${s.shift_name}), ${formatTime(s.start_time)}–${formatTime(s.end_time)}, ${s.hours}h`).join('\n') +
-            `\n\nThat's ${totalHours}h across the week.\n\nIf anything here doesn't look right, just reply to this email or reach out to your manager — we'll get it fixed.\n\nSee you this week,\n${companyName}`
-          : `${greetingLine}\n\n${intro}\n\nSee you soon,\n${companyName}`;
+            `\n\nThat's ${totalHours}h across the week.${eventsBlock}\n\nIf anything here doesn't look right, just reply to this email or reach out to your manager — we'll get it fixed.\n\nSee you this week,\n${companyName}`
+          : `${greetingLine}\n\n${intro}${eventsBlock}\n\nSee you soon,\n${companyName}`;
 
         await sendEmail({
           to: emp.contact_email,
@@ -1614,33 +1687,60 @@ export async function handleDistributeSchedule(
   contact: VerifiedContact,
   extracted: Record<string, unknown>
 ): Promise<void> {
-  void extracted;
+  // Resolve the TARGET week the manager asked for ("this"/"next") the same way
+  // build_schedule does, instead of blindly distributing the latest schedule.
+  // This was the wrong-week bug: "distribute next week's schedule" sent THIS
+  // week's because the handler ignored `extracted` and auto-picked latest.
+  const { data: policyRows } = await supabase
+    .from('policies').select('*').eq('company_id', contact.company_id);
+  const { settings } = parseConstraints((policyRows ?? []) as Policy[]);
+  const { weekStart, weekEnd } = parseTargetWeek(extracted, settings);
+  const weekLabel = `${formatShortDate(weekStart)}–${formatShortDate(weekEnd)}`;
+
+  // Select the schedule for THAT week_start (not "latest"). Prefer a published
+  // one over a draft; newest generated_at within the week breaks any tie.
   type ScheduleRow = { id: string };
   let scheduleRow: ScheduleRow | null = null;
-
-  const { data: pubData } = await supabase
-    .from('schedules').select('id').is('deleted_at', null)
-    .eq('company_id', contact.company_id).eq('status', 'published')
-    .order('generated_at', { ascending: false }).limit(1).maybeSingle();
-
-  if (pubData) {
-    scheduleRow = pubData as ScheduleRow;
-  } else {
-    const { data: draftData } = await supabase
+  for (const status of ['published', 'draft'] as const) {
+    const { data } = await supabase
       .from('schedules').select('id').is('deleted_at', null)
-      .eq('company_id', contact.company_id).eq('status', 'draft')
+      .eq('company_id', contact.company_id)
+      .eq('status', status)
+      .eq('week_start', weekStart)
       .order('generated_at', { ascending: false }).limit(1).maybeSingle();
-    if (draftData) scheduleRow = draftData as ScheduleRow;
+    if (data) { scheduleRow = data as ScheduleRow; break; }
   }
 
   if (!scheduleRow) {
+    // Do NOT fall back to a different week — say so plainly.
     await reply(contact, message,
-      "No schedule found to distribute. Ask Aegis to build a schedule first."
+      `There's no schedule built for the week of ${weekLabel} yet. Once it's built, I can send it out.`
     );
     return;
   }
 
+  // Acknowledge the ACTUAL week being distributed (email channel gets an
+  // in-thread ack; the fan-out + result message follow).
+  if (message.channel === 'email') {
+    const firstName = contact.name?.trim().split(/\s+/)[0] ?? '';
+    const ackBody = firstName
+      ? `Got it, ${firstName}. Sending out the schedule for the week of ${weekLabel} now.`
+      : `Got it. Sending out the schedule for the week of ${weekLabel} now.`;
+    await sendInThreadAck({ message, contact, bodyText: ackBody });
+  }
+
   const result = await distributeScheduleCore(scheduleRow.id, contact.company_id);
+
+  // Guard tripped: schedule already distributed — no messages were sent.
+  if (result.already_distributed) {
+    const when = result.distributed_at
+      ? new Date(result.distributed_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
+      : 'earlier';
+    await reply(contact, message,
+      `The schedule for the week of ${weekLabel} was already sent on ${when}. To re-send, use Distribute in Homebase.`
+    );
+    return;
+  }
 
   const lines = [`Schedule for ${result.week_label} has been sent.`];
   lines.push(`${result.emailed} employee${result.emailed !== 1 ? 's' : ''} emailed, ${result.texted} notified by SMS.`);

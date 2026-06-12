@@ -1,7 +1,7 @@
 import { supabase } from '../db/client';
 import { logActivity } from '../logger/activity-log';
 import { reply, sendInThreadAck } from '../messaging/reply';
-import { sendEmail, type EmailAttachment } from '../messaging/email';
+import { sendEmail } from '../messaging/email';
 import { greeting } from '../messaging/greeting';
 import { sendSms } from '../messaging/sms';
 import { computeWageEstimate } from '../lib/schedule-simulator';
@@ -1304,22 +1304,21 @@ export interface DistributeScheduleResult {
 // Loads the schedule, fans out per-employee summaries, marks the schedule
 // published + distributed_at, logs per-send + aggregate activity. Throws on
 // schedule-not-found so callers can surface the error.
-// ── Full all-staff schedule attachment ─────────────────────────────────────────
+// ── Full all-staff schedule grid (email-safe inline fragment) ──────────────────
 //
-// Self-contained HTML rendering of the WHOLE week for EVERY employee — the same
-// file attaches to every distribution email so each person sees the full picture
-// (who's on, which positions, where the gaps are) without any Homebase login.
-// Aegis builds this purely from data it already loaded (schedules.data), so there
-// is no Homebase call and no exceljs/PDF dependency. Rows are distinct shifts
-// ordered by start_time; columns are the 7 days of the target week.
-function buildFullScheduleAttachmentHtml(args: {
+// Renders the WHOLE week for EVERY employee as a single self-contained <table>
+// FRAGMENT (no <html>/<head>/<body>/<style> wrapper) so it can be embedded
+// directly in the distribution email body and render in Gmail/Outlook/Apple Mail.
+// Email clients strip <style>/<head>, so every style is an inline style=""
+// attribute using only email-safe properties. Aegis builds this purely from data
+// it already loaded (schedules.data) — no Homebase call, no exceljs/PDF dep. Rows
+// are distinct shifts ordered by start_time; columns are the 7 days of the week.
+function buildFullScheduleGridHtml(args: {
   schedData: ScheduleData;
   weekStart: string;
   weekEnd: string;
-  companyName: string;
-  weekLabel: string;
 }): string {
-  const { schedData, weekStart, weekEnd, companyName, weekLabel } = args;
+  const { schedData, weekStart, weekEnd } = args;
   const assignments = schedData.assignments ?? [];
   const gaps = (schedData.gaps ?? []).filter(g => g.required_count > g.filled_count);
   // closed_dates may ride along in the persisted data even though the in-repo
@@ -1357,18 +1356,23 @@ function buildFullScheduleAttachmentHtml(args: {
   const esc = (s: string): string =>
     s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
+  // No shifts at all → a plain inline-styled line, still a fragment (no wrapper).
+  if (shiftNames.length === 0) {
+    return `<p style="margin:0;font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#6b7280;">No shifts are on the schedule for this week.</p>`;
+  }
+
   const headerCells = days.map(d => {
     const closure = closedByDate.get(d);
     const sub = closure
-      ? `<div style="font-size:11px;color:#b91c1c;font-weight:600;">CLOSED${closure ? ` — ${esc(closure)}` : ''}</div>`
+      ? `<div style="font-size:11px;color:#b91c1c;font-weight:bold;">CLOSED — ${esc(closure)}</div>`
       : '';
-    return `<th style="padding:8px 10px;border:1px solid #d1d5db;background:#1f2937;color:#f9fafb;text-align:left;font-size:12px;min-width:120px;">${esc(formatWeekday(d))}<div style="font-weight:400;color:#cbd5e1;font-size:11px;">${esc(formatShortDate(d))}</div>${sub}</th>`;
+    return `<th style="padding:8px 10px;border:1px solid #d1d5db;background-color:#1f2937;color:#f9fafb;text-align:left;font-size:12px;font-weight:bold;">${esc(formatWeekday(d))}<div style="font-weight:normal;color:#cbd5e1;font-size:11px;">${esc(formatShortDate(d))}</div>${sub}</th>`;
   }).join('');
 
   const bodyRows = shiftNames.map(shiftName => {
     const cells = days.map(d => {
       if (closedByDate.has(d)) {
-        return `<td style="padding:8px 10px;border:1px solid #e5e7eb;background:#f3f4f6;color:#9ca3af;font-size:12px;text-align:center;">—</td>`;
+        return `<td style="padding:8px 10px;border:1px solid #e5e7eb;background-color:#f3f4f6;color:#9ca3af;font-size:12px;text-align:center;vertical-align:top;">—</td>`;
       }
       const key = `${shiftName}||${d}`;
       const asgs = (asgByKey.get(key) ?? []).slice().sort((a, b) =>
@@ -1377,42 +1381,28 @@ function buildFullScheduleAttachmentHtml(args: {
       const cellGaps = gapByKey.get(key) ?? [];
       const lines: string[] = [];
       for (const a of asgs) {
-        lines.push(`<div style="margin:2px 0;"><strong>${esc(a.employee_name ?? '')}</strong> <span style="color:#6b7280;">${esc(a.role)}</span></div>`);
+        lines.push(`<div style="color:#111827;"><strong>${esc(a.employee_name ?? '')}</strong> <span style="color:#6b7280;">${esc(a.role)}</span></div>`);
       }
       for (const g of cellGaps) {
         const missing = g.required_count - g.filled_count;
         for (let i = 0; i < missing; i++) {
-          lines.push(`<div style="margin:2px 0;color:#b91c1c;font-weight:600;">UNFILLED — ${esc(g.role)}</div>`);
+          lines.push(`<div style="color:#b91c1c;font-weight:bold;">UNFILLED — ${esc(g.role)}</div>`);
         }
       }
       const inner = lines.length > 0 ? lines.join('') : `<span style="color:#d1d5db;">·</span>`;
-      return `<td style="padding:8px 10px;border:1px solid #e5e7eb;font-size:12px;vertical-align:top;">${inner}</td>`;
+      return `<td style="padding:8px 10px;border:1px solid #e5e7eb;font-size:12px;text-align:left;vertical-align:top;">${inner}</td>`;
     }).join('');
     const startLabel = shiftStart.get(shiftName);
     const sub = startLabel && startLabel !== '99:99'
-      ? `<div style="font-weight:400;color:#6b7280;font-size:11px;">${esc(formatTime(startLabel))}</div>`
+      ? `<div style="font-weight:normal;color:#6b7280;font-size:11px;">${esc(formatTime(startLabel))}</div>`
       : '';
-    return `<tr><th style="padding:8px 10px;border:1px solid #d1d5db;background:#f9fafb;text-align:left;font-size:12px;vertical-align:top;white-space:nowrap;">${esc(shiftName)}${sub}</th>${cells}</tr>`;
+    return `<tr><th style="padding:8px 10px;border:1px solid #d1d5db;background-color:#f9fafb;color:#111827;text-align:left;font-size:12px;font-weight:bold;vertical-align:top;">${esc(shiftName)}${sub}</th>${cells}</tr>`;
   }).join('');
 
-  const emptyNote = shiftNames.length === 0
-    ? `<p style="color:#6b7280;">No shifts are on the schedule for this week.</p>`
-    : '';
-
-  return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>${esc(companyName)} Schedule — ${esc(weekLabel)}</title></head>
-<body style="font-family:Arial,Helvetica,sans-serif;margin:0;padding:20px;color:#111827;background:#ffffff;">
-<h1 style="font-size:20px;margin:0 0 4px;">${esc(companyName)} — Full Schedule</h1>
-<p style="margin:0 0 16px;color:#6b7280;font-size:14px;">Week of ${esc(weekLabel)} · everyone, every position</p>
-${emptyNote}
-<div style="overflow-x:auto;">
-<table style="border-collapse:collapse;width:100%;min-width:680px;">
-<thead><tr><th style="padding:8px 10px;border:1px solid #d1d5db;background:#1f2937;color:#f9fafb;text-align:left;font-size:12px;">Shift</th>${headerCells}</tr></thead>
+  return `<table style="border-collapse:collapse;width:100%;font-family:Arial,Helvetica,sans-serif;">
+<thead><tr><th style="padding:8px 10px;border:1px solid #d1d5db;background-color:#1f2937;color:#f9fafb;text-align:left;font-size:12px;font-weight:bold;">Shift</th>${headerCells}</tr></thead>
 <tbody>${bodyRows}</tbody>
-</table>
-</div>
-<p style="margin:16px 0 0;color:#9ca3af;font-size:12px;">Positions in grey next to each name. <span style="color:#b91c1c;font-weight:600;">UNFILLED</span> marks an open slot. — ${esc(companyName)}</p>
-</body></html>`;
+</table>`;
 }
 
 export async function distributeScheduleCore(
@@ -1445,21 +1435,15 @@ export async function distributeScheduleCore(
   const aegisSmsChannel = (channelRes.data as { channel_value: string } | null)?.channel_value ?? null;
   const employees = (empRes.data ?? []) as Pick<Employee, 'id' | 'name' | 'contact_email' | 'contact_phone'>[];
 
-  // Full all-staff week grid, rendered once and attached to every employee's
-  // email so each person can see the whole week, not just their own shifts.
-  const fullScheduleHtml = buildFullScheduleAttachmentHtml({
+  // Full all-staff week grid, rendered once as an email-safe inline <table>
+  // fragment and embedded in every employee's email body so each person can see
+  // the whole week, not just their own shifts. (Previously sent as an .html
+  // attachment, which Gmail renders as raw source instead of showing the grid.)
+  const teamGridHtml = buildFullScheduleGridHtml({
     schedData,
     weekStart: scheduleRow.week_start,
     weekEnd: scheduleRow.week_end,
-    companyName,
-    weekLabel,
   });
-  const scheduleAttachment: EmailAttachment = {
-    filename: `Schedule_${scheduleRow.week_start}.html`,
-    content: fullScheduleHtml,
-    type: 'text/html',
-    disposition: 'attachment',
-  };
 
   let emailed = 0;
   let texted = 0;
@@ -1521,7 +1505,10 @@ export async function distributeScheduleCore(
 <p style="margin:0 0 16px;line-height:1.5;">${greetingLine}</p>
 <p style="margin:0 0 18px;line-height:1.5;color:#374151;">${intro}</p>
 ${shiftTable}
-<p style="margin:0 0 4px;line-height:1.5;color:#374151;">If anything here doesn't look right, just reply to this email or reach out to your manager — we'll get it fixed.</p>
+<h3 style="margin:26px 0 10px;font-size:16px;color:#111827;">Here's the whole team's week:</h3>
+${teamGridHtml}
+<p style="margin:8px 0 0;line-height:1.5;color:#9ca3af;font-size:12px;">Positions are in grey next to each name. <span style="color:#b91c1c;font-weight:bold;">UNFILLED</span> marks an open slot.</p>
+<p style="margin:20px 0 4px;line-height:1.5;color:#374151;">If anything here doesn't look right, just reply to this email or reach out to your manager — we'll get it fixed.</p>
 <p style="margin:18px 0 0;color:#6b7280;">See you this week,<br>${companyName}</p>
 </body></html>`;
 
@@ -1537,7 +1524,6 @@ ${shiftTable}
           text,
           html,
           company_id: companyId,
-          attachments: [scheduleAttachment],
         });
         emailed++;
         empEmailed = true;

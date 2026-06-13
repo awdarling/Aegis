@@ -56,7 +56,10 @@ vi.mock('../../ai/claude', () => ({ withAnthropicRetry: vi.fn() }));
 import {
   buildAvailabilityManagerEmail,
   applyCustomAvailabilityDecision,
+  isRotatingAvailabilityRequest,
+  startOfWeekSunday,
   type AvailabilitySlot,
+  type RotationSpec,
 } from '../employee-onboarding';
 
 const COMPANY_ID = '00000000-0000-0000-0000-000000000001';
@@ -169,5 +172,102 @@ describe('applyCustomAvailabilityDecision', () => {
     expect(body).toMatch(/wasn't approved/i);
     expect(body).not.toMatch(/homebase/i);
     expect(body).not.toMatch(/https?:\/\//);
+  });
+});
+
+// ── Rotating ("every other week") custom availability ─────────────────────────
+const ROTATION: RotationSpec = {
+  cycle_weeks: 2,
+  cycle_start_date: '2026-06-07',
+  weeks: [
+    { week: 1, days: [{ day_of_week: 6, start_time: '09:00', end_time: '17:00' }] },
+    { week: 2, days: [] },
+  ],
+  end_date: null,
+};
+
+describe('rotating availability — pure helpers', () => {
+  it('detects rotating phrasings, not ordinary changes', () => {
+    expect(isRotatingAvailabilityRequest('I can only work every other week')).toBe(true);
+    expect(isRotatingAvailabilityRequest('week on week off')).toBe(true);
+    expect(isRotatingAvailabilityRequest('alternating weekends')).toBe(true);
+    expect(isRotatingAvailabilityRequest('I can work mornings on Mondays')).toBe(false);
+    expect(isRotatingAvailabilityRequest("I can't work Wednesdays")).toBe(false);
+  });
+
+  it('anchors the cycle to the Sunday of the week', () => {
+    // 2026-06-13 is a Saturday → the Sunday on/before is 2026-06-07.
+    expect(startOfWeekSunday('2026-06-13')).toBe('2026-06-07');
+    expect(startOfWeekSunday('2026-06-07')).toBe('2026-06-07');
+  });
+});
+
+describe('buildAvailabilityManagerEmail (rotating)', () => {
+  it('mints custom-availability tokens and renders the per-week grid', async () => {
+    const { subject, text, html } = await buildAvailabilityManagerEmail({
+      company_id: COMPANY_ID,
+      manager_email: 'sandbox-manager@quriasolutions.com',
+      manager_user_id: 'manager-user-1',
+      manager_name: 'Sandbox Manager',
+      employee_name: 'Shmubba Sploosh',
+      current_availability: [],
+      proposed_availability: [],
+      rotation: ROTATION,
+      token_payload: { employee_id: EMPLOYEE_ID, rotation: ROTATION },
+    });
+
+    const actionTypes = h.recorded
+      .filter(r => r.table === 'aegis_action_tokens' && r.op === 'insert')
+      .map(r => (r.rows as { action_type: string }).action_type)
+      .sort();
+    expect(actionTypes).toEqual(['approve_custom_availability', 'deny_custom_availability']);
+
+    expect(subject).toMatch(/rotating/i);
+    expect(text).toMatch(/2-week cycle/);
+    expect(html).toContain('>Approve</a>');
+    expect(html).toContain('Week 1');
+    expect(html).toContain('Week 2');
+  });
+});
+
+describe('applyCustomAvailabilityDecision (rotating)', () => {
+  const rotInput = (decision: 'approved' | 'denied') => ({
+    decision,
+    company_id: COMPANY_ID,
+    employee_id: EMPLOYEE_ID,
+    employee_name: 'Shmubba Sploosh',
+    proposed_availability: ROTATION.weeks[0].days,
+    custom_end_date: null,
+    rotation: ROTATION,
+    current_availability: [] as AvailabilitySlot[],
+    availability_raw: 'i can only work saturdays every other week',
+    decided_by: 'Sandbox Manager',
+    employee_sender: 'aegisscheduler@gmail.com',
+    employee_recipient: 'sandbox@aegis.quriasolutions.com',
+    employee_channel: 'email' as const,
+    thread_id: null,
+    raw_subject: null,
+  });
+
+  it('APPROVE inserts a type=rotating override with the cycle + per-week patterns', async () => {
+    await applyCustomAvailabilityDecision(rotInput('approved'));
+
+    const insert = h.recorded.find(r => r.table === 'custom_availability' && r.op === 'insert');
+    expect(insert).toBeDefined();
+    const row = insert!.rows as Record<string, unknown>;
+    expect(row.type).toBe('rotating');
+    expect(row.cycle_weeks).toBe(2);
+    expect(row.cycle_start_date).toBe('2026-06-07');
+    expect(row.end_date).toBeNull();
+    expect(row.patterns).toEqual([
+      { week: 1, days: [{ day_of_week: 6, start_time: '09:00', end_time: '17:00' }] },
+      { week: 2, days: [] },
+    ]);
+    // It must NOT replace the permanent availability table.
+    expect(h.recorded.some(r => r.table === 'availability')).toBe(false);
+
+    const body = h.replyMock.mock.calls[0][2] as string;
+    expect(body).toMatch(/rotating/i);
+    expect(body).not.toMatch(/homebase/i);
   });
 });

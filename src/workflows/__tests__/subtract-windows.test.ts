@@ -12,7 +12,7 @@ vi.mock('../../messaging/sms', () => ({ sendSms: vi.fn() }));
 vi.mock('../../messaging/reply', () => ({ reply: vi.fn(), sendInThreadAck: vi.fn() }));
 vi.mock('../../ai/claude', () => ({ withAnthropicRetry: vi.fn() }));
 
-import { subtractWindows, type AvailabilitySlot } from '../employee-onboarding';
+import { subtractWindows, applyNegativeRemovals, type AvailabilitySlot } from '../employee-onboarding';
 
 const slot = (day: number, start: string, end: string): AvailabilitySlot => ({ day_of_week: day, start_time: start, end_time: end });
 
@@ -65,5 +65,38 @@ describe('subtractWindows (negative availability)', () => {
       slot(5, '09:00', '21:00'),
       slot(6, '09:00', '21:00'),
     ]);
+  });
+});
+
+describe('applyNegativeRemovals (whole-day drop vs partial trim)', () => {
+  const bounds = { earliest_start: '09:00', latest_end: '21:15' };
+  const fullWeek = () => [0, 1, 2, 3, 4, 5, 6].map(d => slot(d, '09:00', '21:15'));
+
+  it('clean whole-day removal (00:00–23:59) drops Mon + Wed entirely — no sliver', () => {
+    const result = applyNegativeRemovals(fullWeek(), [slot(1, '00:00', '23:59'), slot(3, '00:00', '23:59')], bounds);
+    expect(result.map(s => s.day_of_week)).toEqual([0, 2, 4, 5, 6]);
+  });
+
+  it('IMPRECISE whole-day removal (09:00–21:00, ~9pm not 9:15pm) still drops the day — the bug fix', () => {
+    const result = applyNegativeRemovals(fullWeek(), [slot(1, '09:00', '21:00')], bounds);
+    // Monday must be GONE, not left as a 9:00pm–9:15pm sliver.
+    expect(result.some(s => s.day_of_week === 1)).toBe(false);
+    expect(result.map(s => s.day_of_week)).toEqual([0, 2, 3, 4, 5, 6]);
+  });
+
+  it('partial removal ("Monday mornings", 09:00–12:00) trims, keeps the rest of Monday', () => {
+    const result = applyNegativeRemovals(fullWeek(), [slot(1, '09:00', '12:00')], bounds);
+    expect(result.find(s => s.day_of_week === 1)).toEqual(slot(1, '12:00', '21:15'));
+  });
+
+  it('partial evening removal ("no Monday evenings", 17:00–21:15) keeps Monday daytime', () => {
+    const result = applyNegativeRemovals(fullWeek(), [slot(1, '17:00', '21:15')], bounds);
+    expect(result.find(s => s.day_of_week === 1)).toEqual(slot(1, '09:00', '17:00'));
+  });
+
+  it('subtracts from existing availability when on file (whole-day clears that day)', () => {
+    const current = [slot(1, '09:00', '17:00'), slot(3, '09:00', '17:00')];
+    const result = applyNegativeRemovals(current, [slot(1, '00:00', '23:59')], bounds);
+    expect(result).toEqual([slot(3, '09:00', '17:00')]);
   });
 });

@@ -652,7 +652,7 @@ async function parseAvailabilityIntent(
         // Same named-period rules as the positive parser.
         `Named periods (no explicit times): morning = ${bounds.earliest_start}–12:00, afternoon = 12:00–17:00, ` +
         `evening/night = 17:00–${bounds.latest_end}; clamp to ${bounds.earliest_start}–${bounds.latest_end}. ` +
-        `A whole-day negative with no period ("can't work Wednesdays") uses the full window ${bounds.earliest_start}–${bounds.latest_end} for that day. ` +
+        `A whole-day negative with no time-of-day ("can't work Wednesdays") covers the ENTIRE day — use start_time "00:00" and end_time "23:59" so the whole day is removed cleanly. ` +
         `Day words: "weekdays" = Mon–Fri; "weekends" = Sat + Sun; a plural weekday ("Mondays") = that weekday. ` +
         `Ignore any trailing date boundary like "until <date>". day_of_week: 0=Sunday..6=Saturday. Times HH:MM (24h). ` +
         `Respond ONLY with JSON (no markdown): ` +
@@ -696,6 +696,53 @@ export function subtractWindows(
     result = next;
   }
   return result.filter(s => s.start_time < s.end_time);
+}
+
+// Applies a set of "can't work" removals to a baseline availability. A removal
+// that spans the whole operating day drops that day ENTIRELY (no leftover sliver
+// from imprecise end times); a partial removal trims/splits the slot. Pure +
+// unit-tested. `bounds` is the company's operating window.
+export function applyNegativeRemovals(
+  baseline: AvailabilitySlot[],
+  removals: AvailabilitySlot[],
+  bounds: { earliest_start: string; latest_end: string }
+): AvailabilitySlot[] {
+  const toMin = (t: string): number => {
+    const [h, m] = t.split(':').map(Number);
+    return h * 60 + m;
+  };
+  const earliestMin = toMin(bounds.earliest_start);
+  const latestMin = toMin(bounds.latest_end);
+
+  const wholeDayDays = new Set<number>();
+  const partial: AvailabilitySlot[] = [];
+  for (const r of removals) {
+    // "Whole day" = starts at/before opening AND ends within an hour of close.
+    // This catches both the clean "00:00–23:59" form and an imprecise end time
+    // (e.g. 9:00pm vs a 9:15pm close), so a whole-day "can't" drops the whole day
+    // instead of leaving an end-of-day sliver. Partial windows (mornings, "after 5",
+    // etc.) start after opening, so they're never mistaken for whole-day.
+    const coversWholeDay = toMin(r.start_time) <= earliestMin && toMin(r.end_time) >= latestMin - 60;
+    if (coversWholeDay) {
+      wholeDayDays.add(r.day_of_week);
+    } else {
+      partial.push({
+        day_of_week: r.day_of_week,
+        start_time: clampTime(r.start_time, bounds.earliest_start, bounds.latest_end),
+        end_time: clampTime(r.end_time, bounds.earliest_start, bounds.latest_end),
+      });
+    }
+  }
+  const afterWholeDays = baseline.filter(s => !wholeDayDays.has(s.day_of_week));
+  // Belt-and-suspenders: drop degenerate slivers (< 15 min) that an imprecise
+  // removal window could leave behind — no real availability slot is that short.
+  return subtractWindows(afterWholeDays, partial).filter(s => slotMinutes(s) >= 15);
+}
+
+function slotMinutes(s: AvailabilitySlot): number {
+  const [sh, sm] = s.start_time.split(':').map(Number);
+  const [eh, em] = s.end_time.split(':').map(Number);
+  return (eh * 60 + em) - (sh * 60 + sm);
 }
 
 // Binary yes/no classifier — used in onboarding confirmation steps where natural
@@ -1711,21 +1758,22 @@ export async function handleUpdateAvailability(
   let proposed: AvailabilitySlot[];
   let assumedFullWeek = false;
   if (intent.mode === 'remove') {
-    const negated = intent.slots.map(clamp);
+    let baseline: AvailabilitySlot[];
     if (currentAvail.length === 0) {
       // Nothing on file → "I can't work X" reads as "available the whole operating
       // week EXCEPT X." Assume that and confirm it explicitly, so they can correct
       // it if they actually meant only a few specific days.
-      const fullWeek: AvailabilitySlot[] = [];
+      baseline = [];
       for (let d = 0; d <= 6; d++) {
-        fullWeek.push({ day_of_week: d, start_time: bounds.earliest_start, end_time: bounds.latest_end });
+        baseline.push({ day_of_week: d, start_time: bounds.earliest_start, end_time: bounds.latest_end });
       }
-      proposed = subtractWindows(fullWeek, negated).filter(s => s.start_time < s.end_time);
       assumedFullWeek = true;
     } else {
       // Availability on file → subtract precisely from what they already have.
-      proposed = subtractWindows(currentAvail, negated).filter(s => s.start_time < s.end_time);
+      baseline = currentAvail;
     }
+    // Whole-day "can't work X" drops the day entirely; partial removals trim it.
+    proposed = applyNegativeRemovals(baseline, intent.slots, bounds);
     if (proposed.length === 0) {
       await reply(
         contact,

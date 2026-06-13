@@ -12,7 +12,7 @@ vi.mock('../../messaging/sms', () => ({ sendSms: vi.fn() }));
 vi.mock('../../messaging/reply', () => ({ reply: vi.fn(), sendInThreadAck: vi.fn() }));
 vi.mock('../../ai/claude', () => ({ generateReply: vi.fn(), withAnthropicRetry: vi.fn() }));
 
-import { coerceJsonObject, isNewCoverageRequest, extractOutreachNames } from '../emergency-coverage';
+import { coerceJsonObject, isNewCoverageRequest, extractOutreachNames, swapScheduleAssignment, type ScheduleAssignment } from '../emergency-coverage';
 import { generateReply } from '../../ai/claude';
 import type { Mock } from 'vitest';
 
@@ -87,5 +87,44 @@ describe('extractOutreachNames (manager reply → who to contact)', () => {
   it('drops blank/whitespace entries defensively', async () => {
     mockReply.mockResolvedValue('{"names":["Shmubba",""," "]}');
     expect(await extractOutreachNames('Shmubba')).toEqual(['Shmubba']);
+  });
+});
+
+describe('swapScheduleAssignment (put the coverer on the schedule)', () => {
+  const a = (over: Partial<ScheduleAssignment>): ScheduleAssignment => ({
+    date: '2026-06-13', employee_id: 'absent', employee_name: 'Test Guard A',
+    shift_name: 'PM Lifeguard', role: 'Lifeguard', start_time: '15:00:00', end_time: '21:00:00', hours: 6,
+    ...over,
+  });
+
+  it('swaps the absent employee for the coverer on the matching shift', () => {
+    const before = [a({}), a({ date: '2026-06-14' })];
+    const { assignments, swapped } = swapScheduleAssignment(before, {
+      shift_date: '2026-06-13', start_time: '15:00:00',
+      absent_employee_id: 'absent', coverer_employee_id: 'cover', coverer_name: 'Shmubba Sploosh',
+    });
+    expect(swapped).toBe(true);
+    expect(assignments[0].employee_id).toBe('cover');
+    expect(assignments[0].employee_name).toBe('Shmubba Sploosh');
+    expect(assignments[0].role).toBe('Lifeguard'); // shift details unchanged
+    expect(assignments[1].employee_id).toBe('absent'); // other days untouched
+  });
+
+  it('tolerates HH:MM vs HH:MM:SS start-time formats', () => {
+    const { swapped } = swapScheduleAssignment([a({ start_time: '15:00' })], {
+      shift_date: '2026-06-13', start_time: '15:00:00',
+      absent_employee_id: 'absent', coverer_employee_id: 'cover', coverer_name: 'X',
+    });
+    expect(swapped).toBe(true);
+  });
+
+  it('does not swap when the absent employee is not on that shift/date', () => {
+    const before = [a({ employee_id: 'someone_else' })];
+    const { assignments, swapped } = swapScheduleAssignment(before, {
+      shift_date: '2026-06-13', start_time: '15:00:00',
+      absent_employee_id: 'absent', coverer_employee_id: 'cover', coverer_name: 'X',
+    });
+    expect(swapped).toBe(false);
+    expect(assignments[0].employee_id).toBe('someone_else');
   });
 });

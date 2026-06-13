@@ -12,7 +12,7 @@ vi.mock('../../messaging/sms', () => ({ sendSms: vi.fn() }));
 vi.mock('../../messaging/reply', () => ({ reply: vi.fn(), sendInThreadAck: vi.fn() }));
 vi.mock('../../ai/claude', () => ({ generateReply: vi.fn(), withAnthropicRetry: vi.fn() }));
 
-import { coerceJsonObject } from '../emergency-coverage';
+import { coerceJsonObject, isNewCoverageRequest } from '../emergency-coverage';
 
 type Details = { employee_name: string | null; shift_date: string; shift_name: string | null };
 
@@ -39,5 +39,26 @@ describe('coerceJsonObject (emergency-coverage extraction parser)', () => {
   it('returns null on genuinely unparseable text (caller then falls back to today)', () => {
     expect(coerceJsonObject<Details>('I could not understand that')).toBeNull();
     expect(coerceJsonObject<Details>('')).toBeNull();
+  });
+});
+
+describe('isNewCoverageRequest (stop a stale session swallowing a fresh call-out)', () => {
+  it('treats a fresh call-out as a new request — the reported bug', () => {
+    expect(isNewCoverageRequest("Maisey Pell can't come in today, I need coverage.")).toBe(true);
+  });
+
+  it('catches common call-out phrasings', () => {
+    expect(isNewCoverageRequest('John called in sick for Saturday')).toBe(true);
+    expect(isNewCoverageRequest('Sarah is out tomorrow, need someone to cover')).toBe(true);
+    expect(isNewCoverageRequest('can someone cover for Mike tonight')).toBe(true);
+    expect(isNewCoverageRequest('Need a replacement for the AM shift')).toBe(true);
+  });
+
+  it('does NOT match a bare name reply (those are answers to "who should I contact?")', () => {
+    expect(isNewCoverageRequest('Kori')).toBe(false);
+    expect(isNewCoverageRequest('Kori Baumann')).toBe(false);
+    expect(isNewCoverageRequest('contact Addison please')).toBe(false);
+    expect(isNewCoverageRequest('the first two')).toBe(false);
+    expect(isNewCoverageRequest('more')).toBe(false);
   });
 });

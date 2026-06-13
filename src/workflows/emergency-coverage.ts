@@ -468,6 +468,23 @@ async function extractEmergencyDetails(
   return { employee_name: null, shift_date: today, shift_name: null };
 }
 
+// Heuristic: does this manager message read as a NEW call-out / coverage
+// request rather than a reply naming who to contact? Used to stop a stale
+// "awaiting_names" session from hijacking a fresh request. Kept deliberately
+// tight — a bare name reply ("Kori", "contact Addison") must NOT match.
+export function isNewCoverageRequest(body: string): boolean {
+  const t = body.toLowerCase();
+  return (
+    /\b(can'?t|cannot|can not|unable to)\s+(come in|make it|work|be there|come)\b/.test(t) ||
+    /\bneed(s)?\s+(coverage|someone|a sub|a substitute|a replacement|to cover|cover)\b/.test(t) ||
+    /\bcall(ed|ing)?\s+(in|out)\b/.test(t) ||
+    /\bcalling in sick\b/.test(t) ||
+    /\bis\s+(out|sick)\b/.test(t) ||
+    /\bcover(ing)?\s+(for|the)\b/.test(t) ||
+    /\bno longer (available|able to (come|work))\b/.test(t)
+  );
+}
+
 async function extractOutreachNames(body: string): Promise<string[]> {
   const system =
     'Extract employee names from this manager reply about coverage outreach. ' +
@@ -1024,6 +1041,18 @@ export async function handleManagerCoverageReply(
   contact: VerifiedContact,
   session: CoverageSession
 ): Promise<void> {
+  // A leftover "awaiting_names" session must NOT swallow a brand-new coverage
+  // request. If the manager's message itself reads as a fresh call-out (rather
+  // than a name reply like "Kori" or "contact Addison"), abandon the stale
+  // session and start a new coverage flow. Without this, "Maisey can't come in,
+  // I need coverage" gets parsed as "contact Maisey" — contacting the person
+  // who's actually out.
+  if (isNewCoverageRequest(message.body)) {
+    await clearSession(contact.company_id);
+    await handleEmergencyCoverage(message, contact, {});
+    return;
+  }
+
   const names = await extractOutreachNames(message.body);
 
   // "Show me more / anyone else / additional batch" → serve the next batch from
@@ -1053,14 +1082,33 @@ export async function handleManagerCoverageReply(
   // Look up each employee by name
   const employees: Employee[] = [];
   const notFound: string[] = [];
+  const skippedCallout: string[] = [];
 
   for (const name of names) {
     const emp = await findEmployeeByName(contact.company_id, name);
-    if (emp) employees.push(emp);
-    else notFound.push(name);
+    if (!emp) {
+      notFound.push(name);
+      continue;
+    }
+    // Never contact the person who's out for their own shift.
+    if (session.callout_employee_id && emp.id === session.callout_employee_id) {
+      skippedCallout.push(emp.name);
+      continue;
+    }
+    // Avoid queueing the same person twice if the manager repeats a name.
+    if (!employees.some(e => e.id === emp.id)) employees.push(emp);
   }
 
   if (employees.length === 0) {
+    if (skippedCallout.length > 0) {
+      await reply(
+        contact,
+        message,
+        `${skippedCallout.join(', ')} is the person who's out for this shift, so I can't ask them to cover it. ` +
+          `Who else would you like me to contact? Reply "more" to see the candidate list again.`
+      );
+      return;
+    }
     await reply(
       contact,
       message,

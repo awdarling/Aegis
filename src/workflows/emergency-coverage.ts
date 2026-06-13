@@ -1490,7 +1490,13 @@ export async function handleEmployeeCoverageResponse(
           if (emp) {
             try { await notifyEmployeeShiftFilled(empOutreach, emp); } catch { /* best effort */ }
           }
-          await clearOutreach(outreach.company_id, empId);
+          // Keep the record but mark it filled (don't delete it). If this person
+          // replies late, getActiveOutreach still finds it, so the reply is
+          // handled as a coverage response ("already covered") instead of
+          // falling through to the swap workflow. The timeout poller cleans
+          // these up once the window lapses.
+          const { _memory_id: _omit, ...rest } = empOutreach;
+          await storeOutreach({ ...rest, coverage_filled: true });
         }
       }
       await clearSession(outreach.company_id);

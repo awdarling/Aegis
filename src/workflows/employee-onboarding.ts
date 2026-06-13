@@ -15,6 +15,7 @@ import { reply, sendInThreadAck } from '../messaging/reply';
 import { greeting } from '../messaging/greeting';
 import { env } from '../config/env';
 import { withAnthropicRetry } from '../ai/claude';
+import { generateActionToken } from '../lib/aegis-actions/tokens';
 import type { InboundMessage, VerifiedContact } from '../security/types';
 import type { Employee } from '../db/types';
 
@@ -1692,11 +1693,11 @@ export async function handleAvailabilityConfirmResponse(
   // than picking a single arbitrary row).
   const { data: mgrData } = await supabase
     .from('users')
-    .select('email, name')
+    .select('id, email, name')
     .eq('company_id', contact.company_id)
     .in('role', ['manager', 'owner']);
 
-  const managers = (mgrData ?? []) as { email: string; name: string }[];
+  const managers = (mgrData ?? []) as { id: string; email: string; name: string }[];
   if (managers.length === 0) {
     await reply(contact, message, `I couldn't locate a manager. Please speak with them directly.`);
     return;
@@ -1763,27 +1764,44 @@ export async function handleAvailabilityConfirmResponse(
     const emailAvailable = !!mgr.email;
     if (!smsAvailable && !emailAvailable) continue;
 
-    const managerChannel: 'sms' | 'email' = emailAvailable ? 'email' : 'sms';
-    const managerMessage: InboundMessage = {
-      sender: managerChannel === 'sms' ? managerPhone! : mgr.email,
-      recipient: managerChannel === 'sms' ? aegisSmsChannel! : '',
-      body: '',
-      channel: managerChannel,
-      raw_subject:
-        managerChannel === 'email'
-          ? `Availability update request from ${pending.employee_name}`
-          : undefined,
-    };
-    const managerContact: VerifiedContact = {
-      role: 'manager',
-      company_id: contact.company_id,
-      employee_id: null,
-      user_id: null,
-      name: mgr.name,
-      matched_identifier: managerChannel === 'sms' ? managerPhone! : mgr.email,
-      channel: managerChannel,
-    };
-    await reply(managerContact, managerMessage, `${greeting(mgr.name)}\n\n${managerBody}`);
+    if (emailAvailable) {
+      // Email managers get a real magic-link Approve / Deny email (mirrors the
+      // time-off manager email). The reply-"YES" text path stays as a fallback
+      // (the email also tells them they can reply YES/NO).
+      const { subject, text, html } = await buildAvailabilityManagerEmail({
+        company_id: contact.company_id,
+        manager_email: mgr.email,
+        manager_user_id: mgr.id ?? undefined,
+        manager_name: mgr.name,
+        employee_name: pending.employee_name,
+        current_availability: pending.current_availability,
+        proposed_availability: pending.proposed_availability,
+        // The token payload is the self-contained approval snapshot — the
+        // magic-link handler applies the decision from this alone (no dependence
+        // on the aegis_memory pending row, so a later re-submit can't strand it).
+        token_payload: approval as unknown as Record<string, unknown>,
+      });
+      await sendEmail({ to: mgr.email, subject, text, html, company_id: contact.company_id });
+    } else {
+      // SMS-only manager: buttons aren't possible over SMS, so keep the
+      // reply-"YES"/"NO" text path.
+      const managerMessage: InboundMessage = {
+        sender: managerPhone!,
+        recipient: aegisSmsChannel!,
+        body: '',
+        channel: 'sms',
+      };
+      const managerContact: VerifiedContact = {
+        role: 'manager',
+        company_id: contact.company_id,
+        employee_id: null,
+        user_id: null,
+        name: mgr.name,
+        matched_identifier: managerPhone!,
+        channel: 'sms',
+      };
+      await reply(managerContact, managerMessage, `${greeting(mgr.name)}\n\n${managerBody}`);
+    }
     notifiedCount++;
   }
 
@@ -1797,6 +1815,203 @@ export async function handleAvailabilityConfirmResponse(
     message,
     `${greeting(contact.name)}\n\nYour availability request has been sent to your manager for approval. You'll hear back soon.`
   );
+}
+
+// ── Availability manager-notify email (magic-link Approve / Deny) ──────────────
+//
+// Mirrors buildTimeOffManagerEmail: mints approve_availability / deny_availability
+// tokens and renders Approve / Deny buttons. The token payload is the full
+// approval snapshot so the Homebase /api/aegis-action dispatcher can hand it to
+// Aegis /internal/apply-availability-decision and the decision applies with no
+// dependence on server-side pending state.
+
+function escAvail(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function availMultiline(s: string): string {
+  return escAvail(s).replace(/\n/g, '<br>');
+}
+
+export async function buildAvailabilityManagerEmail(params: {
+  company_id: string;
+  manager_email: string;
+  manager_user_id?: string;
+  manager_name: string;
+  employee_name: string;
+  current_availability: AvailabilitySlot[];
+  proposed_availability: AvailabilitySlot[];
+  token_payload: Record<string, unknown>;
+}): Promise<{ subject: string; text: string; html: string }> {
+  const [approveTok, denyTok] = await Promise.all([
+    generateActionToken({
+      action_type: 'approve_availability',
+      payload: params.token_payload,
+      company_id: params.company_id,
+      issued_to_email: params.manager_email,
+      issued_to_user_id: params.manager_user_id,
+      ttl_minutes: 4320,
+    }),
+    generateActionToken({
+      action_type: 'deny_availability',
+      payload: params.token_payload,
+      company_id: params.company_id,
+      issued_to_email: params.manager_email,
+      issued_to_user_id: params.manager_user_id,
+      ttl_minutes: 4320,
+    }),
+  ]);
+
+  const currentDisplay =
+    params.current_availability.length > 0
+      ? formatAvailabilityList(params.current_availability)
+      : 'Not on file';
+  const proposedDisplay = formatAvailabilityList(params.proposed_availability);
+
+  const subject = `Availability update request from ${params.employee_name}`;
+
+  const text =
+    `${greeting(params.manager_name)}\n\n` +
+    `${params.employee_name} wants to update their availability.\n\n` +
+    `CURRENT:\n${currentDisplay}\n\nPROPOSED:\n${proposedDisplay}\n\n` +
+    `Approve: ${approveTok.url}\n\nDeny: ${denyTok.url}\n\n` +
+    `(You can also just reply YES to approve or NO to deny.)`;
+
+  const html = `<!DOCTYPE html>
+<html><head><meta charset="utf-8"></head>
+<body style="margin:0;padding:0;background:#f3f4f6;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;color:#111827;">
+<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="background:#f3f4f6;padding:24px 0;">
+  <tr><td align="center">
+    <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="640" style="max-width:640px;background:#ffffff;border-radius:8px;padding:28px;border:1px solid #e5e7eb;">
+      <tr><td style="font-size:16px;line-height:1.5;">
+        <p style="margin:0 0 14px;">${escAvail(greeting(params.manager_name))}</p>
+        <p style="margin:0 0 18px;"><strong>${escAvail(params.employee_name)}</strong> would like to update their availability.</p>
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:0 0 22px;">
+          <tr>
+            <td valign="top" width="48%" style="padding:12px 14px;background:#f9fafb;border:1px solid #e5e7eb;border-radius:6px;font-size:13px;line-height:1.5;">
+              <div style="font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:.04em;font-size:11px;margin-bottom:6px;">Current</div>
+              ${availMultiline(currentDisplay)}
+            </td>
+            <td width="4%">&nbsp;</td>
+            <td valign="top" width="48%" style="padding:12px 14px;background:#eff6ff;border:1px solid #bfdbfe;border-radius:6px;font-size:13px;line-height:1.5;">
+              <div style="font-weight:700;color:#1d4ed8;text-transform:uppercase;letter-spacing:.04em;font-size:11px;margin-bottom:6px;">Proposed</div>
+              ${availMultiline(proposedDisplay)}
+            </td>
+          </tr>
+        </table>
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin:0 auto 18px;">
+          <tr>
+            <td style="padding:0 6px;">
+              <a href="${escAvail(approveTok.url)}" style="display:inline-block;background:#059669;color:#ffffff;text-decoration:none;font-weight:700;font-size:15px;padding:12px 28px;border-radius:6px;">Approve</a>
+            </td>
+            <td style="padding:0 6px;">
+              <a href="${escAvail(denyTok.url)}" style="display:inline-block;background:#dc2626;color:#ffffff;text-decoration:none;font-weight:700;font-size:15px;padding:12px 28px;border-radius:6px;">Deny</a>
+            </td>
+          </tr>
+        </table>
+        <p style="margin:0;font-size:13px;color:#6b7280;">You can also just reply <strong>YES</strong> to approve or <strong>NO</strong> to deny.</p>
+      </td></tr>
+    </table>
+  </td></tr>
+</table>
+</body></html>`;
+
+  return { subject, text, html };
+}
+
+// ── Shared availability-decision effect (reply-"YES" AND email magic-link) ─────
+//
+// The single implementation of "apply a manager's availability approve/deny": the
+// DB write + the employee notification. Both the reply-"YES" path
+// (handleManagerAvailabilityApproval) and the email magic-link path (Aegis
+// /internal/apply-availability-decision) call this, so the two produce the
+// IDENTICAL DB effect and employee notice — no drift. The employee notice never
+// links to Homebase (BUG-4).
+export interface AvailabilityDecisionInput {
+  decision: 'approved' | 'denied';
+  company_id: string;
+  employee_id: string;
+  employee_name: string;
+  current_availability: AvailabilitySlot[];
+  proposed_availability: AvailabilitySlot[];
+  availability_raw: string;
+  decided_by?: string;          // manager name/email — recorded in the activity log
+  // Employee notify context (rebuilds their channel/thread for the decision notice):
+  employee_sender: string;
+  employee_recipient: string;
+  employee_channel: 'sms' | 'email';
+  thread_id?: string | null;
+  raw_subject?: string | null;
+}
+
+export async function applyAvailabilityDecision(input: AvailabilityDecisionInput): Promise<void> {
+  const notifyContext: PendingManagerAvailApproval = {
+    employee_id: input.employee_id,
+    employee_name: input.employee_name,
+    company_id: input.company_id,
+    current_availability: input.current_availability,
+    proposed_availability: input.proposed_availability,
+    availability_raw: input.availability_raw,
+    employee_sender: input.employee_sender,
+    employee_recipient: input.employee_recipient,
+    employee_channel: input.employee_channel,
+    thread_id: input.thread_id ?? null,
+    raw_subject: input.raw_subject ?? null,
+    expires_at: '',
+  };
+
+  if (input.decision === 'approved') {
+    // Identical to the reply-"YES" effect: replace the employee's availability
+    // rows with the proposed set.
+    await supabase.from('availability').delete().eq('employee_id', input.employee_id);
+    await supabase.from('availability').insert(
+      input.proposed_availability.map(s => ({
+        company_id: input.company_id,
+        employee_id: input.employee_id,
+        day_of_week: s.day_of_week,
+        start_time: s.start_time,
+        end_time: s.end_time,
+      }))
+    );
+
+    await logActivity({
+      company_id: input.company_id,
+      action: 'availability_updated',
+      entity_type: 'employee',
+      entity_id: input.employee_id,
+      summary: `${input.employee_name}'s availability updated via manager approval`,
+      metadata: {
+        approved_by: input.decided_by ?? 'manager',
+        previous: input.current_availability,
+        updated: input.proposed_availability,
+        raw_request: input.availability_raw,
+      },
+    });
+
+    await notifyEmployeeOfAvailabilityDecision(
+      notifyContext,
+      `Your availability update has been approved. Your new schedule reflects the change.`
+    );
+  } else {
+    await logActivity({
+      company_id: input.company_id,
+      action: 'availability_update_denied',
+      entity_type: 'employee',
+      entity_id: input.employee_id,
+      summary: `${input.employee_name}'s availability update denied by manager`,
+      metadata: { denied_by: input.decided_by ?? 'manager' },
+    });
+
+    await notifyEmployeeOfAvailabilityDecision(
+      notifyContext,
+      `Your availability update was not approved. Please speak with your manager directly if you'd like to discuss.`
+    );
+  }
 }
 
 export async function handleManagerAvailabilityApproval(
@@ -1819,52 +2034,30 @@ export async function handleManagerAvailabilityApproval(
 
   await supabase.from('aegis_memory').delete().eq('id', pending._memory_id);
 
+  // Apply the decision via the shared effect (same code the email magic-link
+  // path runs), then send the manager their confirmation. reply-"YES" stays the
+  // fallback for SMS managers and anyone who replies instead of clicking.
+  const decisionInput = {
+    company_id: pending.company_id,
+    employee_id: pending.employee_id,
+    employee_name: pending.employee_name,
+    current_availability: pending.current_availability,
+    proposed_availability: pending.proposed_availability,
+    availability_raw: pending.availability_raw,
+    decided_by: contact.name,
+    employee_sender: pending.employee_sender,
+    employee_recipient: pending.employee_recipient,
+    employee_channel: pending.employee_channel,
+    thread_id: pending.thread_id,
+    raw_subject: pending.raw_subject,
+  };
+
   if (isYes) {
-    await supabase.from('availability').delete().eq('employee_id', pending.employee_id);
-    await supabase.from('availability').insert(
-      pending.proposed_availability.map(s => ({
-        company_id: pending.company_id,
-        employee_id: pending.employee_id,
-        day_of_week: s.day_of_week,
-        start_time: s.start_time,
-        end_time: s.end_time,
-      }))
-    );
-
-    await logActivity({
-      company_id: contact.company_id,
-      action: 'availability_updated',
-      entity_type: 'employee',
-      entity_id: pending.employee_id,
-      summary: `${pending.employee_name}'s availability updated via manager approval`,
-      metadata: {
-        approved_by: contact.name,
-        previous: pending.current_availability,
-        updated: pending.proposed_availability,
-        raw_request: pending.availability_raw,
-      },
-    });
-
+    await applyAvailabilityDecision({ ...decisionInput, decision: 'approved' });
     await reply(contact, message, `${pending.employee_name}'s availability has been updated.`);
-    await notifyEmployeeOfAvailabilityDecision(
-      pending,
-      `Your availability update has been approved. Your new schedule reflects the change.`
-    );
   } else {
-    await logActivity({
-      company_id: contact.company_id,
-      action: 'availability_update_denied',
-      entity_type: 'employee',
-      entity_id: pending.employee_id,
-      summary: `${pending.employee_name}'s availability update denied by manager`,
-      metadata: { denied_by: contact.name },
-    });
-
+    await applyAvailabilityDecision({ ...decisionInput, decision: 'denied' });
     await reply(contact, message, `${pending.employee_name}'s availability update has been denied.`);
-    await notifyEmployeeOfAvailabilityDecision(
-      pending,
-      `Your availability update was not approved. Please speak with your manager directly if you'd like to discuss.`
-    );
   }
 }
 

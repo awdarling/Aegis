@@ -8,7 +8,9 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "dry-run-schedule": "ts-node --skip-project scripts/dry-run-schedule.ts",
-    "test-cascade": "ts-node --skip-project scripts/test-cascade.ts"
+    "test-cascade": "ts-node --skip-project scripts/test-cascade.ts",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "license": "ISC",
   "dependencies": {
@@ -30,6 +32,7 @@
     "@types/node": "^25.6.0",
     "nodemon": "^3.1.14",
     "ts-node": "^10.9.2",
-    "typescript": "^6.0.3"
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.8"
   }
 }

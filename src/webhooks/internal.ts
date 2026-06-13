@@ -2,6 +2,10 @@ import express, { Router, type Request, type Response } from 'express';
 import { requireInternalAuth } from '../security/internal-auth';
 import { sendDecisionNotification } from '../workflows/time-off';
 import { distributeScheduleCore } from '../workflows/schedule-build';
+import {
+  applyAvailabilityDecision,
+  type AvailabilitySlot,
+} from '../workflows/employee-onboarding';
 import { supabase } from '../db/client';
 
 // Bearer-auth-gated endpoints called by Homebase /api/aegis-action after a
@@ -43,6 +47,73 @@ internalRouter.post('/notify-to-decision', async (req: Request, res: Response) =
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[internal] notify-to-decision failed:', msg);
+    serverError(res, msg);
+  }
+});
+
+// POST /internal/apply-availability-decision
+// Called by Homebase /api/aegis-action after a manager clicks Approve/Deny on
+// the availability email. The token payload (the approval snapshot) is forwarded
+// here; we apply the SAME effect the reply-"YES" path applies (DB write +
+// employee notification) via the shared applyAvailabilityDecision.
+internalRouter.post('/apply-availability-decision', async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as Record<string, unknown>;
+
+  const decision = body.decision;
+  if (decision !== 'approved' && decision !== 'denied') {
+    badRequest(res, 'decision must be "approved" or "denied"');
+    return;
+  }
+
+  const companyId = body.company_id;
+  const employeeId = body.employee_id;
+  const employeeSender = body.employee_sender;
+  const employeeChannel = body.employee_channel;
+  const proposed = body.proposed_availability;
+
+  if (typeof companyId !== 'string' || companyId.length === 0) {
+    badRequest(res, 'company_id is required');
+    return;
+  }
+  if (typeof employeeId !== 'string' || employeeId.length === 0) {
+    badRequest(res, 'employee_id is required');
+    return;
+  }
+  if (!Array.isArray(proposed)) {
+    badRequest(res, 'proposed_availability must be an array');
+    return;
+  }
+  if (typeof employeeSender !== 'string' || employeeSender.length === 0) {
+    badRequest(res, 'employee_sender is required to notify the employee');
+    return;
+  }
+  if (employeeChannel !== 'sms' && employeeChannel !== 'email') {
+    badRequest(res, 'employee_channel must be "sms" or "email"');
+    return;
+  }
+
+  try {
+    await applyAvailabilityDecision({
+      decision,
+      company_id: companyId,
+      employee_id: employeeId,
+      employee_name: typeof body.employee_name === 'string' ? body.employee_name : 'there',
+      current_availability: Array.isArray(body.current_availability)
+        ? (body.current_availability as AvailabilitySlot[])
+        : [],
+      proposed_availability: proposed as AvailabilitySlot[],
+      availability_raw: typeof body.availability_raw === 'string' ? body.availability_raw : '',
+      decided_by: typeof body.decided_by === 'string' ? body.decided_by : undefined,
+      employee_sender: employeeSender,
+      employee_recipient: typeof body.employee_recipient === 'string' ? body.employee_recipient : '',
+      employee_channel: employeeChannel,
+      thread_id: typeof body.thread_id === 'string' ? body.thread_id : null,
+      raw_subject: typeof body.raw_subject === 'string' ? body.raw_subject : null,
+    });
+    res.json({ ok: true, decision });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[internal] apply-availability-decision failed:', msg);
     serverError(res, msg);
   }
 });

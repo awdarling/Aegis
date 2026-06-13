@@ -2064,7 +2064,11 @@ export async function handleAvailabilityConfirmResponse(
   await supabase.from('aegis_memory').delete().eq('id', pending._memory_id);
 
   if (isNo) {
-    await reply(contact, message, `No problem — availability update cancelled.`);
+    await reply(
+      contact,
+      message,
+      `No problem — I've scrapped that. To redo it, just send me the days and times you can work (or describe the rotation again) and I'll set it back up.`
+    );
     return;
   }
 

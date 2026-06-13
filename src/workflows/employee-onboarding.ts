@@ -1709,19 +1709,23 @@ export async function handleUpdateAvailability(
   });
 
   let proposed: AvailabilitySlot[];
+  let assumedFullWeek = false;
   if (intent.mode === 'remove') {
-    // Negative ("I can't work X"): start from current availability and take the
-    // stated windows away. The manager still approves before anything changes.
+    const negated = intent.slots.map(clamp);
     if (currentAvail.length === 0) {
-      await reply(
-        contact,
-        message,
-        `I don't have any availability on file for you yet, so there's nothing to take away. ` +
-          `Tell me the days and times you CAN work and I'll set that up — for example: "Monday 9am to 5pm and Friday 10am to 3pm."`
-      );
-      return;
+      // Nothing on file → "I can't work X" reads as "available the whole operating
+      // week EXCEPT X." Assume that and confirm it explicitly, so they can correct
+      // it if they actually meant only a few specific days.
+      const fullWeek: AvailabilitySlot[] = [];
+      for (let d = 0; d <= 6; d++) {
+        fullWeek.push({ day_of_week: d, start_time: bounds.earliest_start, end_time: bounds.latest_end });
+      }
+      proposed = subtractWindows(fullWeek, negated).filter(s => s.start_time < s.end_time);
+      assumedFullWeek = true;
+    } else {
+      // Availability on file → subtract precisely from what they already have.
+      proposed = subtractWindows(currentAvail, negated).filter(s => s.start_time < s.end_time);
     }
-    proposed = subtractWindows(currentAvail, intent.slots.map(clamp)).filter(s => s.start_time < s.end_time);
     if (proposed.length === 0) {
       await reply(
         contact,
@@ -1776,9 +1780,22 @@ export async function handleUpdateAvailability(
   });
 
   const proposedDisplay = formatAvailabilityList(proposed);
-  const confirmBody = customEndDate
-    ? `Got it — through ${formatDateRange(customEndDate, customEndDate)}, you'd be available:\n${proposedDisplay}\nAfter that you'd go back to your normal availability. I'll send this to your manager to approve. Is that right? Reply YES or NO.`
-    : `You want to change your availability to:\n${proposedDisplay}\nI'll send this to your manager for approval. Is that correct? Reply YES or NO.`;
+  let confirmBody: string;
+  if (assumedFullWeek) {
+    // We inferred "available the whole week except what you can't do" because
+    // nothing was on file — say so plainly so they can catch a wrong assumption.
+    const tail = customEndDate
+      ? ` This would run through ${formatDateRange(customEndDate, customEndDate)}, then back to normal.`
+      : '';
+    confirmBody =
+      `You don't have any availability on file yet, so I'm reading that as: you can work your usual hours every day EXCEPT what you mentioned.${tail}\n\n` +
+      `Here's what I'd set:\n${proposedDisplay}\n\n` +
+      `Reply YES to send it to your manager — or NO to redo it, then just tell me the exact days and times you CAN work.`;
+  } else if (customEndDate) {
+    confirmBody = `Got it — through ${formatDateRange(customEndDate, customEndDate)}, you'd be available:\n${proposedDisplay}\nAfter that you'd go back to your normal availability. I'll send this to your manager to approve. Is that right? Reply YES or NO.`;
+  } else {
+    confirmBody = `You want to change your availability to:\n${proposedDisplay}\nI'll send this to your manager for approval. Is that correct? Reply YES or NO.`;
+  }
   await reply(contact, message, confirmBody);
 }
 

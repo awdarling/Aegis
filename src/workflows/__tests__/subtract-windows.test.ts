@@ -52,4 +52,18 @@ describe('subtractWindows (negative availability)', () => {
     const remove = [slot(1, '09:00', '21:00')];
     expect(subtractWindows(current, remove)).toEqual([]);
   });
+
+  it('full-week default: "can\'t work Mon & Wed" with nothing on file → available the other 5 days', () => {
+    // Mirrors the handler\'s empty-availability path: start from a full operating
+    // week (all 7 days, full hours) and subtract the negated whole days.
+    const fullWeek = [0, 1, 2, 3, 4, 5, 6].map(d => slot(d, '09:00', '21:00'));
+    const remove = [slot(1, '09:00', '21:00'), slot(3, '09:00', '21:00')]; // Mon + Wed
+    expect(subtractWindows(fullWeek, remove)).toEqual([
+      slot(0, '09:00', '21:00'),
+      slot(2, '09:00', '21:00'),
+      slot(4, '09:00', '21:00'),
+      slot(5, '09:00', '21:00'),
+      slot(6, '09:00', '21:00'),
+    ]);
+  });
 });

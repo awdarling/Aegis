@@ -485,17 +485,31 @@ export function isNewCoverageRequest(body: string): boolean {
   );
 }
 
-async function extractOutreachNames(body: string): Promise<string[]> {
+export async function extractOutreachNames(body: string): Promise<string[]> {
   const system =
-    'Extract employee names from this manager reply about coverage outreach. ' +
-    'Return ONLY valid JSON: {"names":["Name1","Name2"]} or {"names":[]} if declining/no names.';
+    `You read a manager's reply to a coverage candidate list and extract which ` +
+    `employee(s) they want Aegis to contact. The reply is usually just a name or ` +
+    `two, sometimes with filler words.\n` +
+    `Rules:\n` +
+    `- Return the employee NAMES the manager wants contacted, in the order given.\n` +
+    `- A bare name on its own (e.g. "Shmubba") means contact that person.\n` +
+    `- If the manager is declining or will handle it themselves ("never mind", ` +
+    `"I'll do it", "leave it with me"), return an empty list.\n` +
+    `Respond with ONLY a JSON object — no markdown, no commentary:\n` +
+    `{"names":["Name1","Name2"]}\n` +
+    `Examples:\n` +
+    `  "Shmubba" → {"names":["Shmubba"]}\n` +
+    `  "contact Kori Baumann please" → {"names":["Kori Baumann"]}\n` +
+    `  "Addison and Mia" → {"names":["Addison","Mia"]}\n` +
+    `  "never mind, I'll handle it" → {"names":[]}`;
   const text = await generateReply(system, body, []);
-  try {
-    const parsed = JSON.parse(text) as { names: unknown };
-    return Array.isArray(parsed.names) ? (parsed.names as string[]) : [];
-  } catch {
-    return [];
+  const parsed = coerceJsonObject<{ names: unknown }>(text);
+  if (parsed && Array.isArray(parsed.names)) {
+    return (parsed.names as unknown[]).filter(
+      (n): n is string => typeof n === 'string' && n.trim().length > 0
+    );
   }
+  return [];
 }
 
 // ── Candidate pool ────────────────────────────────────────────────────────────

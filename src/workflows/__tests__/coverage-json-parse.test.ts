@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // emergency-coverage.ts reads env + builds an Anthropic client at import time —
 // mock those so importing the pure helper is side-effect-free.
@@ -12,7 +12,9 @@ vi.mock('../../messaging/sms', () => ({ sendSms: vi.fn() }));
 vi.mock('../../messaging/reply', () => ({ reply: vi.fn(), sendInThreadAck: vi.fn() }));
 vi.mock('../../ai/claude', () => ({ generateReply: vi.fn(), withAnthropicRetry: vi.fn() }));
 
-import { coerceJsonObject, isNewCoverageRequest } from '../emergency-coverage';
+import { coerceJsonObject, isNewCoverageRequest, extractOutreachNames } from '../emergency-coverage';
+import { generateReply } from '../../ai/claude';
+import type { Mock } from 'vitest';
 
 type Details = { employee_name: string | null; shift_date: string; shift_name: string | null };
 
@@ -60,5 +62,30 @@ describe('isNewCoverageRequest (stop a stale session swallowing a fresh call-out
     expect(isNewCoverageRequest('contact Addison please')).toBe(false);
     expect(isNewCoverageRequest('the first two')).toBe(false);
     expect(isNewCoverageRequest('more')).toBe(false);
+  });
+});
+
+describe('extractOutreachNames (manager reply → who to contact)', () => {
+  const mockReply = generateReply as unknown as Mock;
+  beforeEach(() => mockReply.mockReset());
+
+  it('extracts a bare name even when the model wraps it in ```json fences — the reported bug', async () => {
+    mockReply.mockResolvedValue('```json\n{"names":["Shmubba"]}\n```');
+    expect(await extractOutreachNames('Shmubba')).toEqual(['Shmubba']);
+  });
+
+  it('extracts names when the model adds preamble', async () => {
+    mockReply.mockResolvedValue('Sure thing: {"names":["Kori Baumann","Mia"]}');
+    expect(await extractOutreachNames('Kori and Mia')).toEqual(['Kori Baumann', 'Mia']);
+  });
+
+  it('returns empty list for a genuine decline', async () => {
+    mockReply.mockResolvedValue('{"names":[]}');
+    expect(await extractOutreachNames("never mind, I'll handle it")).toEqual([]);
+  });
+
+  it('drops blank/whitespace entries defensively', async () => {
+    mockReply.mockResolvedValue('{"names":["Shmubba",""," "]}');
+    expect(await extractOutreachNames('Shmubba')).toEqual(['Shmubba']);
   });
 });

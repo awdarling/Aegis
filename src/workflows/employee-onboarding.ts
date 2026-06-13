@@ -73,6 +73,26 @@ interface ShiftBounds {
   min_shift_hours: number;
 }
 
+// A rotating (e.g. "every other week") custom-availability change: a cycle of N
+// weeks, each with its own day/time pattern, anchored to a calendar week.
+export interface RotationWeek {
+  week: number; // 1-indexed week within the cycle
+  days: AvailabilitySlot[];
+}
+export interface RotationSpec {
+  cycle_weeks: number;        // length of the cycle (e.g. 2 for "every other week")
+  cycle_start_date: string;   // YYYY-MM-DD anchor — the start of "week 1"
+  weeks: RotationWeek[];
+  end_date?: string | null;   // optional YYYY-MM-DD when the rotation stops
+}
+
+// Human-readable per-week grid for confirmations + the manager email.
+export function formatRotationWeeks(rotation: RotationSpec): string {
+  return rotation.weeks
+    .map(w => `Week ${w.week}:\n${w.days.length ? formatAvailabilityList(w.days) : '  (off — not available)'}`)
+    .join('\n\n');
+}
+
 interface PendingAvailUpdate {
   employee_id: string;
   employee_name: string;
@@ -85,6 +105,8 @@ interface PendingAvailUpdate {
   // Set (YYYY-MM-DD) when this is a TEMPORARY, date-limited custom-availability
   // change ("until <date>"); absent/null for a normal permanent availability change.
   custom_end_date?: string | null;
+  // Set when this is a ROTATING custom-availability change ("every other week").
+  rotation?: RotationSpec | null;
   expires_at: string;
 }
 
@@ -105,6 +127,7 @@ interface PendingManagerAvailApproval {
   thread_id?: string | null;
   raw_subject?: string | null;
   custom_end_date?: string | null;
+  rotation?: RotationSpec | null;
   expires_at: string;
 }
 
@@ -662,6 +685,74 @@ async function parseAvailabilityIntent(
   if (!parsed) return { mode: 'set', slots: [] };
   const mode: 'set' | 'remove' = parsed.mode === 'remove' ? 'remove' : 'set';
   return { mode, slots: parsed.slots ?? [] };
+}
+
+// Does this message describe a ROTATING availability change (a multi-week
+// cycle), e.g. "every other week"? Kept tight so ordinary changes don't match.
+export function isRotatingAvailabilityRequest(body: string): boolean {
+  return /\b(every other \w+|alternating \w+|week on,?\s*week off|bi-?weekly|every (2|two) weeks?|on a rotation|rotating\b|odd weeks?|even weeks?|week [ab]\b)\b/i.test(body);
+}
+
+// Parses a rotating availability message into a cycle of weeks, each with the
+// day/time windows the employee CAN work that week. Best-effort; the employee
+// confirms the parsed grid before anything is saved.
+async function parseRotatingAvailability(
+  message: string,
+  bounds: ShiftBounds
+): Promise<{ cycle_weeks: number; weeks: RotationWeek[]; end_date: string | null } | null> {
+  const response = await withAnthropicRetry(() =>
+    client.messages.create({
+      model: MODEL,
+      max_tokens: 700,
+      system:
+        `You are parsing an employee's ROTATING availability message — their availability repeats on a cycle of weeks ` +
+        `(e.g. "every other week" = a 2-week cycle). Determine the cycle length and, for EACH week in the cycle, ` +
+        `the day+time windows the employee CAN work that week.\n` +
+        `- cycle_weeks: the number of weeks in the cycle (2 for "every other week"/"alternating"/"week on week off").\n` +
+        `- weeks: one entry per week, numbered 1..cycle_weeks. Week 1 is the FIRST/THIS week, week 2 the next, etc.\n` +
+        `- For "week on, week off" style: the "on" week lists the days they can work (full hours ${bounds.earliest_start}–${bounds.latest_end}); ` +
+        `the "off" week has an empty days array.\n` +
+        `- Named periods (no explicit times): morning = ${bounds.earliest_start}–12:00, afternoon = 12:00–17:00, ` +
+        `evening/night = 17:00–${bounds.latest_end}; clamp to ${bounds.earliest_start}–${bounds.latest_end}.\n` +
+        `- Day words: "weekdays" = Mon–Fri; "weekends" = Sat + Sun; a plural weekday ("Mondays") = that weekday. day_of_week: 0=Sunday..6=Saturday. Times HH:MM (24h).\n` +
+        `- If the message includes an end boundary ("until <date>"), set end_date to YYYY-MM-DD, else null.\n` +
+        `Respond ONLY with JSON (no markdown): ` +
+        `{ "cycle_weeks": 2, "weeks": [ { "week": 1, "days": [ { "day_of_week": 0, "start_time": "HH:MM", "end_time": "HH:MM" } ] }, { "week": 2, "days": [] } ], "end_date": "YYYY-MM-DD" | null }. ` +
+        `If nothing clear can be parsed: { "cycle_weeks": 0, "weeks": [], "end_date": null }.`,
+      messages: [{ role: 'user', content: message }],
+    })
+  );
+
+  const text = response.content[0].type === 'text' ? response.content[0].text : '';
+  const parsed = coerceJsonObject<{ cycle_weeks?: number; weeks?: { week?: number; days?: AvailabilitySlot[] }[]; end_date?: string | null }>(text);
+  if (!parsed || !parsed.cycle_weeks || parsed.cycle_weeks < 2 || !Array.isArray(parsed.weeks) || parsed.weeks.length === 0) {
+    return null;
+  }
+
+  const clamp = (s: AvailabilitySlot): AvailabilitySlot => ({
+    day_of_week: s.day_of_week,
+    start_time: clampTime(s.start_time, bounds.earliest_start, bounds.latest_end),
+    end_time: clampTime(s.end_time, bounds.earliest_start, bounds.latest_end),
+  });
+
+  const weeks: RotationWeek[] = parsed.weeks.map((w, i) => ({
+    week: typeof w.week === 'number' ? w.week : i + 1,
+    days: (w.days ?? []).map(clamp).filter(s => s.start_time < s.end_time),
+  }));
+
+  const endRaw = typeof parsed.end_date === 'string' ? parsed.end_date.trim() : '';
+  const end_date = /^\d{4}-\d{2}-\d{2}$/.test(endRaw) ? endRaw : null;
+
+  return { cycle_weeks: parsed.cycle_weeks, weeks, end_date };
+}
+
+// The Sunday on/before a given YYYY-MM-DD — the anchor for a rotation cycle so
+// "week 1" lines up with a calendar week boundary.
+export function startOfWeekSunday(dateStr: string): string {
+  const d = new Date(dateStr + 'T12:00:00Z');
+  const dow = d.getUTCDay(); // 0=Sun
+  d.setUTCDate(d.getUTCDate() - dow);
+  return d.toISOString().slice(0, 10);
 }
 
 // Pure: subtract a set of "can't work" windows from the employee's current
@@ -1793,6 +1884,69 @@ export async function handleUpdateAvailability(
     .eq('employee_id', employeeId);
 
   const currentAvail = (currentData ?? []) as AvailabilitySlot[];
+
+  // ROTATING ("every other week") custom availability is its own path: parse the
+  // multi-week cycle, anchor it to this calendar week, and confirm the grid
+  // before sending to the manager. Falls through to the normal parser otherwise.
+  if (isRotatingAvailabilityRequest(message.body)) {
+    const parsedRotation = await parseRotatingAvailability(message.body, bounds);
+    if (!parsedRotation || parsedRotation.weeks.every(w => w.days.length === 0)) {
+      await reply(
+        contact,
+        message,
+        `It sounds like your availability rotates week to week, but I couldn't pin down the pattern. ` +
+          `Try describing each week, e.g. "Week one I can work mornings; week two I can only work weekends."`
+      );
+      return;
+    }
+
+    const anchor = startOfWeekSunday(new Date().toISOString().slice(0, 10));
+    const rotation: RotationSpec = {
+      cycle_weeks: parsedRotation.cycle_weeks,
+      cycle_start_date: anchor,
+      weeks: parsedRotation.weeks,
+      end_date: parsedRotation.end_date,
+    };
+
+    const pendingRot: PendingAvailUpdate = {
+      employee_id: employeeId,
+      employee_name: contact.name,
+      company_id: contact.company_id,
+      current_availability: currentAvail,
+      proposed_availability: rotation.weeks[0]?.days ?? [],
+      availability_raw: message.body,
+      employee_sender: message.sender,
+      employee_recipient: message.recipient,
+      custom_end_date: null,
+      rotation,
+      expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+    };
+
+    await supabase
+      .from('aegis_memory')
+      .delete()
+      .eq('company_id', contact.company_id)
+      .eq('source', availConfirmSource(employeeId));
+    await supabase.from('aegis_memory').insert({
+      company_id: contact.company_id,
+      memory_type: 'observation',
+      source: availConfirmSource(employeeId),
+      content: JSON.stringify(pendingRot),
+    });
+
+    const endTail = rotation.end_date
+      ? ` This rotation would run until ${formatDateRange(rotation.end_date, rotation.end_date)}.`
+      : '';
+    await reply(
+      contact,
+      message,
+      `Got it — a rotating schedule on a ${rotation.cycle_weeks}-week cycle, starting the week of ${formatDateRange(anchor, anchor)}:\n\n` +
+        `${formatRotationWeeks(rotation)}\n\n` +
+        `Then it repeats from week 1.${endTail}\n\nReply YES to send this to your manager, or NO to redo it.`
+    );
+    return;
+  }
+
   const intent = await parseAvailabilityIntent(message.body, bounds);
 
   const clamp = (s: AvailabilitySlot): AvailabilitySlot => ({
@@ -1971,12 +2125,18 @@ export async function handleAvailabilityConfirmResponse(
   // A date-limited request reads as a TEMPORARY override through a date, then
   // back to normal; a permanent change reads as a plain availability update.
   const customEndDate = approval.custom_end_date ?? null;
-  const headline = customEndDate
+  const rotation = approval.rotation ?? null;
+  const headline = rotation
+    ? `${pending.employee_name} wants a rotating availability change (a ${rotation.cycle_weeks}-week cycle, starting the week of ${formatDateRange(rotation.cycle_start_date, rotation.cycle_start_date)}).`
+    : customEndDate
     ? `${pending.employee_name} wants a temporary availability change through ${formatDateRange(customEndDate, customEndDate)} (then back to normal).`
     : `${pending.employee_name} wants to update their availability.`;
+  const proposedBlock = rotation
+    ? `PROPOSED ROTATION:\n${formatRotationWeeks(rotation)}`
+    : `CURRENT:\n${currentDisplay}\n\nPROPOSED:\n${proposedDisplay}`;
   const managerBody =
     `${headline}\n\n` +
-    `CURRENT:\n${currentDisplay}\n\nPROPOSED:\n${proposedDisplay}\n\n` +
+    `${proposedBlock}\n\n` +
     `Reply YES to approve or NO to deny.`;
 
   // Email-first per manager; SMS only when a manager has no email but has a
@@ -2008,6 +2168,7 @@ export async function handleAvailabilityConfirmResponse(
         current_availability: pending.current_availability,
         proposed_availability: pending.proposed_availability,
         custom_end_date: customEndDate,
+        rotation,
         // The token payload is the self-contained approval snapshot — the
         // magic-link handler applies the decision from this alone (no dependence
         // on the aegis_memory pending row, so a later re-submit can't strand it).
@@ -2082,9 +2243,13 @@ export async function buildAvailabilityManagerEmail(params: {
   // request: the buttons mint approve/deny_custom_availability and the copy says
   // "through <date>, then back to normal".
   custom_end_date?: string | null;
+  // Set for a ROTATING request — rendered as a per-week grid; also mints the
+  // custom-availability tokens (same buttons as date-limited).
+  rotation?: RotationSpec | null;
   token_payload: Record<string, unknown>;
 }): Promise<{ subject: string; text: string; html: string }> {
-  const isCustom = !!params.custom_end_date;
+  const isRotating = !!params.rotation;
+  const isCustom = !!params.custom_end_date || isRotating;
   const throughLabel = params.custom_end_date
     ? formatDateRange(params.custom_end_date, params.custom_end_date)
     : '';
@@ -2111,16 +2276,29 @@ export async function buildAvailabilityManagerEmail(params: {
     params.current_availability.length > 0
       ? formatAvailabilityList(params.current_availability)
       : 'Not on file';
-  const proposedDisplay = formatAvailabilityList(params.proposed_availability);
+  const rotationEndTail = params.rotation?.end_date
+    ? ` until ${formatDateRange(params.rotation.end_date, params.rotation.end_date)}`
+    : '';
+  const proposedDisplay = isRotating
+    ? formatRotationWeeks(params.rotation!)
+    : formatAvailabilityList(params.proposed_availability);
 
-  const subject = isCustom
+  const subject = isRotating
+    ? `Rotating availability request from ${params.employee_name}`
+    : isCustom
     ? `Temporary availability request from ${params.employee_name} (through ${throughLabel})`
     : `Availability update request from ${params.employee_name}`;
 
-  const intro = isCustom
+  const intro = isRotating
+    ? `${params.employee_name} wants a rotating availability change — a ${params.rotation!.cycle_weeks}-week cycle starting the week of ${formatDateRange(params.rotation!.cycle_start_date, params.rotation!.cycle_start_date)}${rotationEndTail}, then repeating.`
+    : isCustom
     ? `${params.employee_name} wants a temporary availability change through ${throughLabel}, then back to normal.`
     : `${params.employee_name} wants to update their availability.`;
-  const proposedHeading = isCustom ? `AVAILABLE THROUGH ${throughLabel.toUpperCase()}` : 'PROPOSED';
+  const proposedHeading = isRotating
+    ? 'PROPOSED ROTATION'
+    : isCustom
+    ? `AVAILABLE THROUGH ${throughLabel.toUpperCase()}`
+    : 'PROPOSED';
 
   const text =
     `${greeting(params.manager_name)}\n\n` +
@@ -2274,7 +2452,8 @@ export interface CustomAvailabilityDecisionInput {
   employee_id: string;
   employee_name: string;
   proposed_availability: AvailabilitySlot[];  // days/times available DURING the override
-  custom_end_date: string;                     // YYYY-MM-DD — when the override expires
+  custom_end_date: string | null;             // YYYY-MM-DD when a date_limited override expires; null for an open-ended rotation
+  rotation?: RotationSpec | null;              // set for a ROTATING override
   current_availability: AvailabilitySlot[];
   availability_raw: string;
   decided_by?: string;
@@ -2299,19 +2478,62 @@ export async function applyCustomAvailabilityDecision(input: CustomAvailabilityD
     thread_id: input.thread_id ?? null,
     raw_subject: input.raw_subject ?? null,
     custom_end_date: input.custom_end_date,
+    rotation: input.rotation ?? null,
     expires_at: '',
   };
-  const throughLabel = formatDateRange(input.custom_end_date, input.custom_end_date);
+  const throughLabel = input.custom_end_date
+    ? formatDateRange(input.custom_end_date, input.custom_end_date)
+    : '';
 
   if (input.decision === 'approved') {
-    // Same write the Employees tab + Soteria do: switch off any existing active
-    // override for this employee, then insert the new date-limited one.
+    // Switch off any existing active override for this employee, then insert the
+    // new one (same write the Employees tab + Soteria do).
     await supabase
       .from('custom_availability')
       .update({ active: false })
       .eq('employee_id', input.employee_id)
       .eq('company_id', input.company_id);
 
+    // ROTATING override: a multi-week cycle anchored to cycle_start_date.
+    if (input.rotation) {
+      const rot = input.rotation;
+      const patterns = rot.weeks.map(w => ({
+        week: w.week,
+        days: w.days.map(s => ({ day_of_week: s.day_of_week, start_time: s.start_time, end_time: s.end_time })),
+      }));
+      await supabase.from('custom_availability').insert({
+        company_id: input.company_id,
+        employee_id: input.employee_id,
+        type: 'rotating',
+        end_date: rot.end_date ?? null,
+        cycle_weeks: rot.cycle_weeks,
+        cycle_start_date: rot.cycle_start_date,
+        patterns,
+        active: true,
+      });
+      await logActivity({
+        company_id: input.company_id,
+        action: 'custom_availability_set',
+        entity_type: 'custom_availability',
+        entity_id: input.employee_id,
+        summary: `${input.decided_by ?? 'A manager'} approved ${input.employee_name}'s rotating availability (${rot.cycle_weeks}-week cycle)`,
+        metadata: {
+          approved_by: input.decided_by ?? 'manager',
+          type: 'rotating',
+          cycle_weeks: rot.cycle_weeks,
+          cycle_start_date: rot.cycle_start_date,
+          patterns,
+          raw_request: input.availability_raw,
+        },
+      });
+      await notifyEmployeeOfAvailabilityDecision(
+        notifyContext,
+        `Your rotating availability is approved — it's set on a ${rot.cycle_weeks}-week cycle${rot.end_date ? ` through ${formatDateRange(rot.end_date, rot.end_date)}` : ''}.`
+      );
+      return;
+    }
+
+    // DATE-LIMITED override.
     const patterns = input.proposed_availability.map(s => ({
       day_of_week: s.day_of_week,
       start_time: s.start_time,
@@ -2353,13 +2575,13 @@ export async function applyCustomAvailabilityDecision(input: CustomAvailabilityD
       action: 'custom_availability_denied',
       entity_type: 'custom_availability',
       entity_id: input.employee_id,
-      summary: `${input.decided_by ?? 'A manager'} denied ${input.employee_name}'s temporary availability change`,
-      metadata: { denied_by: input.decided_by ?? 'manager', end_date: input.custom_end_date },
+      summary: `${input.decided_by ?? 'A manager'} denied ${input.employee_name}'s ${input.rotation ? 'rotating' : 'temporary'} availability change`,
+      metadata: { denied_by: input.decided_by ?? 'manager', end_date: input.custom_end_date, rotating: !!input.rotation },
     });
 
     await notifyEmployeeOfAvailabilityDecision(
       notifyContext,
-      `Your temporary availability change wasn't approved. Please speak with your manager directly if you'd like to discuss.`
+      `Your availability change wasn't approved. Please speak with your manager directly if you'd like to discuss.`
     );
   }
 }
@@ -2403,8 +2625,12 @@ export async function handleManagerAvailabilityApproval(
   };
 
   const customEndDate = pending.custom_end_date ?? null;
+  const rotation = pending.rotation ?? null;
   if (isYes) {
-    if (customEndDate) {
+    if (rotation) {
+      await applyCustomAvailabilityDecision({ ...decisionInput, custom_end_date: customEndDate, rotation, decision: 'approved' });
+      await reply(contact, message, `${pending.employee_name}'s rotating availability is set (${rotation.cycle_weeks}-week cycle).`);
+    } else if (customEndDate) {
       await applyCustomAvailabilityDecision({ ...decisionInput, custom_end_date: customEndDate, decision: 'approved' });
       await reply(contact, message, `${pending.employee_name}'s temporary availability is set through ${formatDateRange(customEndDate, customEndDate)}.`);
     } else {
@@ -2412,7 +2638,10 @@ export async function handleManagerAvailabilityApproval(
       await reply(contact, message, `${pending.employee_name}'s availability has been updated.`);
     }
   } else {
-    if (customEndDate) {
+    if (rotation) {
+      await applyCustomAvailabilityDecision({ ...decisionInput, custom_end_date: customEndDate, rotation, decision: 'denied' });
+      await reply(contact, message, `${pending.employee_name}'s rotating availability change has been denied.`);
+    } else if (customEndDate) {
       await applyCustomAvailabilityDecision({ ...decisionInput, custom_end_date: customEndDate, decision: 'denied' });
       await reply(contact, message, `${pending.employee_name}'s temporary availability change has been denied.`);
     } else {

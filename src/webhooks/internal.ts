@@ -6,6 +6,7 @@ import {
   applyAvailabilityDecision,
   applyCustomAvailabilityDecision,
   type AvailabilitySlot,
+  type RotationSpec,
 } from '../workflows/employee-onboarding';
 import { supabase } from '../db/client';
 
@@ -139,6 +140,13 @@ internalRouter.post('/apply-custom-availability-decision', async (req: Request, 
   const employeeChannel = body.employee_channel;
   const proposed = body.proposed_availability;
   const customEndDate = body.custom_end_date;
+  const rotationRaw = body.rotation && typeof body.rotation === 'object'
+    ? (body.rotation as { cycle_weeks?: unknown; cycle_start_date?: unknown; weeks?: unknown })
+    : null;
+  const isRotating = !!rotationRaw
+    && typeof rotationRaw.cycle_weeks === 'number'
+    && typeof rotationRaw.cycle_start_date === 'string'
+    && Array.isArray(rotationRaw.weeks);
 
   if (typeof companyId !== 'string' || companyId.length === 0) {
     badRequest(res, 'company_id is required');
@@ -148,13 +156,17 @@ internalRouter.post('/apply-custom-availability-decision', async (req: Request, 
     badRequest(res, 'employee_id is required');
     return;
   }
-  if (typeof customEndDate !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(customEndDate)) {
-    badRequest(res, 'custom_end_date is required (YYYY-MM-DD)');
-    return;
-  }
-  if (!Array.isArray(proposed)) {
-    badRequest(res, 'proposed_availability must be an array');
-    return;
+  // A date-limited override needs custom_end_date + a proposed list. A rotating
+  // override carries its pattern in `rotation` instead, so neither is required.
+  if (!isRotating) {
+    if (typeof customEndDate !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(customEndDate)) {
+      badRequest(res, 'custom_end_date is required (YYYY-MM-DD) unless a rotation is provided');
+      return;
+    }
+    if (!Array.isArray(proposed)) {
+      badRequest(res, 'proposed_availability must be an array');
+      return;
+    }
   }
   if (typeof employeeSender !== 'string' || employeeSender.length === 0) {
     badRequest(res, 'employee_sender is required to notify the employee');
@@ -171,8 +183,9 @@ internalRouter.post('/apply-custom-availability-decision', async (req: Request, 
       company_id: companyId,
       employee_id: employeeId,
       employee_name: typeof body.employee_name === 'string' ? body.employee_name : 'there',
-      proposed_availability: proposed as AvailabilitySlot[],
-      custom_end_date: customEndDate,
+      proposed_availability: Array.isArray(proposed) ? (proposed as AvailabilitySlot[]) : [],
+      custom_end_date: typeof customEndDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(customEndDate) ? customEndDate : null,
+      rotation: isRotating ? (rotationRaw as unknown as RotationSpec) : null,
       current_availability: Array.isArray(body.current_availability)
         ? (body.current_availability as AvailabilitySlot[])
         : [],

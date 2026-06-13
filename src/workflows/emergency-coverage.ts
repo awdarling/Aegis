@@ -2,6 +2,7 @@ import { supabase } from '../db/client';
 import { logActivity } from '../logger/activity-log';
 import { reply } from '../messaging/reply';
 import { sendSms } from '../messaging/sms';
+import { sendEmail } from '../messaging/email';
 import { greeting } from '../messaging/greeting';
 import { generateReply } from '../ai/claude';
 import { getSpecialNotes } from './special-notes';
@@ -71,7 +72,24 @@ export interface CoverageSession {
   coverage_filled: boolean;
   covered_by_employee_id: string | null;
   urgency_window_minutes: number;
+  // The full engine-ranked candidate pool + how many have been shown, so the
+  // manager can ask for "more" (additional batch) without recomputing.
+  candidate_pool?: PoolCandidate[];
+  shown_count?: number;
   expires_at: string;
+}
+
+// Lightweight, serializable candidate row stored on the session for additional batches.
+export interface PoolCandidate {
+  employee_id: string;
+  name: string;
+  primary_role: string;
+  phone: string | null;
+  current_weekly_hours: number;
+  shift_hours: number;
+  would_exceed_max: boolean;
+  max_weekly_hours: number;
+  tier: 1 | 2 | 3;
 }
 
 export interface ActiveOutreach {
@@ -81,8 +99,12 @@ export interface ActiveOutreach {
   shift_date: string;
   shift_info: ShiftInfo;
   callout_employee_name: string;
-  aegis_sms_channel: string;
-  employee_phone: string;
+  aegis_sms_channel: string | null;
+  employee_phone: string | null;
+  // The channel the outreach was sent on + the employee's email, so "shift filled"
+  // notices reach email-contacted employees too (not just SMS).
+  employee_channel: 'sms' | 'email';
+  employee_email: string | null;
   manager_contact: string;
   manager_channel: 'sms' | 'email';
   manager_sender: string;
@@ -663,27 +685,36 @@ function managerReplyTarget(outreach: ActiveOutreach): { contact: VerifiedContac
 export async function dispatchOutreach(params: {
   employee: Employee;
   session: CoverageSession;
-  aegisSmsNumber: string;
+  aegisSmsNumber: string | null;
 }): Promise<{ sent: true } | { sent: false; reason: string }> {
   const { employee, session, aegisSmsNumber } = params;
 
-  if (!employee.contact_phone) {
-    return { sent: false, reason: `${employee.name} has no phone number on file` };
-  }
-
   const dateStr = formatDisplayDate(session.shift_date);
   const si = session.shift_info;
+  const body =
+    `${greeting(employee.name)} this is Aegis. ` +
+    `${session.callout_employee_name} is out and we need coverage for the ` +
+    `${si.shift_name} shift (${si.start_time}–${si.end_time}, ${si.role}) on ${dateStr}. ` +
+    `Can you come in?\n\nReply YES to accept or NO to decline.`;
 
-  await sendSms({
-    to: employee.contact_phone,
-    from: aegisSmsNumber,
-    body:
-      `${greeting(employee.name)} this is Aegis. ` +
-      `${session.callout_employee_name} is out and we need coverage for the ` +
-      `${si.shift_name} shift (${si.start_time}–${si.end_time}, ${si.role}) on ${dateStr}. ` +
-      `Can you come in?\n\nReply YES to accept or NO to decline.`,
-    company_id: session.company_id,
-  });
+  // Email-first during the email rollout; fall back to SMS. (When Aegis has a
+  // live phone number, flip this to prefer SMS for urgency.) Reply YES/NO works
+  // the same on both channels, which is what makes the SMS migration a drop-in.
+  let channel: 'sms' | 'email';
+  if (employee.contact_email) {
+    channel = 'email';
+    await sendEmail({
+      to: employee.contact_email,
+      subject: `Can you cover the ${si.shift_name} shift on ${formatShortDate(session.shift_date)}?`,
+      text: body,
+      company_id: session.company_id,
+    });
+  } else if (employee.contact_phone && aegisSmsNumber) {
+    channel = 'sms';
+    await sendSms({ to: employee.contact_phone, from: aegisSmsNumber, body, company_id: session.company_id });
+  } else {
+    return { sent: false, reason: `${employee.name} has no email or phone on file` };
+  }
 
   const outreach: ActiveOutreach = {
     company_id: session.company_id,
@@ -693,6 +724,8 @@ export async function dispatchOutreach(params: {
     callout_employee_name: session.callout_employee_name,
     aegis_sms_channel: aegisSmsNumber,
     employee_phone: employee.contact_phone,
+    employee_channel: channel,
+    employee_email: employee.contact_email,
     manager_contact: session.manager_contact,
     manager_channel: session.manager_channel,
     manager_sender: session.manager_sender,
@@ -713,13 +746,22 @@ async function notifyEmployeeShiftFilled(
   outreach: ActiveOutreach,
   employee: Employee
 ): Promise<void> {
-  if (!employee.contact_phone) return;
-  await sendSms({
-    to: employee.contact_phone,
-    from: outreach.aegis_sms_channel,
-    body: `${greeting(employee.name)} the ${outreach.shift_info.shift_name} shift on ${formatShortDate(outreach.shift_date)} has been filled — no response needed. Thanks!`,
-    company_id: outreach.company_id,
-  });
+  const body = `${greeting(employee.name)} the ${outreach.shift_info.shift_name} shift on ${formatShortDate(outreach.shift_date)} has been filled — no response needed. Thanks!`;
+  if (outreach.employee_channel === 'email' && (outreach.employee_email || employee.contact_email)) {
+    await sendEmail({
+      to: (outreach.employee_email ?? employee.contact_email)!,
+      subject: `Re: coverage for the ${outreach.shift_info.shift_name} shift`,
+      text: body,
+      company_id: outreach.company_id,
+    });
+  } else if (employee.contact_phone && outreach.aegis_sms_channel) {
+    await sendSms({
+      to: employee.contact_phone,
+      from: outreach.aegis_sms_channel,
+      body,
+      company_id: outreach.company_id,
+    });
+  }
 }
 
 // ── Main handlers ─────────────────────────────────────────────────────────────
@@ -811,6 +853,22 @@ export async function handleEmergencyCoverage(
 
   const urgencyWindow = calcUrgencyWindowMinutes(shiftDate, shiftInfo.start_time);
 
+  // Full ranked pool (Preferred → Overtime-risk → Already-working) for "show me
+  // more" batches, plus how many the first message displays.
+  const orderedPool: PoolCandidate[] = [...tier1, ...tier2, ...tier3].map(c => ({
+    employee_id: c.employee.id,
+    name: c.employee.name,
+    primary_role: c.employee.primary_role,
+    phone: c.employee.contact_phone,
+    current_weekly_hours: c.current_weekly_hours,
+    shift_hours: c.shift_hours,
+    would_exceed_max: c.would_exceed_max,
+    max_weekly_hours: c.employee.max_weekly_hours,
+    tier: c.tier,
+  }));
+  const t12 = tier1.length + tier2.length;
+  const shownCount = t12 > 0 ? Math.min(5, t12) : Math.min(5, tier3.length);
+
   // Store session (awaiting manager's name reply)
   const session: CoverageSession = {
     company_id: contact.company_id,
@@ -830,11 +888,56 @@ export async function handleEmergencyCoverage(
     coverage_filled: false,
     covered_by_employee_id: null,
     urgency_window_minutes: urgencyWindow,
+    candidate_pool: orderedPool,
+    shown_count: shownCount,
     expires_at: new Date(Date.now() + 4 * 60 * 60 * 1000).toISOString(),
   };
   await storeSession(session);
 
   await reply(contact, message, text, html);
+}
+
+// Manager asked for more candidates ("show me more"): serve the next batch from
+// the engine-ranked pool stored on the session.
+async function presentAdditionalBatch(
+  message: InboundMessage,
+  contact: VerifiedContact,
+  session: CoverageSession
+): Promise<void> {
+  const pool = session.candidate_pool ?? [];
+  const shown = session.shown_count ?? 0;
+  const next = pool.slice(shown, shown + 5);
+
+  if (next.length === 0) {
+    await reply(
+      contact,
+      message,
+      `That's everyone qualified and available I could find for the ${session.shift_info.shift_name} shift. You may need to contact staff directly, or ask someone already working to extend.`
+    );
+    return;
+  }
+
+  const lines = next.map((c, i) => {
+    const overtime = c.would_exceed_max
+      ? ` ⚠ would be ${(c.current_weekly_hours + c.shift_hours).toFixed(1)}h (max ${c.max_weekly_hours}h)`
+      : '';
+    return `${shown + i + 1}. ${c.name} (${c.primary_role}) • ${formatPhone(c.phone)} • ${c.current_weekly_hours.toFixed(1)}h this wk${overtime}`;
+  });
+
+  await updateSession({ ...session, shown_count: shown + next.length });
+
+  await reply(
+    contact,
+    message,
+    `Here are more candidates:\n\n${lines.join('\n')}\n\nReply with a name and I'll contact them, or "more" for additional options.`
+  );
+
+  await logActivity({
+    company_id: contact.company_id,
+    action: 'emergency_coverage_additional_batch',
+    summary: `Showed an additional batch of coverage candidates for ${session.callout_employee_name}'s shift`,
+    metadata: { shift_date: session.shift_date, shift_name: session.shift_info.shift_name, batch_from: shown, batch_size: next.length },
+  });
 }
 
 // Step 2: Manager replies with employee names. Start sequential outreach.
@@ -844,6 +947,13 @@ export async function handleManagerCoverageReply(
   session: CoverageSession
 ): Promise<void> {
   const names = await extractOutreachNames(message.body);
+
+  // "Show me more / anyone else / additional batch" → serve the next batch from
+  // the engine-ranked pool, without recomputing.
+  if (names.length === 0 && /\b(more|others?|else|another|additional|other options?|who else|anyone else)\b/i.test(message.body)) {
+    await presentAdditionalBatch(message, contact, session);
+    return;
+  }
 
   if (names.length === 0) {
     // Manager is declining Aegis outreach or just following up
@@ -881,16 +991,10 @@ export async function handleManagerCoverageReply(
     return;
   }
 
-  // Get Aegis SMS channel
+  // SMS channel is optional now — outreach goes by email when the employee has
+  // one, and falls back to SMS otherwise. dispatchOutreach reports per-candidate
+  // if someone can't be reached on any channel.
   const aegisSmsNumber = await getAegisSmsChannel(contact.company_id);
-  if (!aegisSmsNumber) {
-    await reply(
-      contact,
-      message,
-      "I can't send SMS outreach — no SMS channel is configured for this company. Please contact employees directly."
-    );
-    return;
-  }
 
   // Update session to outreach_in_progress
   const updatedSession: CoverageSession = {
@@ -927,7 +1031,7 @@ export async function handleManagerCoverageReply(
       contact,
       message,
       `Contacting employees in order:\n${orderSummary}\n\n` +
-        `Texting ${firstEmployee.name} now. Response window: ${session.urgency_window_minutes} minutes.${notFoundNote}\n\n` +
+        `Reaching out to ${firstEmployee.name} now. Response window: ${session.urgency_window_minutes} minutes.${notFoundNote}\n\n` +
         "I'll update you after each response."
     );
   }

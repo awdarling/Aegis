@@ -1,5 +1,6 @@
 import { supabase } from '../db/client';
 import { logActivity } from '../logger/activity-log';
+import { coerceJsonObject } from '../utils/coerce-json';
 import { reply } from '../messaging/reply';
 import { sendEmail } from '../messaging/email';
 import { sendSms } from '../messaging/sms';
@@ -230,9 +231,10 @@ export async function handleBroadcast(
     channel: 'sms' | 'email' | 'both';
   };
 
-  try {
-    params = JSON.parse(extractText) as typeof params;
-  } catch {
+  const parsedParams = coerceJsonObject<typeof params>(extractText);
+  if (parsedParams) {
+    params = parsedParams;
+  } else {
     await reply(
       contact,
       message,

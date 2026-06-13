@@ -1,5 +1,6 @@
 import { randomUUID } from 'crypto';
 import { supabase } from '../db/client';
+import { coerceJsonObject } from '../utils/coerce-json';
 import { logActivity } from '../logger/activity-log';
 import { reply } from '../messaging/reply';
 import { sendSms } from '../messaging/sms';
@@ -336,12 +337,12 @@ async function validateSwap(params: {
       'If valid=false, reason must be a specific, human-readable explanation.';
     const context = `Swap date: ${shift_date}. Today: ${today}.\nPolicies:\n${policyText}`;
     const text = await generateReply(system, context, []);
-    try {
-      const result = JSON.parse(text) as { valid: boolean; reason: string | null };
+    const result = coerceJsonObject<{ valid: boolean; reason: string | null }>(text);
+    if (result) {
       if (!result.valid) {
         return { valid: false, reason: result.reason ?? 'This swap does not meet company swap policies.', policy_note: result.reason ?? undefined };
       }
-    } catch {
+    } else {
       // If Claude fails, don't block — log and continue
       console.warn('[shift-swap] policy validation Claude parse failed');
     }
@@ -448,11 +449,10 @@ async function extractSwapDetails(body: string, today: string): Promise<{
     'Extract shift swap details from an employee message. ' +
     'Respond with ONLY valid JSON: {"shift_date":"YYYY-MM-DD"|null,"shift_name":string|null,"target_employee_name":string|null}';
   const text = await generateReply(system, body, []);
-  try {
-    return JSON.parse(text) as { shift_date: string | null; shift_name: string | null; target_employee_name: string | null };
-  } catch {
-    return { shift_date: null, shift_name: null, target_employee_name: null };
-  }
+  return (
+    coerceJsonObject<{ shift_date: string | null; shift_name: string | null; target_employee_name: string | null }>(text) ??
+    { shift_date: null, shift_name: null, target_employee_name: null }
+  );
 }
 
 // ── Manager notification ──────────────────────────────────────────────────────
@@ -1078,12 +1078,8 @@ export async function handleSwapOutreachResponse(
     const policyText = policies.map(p => `${p.policy_key}: ${p.policy_value}${p.description ? ' — ' + p.description : ''}`).join('\n');
     const system = 'Based on these swap policies, does manager approval EXPLICITLY appear to be required before a swap is executed? Respond ONLY with valid JSON: {"requires_approval":true|false}';
     const text = await generateReply(system, policyText, []);
-    try {
-      const parsed = JSON.parse(text) as { requires_approval: boolean };
-      requiresApproval = parsed.requires_approval;
-    } catch {
-      requiresApproval = false;
-    }
+    const parsed = coerceJsonObject<{ requires_approval: boolean }>(text);
+    requiresApproval = parsed?.requires_approval ?? false;
   }
 
   await logActivity({

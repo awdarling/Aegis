@@ -2,6 +2,7 @@ import { supabase } from '../db/client';
 import { logActivity } from '../logger/activity-log';
 import { reply } from '../messaging/reply';
 import { generateReply } from '../ai/claude';
+import { coerceJsonObject } from '../utils/coerce-json';
 import { computeWageEstimate } from '../lib/schedule-simulator';
 import { handleWageRateSync } from './payroll';
 import type { InboundMessage, VerifiedContact } from '../security/types';
@@ -263,9 +264,10 @@ Available Homebase tables (all scoped to this company):
   const fetchPlanText = await generateReply(fetchPlanSystem, message.body, []);
 
   let plan: FetchPlan = { fetches: [] };
-  try {
-    plan = JSON.parse(fetchPlanText) as FetchPlan;
-  } catch {
+  const parsedPlan = coerceJsonObject<FetchPlan>(fetchPlanText);
+  if (parsedPlan) {
+    plan = parsedPlan;
+  } else {
     // If Claude can't produce a plan, fall back to fetching common tables
     plan = {
       fetches: [
@@ -323,15 +325,14 @@ export async function handleHomebaseEdit(
 
   const parseText = await generateReply(parseSystem, message.body, []);
 
-  let parsed: ParsedEdit;
-  try {
-    parsed = JSON.parse(parseText) as ParsedEdit;
-  } catch {
+  const parsedEdit = coerceJsonObject<ParsedEdit>(parseText);
+  if (!parsedEdit) {
     await reply(contact, message,
       "I couldn't parse that edit request. Could you be more specific? For example: \"Update Jordan's max hours to 32\" or \"Mark Marcus as inactive\"."
     );
     return;
   }
+  const parsed: ParsedEdit = parsedEdit;
 
   const table = ENTITY_TABLE[parsed.entity_type];
   if (!table) {

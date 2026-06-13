@@ -1,5 +1,6 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { env } from '../config/env';
+import { coerceJsonObject } from '../utils/coerce-json';
 
 const client = new Anthropic({ apiKey: env.ANTHROPIC_API_KEY });
 
@@ -127,11 +128,10 @@ export async function classifyIntent(
 
   const text = response.content[0].type === 'text' ? response.content[0].text : '';
 
-  try {
-    return JSON.parse(text) as ClassifyResult;
-  } catch {
-    return { intent: 'unknown', confidence: 'low', extracted: {} };
-  }
+  return (
+    coerceJsonObject<ClassifyResult>(text) ??
+    { intent: 'unknown', confidence: 'low', extracted: {} }
+  );
 }
 
 // Generates a natural language reply to send back to the user.

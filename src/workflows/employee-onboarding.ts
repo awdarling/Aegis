@@ -16,6 +16,7 @@ import { greeting } from '../messaging/greeting';
 import { env } from '../config/env';
 import { withAnthropicRetry } from '../ai/claude';
 import { generateActionToken } from '../lib/aegis-actions/tokens';
+import { formatDateRange } from './time-off';
 import type { InboundMessage, VerifiedContact } from '../security/types';
 import type { Employee } from '../db/types';
 
@@ -1069,7 +1070,7 @@ async function handleTimeOffStep(
         action: 'time_off_request_created',
         entity_type: 'time_off_request',
         entity_id: tor.id,
-        summary: `${session.employee_name} submitted time-off during onboarding: ${start_date} to ${end_date}`,
+        summary: `${session.employee_name} requested time off during onboarding for ${formatDateRange(start_date, end_date)}`,
         metadata: { source: 'onboarding' },
       });
       const dateStr = start_date === end_date ? start_date : `${start_date} to ${end_date}`;
@@ -1984,7 +1985,7 @@ export async function applyAvailabilityDecision(input: AvailabilityDecisionInput
       action: 'availability_updated',
       entity_type: 'employee',
       entity_id: input.employee_id,
-      summary: `${input.employee_name}'s availability updated via manager approval`,
+      summary: `${input.decided_by ?? 'A manager'} approved ${input.employee_name}'s availability update`,
       metadata: {
         approved_by: input.decided_by ?? 'manager',
         previous: input.current_availability,
@@ -2003,7 +2004,7 @@ export async function applyAvailabilityDecision(input: AvailabilityDecisionInput
       action: 'availability_update_denied',
       entity_type: 'employee',
       entity_id: input.employee_id,
-      summary: `${input.employee_name}'s availability update denied by manager`,
+      summary: `${input.decided_by ?? 'A manager'} denied ${input.employee_name}'s availability update`,
       metadata: { denied_by: input.decided_by ?? 'manager' },
     });
 

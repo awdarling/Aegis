@@ -432,7 +432,7 @@ function formatTime12h(time: string): string {
 
 const DAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 
-function formatAvailabilityList(slots: AvailabilitySlot[]): string {
+export function formatAvailabilityList(slots: AvailabilitySlot[]): string {
   const byDay = new Map<number, AvailabilitySlot[]>();
   for (const slot of slots) {
     const existing = byDay.get(slot.day_of_week) ?? [];
@@ -743,6 +743,64 @@ function slotMinutes(s: AvailabilitySlot): number {
   const [sh, sm] = s.start_time.split(':').map(Number);
   const [eh, em] = s.end_time.split(':').map(Number);
   return (eh * 60 + em) - (sh * 60 + sm);
+}
+
+// ── Manager-initiated availability change (used by the Homebase edit-by-text path) ──
+//
+// A manager says "Maria can't work Wednesdays" / "set Maria to Mondays 9–5". Reuses
+// the same availability engine the employee flow uses (parse → set/remove → full-week
+// default), for a NAMED employee. Returns the current + proposed slots so the caller
+// can confirm with the manager before writing. Returns null if nothing parseable.
+export async function computeManagerAvailabilityChange(
+  companyId: string,
+  employeeId: string,
+  messageBody: string
+): Promise<{ current: AvailabilitySlot[]; proposed: AvailabilitySlot[]; mode: 'set' | 'remove' } | null> {
+  const bounds = await loadShiftBounds(companyId);
+  const { data: currentData } = await supabase
+    .from('availability')
+    .select('day_of_week, start_time, end_time')
+    .eq('employee_id', employeeId);
+  const currentAvail = (currentData ?? []) as AvailabilitySlot[];
+
+  const intent = await parseAvailabilityIntent(messageBody, bounds);
+  const clamp = (s: AvailabilitySlot): AvailabilitySlot => ({
+    day_of_week: s.day_of_week,
+    start_time: clampTime(s.start_time, bounds.earliest_start, bounds.latest_end),
+    end_time: clampTime(s.end_time, bounds.earliest_start, bounds.latest_end),
+  });
+
+  let proposed: AvailabilitySlot[];
+  if (intent.mode === 'remove') {
+    const baseline = currentAvail.length === 0
+      ? [0, 1, 2, 3, 4, 5, 6].map(d => ({ day_of_week: d, start_time: bounds.earliest_start, end_time: bounds.latest_end }))
+      : currentAvail;
+    proposed = applyNegativeRemovals(baseline, intent.slots, bounds);
+  } else {
+    proposed = intent.slots.map(clamp).filter(s => s.start_time < s.end_time);
+  }
+  if (proposed.length === 0) return null;
+  return { current: currentAvail, proposed, mode: intent.mode };
+}
+
+// Replace an employee's availability with the given slots (delete + insert).
+export async function writeEmployeeAvailability(
+  companyId: string,
+  employeeId: string,
+  slots: AvailabilitySlot[]
+): Promise<void> {
+  await supabase.from('availability').delete().eq('employee_id', employeeId);
+  if (slots.length > 0) {
+    await supabase.from('availability').insert(
+      slots.map(s => ({
+        company_id: companyId,
+        employee_id: employeeId,
+        day_of_week: s.day_of_week,
+        start_time: s.start_time,
+        end_time: s.end_time,
+      }))
+    );
+  }
 }
 
 // Binary yes/no classifier — used in onboarding confirmation steps where natural

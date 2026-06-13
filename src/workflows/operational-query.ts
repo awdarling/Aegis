@@ -4,6 +4,12 @@ import { reply } from '../messaging/reply';
 import { generateReply } from '../ai/claude';
 import { computeWageEstimate } from '../lib/schedule-simulator';
 import { handleWageRateSync } from './payroll';
+import {
+  computeManagerAvailabilityChange,
+  writeEmployeeAvailability,
+  formatAvailabilityList,
+  type AvailabilitySlot,
+} from './employee-onboarding';
 import type { InboundMessage, VerifiedContact } from '../security/types';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -40,6 +46,7 @@ export interface PendingEdit {
   new_value?: unknown;
   create_fields?: Record<string, unknown>;
   schedule_id?: string;
+  availability_slots?: AvailabilitySlot[]; // for entity_type 'availability' (manager-set)
   expires_at: string;
 }
 
@@ -70,6 +77,15 @@ const ENTITY_TABLE: Record<string, string> = {
   shift_requirement: 'shift_requirements',
   schedule: 'schedules',
 };
+
+// The column to match an entity_name against. Most tables use 'name', but some
+// are keyed differently — without this, editing a rule/wage/requirement by name
+// fails because those tables have no 'name' column.
+function editLookupColumn(table: string): string {
+  if (table === 'policies') return 'policy_key';
+  if (table === 'wage_rates' || table === 'shift_requirements') return 'role';
+  return 'name';
+}
 
 // ── Personality prompt ────────────────────────────────────────────────────────
 
@@ -290,9 +306,12 @@ Available Homebase tables (all scoped to this company):
       ? `${personality}\n\nToday is ${today}. ` +
         `You are answering a question from ${contact.name}, an employee. ` +
         `Only answer questions about their own schedule, their own time off, their own availability, and their own shifts. ` +
-        `Do not reveal other employees' hours, wages, availability, or personal details. ` +
+        `You CAN answer things like: when their next shift is, what they're scheduled this week, how many hours they have, and who they're working alongside on a given day. ` +
+        `For "who am I working with" you may share coworkers' names and roles on a shift this employee is ALSO on — but never reveal anyone's wages, availability, hours totals, or personal details. ` +
         `Answer using the Homebase data below. Be direct and specific. If the data doesn't contain what's needed, say so clearly.`
-      : `${personality}\n\nToday is ${today}. Answer using the Homebase data below. Be direct and specific. If the data doesn't contain what's needed, say so clearly.`;
+      : `${personality}\n\nToday is ${today}. ` +
+        `You can answer staffing questions like who's free/available on a given day, where coverage is short (gaps), and who's near their max weekly hours / approaching overtime. ` +
+        `Answer using the Homebase data below. Be direct and specific. If the data doesn't contain what's needed, say so clearly.`;
 
   const answer = await generateReply(answerSystem, `Question: ${message.body}\n\nData:\n${dataContext || 'No relevant data found.'}`, []);
 
@@ -318,8 +337,9 @@ export async function handleHomebaseEdit(
   // Step 1: Parse the edit intent
   const parseSystem =
     `You are parsing a Homebase data edit request from a manager. ` +
-    `Return ONLY valid JSON: {"entity_type":"employee|event|policy|wage_rate|shift_type|shift_requirement|schedule","entity_name":"...","action":"update|create|delete","field":"column_name_or_null","new_value":"...or null","create_fields":{} }. ` +
-    `For schedule edits (move/add/remove employee from shift), entity_type="schedule" and use create_fields to describe the change: {"change":"move|add|remove","employee_name":"...","shift_name":"...","date":"YYYY-MM-DD"}.`;
+    `Return ONLY valid JSON: {"entity_type":"employee|event|policy|wage_rate|shift_type|shift_requirement|availability|schedule","entity_name":"...","action":"update|create|delete","field":"column_name_or_null","new_value":"...or null","create_fields":{} }. ` +
+    `For an availability change to an employee ("Maria can't work Wednesdays anymore", "set Maria to Mondays 9am-5pm", "give Jordan mornings off until Sept 1"), entity_type="availability", entity_name=the employee's name, action="update" — the day/time details stay in the message and are parsed downstream. ` +
+    `For schedule edits (move/add/remove employee from shift), entity_type="schedule".`;
 
   const parseText = await generateReply(parseSystem, message.body, []);
 
@@ -333,9 +353,23 @@ export async function handleHomebaseEdit(
     return;
   }
 
+  // Availability changes are multi-row + natural-language, so they get their own
+  // handler (reuses the availability engine) rather than the generic field editor.
+  if (parsed.entity_type === 'availability') {
+    await handleAvailabilityEdit(message, contact, parsed);
+    return;
+  }
+
+  // Schedule edits by message aren't supported — point the manager to Homebase
+  // rather than dead-end or misfire.
+  if (parsed.entity_type === 'schedule') {
+    await reply(contact, message, `I can't move shifts around by message yet — make schedule changes in Homebase's schedule editor for now. I can change availability, rules, wages, roles, shifts, and employee details by message, though.`);
+    return;
+  }
+
   const table = ENTITY_TABLE[parsed.entity_type];
   if (!table) {
-    await reply(contact, message, `I don't know how to edit ${parsed.entity_type} records. Try specifying: employee, event, policy, wage_rate, shift_type, or shift_requirement.`);
+    await reply(contact, message, `I don't know how to edit ${parsed.entity_type} records. Try specifying: employee, event, policy, wage_rate, shift_type, shift_requirement, or availability.`);
     return;
   }
 
@@ -346,6 +380,56 @@ export async function handleHomebaseEdit(
   } else {
     await handleUpdateEdit(message, contact, parsed, table, personality);
   }
+}
+
+// Manager changes a named employee's availability by message. Reuses the same
+// availability engine the employee flow uses (parse → set/remove → full-week
+// default), then confirms before writing — the manager is the authority here.
+async function handleAvailabilityEdit(
+  message: InboundMessage,
+  contact: VerifiedContact,
+  parsed: ParsedEdit
+): Promise<void> {
+  const { data: emps } = await supabase
+    .from('employees')
+    .select('id, name')
+    .eq('company_id', contact.company_id)
+    .ilike('name', `%${parsed.entity_name}%`)
+    .limit(3);
+  const rows = (emps ?? []) as { id: string; name: string }[];
+  if (rows.length === 0) {
+    await reply(contact, message, `I couldn't find an employee named "${parsed.entity_name}" in Homebase.`);
+    return;
+  }
+  const emp = rows[0];
+  const firstName = emp.name.split(' ')[0];
+
+  const change = await computeManagerAvailabilityChange(contact.company_id, emp.id, message.body);
+  if (!change) {
+    await reply(
+      contact,
+      message,
+      `I couldn't work out the availability change for ${emp.name}. Try something like "${firstName} can't work Wednesdays" or "set ${firstName} to Mondays 9am-5pm".`
+    );
+    return;
+  }
+
+  const proposedDisplay = formatAvailabilityList(change.proposed);
+  const confirmMsg = `Update ${emp.name}'s availability to:\n${proposedDisplay}\n\nConfirm? (yes/no)`;
+
+  const pending: PendingEdit = {
+    company_id: contact.company_id,
+    manager_id: contact.matched_identifier,
+    table: 'availability',
+    action: 'update',
+    entity_type: 'availability',
+    entity_name: emp.name,
+    entity_id: emp.id,
+    availability_slots: change.proposed,
+    expires_at: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+  };
+  await storePendingEdit(pending);
+  await reply(contact, message, confirmMsg);
 }
 
 async function handleUpdateEdit(
@@ -360,12 +444,14 @@ async function handleUpdateEdit(
     return;
   }
 
-  // Find the record by name
+  // Find the record by its lookup column (name, or policy_key / role for the
+  // tables that have no name column).
+  const lookupCol = editLookupColumn(table);
   const { data: records } = await supabase
     .from(table)
     .select('*')
     .eq('company_id', contact.company_id)
-    .ilike('name', `%${parsed.entity_name}%`)
+    .ilike(lookupCol, `%${parsed.entity_name}%`)
     .limit(3);
 
   const rows = (records ?? []) as Record<string, unknown>[];
@@ -434,21 +520,23 @@ async function handleDeleteEdit(
   table: string,
   personality: string
 ): Promise<void> {
+  const lookupCol = editLookupColumn(table);
   const { data: records } = await supabase
     .from(table)
-    .select('id, name')
+    .select(`id, ${lookupCol}`)
     .eq('company_id', contact.company_id)
-    .ilike('name', `%${parsed.entity_name}%`)
+    .ilike(lookupCol, `%${parsed.entity_name}%`)
     .limit(3);
 
-  const rows = (records ?? []) as { id: string; name: string }[];
+  const rows = (records ?? []) as unknown as Record<string, unknown>[];
   if (rows.length === 0) {
     await reply(contact, message, `I couldn't find a ${parsed.entity_type} named "${parsed.entity_name}" to delete.`);
     return;
   }
 
   const record = rows[0];
-  const confirmMsg = `Delete ${parsed.entity_type} "${record.name}"? This cannot be undone. (yes/no)`;
+  const displayName = String(record[lookupCol] ?? parsed.entity_name);
+  const confirmMsg = `Delete ${parsed.entity_type} "${displayName}"? This cannot be undone. (yes/no)`;
 
   const pending: PendingEdit = {
     company_id: contact.company_id,
@@ -456,8 +544,8 @@ async function handleDeleteEdit(
     table,
     action: 'delete',
     entity_type: parsed.entity_type,
-    entity_name: record.name,
-    entity_id: record.id,
+    entity_name: displayName,
+    entity_id: String(record['id']),
     expires_at: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
   };
   await storePendingEdit(pending);
@@ -514,7 +602,9 @@ export async function handleEditConfirmation(
       action: `homebase_edit_${pending.action}`,
       entity_type: pending.entity_type,
       entity_id: pending.entity_id ?? undefined,
-      summary: `Manager edited ${pending.entity_type} "${pending.entity_name}": ${pending.action === 'update' ? `${pending.field} → ${JSON.stringify(pending.new_value)}` : pending.action}`,
+      summary: pending.table === 'availability'
+        ? `Manager updated ${pending.entity_name}'s availability`
+        : `Manager edited ${pending.entity_type} "${pending.entity_name}": ${pending.action === 'update' ? `${pending.field} → ${JSON.stringify(pending.new_value)}` : pending.action}`,
       metadata: {
         table: pending.table, field: pending.field,
         old_value: pending.current_value, new_value: pending.new_value,
@@ -523,11 +613,13 @@ export async function handleEditConfirmation(
     });
 
     const isStructural = ['policies', 'wage_rates', 'shift_types', 'shift_requirements'].includes(pending.table);
-    const doneMsg = pending.action === 'create'
-      ? `Done — ${pending.entity_type} "${pending.entity_name}" created.`
-      : pending.action === 'delete'
-        ? `Done — ${pending.entity_type} "${pending.entity_name}" deleted.`
-        : `Done — ${pending.entity_name}'s ${(pending.field ?? '').replace(/_/g, ' ')} updated to ${JSON.stringify(pending.new_value)}.`;
+    const doneMsg = pending.table === 'availability'
+      ? `Done — ${pending.entity_name}'s availability updated.`
+      : pending.action === 'create'
+        ? `Done — ${pending.entity_type} "${pending.entity_name}" created.`
+        : pending.action === 'delete'
+          ? `Done — ${pending.entity_type} "${pending.entity_name}" deleted.`
+          : `Done — ${pending.entity_name}'s ${(pending.field ?? '').replace(/_/g, ' ')} updated to ${JSON.stringify(pending.new_value)}.`;
 
     const footerMsg = isStructural
       ? ' This affects how Aegis builds schedules — worth verifying in Homebase.'
@@ -541,6 +633,13 @@ export async function handleEditConfirmation(
 }
 
 async function executeEdit(pending: PendingEdit, companyId: string): Promise<void> {
+  // Availability is a multi-row replace (delete + insert), handled by the engine.
+  if (pending.table === 'availability') {
+    if (!pending.entity_id || !pending.availability_slots) throw new Error('Missing availability data for edit');
+    await writeEmployeeAvailability(companyId, pending.entity_id, pending.availability_slots);
+    return;
+  }
+
   if (pending.action === 'create') {
     const fields: Record<string, unknown> = { ...(pending.create_fields ?? {}), company_id: companyId };
     // Sensible defaults for employee creation

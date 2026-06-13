@@ -8,6 +8,7 @@
 
 import Anthropic from '@anthropic-ai/sdk';
 import { supabase } from '../db/client';
+import { coerceJsonObject } from '../utils/coerce-json';
 import { logActivity } from '../logger/activity-log';
 import { sendSms } from '../messaging/sms';
 import { sendEmail } from '../messaging/email';
@@ -578,15 +579,13 @@ async function claudeMatchName(message: string, employeeName: string): Promise<b
   );
 
   const text = response.content[0].type === 'text' ? response.content[0].text : '';
-  try {
-    return (JSON.parse(text) as { matches: boolean }).matches;
-  } catch {
-    const lower = message.toLowerCase();
-    return employeeName
-      .toLowerCase()
-      .split(' ')
-      .some(part => lower.includes(part));
-  }
+  const parsed = coerceJsonObject<{ matches: boolean }>(text);
+  if (parsed) return parsed.matches;
+  const lower = message.toLowerCase();
+  return employeeName
+    .toLowerCase()
+    .split(' ')
+    .some(part => lower.includes(part));
 }
 
 async function claudeParseAvailability(
@@ -619,11 +618,7 @@ async function claudeParseAvailability(
   );
 
   const text = response.content[0].type === 'text' ? response.content[0].text : '';
-  try {
-    return (JSON.parse(text) as { slots: AvailabilitySlot[] }).slots ?? [];
-  } catch {
-    return [];
-  }
+  return coerceJsonObject<{ slots: AvailabilitySlot[] }>(text)?.slots ?? [];
 }
 
 // Parses an availability-CHANGE message (the update flow, not onboarding) into an
@@ -663,13 +658,10 @@ async function parseAvailabilityIntent(
   );
 
   const text = response.content[0].type === 'text' ? response.content[0].text : '';
-  try {
-    const parsed = JSON.parse(text) as { mode?: string; slots?: AvailabilitySlot[] };
-    const mode: 'set' | 'remove' = parsed.mode === 'remove' ? 'remove' : 'set';
-    return { mode, slots: parsed.slots ?? [] };
-  } catch {
-    return { mode: 'set', slots: [] };
-  }
+  const parsed = coerceJsonObject<{ mode?: string; slots?: AvailabilitySlot[] }>(text);
+  if (!parsed) return { mode: 'set', slots: [] };
+  const mode: 'set' | 'remove' = parsed.mode === 'remove' ? 'remove' : 'set';
+  return { mode, slots: parsed.slots ?? [] };
 }
 
 // Pure: subtract a set of "can't work" windows from the employee's current
@@ -842,11 +834,7 @@ async function claudeExtractDates(
   );
 
   const text = response.content[0].type === 'text' ? response.content[0].text : '';
-  try {
-    return (JSON.parse(text) as { dates: { start_date: string; end_date: string }[] }).dates ?? [];
-  } catch {
-    return [];
-  }
+  return coerceJsonObject<{ dates: { start_date: string; end_date: string }[] }>(text)?.dates ?? [];
 }
 
 // ── Step senders ──────────────────────────────────────────────────────────────

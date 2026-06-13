@@ -1,5 +1,6 @@
 import { randomUUID } from 'crypto';
 import { supabase } from '../db/client';
+import { coerceJsonObject } from '../utils/coerce-json';
 import { logActivity } from '../logger/activity-log';
 import { reply, normalizeReSubject } from '../messaging/reply';
 import { sendEmail } from '../messaging/email';
@@ -294,19 +295,18 @@ async function generateTimeOffRecommendation(
 
   const responseText = await generateReply(systemPrompt, context, []);
 
-  try {
-    return JSON.parse(responseText) as DecisionRecommendation;
-  } catch {
-    // Structural fallback if Claude returns non-JSON
-    const feasible = stage1.overall_feasible && (stage2?.overall_feasible ?? true);
-    return {
-      recommendation: feasible ? 'approve' : 'deny',
-      reasoning: feasible
-        ? 'Staffing levels appear sufficient to accommodate this request.'
-        : 'This request would create staffing shortfalls that cannot be covered.',
-      policy_notes: '',
-    };
-  }
+  const parsed = coerceJsonObject<DecisionRecommendation>(responseText);
+  if (parsed) return parsed;
+
+  // Structural fallback if Claude returns non-JSON
+  const feasible = stage1.overall_feasible && (stage2?.overall_feasible ?? true);
+  return {
+    recommendation: feasible ? 'approve' : 'deny',
+    reasoning: feasible
+      ? 'Staffing levels appear sufficient to accommodate this request.'
+      : 'This request would create staffing shortfalls that cannot be covered.',
+    policy_notes: '',
+  };
 }
 
 // ── Manager email builder ─────────────────────────────────────────────────────

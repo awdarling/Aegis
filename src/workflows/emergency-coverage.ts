@@ -8,6 +8,10 @@ import { generateReply } from '../ai/claude';
 import { getSpecialNotes } from './special-notes';
 import type { InboundMessage, VerifiedContact } from '../security/types';
 import type { Employee, Availability, Event } from '../db/types';
+import { coerceJsonObject } from '../utils/coerce-json';
+
+// Re-exported so existing tests importing it from this module keep working.
+export { coerceJsonObject };
 
 // ── Internal schedule types ───────────────────────────────────────────────────
 // These define the expected shape of schedules.data — schedule-build must match.
@@ -417,23 +421,6 @@ function buildScheduledTodaySet(scheduleData: ScheduleData | null, date: string)
 }
 
 // ── AI extraction ─────────────────────────────────────────────────────────────
-
-// Tolerant JSON-object reader. The model occasionally wraps its JSON in
-// ```json fences or adds a sentence of preamble; a bare JSON.parse throws on
-// those and the caller would silently lose ALL extracted fields. This strips
-// fences and grabs the first {...} block before parsing.
-export function coerceJsonObject<T>(text: string): T | null {
-  if (!text) return null;
-  let t = text.trim();
-  t = t.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
-  const m = t.match(/\{[\s\S]*\}/);
-  if (m) t = m[0];
-  try {
-    return JSON.parse(t) as T;
-  } catch {
-    return null;
-  }
-}
 
 async function extractEmergencyDetails(
   body: string,

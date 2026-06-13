@@ -1,13 +1,11 @@
 import { supabase } from '../db/client';
 import { logActivity } from '../logger/activity-log';
-import { reply } from '../messaging/reply';
-import { dispatchOutreach } from '../workflows/emergency-coverage';
+import { promptForNextBatchOrExhaust } from '../workflows/emergency-coverage';
 import {
   checkStaleOnboardingSessions,
   expireOldOnboardingSessions,
 } from '../workflows/employee-onboarding';
 import type { ActiveOutreach, CoverageSession, OutreachResult } from '../workflows/emergency-coverage';
-import type { Employee } from '../db/types';
 import type { InboundMessage, VerifiedContact } from '../security/types';
 
 const POLL_INTERVAL_MS = 60_000;
@@ -141,127 +139,34 @@ async function handleTimeout(
   outreach: ActiveOutreach,
   session: CoverageSession & { _memory_id: string }
 ): Promise<void> {
-  const timedOutName =
-    session.outreach_results.find(r => r.employee_id === outreach.employee_id)?.employee_name ??
-    'Employee';
-
-  // 1. Remove the expired outreach record
+  // 1. Remove the expired outreach record.
   await supabase.from('aegis_memory').delete().eq('id', outreachMemoryId);
 
-  // 2. Mark this employee as no_response in the session results
+  // 2. Mark this employee as no_response.
   const updatedResults: OutreachResult[] = session.outreach_results.map(r =>
     r.employee_id === outreach.employee_id
       ? { ...r, response: 'no_response' as const, responded_at: new Date().toISOString() }
       : r
   );
 
-  // 3. Find the next pending employee in the queue
-  const nextId = session.outreach_queue.find(empId =>
-    updatedResults.some(r => r.employee_id === empId && r.response === 'pending')
+  // 3. If others in the contacted batch are still pending, just record it and
+  // keep waiting — we only escalate once the whole group has lapsed.
+  const anyPending = session.outreach_queue.some(id =>
+    updatedResults.some(r => r.employee_id === id && r.response === 'pending')
   );
-
-  const managerContact = buildManagerContact(outreach);
-  const managerMsg = buildManagerMessage(outreach);
-
-  if (nextId) {
-    // Load next employee record
-    const { data: empData } = await supabase
-      .from('employees')
-      .select('*')
-      .eq('id', nextId)
-      .single();
-    const nextEmp = empData as Employee | null;
-
-    // Update session results regardless of whether we can contact the next employee
-    const updatedSession: CoverageSession = { ...session, outreach_results: updatedResults };
-    await updateSession(updatedSession);
-
-    if (!nextEmp) {
-      await reply(
-        managerContact,
-        managerMsg,
-        `${timedOutName} did not respond within the ${session.urgency_window_minutes}-minute window. ` +
-          `The next employee in the queue could not be found. Please follow up directly.`
-      );
-      await logActivity({
-        company_id: outreach.company_id,
-        action: 'emergency_coverage_timeout',
-        summary: `Outreach to ${timedOutName} timed out — next employee not found in DB`,
-        metadata: {
-          timed_out_employee_id: outreach.employee_id,
-          next_employee_id: nextId,
-          shift_date: outreach.shift_date,
-          shift_name: outreach.shift_info.shift_name,
-        },
-      });
-      return;
-    }
-
-    // Dispatch outreach to next employee
-    const dispatchResult = await dispatchOutreach({
-      employee: nextEmp,
-      session: updatedSession,
-      aegisSmsNumber: outreach.aegis_sms_channel,
-    });
-
-    if (dispatchResult.sent) {
-      await reply(
-        managerContact,
-        managerMsg,
-        `${timedOutName} did not respond within the ${session.urgency_window_minutes}-minute window. ` +
-          `Now contacting ${nextEmp.name} (window: ${session.urgency_window_minutes} min).`
-      );
-    } else {
-      await reply(
-        managerContact,
-        managerMsg,
-        `${timedOutName} did not respond. Unable to contact ${nextEmp.name}: ${dispatchResult.reason}. ` +
-          `No further employees can be reached automatically — please contact staff directly.`
-      );
-    }
-
-    await logActivity({
-      company_id: outreach.company_id,
-      action: 'emergency_coverage_timeout',
-      summary: `Outreach to ${timedOutName} timed out — ${dispatchResult.sent ? `advancing to ${nextEmp.name}` : `unable to contact ${nextEmp.name}`}`,
-      metadata: {
-        timed_out_employee_id: outreach.employee_id,
-        timed_out_name: timedOutName,
-        next_employee_id: nextId,
-        next_employee_name: nextEmp.name,
-        next_dispatch_sent: dispatchResult.sent,
-        window_minutes: session.urgency_window_minutes,
-        shift_date: outreach.shift_date,
-        shift_name: outreach.shift_info.shift_name,
-        role: outreach.shift_info.role,
-      },
-    });
-  } else {
-    // Queue exhausted — no more pending employees
-    await clearSession(outreach.company_id);
-
-    await reply(
-      managerContact,
-      managerMsg,
-      `${timedOutName} did not respond within the ${session.urgency_window_minutes}-minute window. ` +
-        `The outreach queue is exhausted — no coverage found for the ${outreach.shift_info.shift_name} shift on ` +
-        `${formatShortDate(outreach.shift_date)}. Please contact additional staff directly.`
-    );
-
-    await logActivity({
-      company_id: outreach.company_id,
-      action: 'emergency_coverage_queue_exhausted',
-      summary: `Outreach queue exhausted after timeout from ${timedOutName} — no coverage found for ${outreach.shift_date}`,
-      metadata: {
-        timed_out_employee_id: outreach.employee_id,
-        timed_out_name: timedOutName,
-        shift_date: outreach.shift_date,
-        shift_name: outreach.shift_info.shift_name,
-        role: outreach.shift_info.role,
-        all_results: updatedResults,
-      },
-    });
+  if (anyPending) {
+    await updateSession({ ...session, outreach_results: updatedResults });
+    return;
   }
+
+  // 4. Whole contacted group lapsed with no acceptance. Ask the manager whether
+  // to send another batch — never auto-send. (Shared with the decline path.)
+  await promptForNextBatchOrExhaust({
+    session,
+    managerContact: buildManagerContact(outreach),
+    managerMessage: buildManagerMessage(outreach),
+    updatedResults,
+  });
 }
 
 // ── Session DB helpers ────────────────────────────────────────────────────────

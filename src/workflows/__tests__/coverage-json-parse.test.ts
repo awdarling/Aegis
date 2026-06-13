@@ -12,7 +12,7 @@ vi.mock('../../messaging/sms', () => ({ sendSms: vi.fn() }));
 vi.mock('../../messaging/reply', () => ({ reply: vi.fn(), sendInThreadAck: vi.fn() }));
 vi.mock('../../ai/claude', () => ({ generateReply: vi.fn(), withAnthropicRetry: vi.fn() }));
 
-import { coerceJsonObject, isNewCoverageRequest, extractOutreachNames, swapScheduleAssignment, type ScheduleAssignment } from '../emergency-coverage';
+import { coerceJsonObject, isNewCoverageRequest, extractOutreachNames, swapScheduleAssignment, isContactAll, type ScheduleAssignment } from '../emergency-coverage';
 import { generateReply } from '../../ai/claude';
 import type { Mock } from 'vitest';
 
@@ -126,5 +126,17 @@ describe('swapScheduleAssignment (put the coverer on the schedule)', () => {
     });
     expect(swapped).toBe(false);
     expect(assignments[0].employee_id).toBe('someone_else');
+  });
+});
+
+describe('isContactAll (manager chose "everyone" vs a specific name)', () => {
+  it('matches blanket "contact everyone" phrasings', () => {
+    ['all', 'everyone', 'All of them', 'reach out to all', 'contact all', 'text all', 'the whole list', 'everyone on the list']
+      .forEach(s => expect(isContactAll(s)).toBe(true));
+  });
+
+  it('does NOT match a specific-name reply', () => {
+    ['Kori', 'Kori Baumann', 'contact Addison', 'Shmubba and Mia', 'the first two']
+      .forEach(s => expect(isContactAll(s)).toBe(false));
   });
 });

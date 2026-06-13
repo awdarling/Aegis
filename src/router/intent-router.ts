@@ -216,7 +216,7 @@ async function routeIntentInner(
     }
 
     const session = await getActiveCoverageSession(contact.company_id, contact.matched_identifier);
-    if (session && session.state === 'awaiting_names') {
+    if (session && (session.state === 'awaiting_names' || session.state === 'awaiting_next_batch_decision')) {
       await handleManagerCoverageReply(message, contact, session);
       console.log('[router] EARLY RETURN', { reason: 'manager_coverage_reply' });
       return;

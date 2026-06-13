@@ -13,6 +13,12 @@ import { coerceJsonObject } from '../utils/coerce-json';
 // Re-exported so existing tests importing it from this module keep working.
 export { coerceJsonObject };
 
+// Fan-out tuning. The manager blasts a batch; if no one accepts within this
+// window we ask the manager whether to send another batch (we never auto-send).
+// TODO (DEV_ROADMAP): make this a per-company Homebase setting rather than a constant.
+const NEXT_BATCH_PROMPT_MINUTES = 30;
+const NEXT_BATCH_SIZE = 5;
+
 // ── Internal schedule types ───────────────────────────────────────────────────
 // These define the expected shape of schedules.data — schedule-build must match.
 
@@ -70,7 +76,7 @@ export interface CoverageSession {
   callout_employee_name: string;
   shift_date: string;
   shift_info: ShiftInfo;
-  state: 'awaiting_names' | 'outreach_in_progress';
+  state: 'awaiting_names' | 'outreach_in_progress' | 'awaiting_next_batch_decision';
   outreach_queue: string[];
   outreach_results: OutreachResult[];
   coverage_filled: boolean;
@@ -733,7 +739,7 @@ function buildCandidateMessage(
   }
 
   sections.push('');
-  sections.push("Reply with a name and I'll contact them, or handle it yourself.");
+  sections.push('Reply ALL to contact everyone on this list, a name (or names) to contact just them, or handle it yourself.');
 
   const text = sections.join('\n');
 
@@ -780,7 +786,7 @@ function buildCandidateMessage(
 </table>
 ${candidatesHtml}
 ${specialNotesHtml}
-<p style="margin-top:16px;color:#374151;">Reply with a name and I'll contact them, or handle it yourself.</p>
+<p style="margin-top:16px;color:#374151;">Reply ALL to contact everyone on this list, a name (or names) to contact just them, or handle it yourself.</p>
 </div>`;
 
   return { text, html };
@@ -1114,7 +1120,7 @@ async function presentAdditionalBatch(
   await reply(
     contact,
     message,
-    `Here are more candidates:\n\n${lines.join('\n')}\n\nReply with a name and I'll contact them, or "more" for additional options.`
+    `Here are more candidates:\n\n${lines.join('\n')}\n\nReply ALL to contact everyone shown, a name to contact just them, or "more" for additional options.`
   );
 
   await logActivity({
@@ -1125,7 +1131,176 @@ async function presentAdditionalBatch(
   });
 }
 
-// Step 2: Manager replies with employee names. Start sequential outreach.
+// Does the manager's reply mean "contact everyone on the list" (vs naming
+// specific people)? Kept tight so a bare name never matches.
+export function isContactAll(body: string): boolean {
+  const t = body.trim();
+  return (
+    /^(all|everyone|everybody)\b/i.test(t) ||
+    /\b(all of them|all of the (employees|guards|staff)|contact all|reach out to all|message all|text all|email all|the whole list|the entire list|everyone on (the|that) list)\b/i.test(t)
+  );
+}
+
+// Load active employees by id, preserving the given order.
+async function loadEmployeesByIds(companyId: string, ids: string[]): Promise<Employee[]> {
+  if (ids.length === 0) return [];
+  const { data } = await supabase
+    .from('employees')
+    .select('*')
+    .eq('company_id', companyId)
+    .in('id', ids)
+    .eq('active', true);
+  const byId = new Map(((data ?? []) as Employee[]).map(e => [e.id, e]));
+  return ids.map(id => byId.get(id)).filter((e): e is Employee => !!e);
+}
+
+// Blast outreach to a whole group at once (parallel). First YES wins — the
+// accept/decline handlers already lock the shift and tell the rest "it's
+// covered." Resets the session's contacted group + window to this batch.
+async function blastBatch(params: {
+  message: InboundMessage;
+  contact: VerifiedContact;
+  session: CoverageSession;
+  employees: Employee[];
+  notFound?: string[];
+}): Promise<void> {
+  const { message, contact, session, employees } = params;
+  const notFound = params.notFound ?? [];
+  const aegisSmsNumber = await getAegisSmsChannel(contact.company_id);
+
+  const batchSession: CoverageSession = {
+    ...session,
+    state: 'outreach_in_progress',
+    urgency_window_minutes: NEXT_BATCH_PROMPT_MINUTES,
+    outreach_queue: employees.map(e => e.id),
+    outreach_results: [
+      ...session.outreach_results.filter(r => !employees.some(e => e.id === r.employee_id)),
+      ...employees.map(e => ({
+        employee_id: e.id,
+        employee_name: e.name,
+        response: 'pending' as const,
+        responded_at: null,
+      })),
+    ],
+  };
+  await updateSession(batchSession);
+
+  const sent: string[] = [];
+  const failed: string[] = [];
+  for (const emp of employees) {
+    const r = await dispatchOutreach({ employee: emp, session: batchSession, aegisSmsNumber });
+    if (r.sent) sent.push(emp.name);
+    else failed.push(`${emp.name} (${r.reason})`);
+  }
+
+  const lines: string[] = [];
+  if (sent.length) lines.push(`Reaching out to ${sent.join(', ')} now.`);
+  if (failed.length) lines.push(`Couldn't reach: ${failed.join(', ')}.`);
+  if (notFound.length) lines.push(`Not found: ${notFound.join(', ')}.`);
+  lines.push(
+    `I'll let you know the moment someone accepts. If no one responds within ${NEXT_BATCH_PROMPT_MINUTES} minutes, ` +
+      `I'll check whether you want me to reach out to another batch.`
+  );
+  await reply(contact, message, lines.join('\n\n'));
+
+  await logActivity({
+    company_id: contact.company_id,
+    action: 'emergency_coverage_batch_sent',
+    summary: `Contacted ${sent.length} employee(s) for ${session.callout_employee_name}'s shift: ${sent.join(', ')}`,
+    metadata: {
+      shift_date: session.shift_date,
+      shift_name: session.shift_info.shift_name,
+      contacted: sent,
+      failed,
+      window_minutes: NEXT_BATCH_PROMPT_MINUTES,
+    },
+  });
+}
+
+// Manager said "yes, send the next batch" — blast the next slice of the pool.
+async function blastNextBatch(
+  message: InboundMessage,
+  contact: VerifiedContact,
+  session: CoverageSession
+): Promise<void> {
+  const pool = session.candidate_pool ?? [];
+  const shown = session.shown_count ?? 0;
+  const next = pool
+    .slice(shown, shown + NEXT_BATCH_SIZE)
+    .filter(c => c.employee_id !== session.callout_employee_id);
+
+  if (next.length === 0) {
+    await clearSession(contact.company_id);
+    await reply(
+      contact,
+      message,
+      `That's everyone qualified and available I could find for the ${session.shift_info.shift_name} shift. ` +
+        `You'll need to contact staff directly or ask someone already working to extend.`
+    );
+    return;
+  }
+
+  const employees = await loadEmployeesByIds(contact.company_id, next.map(c => c.employee_id));
+  await blastBatch({
+    message,
+    contact,
+    session: { ...session, shown_count: shown + next.length },
+    employees,
+  });
+}
+
+// The contacted group is exhausted with no acceptance (everyone declined or the
+// window lapsed). Ask the manager whether to send another batch — we never
+// auto-send. Shared by the decline path and the timeout scheduler.
+export async function promptForNextBatchOrExhaust(params: {
+  session: CoverageSession;
+  managerContact: VerifiedContact;
+  managerMessage: InboundMessage;
+  updatedResults: OutreachResult[];
+}): Promise<void> {
+  const { session, managerContact, managerMessage, updatedResults } = params;
+  const pool = session.candidate_pool ?? [];
+  const shown = session.shown_count ?? 0;
+  const moreAvailable = shown < pool.length;
+
+  if (moreAvailable) {
+    await updateSession({
+      ...session,
+      outreach_results: updatedResults,
+      state: 'awaiting_next_batch_decision',
+    });
+    await reply(
+      managerContact,
+      managerMessage,
+      `No one I reached out to has accepted the ${session.shift_info.shift_name} shift on ${formatShortDate(session.shift_date)}. ` +
+        `Want me to reach out to another batch of employees? Reply YES to send the next group, or NO to handle it yourself.`
+    );
+    await logActivity({
+      company_id: session.company_id,
+      action: 'emergency_coverage_prompt_next_batch',
+      summary: `Asked manager whether to contact another batch for ${session.callout_employee_name}'s shift`,
+      metadata: { shift_date: session.shift_date, shift_name: session.shift_info.shift_name, already_contacted: shown },
+    });
+  } else {
+    await clearSession(session.company_id);
+    await reply(
+      managerContact,
+      managerMessage,
+      `No one accepted, and I've now reached everyone qualified and available for the ${session.shift_info.shift_name} shift on ${formatShortDate(session.shift_date)}. ` +
+        `You'll need to contact staff directly.`
+    );
+    await logActivity({
+      company_id: session.company_id,
+      action: 'emergency_coverage_queue_exhausted',
+      summary: `All candidates exhausted for ${session.callout_employee_name}'s shift on ${session.shift_date}`,
+      metadata: { shift_date: session.shift_date, shift_name: session.shift_info.shift_name },
+    });
+  }
+}
+
+// Step 2: Manager decides who to contact (everyone on the list or specific
+// names), or answers a "send another batch?" prompt. Outreach goes out in
+// parallel — first YES wins.
 export async function handleManagerCoverageReply(
   message: InboundMessage,
   contact: VerifiedContact,
@@ -1143,17 +1318,58 @@ export async function handleManagerCoverageReply(
     return;
   }
 
+  // The manager is answering a "send another batch?" prompt.
+  if (session.state === 'awaiting_next_batch_decision') {
+    if (parseEmployeeResponse(message.body) === 'yes') {
+      await blastNextBatch(message, contact, session);
+    } else {
+      await clearSession(contact.company_id);
+      await reply(
+        contact,
+        message,
+        "Understood — I'll leave it with you. Reply any time if you'd like me to find more coverage."
+      );
+      await logActivity({
+        company_id: contact.company_id,
+        action: 'emergency_coverage_declined_outreach',
+        summary: `Manager declined another batch for ${session.callout_employee_name}'s shift`,
+        metadata: { shift_date: session.shift_date, shift_name: session.shift_info.shift_name },
+      });
+    }
+    return;
+  }
+
   const names = await extractOutreachNames(message.body);
 
-  // "Show me more / anyone else / additional batch" → serve the next batch from
-  // the engine-ranked pool, without recomputing.
-  if (names.length === 0 && /\b(more|others?|else|another|additional|other options?|who else|anyone else)\b/i.test(message.body)) {
+  // "Show me more" (view only — does NOT contact anyone) when the manager isn't
+  // asking to contact everyone.
+  if (
+    names.length === 0 &&
+    !isContactAll(message.body) &&
+    /\b(more|others?|else|additional|other options?|who else|anyone else)\b/i.test(message.body)
+  ) {
     await presentAdditionalBatch(message, contact, session);
     return;
   }
 
+  // "Reach out to everyone on the list" → blast the shown batch in parallel.
+  if (isContactAll(message.body)) {
+    const shown = session.shown_count ?? 0;
+    const pool = session.candidate_pool ?? [];
+    const ids = (shown > 0 ? pool.slice(0, shown) : pool)
+      .map(c => c.employee_id)
+      .filter(id => id !== session.callout_employee_id);
+    const employees = await loadEmployeesByIds(contact.company_id, ids);
+    if (employees.length === 0) {
+      await reply(contact, message, "I don't have any candidates to contact for this shift. Reply with a specific name if you have someone in mind.");
+      return;
+    }
+    await blastBatch({ message, contact, session, employees });
+    return;
+  }
+
   if (names.length === 0) {
-    // Manager is declining Aegis outreach or just following up
+    // Manager is declining Aegis outreach or just following up.
     await clearSession(contact.company_id);
     await reply(
       contact,
@@ -1169,7 +1385,7 @@ export async function handleManagerCoverageReply(
     return;
   }
 
-  // Look up each employee by name
+  // Specific names → contact just those (in parallel).
   const employees: Employee[] = [];
   const notFound: string[] = [];
   const skippedCallout: string[] = [];
@@ -1195,7 +1411,7 @@ export async function handleManagerCoverageReply(
         contact,
         message,
         `${skippedCallout.join(', ')} is the person who's out for this shift, so I can't ask them to cover it. ` +
-          `Who else would you like me to contact? Reply "more" to see the candidate list again.`
+          `Who else would you like me to contact? Reply "all" to contact everyone on the list, or "more" to see additional options.`
       );
       return;
     }
@@ -1207,63 +1423,7 @@ export async function handleManagerCoverageReply(
     return;
   }
 
-  // SMS channel is optional now — outreach goes by email when the employee has
-  // one, and falls back to SMS otherwise. dispatchOutreach reports per-candidate
-  // if someone can't be reached on any channel.
-  const aegisSmsNumber = await getAegisSmsChannel(contact.company_id);
-
-  // Update session to outreach_in_progress
-  const updatedSession: CoverageSession = {
-    ...session,
-    state: 'outreach_in_progress',
-    outreach_queue: employees.map(e => e.id),
-    outreach_results: employees.map(e => ({
-      employee_id: e.id,
-      employee_name: e.name,
-      response: 'pending' as const,
-      responded_at: null,
-    })),
-  };
-  await updateSession(updatedSession);
-
-  // Contact first employee immediately
-  const firstEmployee = employees[0];
-  const dispatchResult = await dispatchOutreach({
-    employee: firstEmployee,
-    session: updatedSession,
-    aegisSmsNumber,
-  });
-
-  if (!dispatchResult.sent) {
-    await reply(
-      contact,
-      message,
-      `Unable to contact ${firstEmployee.name}: ${dispatchResult.reason}. Please contact them directly.`
-    );
-  } else {
-    const orderSummary = employees.map((e, i) => `${i + 1}. ${e.name}`).join('\n');
-    const notFoundNote = notFound.length > 0 ? `\n\nNot found: ${notFound.join(', ')}` : '';
-    await reply(
-      contact,
-      message,
-      `Contacting employees in order:\n${orderSummary}\n\n` +
-        `Reaching out to ${firstEmployee.name} now. Response window: ${session.urgency_window_minutes} minutes.${notFoundNote}\n\n` +
-        "I'll update you after each response."
-    );
-  }
-
-  await logActivity({
-    company_id: contact.company_id,
-    action: 'emergency_coverage_outreach_started',
-    summary: `Outreach started for ${session.callout_employee_name}'s shift — contacting ${employees.map(e => e.name).join(', ')}`,
-    metadata: {
-      shift_date: session.shift_date,
-      shift_name: session.shift_info.shift_name,
-      employees_queued: employees.map(e => ({ id: e.id, name: e.name })),
-      first_contact: firstEmployee.name,
-      window_minutes: session.urgency_window_minutes,
-    },
-  });
+  await blastBatch({ message, contact, session, employees, notFound });
 }
 
 // Step 3: Employee responds to outreach SMS.
@@ -1388,75 +1548,36 @@ export async function handleEmployeeCoverageResponse(
     // Employee said no
     await clearOutreach(outreach.company_id, contact.employee_id!);
 
-    // Update session with this decline
+    // Confirm to employee
+    await reply(contact, message, "No problem — thanks for letting us know!");
+
+    // Update session with this decline. We do NOT auto-advance to the next
+    // person — the blast already went to the whole group. If everyone we
+    // contacted has now responded (declined/no-response) without an accept,
+    // ask the manager whether to send another batch.
     if (session) {
       const updatedResults = session.outreach_results.map(r =>
         r.employee_id === contact.employee_id
           ? { ...r, response: 'no' as const, responded_at: new Date().toISOString() }
           : r
       );
-      const remainingQueue = session.outreach_queue.filter(id => id !== contact.employee_id);
 
-      // Confirm to employee
-      await reply(contact, message, "No problem — thanks for letting us know!");
-
-      // Find next employee in queue who hasn't been contacted yet
-      const nextId = remainingQueue.find(id =>
-        updatedResults.find(r => r.employee_id === id && r.response === 'pending')
+      const anyPending = session.outreach_queue.some(id =>
+        updatedResults.some(r => r.employee_id === id && r.response === 'pending')
       );
 
-      if (nextId) {
-        const { data: nextEmpData } = await supabase.from('employees').select('*')
-          .eq('id', nextId).single();
-        const nextEmp = nextEmpData as Employee | null;
-        const aegisSmsNumber = await getAegisSmsChannel(outreach.company_id);
-
-        if (nextEmp && aegisSmsNumber) {
-          const dispatchResult = await dispatchOutreach({
-            employee: nextEmp,
-            session: { ...session, outreach_results: updatedResults },
-            aegisSmsNumber,
-          });
-
-          await updateSession({ ...session, outreach_results: updatedResults });
-
-          if (dispatchResult.sent) {
-            await reply(
-              managerContact,
-              managerMessage,
-              `${contact.name} declined. Contacting ${nextEmp.name} now (window: ${session.urgency_window_minutes} min).`
-            );
-          } else {
-            await reply(
-              managerContact,
-              managerMessage,
-              `${contact.name} declined. Unable to contact ${nextEmp.name}: ${dispatchResult.reason}. No more candidates in queue.`
-            );
-            await clearSession(outreach.company_id);
-          }
-        } else {
-          await updateSession({ ...session, outreach_results: updatedResults });
-          await reply(
-            managerContact,
-            managerMessage,
-            `${contact.name} declined. Unable to contact the next employee — please try directly.`
-          );
-        }
-      } else {
-        // No more candidates in queue
+      if (anyPending) {
+        // Still waiting on others in this batch — just record the decline.
         await updateSession({ ...session, outreach_results: updatedResults });
-        await clearSession(outreach.company_id);
-        await reply(
+      } else {
+        // Whole contacted group is done with no acceptance.
+        await promptForNextBatchOrExhaust({
+          session,
           managerContact,
           managerMessage,
-          `${contact.name} declined and the outreach queue is exhausted. ` +
-            `No coverage found for the ${session.shift_info.shift_name} shift on ${formatShortDate(session.shift_date)}. ` +
-            `You may need to contact additional staff directly.`
-        );
+          updatedResults,
+        });
       }
-    } else {
-      // No session found (already cleared or expired)
-      await reply(contact, message, "No problem — thanks for letting us know!");
     }
 
     await logActivity({

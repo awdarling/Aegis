@@ -4,6 +4,7 @@ import { sendDecisionNotification } from '../workflows/time-off';
 import { distributeScheduleCore } from '../workflows/schedule-build';
 import {
   applyAvailabilityDecision,
+  applyCustomAvailabilityDecision,
   type AvailabilitySlot,
 } from '../workflows/employee-onboarding';
 import { supabase } from '../db/client';
@@ -114,6 +115,79 @@ internalRouter.post('/apply-availability-decision', async (req: Request, res: Re
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[internal] apply-availability-decision failed:', msg);
+    serverError(res, msg);
+  }
+});
+
+// POST /internal/apply-custom-availability-decision
+// Sibling of apply-availability-decision for the TEMPORARY (date-limited) custom
+// override. Homebase forwards the consumed token payload here; we apply the SAME
+// effect the reply-"YES" path applies (write the date-limited custom_availability
+// override + notify the employee) via the shared applyCustomAvailabilityDecision.
+internalRouter.post('/apply-custom-availability-decision', async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as Record<string, unknown>;
+
+  const decision = body.decision;
+  if (decision !== 'approved' && decision !== 'denied') {
+    badRequest(res, 'decision must be "approved" or "denied"');
+    return;
+  }
+
+  const companyId = body.company_id;
+  const employeeId = body.employee_id;
+  const employeeSender = body.employee_sender;
+  const employeeChannel = body.employee_channel;
+  const proposed = body.proposed_availability;
+  const customEndDate = body.custom_end_date;
+
+  if (typeof companyId !== 'string' || companyId.length === 0) {
+    badRequest(res, 'company_id is required');
+    return;
+  }
+  if (typeof employeeId !== 'string' || employeeId.length === 0) {
+    badRequest(res, 'employee_id is required');
+    return;
+  }
+  if (typeof customEndDate !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(customEndDate)) {
+    badRequest(res, 'custom_end_date is required (YYYY-MM-DD)');
+    return;
+  }
+  if (!Array.isArray(proposed)) {
+    badRequest(res, 'proposed_availability must be an array');
+    return;
+  }
+  if (typeof employeeSender !== 'string' || employeeSender.length === 0) {
+    badRequest(res, 'employee_sender is required to notify the employee');
+    return;
+  }
+  if (employeeChannel !== 'sms' && employeeChannel !== 'email') {
+    badRequest(res, 'employee_channel must be "sms" or "email"');
+    return;
+  }
+
+  try {
+    await applyCustomAvailabilityDecision({
+      decision,
+      company_id: companyId,
+      employee_id: employeeId,
+      employee_name: typeof body.employee_name === 'string' ? body.employee_name : 'there',
+      proposed_availability: proposed as AvailabilitySlot[],
+      custom_end_date: customEndDate,
+      current_availability: Array.isArray(body.current_availability)
+        ? (body.current_availability as AvailabilitySlot[])
+        : [],
+      availability_raw: typeof body.availability_raw === 'string' ? body.availability_raw : '',
+      decided_by: typeof body.decided_by === 'string' ? body.decided_by : undefined,
+      employee_sender: employeeSender,
+      employee_recipient: typeof body.employee_recipient === 'string' ? body.employee_recipient : '',
+      employee_channel: employeeChannel,
+      thread_id: typeof body.thread_id === 'string' ? body.thread_id : null,
+      raw_subject: typeof body.raw_subject === 'string' ? body.raw_subject : null,
+    });
+    res.json({ ok: true, decision });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[internal] apply-custom-availability-decision failed:', msg);
     serverError(res, msg);
   }
 });

@@ -55,7 +55,7 @@ interface DecisionRecommendation {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-function formatDateRange(startDate: string, endDate: string): string {
+export function formatDateRange(startDate: string, endDate: string): string {
   const opts: Intl.DateTimeFormatOptions = {
     weekday: 'long',
     month: 'long',
@@ -671,7 +671,7 @@ export async function sendDecisionNotification(
     action: `time_off_${decision === 'approved' ? 'approved' : 'denied'}_notified`,
     entity_type: 'time_off_request',
     entity_id: requestId,
-    summary: `${employee.name} notified that their time-off request for ${dateRange} was ${decision} (via ${channel})`,
+    summary: `Let ${employee.name} know their time-off request for ${dateRange} was ${decision}`,
     metadata: {
       employee_id: employee.id,
       decision,
@@ -1195,7 +1195,7 @@ export async function handlePendingTimeOffConfirmation(
     action: 'time_off_request_created',
     entity_type: 'time_off_request',
     entity_id: requestId,
-    summary: `${employee.name} submitted time-off request: ${pending.start_date} to ${pending.end_date}`,
+    summary: `${employee.name} submitted a time-off request for ${formatDateRange(pending.start_date, pending.end_date)}`,
     metadata: {
       reason: pending.reason,
       stage1_feasible: stage1Result?.overall_feasible ?? null,

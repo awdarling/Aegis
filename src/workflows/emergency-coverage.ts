@@ -418,20 +418,54 @@ function buildScheduledTodaySet(scheduleData: ScheduleData | null, date: string)
 
 // ── AI extraction ─────────────────────────────────────────────────────────────
 
+// Tolerant JSON-object reader. The model occasionally wraps its JSON in
+// ```json fences or adds a sentence of preamble; a bare JSON.parse throws on
+// those and the caller would silently lose ALL extracted fields. This strips
+// fences and grabs the first {...} block before parsing.
+export function coerceJsonObject<T>(text: string): T | null {
+  if (!text) return null;
+  let t = text.trim();
+  t = t.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+  const m = t.match(/\{[\s\S]*\}/);
+  if (m) t = m[0];
+  try {
+    return JSON.parse(t) as T;
+  } catch {
+    return null;
+  }
+}
+
 async function extractEmergencyDetails(
   body: string,
   today: string
 ): Promise<{ employee_name: string | null; shift_date: string; shift_name: string | null }> {
+  const weekday = new Date(today + 'T12:00:00Z').toLocaleDateString('en-US', { weekday: 'long' });
   const system =
-    `You are a data extractor for a workforce scheduling system. Today is ${today}. ` +
-    `Extract emergency coverage details from a manager's message. ` +
-    `Respond with ONLY valid JSON: {"employee_name":string|null,"shift_date":"YYYY-MM-DD","shift_name":string|null}`;
+    `You are a data extractor for a workforce scheduling system. ` +
+    `Today is ${today} (${weekday}) in the company's local timezone. ` +
+    `A manager is reporting that an employee cannot work a shift and needs coverage. Extract three fields:\n` +
+    `- employee_name: the full name of the person who is OUT / calling in sick / can't come in, exactly as written. null if no person is named.\n` +
+    `- shift_date: the calendar date that needs coverage, as YYYY-MM-DD. Resolve relative words against today (${today}):\n` +
+    `    • "today", "tonight", "this morning", or no date mentioned → ${today}\n` +
+    `    • "tomorrow", "tomorrow night" → the day after today\n` +
+    `    • a weekday name like "Saturday" or "this Friday" → the next occurrence of that weekday on or after today\n` +
+    `- shift_name: a shift name or time window if the manager names one (e.g. "morning shift", "3-11", "AM"), else null.\n` +
+    `Resolution examples (pretend today is 2026-03-16, a Monday):\n` +
+    `  "Maisey Pell can't come in today, I need coverage." → {"employee_name":"Maisey Pell","shift_date":"2026-03-16","shift_name":null}\n` +
+    `  "Cover for John tomorrow night" → {"employee_name":"John","shift_date":"2026-03-17","shift_name":"night"}\n` +
+    `  "Sarah called in sick for Saturday" → {"employee_name":"Sarah","shift_date":"2026-03-21","shift_name":null}\n` +
+    `Respond with ONLY a JSON object — no markdown, no commentary: ` +
+    `{"employee_name":string|null,"shift_date":"YYYY-MM-DD","shift_name":string|null}`;
   const text = await generateReply(system, body, []);
-  try {
-    return JSON.parse(text) as { employee_name: string | null; shift_date: string; shift_name: string | null };
-  } catch {
-    return { employee_name: null, shift_date: today, shift_name: null };
+  const parsed = coerceJsonObject<{ employee_name: string | null; shift_date: string; shift_name: string | null }>(text);
+  if (parsed && typeof parsed.shift_date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(parsed.shift_date)) {
+    return {
+      employee_name: parsed.employee_name ?? null,
+      shift_date: parsed.shift_date,
+      shift_name: parsed.shift_name ?? null,
+    };
   }
+  return { employee_name: null, shift_date: today, shift_name: null };
 }
 
 async function extractOutreachNames(body: string): Promise<string[]> {
@@ -780,14 +814,58 @@ export async function handleEmergencyCoverage(
   const shiftNameHint = raw.shift_name ?? null;
 
   // Find the called-out employee
+  const nameProvided = !!(raw.employee_name && raw.employee_name.trim());
   let calledOutEmployee: Employee | null = null;
-  if (raw.employee_name) {
-    calledOutEmployee = await findEmployeeByName(contact.company_id, raw.employee_name);
+  if (nameProvided) {
+    calledOutEmployee = await findEmployeeByName(contact.company_id, raw.employee_name!);
   }
-  const calledOutName = calledOutEmployee?.name ?? raw.employee_name ?? 'Unknown employee';
+
+  // A name was given but we couldn't match it to the roster — ask rather than
+  // guessing a shift, which produces a confidently-wrong candidate list.
+  if (nameProvided && !calledOutEmployee) {
+    await reply(
+      contact,
+      message,
+      `I couldn't find anyone named "${raw.employee_name}" on the roster. Who needs coverage? ` +
+        `Reply with their name as it appears in Homebase, or name the shift directly ` +
+        `(for example: "the Saturday morning lifeguard shift").`
+    );
+    return;
+  }
+
+  const calledOutName = calledOutEmployee?.name ?? 'a team member';
 
   // Find schedule and shift info
   const scheduleData = await findSchedule(contact.company_id, shiftDate);
+
+  // If we matched the employee, their actual scheduled shift is the source of
+  // truth for role + times. If they aren't on the schedule that day, don't fall
+  // back to an unrelated shift type — clarify instead of guessing.
+  if (calledOutEmployee && scheduleData) {
+    const scheduledThatDay = scheduleData.assignments.some(
+      s => s.employee_id === calledOutEmployee!.id && s.date === shiftDate
+    );
+    if (!scheduledThatDay) {
+      const otherDays = [
+        ...new Set(
+          scheduleData.assignments
+            .filter(s => s.employee_id === calledOutEmployee!.id)
+            .map(s => s.date)
+        ),
+      ].sort();
+      const hint = otherDays.length
+        ? ` ${calledOutEmployee.name} is scheduled on: ${otherDays.map(formatShortDate).join(', ')}.`
+        : '';
+      await reply(
+        contact,
+        message,
+        `${calledOutEmployee.name} isn't on the schedule for ${formatDisplayDate(shiftDate)}.${hint} ` +
+          `Which date needs coverage? You can also name the shift directly.`
+      );
+      return;
+    }
+  }
+
   const shiftInfo = await findShiftInfo(
     contact.company_id,
     shiftDate,

@@ -3,6 +3,8 @@ export type ActionType =
   | 'deny_to'
   | 'approve_availability'
   | 'deny_availability'
+  | 'approve_custom_availability'
+  | 'deny_custom_availability'
   | 'accept_emergency_coverage'
   | 'decline_emergency_coverage'
   | 'confirm_distribution'

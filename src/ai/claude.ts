@@ -198,6 +198,18 @@ recurring availability change (update_availability). Pick by the date signal:
 If a message contains BOTH a specific calendar date AND availability-sounding
 language, the specific date wins → submit_time_off.
 
+EXCEPTION — temporary recurring change with an "until/through" boundary:
+when a RECURRING pattern (plural days / a day-period like "mornings") is bounded
+by an "until <date>", "through <date>", "until the end of <month>", or
+"for the summer/season" phrase, it is a TEMPORARY availability change, NOT
+time-off. Classify it as update_availability and put the boundary date in
+extracted.end_date (YYYY-MM-DD). The "specific date wins → submit_time_off" rule
+does NOT apply to an until/through boundary on a recurring pattern.
+- "no mornings until September 1", "afternoons only through Aug 15",
+  "can't do weekends until the end of June" → update_availability with end_date.
+- A recurring pattern with NO end boundary → update_availability with NO end_date
+  (a permanent change).
+
 ## Informal / indirect phrasing
 
 Teen/informal register is common (lowercase, no punctuation, slang). Map:
@@ -219,6 +231,9 @@ User: "take me off thursday nights"
 
 User: "i cant do tuesday mornings anymore"
 {"intent":"update_availability","confidence":"high","extracted":{}}
+
+User: "no mornings until september 1"
+{"intent":"update_availability","confidence":"high","extracted":{"end_date":"${currentYear}-09-01"}}
 
 User: "gimme june 20 off"
 {"intent":"submit_time_off","confidence":"high","extracted":{"dates":[{"start_date":"${currentYear}-06-20","end_date":"${currentYear}-06-20","time_off_type":"full_day","period_label":null,"start_time":null,"end_time":null}],"reason":null}}
@@ -280,7 +295,10 @@ Respond with ONLY valid JSON in this exact shape — no markdown, no explanation
     //   unspecified. Never emit a calendar date — you do not know today's date.
     // For homebase_edit: { "entity_type": "employee|event|policy|wage_rate|shift_type", "entity_name": "...", "field": "...", "new_value": "..." }
     // For initiate_onboarding: { "employee_name": "..." } if targeting one employee, or {} for all
-    // For update_availability: {}
+    // For update_availability: {} for a permanent change, OR { "end_date": "YYYY-MM-DD" }
+    //   when the change is TEMPORARY (bounded by "until/through <date>"). The
+    //   availability times themselves are parsed downstream from the message text;
+    //   you only need to surface end_date here when a boundary is stated.
     // For operational_query: {}
     // For run_payroll_check: { "period_start": "YYYY-MM-DD", "period_end": "YYYY-MM-DD" }
     // For broadcast_message: { "message_text": "exact message to send", "target_type": "all|managers|employees|role|specific", "target_role": "Lifeguard|null", "target_names": ["Name1"]|null, "channel": "sms|email|both" }

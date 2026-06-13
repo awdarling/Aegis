@@ -81,6 +81,9 @@ interface PendingAvailUpdate {
   availability_raw: string;
   employee_sender: string;
   employee_recipient: string;
+  // Set (YYYY-MM-DD) when this is a TEMPORARY, date-limited custom-availability
+  // change ("until <date>"); absent/null for a normal permanent availability change.
+  custom_end_date?: string | null;
   expires_at: string;
 }
 
@@ -100,6 +103,7 @@ interface PendingManagerAvailApproval {
   employee_channel: 'sms' | 'email';
   thread_id?: string | null;
   raw_subject?: string | null;
+  custom_end_date?: string | null;
   expires_at: string;
 }
 
@@ -1593,7 +1597,7 @@ export async function getPendingManagerAvailApproval(
 export async function handleUpdateAvailability(
   message: InboundMessage,
   contact: VerifiedContact,
-  _extracted: Record<string, unknown>
+  extracted: Record<string, unknown>
 ): Promise<void> {
   // Conversational ack on email so the employee sees an immediate in-thread
   // reply while the availability parse runs. The YES/NO confirmation follows
@@ -1636,6 +1640,12 @@ export async function handleUpdateAvailability(
     }))
     .filter(s => s.start_time < s.end_time);
 
+  // A bounded "until <date>" change is a TEMPORARY (date-limited) custom override,
+  // not a permanent availability change. The classifier surfaces end_date when it
+  // sees the boundary; we only treat it as custom when it's a valid YYYY-MM-DD.
+  const endRaw = typeof extracted.end_date === 'string' ? extracted.end_date.trim() : '';
+  const customEndDate = /^\d{4}-\d{2}-\d{2}$/.test(endRaw) ? endRaw : null;
+
   const pending: PendingAvailUpdate = {
     employee_id: employeeId,
     employee_name: contact.name,
@@ -1645,6 +1655,7 @@ export async function handleUpdateAvailability(
     availability_raw: message.body,
     employee_sender: message.sender,
     employee_recipient: message.recipient,
+    custom_end_date: customEndDate,
     expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
   };
 
@@ -1662,11 +1673,10 @@ export async function handleUpdateAvailability(
   });
 
   const proposedDisplay = formatAvailabilityList(proposed);
-  await reply(
-    contact,
-    message,
-    `You want to change your availability to:\n${proposedDisplay}\nI'll send this to your manager for approval. Is that correct? Reply YES or NO.`
-  );
+  const confirmBody = customEndDate
+    ? `Got it — through ${formatDateRange(customEndDate, customEndDate)}, you'd be available:\n${proposedDisplay}\nAfter that you'd go back to your normal availability. I'll send this to your manager to approve. Is that right? Reply YES or NO.`
+    : `You want to change your availability to:\n${proposedDisplay}\nI'll send this to your manager for approval. Is that correct? Reply YES or NO.`;
+  await reply(contact, message, confirmBody);
 }
 
 export async function handleAvailabilityConfirmResponse(
@@ -1744,8 +1754,14 @@ export async function handleAvailabilityConfirmResponse(
       : 'Not on file';
   const proposedDisplay = formatAvailabilityList(pending.proposed_availability);
 
+  // A date-limited request reads as a TEMPORARY override through a date, then
+  // back to normal; a permanent change reads as a plain availability update.
+  const customEndDate = approval.custom_end_date ?? null;
+  const headline = customEndDate
+    ? `${pending.employee_name} wants a temporary availability change through ${formatDateRange(customEndDate, customEndDate)} (then back to normal).`
+    : `${pending.employee_name} wants to update their availability.`;
   const managerBody =
-    `${pending.employee_name} wants to update their availability.\n\n` +
+    `${headline}\n\n` +
     `CURRENT:\n${currentDisplay}\n\nPROPOSED:\n${proposedDisplay}\n\n` +
     `Reply YES to approve or NO to deny.`;
 
@@ -1777,6 +1793,7 @@ export async function handleAvailabilityConfirmResponse(
         employee_name: pending.employee_name,
         current_availability: pending.current_availability,
         proposed_availability: pending.proposed_availability,
+        custom_end_date: customEndDate,
         // The token payload is the self-contained approval snapshot — the
         // magic-link handler applies the decision from this alone (no dependence
         // on the aegis_memory pending row, so a later re-submit can't strand it).
@@ -1847,11 +1864,19 @@ export async function buildAvailabilityManagerEmail(params: {
   employee_name: string;
   current_availability: AvailabilitySlot[];
   proposed_availability: AvailabilitySlot[];
+  // When set (YYYY-MM-DD), this is a TEMPORARY date-limited custom-availability
+  // request: the buttons mint approve/deny_custom_availability and the copy says
+  // "through <date>, then back to normal".
+  custom_end_date?: string | null;
   token_payload: Record<string, unknown>;
 }): Promise<{ subject: string; text: string; html: string }> {
+  const isCustom = !!params.custom_end_date;
+  const throughLabel = params.custom_end_date
+    ? formatDateRange(params.custom_end_date, params.custom_end_date)
+    : '';
   const [approveTok, denyTok] = await Promise.all([
     generateActionToken({
-      action_type: 'approve_availability',
+      action_type: isCustom ? 'approve_custom_availability' : 'approve_availability',
       payload: params.token_payload,
       company_id: params.company_id,
       issued_to_email: params.manager_email,
@@ -1859,7 +1884,7 @@ export async function buildAvailabilityManagerEmail(params: {
       ttl_minutes: 4320,
     }),
     generateActionToken({
-      action_type: 'deny_availability',
+      action_type: isCustom ? 'deny_custom_availability' : 'deny_availability',
       payload: params.token_payload,
       company_id: params.company_id,
       issued_to_email: params.manager_email,
@@ -1874,12 +1899,19 @@ export async function buildAvailabilityManagerEmail(params: {
       : 'Not on file';
   const proposedDisplay = formatAvailabilityList(params.proposed_availability);
 
-  const subject = `Availability update request from ${params.employee_name}`;
+  const subject = isCustom
+    ? `Temporary availability request from ${params.employee_name} (through ${throughLabel})`
+    : `Availability update request from ${params.employee_name}`;
+
+  const intro = isCustom
+    ? `${params.employee_name} wants a temporary availability change through ${throughLabel}, then back to normal.`
+    : `${params.employee_name} wants to update their availability.`;
+  const proposedHeading = isCustom ? `AVAILABLE THROUGH ${throughLabel.toUpperCase()}` : 'PROPOSED';
 
   const text =
     `${greeting(params.manager_name)}\n\n` +
-    `${params.employee_name} wants to update their availability.\n\n` +
-    `CURRENT:\n${currentDisplay}\n\nPROPOSED:\n${proposedDisplay}\n\n` +
+    `${intro}\n\n` +
+    `CURRENT:\n${currentDisplay}\n\n${proposedHeading}:\n${proposedDisplay}\n\n` +
     `Approve: ${approveTok.url}\n\nDeny: ${denyTok.url}\n\n` +
     `(You can also just reply YES to approve or NO to deny.)`;
 
@@ -1891,7 +1923,7 @@ export async function buildAvailabilityManagerEmail(params: {
     <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="640" style="max-width:640px;background:#ffffff;border-radius:8px;padding:28px;border:1px solid #e5e7eb;">
       <tr><td style="font-size:16px;line-height:1.5;">
         <p style="margin:0 0 14px;">${escAvail(greeting(params.manager_name))}</p>
-        <p style="margin:0 0 18px;"><strong>${escAvail(params.employee_name)}</strong> would like to update their availability.</p>
+        <p style="margin:0 0 18px;">${escAvail(intro)}</p>
         <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:0 0 22px;">
           <tr>
             <td valign="top" width="48%" style="padding:12px 14px;background:#f9fafb;border:1px solid #e5e7eb;border-radius:6px;font-size:13px;line-height:1.5;">
@@ -1900,7 +1932,7 @@ export async function buildAvailabilityManagerEmail(params: {
             </td>
             <td width="4%">&nbsp;</td>
             <td valign="top" width="48%" style="padding:12px 14px;background:#eff6ff;border:1px solid #bfdbfe;border-radius:6px;font-size:13px;line-height:1.5;">
-              <div style="font-weight:700;color:#1d4ed8;text-transform:uppercase;letter-spacing:.04em;font-size:11px;margin-bottom:6px;">Proposed</div>
+              <div style="font-weight:700;color:#1d4ed8;text-transform:uppercase;letter-spacing:.04em;font-size:11px;margin-bottom:6px;">${escAvail(proposedHeading)}</div>
               ${availMultiline(proposedDisplay)}
             </td>
           </tr>
@@ -2015,6 +2047,109 @@ export async function applyAvailabilityDecision(input: AvailabilityDecisionInput
   }
 }
 
+// ── Shared CUSTOM-availability decision effect (date-limited override) ─────────
+//
+// Sibling to applyAvailabilityDecision, but on approve it writes a date-limited
+// custom_availability OVERRIDE (the same kind the Employees tab + Soteria create)
+// instead of replacing the permanent availability. Used by both the reply-"YES"
+// path and the email magic-link path (/internal/apply-custom-availability-decision),
+// so the two produce the identical effect. Employee notice never links to Homebase.
+export interface CustomAvailabilityDecisionInput {
+  decision: 'approved' | 'denied';
+  company_id: string;
+  employee_id: string;
+  employee_name: string;
+  proposed_availability: AvailabilitySlot[];  // days/times available DURING the override
+  custom_end_date: string;                     // YYYY-MM-DD — when the override expires
+  current_availability: AvailabilitySlot[];
+  availability_raw: string;
+  decided_by?: string;
+  employee_sender: string;
+  employee_recipient: string;
+  employee_channel: 'sms' | 'email';
+  thread_id?: string | null;
+  raw_subject?: string | null;
+}
+
+export async function applyCustomAvailabilityDecision(input: CustomAvailabilityDecisionInput): Promise<void> {
+  const notifyContext: PendingManagerAvailApproval = {
+    employee_id: input.employee_id,
+    employee_name: input.employee_name,
+    company_id: input.company_id,
+    current_availability: input.current_availability,
+    proposed_availability: input.proposed_availability,
+    availability_raw: input.availability_raw,
+    employee_sender: input.employee_sender,
+    employee_recipient: input.employee_recipient,
+    employee_channel: input.employee_channel,
+    thread_id: input.thread_id ?? null,
+    raw_subject: input.raw_subject ?? null,
+    custom_end_date: input.custom_end_date,
+    expires_at: '',
+  };
+  const throughLabel = formatDateRange(input.custom_end_date, input.custom_end_date);
+
+  if (input.decision === 'approved') {
+    // Same write the Employees tab + Soteria do: switch off any existing active
+    // override for this employee, then insert the new date-limited one.
+    await supabase
+      .from('custom_availability')
+      .update({ active: false })
+      .eq('employee_id', input.employee_id)
+      .eq('company_id', input.company_id);
+
+    const patterns = input.proposed_availability.map(s => ({
+      day_of_week: s.day_of_week,
+      start_time: s.start_time,
+      end_time: s.end_time,
+    }));
+
+    await supabase.from('custom_availability').insert({
+      company_id: input.company_id,
+      employee_id: input.employee_id,
+      type: 'date_limited',
+      end_date: input.custom_end_date,
+      cycle_weeks: null,
+      cycle_start_date: null,
+      patterns,
+      active: true,
+    });
+
+    await logActivity({
+      company_id: input.company_id,
+      action: 'custom_availability_set',
+      entity_type: 'custom_availability',
+      entity_id: input.employee_id,
+      summary: `${input.decided_by ?? 'A manager'} approved ${input.employee_name}'s temporary availability through ${throughLabel}`,
+      metadata: {
+        approved_by: input.decided_by ?? 'manager',
+        end_date: input.custom_end_date,
+        patterns,
+        raw_request: input.availability_raw,
+      },
+    });
+
+    await notifyEmployeeOfAvailabilityDecision(
+      notifyContext,
+      `Your temporary availability change is approved — it's set through ${throughLabel}, then you'll go back to your normal availability.`
+    );
+  } else {
+    await logActivity({
+      company_id: input.company_id,
+      action: 'custom_availability_denied',
+      entity_type: 'custom_availability',
+      entity_id: input.employee_id,
+      summary: `${input.decided_by ?? 'A manager'} denied ${input.employee_name}'s temporary availability change`,
+      metadata: { denied_by: input.decided_by ?? 'manager', end_date: input.custom_end_date },
+    });
+
+    await notifyEmployeeOfAvailabilityDecision(
+      notifyContext,
+      `Your temporary availability change wasn't approved. Please speak with your manager directly if you'd like to discuss.`
+    );
+  }
+}
+
 export async function handleManagerAvailabilityApproval(
   message: InboundMessage,
   contact: VerifiedContact,
@@ -2053,12 +2188,23 @@ export async function handleManagerAvailabilityApproval(
     raw_subject: pending.raw_subject,
   };
 
+  const customEndDate = pending.custom_end_date ?? null;
   if (isYes) {
-    await applyAvailabilityDecision({ ...decisionInput, decision: 'approved' });
-    await reply(contact, message, `${pending.employee_name}'s availability has been updated.`);
+    if (customEndDate) {
+      await applyCustomAvailabilityDecision({ ...decisionInput, custom_end_date: customEndDate, decision: 'approved' });
+      await reply(contact, message, `${pending.employee_name}'s temporary availability is set through ${formatDateRange(customEndDate, customEndDate)}.`);
+    } else {
+      await applyAvailabilityDecision({ ...decisionInput, decision: 'approved' });
+      await reply(contact, message, `${pending.employee_name}'s availability has been updated.`);
+    }
   } else {
-    await applyAvailabilityDecision({ ...decisionInput, decision: 'denied' });
-    await reply(contact, message, `${pending.employee_name}'s availability update has been denied.`);
+    if (customEndDate) {
+      await applyCustomAvailabilityDecision({ ...decisionInput, custom_end_date: customEndDate, decision: 'denied' });
+      await reply(contact, message, `${pending.employee_name}'s temporary availability change has been denied.`);
+    } else {
+      await applyAvailabilityDecision({ ...decisionInput, decision: 'denied' });
+      await reply(contact, message, `${pending.employee_name}'s availability update has been denied.`);
+    }
   }
 }
 

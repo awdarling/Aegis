@@ -626,6 +626,78 @@ async function claudeParseAvailability(
   }
 }
 
+// Parses an availability-CHANGE message (the update flow, not onboarding) into an
+// intent: "set" = the employee stated when they CAN work (replace), "remove" =
+// they stated when they CANNOT work (negative — subtract from current). For
+// "remove" the slots are the windows to take away. Lets employees talk naturally
+// ("I can't work Wednesdays anymore", "no mornings until Aug 1").
+export type AvailabilityIntent = { mode: 'set' | 'remove'; slots: AvailabilitySlot[] };
+
+async function parseAvailabilityIntent(
+  message: string,
+  bounds: ShiftBounds
+): Promise<AvailabilityIntent> {
+  const response = await withAnthropicRetry(() =>
+    client.messages.create({
+      model: MODEL,
+      max_tokens: 512,
+      system:
+        `You are parsing an employee's availability-change message. ` +
+        `First decide the MODE: ` +
+        `"set" = the employee states when they CAN work (positive); ` +
+        `"remove" = the employee states when they CANNOT work (negative — phrases like ` +
+        `"I can't work...", "no more...", "take me off...", "stop scheduling me...", "no <day/period>..."). ` +
+        `Then list the day+time windows the message refers to — the windows they CAN work (mode "set") ` +
+        `or the windows they CANNOT work (mode "remove"). ` +
+        // Same named-period rules as the positive parser.
+        `Named periods (no explicit times): morning = ${bounds.earliest_start}–12:00, afternoon = 12:00–17:00, ` +
+        `evening/night = 17:00–${bounds.latest_end}; clamp to ${bounds.earliest_start}–${bounds.latest_end}. ` +
+        `A whole-day negative with no period ("can't work Wednesdays") uses the full window ${bounds.earliest_start}–${bounds.latest_end} for that day. ` +
+        `Day words: "weekdays" = Mon–Fri; "weekends" = Sat + Sun; a plural weekday ("Mondays") = that weekday. ` +
+        `Ignore any trailing date boundary like "until <date>". day_of_week: 0=Sunday..6=Saturday. Times HH:MM (24h). ` +
+        `Respond ONLY with JSON (no markdown): ` +
+        `{ "mode": "set" | "remove", "slots": [{ "day_of_week": 0, "start_time": "HH:MM", "end_time": "HH:MM" }] }. ` +
+        `If nothing clear can be parsed: { "mode": "set", "slots": [] }.`,
+      messages: [{ role: 'user', content: message }],
+    })
+  );
+
+  const text = response.content[0].type === 'text' ? response.content[0].text : '';
+  try {
+    const parsed = JSON.parse(text) as { mode?: string; slots?: AvailabilitySlot[] };
+    const mode: 'set' | 'remove' = parsed.mode === 'remove' ? 'remove' : 'set';
+    return { mode, slots: parsed.slots ?? [] };
+  } catch {
+    return { mode: 'set', slots: [] };
+  }
+}
+
+// Pure: subtract a set of "can't work" windows from the employee's current
+// availability, returning what remains. Whole-day removals drop the day; partial
+// removals trim or split the slot. Times are "HH:MM" 24h (lexical order = time
+// order). No side effects — unit-tested.
+export function subtractWindows(
+  current: AvailabilitySlot[],
+  remove: AvailabilitySlot[]
+): AvailabilitySlot[] {
+  let result = current.map(s => ({ ...s }));
+  for (const r of remove) {
+    const next: AvailabilitySlot[] = [];
+    for (const s of result) {
+      if (s.day_of_week !== r.day_of_week || r.end_time <= s.start_time || r.start_time >= s.end_time) {
+        next.push(s); // different day or no overlap → keep as-is
+        continue;
+      }
+      // Overlap on this day: keep the parts of s outside [r.start, r.end].
+      if (s.start_time < r.start_time) next.push({ ...s, end_time: r.start_time });
+      if (r.end_time < s.end_time) next.push({ ...s, start_time: r.end_time });
+      // (r fully covers s → contribute nothing)
+    }
+    result = next;
+  }
+  return result.filter(s => s.start_time < s.end_time);
+}
+
 // Binary yes/no classifier — used in onboarding confirmation steps where natural
 // language ("right but Friday's wrong", "looks good") needs to be interpreted
 // reliably. Falls back to 'no' on parse failure (the safe default everywhere
@@ -1628,25 +1700,48 @@ export async function handleUpdateAvailability(
     .eq('employee_id', employeeId);
 
   const currentAvail = (currentData ?? []) as AvailabilitySlot[];
-  const parsed = await claudeParseAvailability(message.body, bounds);
+  const intent = await parseAvailabilityIntent(message.body, bounds);
 
-  if (parsed.length === 0) {
-    await reply(
-      contact,
-      message,
-      `I wasn't able to understand your availability. Could you be more specific? ` +
-        `For example: "Monday 9am to 5pm and Friday 10am to 3pm."`
-    );
-    return;
+  const clamp = (s: AvailabilitySlot): AvailabilitySlot => ({
+    day_of_week: s.day_of_week,
+    start_time: clampTime(s.start_time, bounds.earliest_start, bounds.latest_end),
+    end_time: clampTime(s.end_time, bounds.earliest_start, bounds.latest_end),
+  });
+
+  let proposed: AvailabilitySlot[];
+  if (intent.mode === 'remove') {
+    // Negative ("I can't work X"): start from current availability and take the
+    // stated windows away. The manager still approves before anything changes.
+    if (currentAvail.length === 0) {
+      await reply(
+        contact,
+        message,
+        `I don't have any availability on file for you yet, so there's nothing to take away. ` +
+          `Tell me the days and times you CAN work and I'll set that up — for example: "Monday 9am to 5pm and Friday 10am to 3pm."`
+      );
+      return;
+    }
+    proposed = subtractWindows(currentAvail, intent.slots.map(clamp)).filter(s => s.start_time < s.end_time);
+    if (proposed.length === 0) {
+      await reply(
+        contact,
+        message,
+        `That would leave you with no availability at all. If you need to stop working or take time off, let your manager know directly — otherwise tell me the days and times you CAN work.`
+      );
+      return;
+    }
+  } else {
+    proposed = intent.slots.map(clamp).filter(s => s.start_time < s.end_time);
+    if (proposed.length === 0) {
+      await reply(
+        contact,
+        message,
+        `I wasn't able to understand your availability. Could you be more specific? ` +
+          `For example: "Monday 9am to 5pm and Friday 10am to 3pm."`
+      );
+      return;
+    }
   }
-
-  const proposed = parsed
-    .map(s => ({
-      ...s,
-      start_time: clampTime(s.start_time, bounds.earliest_start, bounds.latest_end),
-      end_time: clampTime(s.end_time, bounds.earliest_start, bounds.latest_end),
-    }))
-    .filter(s => s.start_time < s.end_time);
 
   // A bounded "until <date>" change is a TEMPORARY (date-limited) custom override,
   // not a permanent availability change. The classifier surfaces end_date when it

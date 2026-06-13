@@ -1838,7 +1838,7 @@ function availMultiline(s: string): string {
   return escAvail(s).replace(/\n/g, '<br>');
 }
 
-async function buildAvailabilityManagerEmail(params: {
+export async function buildAvailabilityManagerEmail(params: {
   company_id: string;
   manager_email: string;
   manager_user_id?: string;

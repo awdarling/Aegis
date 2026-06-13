@@ -602,6 +602,14 @@ async function claudeParseAvailability(
         `Extract all days and time ranges the employee is available. ` +
         `Clamp all times to ${bounds.earliest_start}–${bounds.latest_end} (24h). ` +
         `"All day" or "anytime" means ${bounds.earliest_start} to ${bounds.latest_end}. ` +
+        // Named parts of the day, when the employee gives no explicit clock times.
+        // These are the GENERAL clock meanings; clamp to the company's hours.
+        `Named periods (no explicit times given) map to: ` +
+        `morning = ${bounds.earliest_start}–12:00, afternoon = 12:00–17:00, ` +
+        `evening/night = 17:00–${bounds.latest_end}; then clamp to ${bounds.earliest_start}–${bounds.latest_end}. ` +
+        `So "Monday mornings" → Monday with the morning window; "weekend afternoons" → Saturday and Sunday with the afternoon window. ` +
+        `Day words: "weekdays" = Monday–Friday; "weekends" = Saturday and Sunday; a plural weekday ("Mondays") = that weekday. ` +
+        `Ignore any trailing date boundary such as "until <date>" or "through <date>" — parse only the days and times. ` +
         `day_of_week: 0=Sunday through 6=Saturday. Times in HH:MM (24h). ` +
         `Respond ONLY with valid JSON (no markdown): ` +
         `{ "slots": [{ "day_of_week": 0, "start_time": "HH:MM", "end_time": "HH:MM" }] } ` +

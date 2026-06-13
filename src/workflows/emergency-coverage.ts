@@ -16,7 +16,7 @@ export { coerceJsonObject };
 // ── Internal schedule types ───────────────────────────────────────────────────
 // These define the expected shape of schedules.data — schedule-build must match.
 
-interface ScheduleAssignment {
+export interface ScheduleAssignment {
   date: string;
   employee_id: string;
   employee_name: string;
@@ -103,6 +103,9 @@ export interface ActiveOutreach {
   shift_date: string;
   shift_info: ShiftInfo;
   callout_employee_name: string;
+  // The absent employee's id, carried so we can swap them out of the schedule on
+  // accept even if the manager's session has since expired.
+  callout_employee_id: string | null;
   aegis_sms_channel: string | null;
   employee_phone: string | null;
   // The channel the outreach was sent on + the employee's email, so "shift filled"
@@ -312,6 +315,91 @@ async function findSchedule(companyId: string, date: string): Promise<ScheduleDa
   if (draft) return (draft as { data: ScheduleData }).data;
 
   return null;
+}
+
+// Pure swap: replace the absent employee with the coverer on the matching shift.
+// Matched by date + absent employee + start time (HH:MM), which uniquely
+// identifies their assignment. Returns a new array + whether a swap happened.
+export function swapScheduleAssignment(
+  assignments: ScheduleAssignment[],
+  params: {
+    shift_date: string;
+    start_time: string;
+    absent_employee_id: string;
+    coverer_employee_id: string;
+    coverer_name: string;
+  }
+): { assignments: ScheduleAssignment[]; swapped: boolean } {
+  const idx = assignments.findIndex(
+    a =>
+      a.date === params.shift_date &&
+      a.employee_id === params.absent_employee_id &&
+      a.start_time.slice(0, 5) === params.start_time.slice(0, 5)
+  );
+  if (idx === -1) return { assignments, swapped: false };
+  const next = assignments.slice();
+  next[idx] = {
+    ...next[idx],
+    employee_id: params.coverer_employee_id,
+    employee_name: params.coverer_name,
+  };
+  return { assignments: next, swapped: true };
+}
+
+// Loads the schedule row (id + data) covering a date — published first, else draft.
+async function loadScheduleRow(
+  companyId: string,
+  date: string
+): Promise<{ id: string; data: ScheduleData } | null> {
+  for (const status of ['published', 'draft'] as const) {
+    const { data } = await supabase
+      .from('schedules')
+      .select('id, data')
+      .is('deleted_at', null)
+      .eq('company_id', companyId)
+      .lte('week_start', date)
+      .gte('week_end', date)
+      .eq('status', status)
+      .order('generated_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (data) return data as { id: string; data: ScheduleData };
+  }
+  return null;
+}
+
+// On accept, swap the absent employee for the coverer on the matching shift in
+// the published/draft schedule, so Homebase reflects reality and the coverer's
+// hours follow. Best-effort: returns whether it actually updated.
+async function applyCoverageToSchedule(params: {
+  company_id: string;
+  shift_date: string;
+  shift_info: ShiftInfo;
+  absent_employee_id: string | null;
+  coverer_employee_id: string;
+  coverer_name: string;
+}): Promise<{ updated: boolean; reason?: string }> {
+  if (!params.absent_employee_id) return { updated: false, reason: 'no_absent_id' };
+
+  const row = await loadScheduleRow(params.company_id, params.shift_date);
+  if (!row) return { updated: false, reason: 'no_schedule' };
+
+  const data: ScheduleData = row.data ?? { assignments: [] };
+  const { assignments, swapped } = swapScheduleAssignment(data.assignments ?? [], {
+    shift_date: params.shift_date,
+    start_time: params.shift_info.start_time,
+    absent_employee_id: params.absent_employee_id,
+    coverer_employee_id: params.coverer_employee_id,
+    coverer_name: params.coverer_name,
+  });
+  if (!swapped) return { updated: false, reason: 'assignment_not_found' };
+
+  const { error } = await supabase
+    .from('schedules')
+    .update({ data: { ...data, assignments } })
+    .eq('id', row.id);
+  if (error) return { updated: false, reason: error.message };
+  return { updated: true };
 }
 
 async function findShiftInfo(
@@ -774,6 +862,7 @@ export async function dispatchOutreach(params: {
     shift_date: session.shift_date,
     shift_info: session.shift_info,
     callout_employee_name: session.callout_employee_name,
+    callout_employee_id: session.callout_employee_id,
     aegis_sms_channel: aegisSmsNumber,
     employee_phone: employee.contact_phone,
     employee_channel: channel,
@@ -1249,6 +1338,21 @@ export async function handleEmployeeCoverageResponse(
 
     await clearOutreach(outreach.company_id, contact.employee_id!);
 
+    // Put the coverer on the schedule in place of the absent employee, so
+    // Homebase reflects reality and hours/pay follow. Best-effort — a failure
+    // here must not block the confirmation, just changes the manager note.
+    const scheduleResult = await applyCoverageToSchedule({
+      company_id: outreach.company_id,
+      shift_date: outreach.shift_date,
+      shift_info: outreach.shift_info,
+      absent_employee_id: outreach.callout_employee_id ?? session?.callout_employee_id ?? null,
+      coverer_employee_id: contact.employee_id!,
+      coverer_name: contact.name,
+    }).catch(err => {
+      console.error('[coverage] schedule update failed:', err);
+      return { updated: false, reason: 'error' } as { updated: boolean; reason?: string };
+    });
+
     // Confirm to employee
     await reply(
       contact,
@@ -1256,11 +1360,14 @@ export async function handleEmployeeCoverageResponse(
       `Great, thank you! You're confirmed for the ${outreach.shift_info.shift_name} shift (${outreach.shift_info.start_time}–${outreach.shift_info.end_time}) on ${formatDisplayDate(outreach.shift_date)}.`
     );
 
-    // Notify manager
+    // Notify manager — tell them whether the schedule auto-updated.
+    const scheduleNote = scheduleResult.updated
+      ? ` I've updated the schedule to show ${contact.name} on this shift.`
+      : ` Heads up: I couldn't update the published schedule automatically — please move them onto the shift in Homebase.`;
     await reply(
       managerContact,
       managerMessage,
-      `${contact.name} has accepted coverage for the ${outreach.shift_info.shift_name} shift (${outreach.shift_info.role}) on ${formatShortDate(outreach.shift_date)}. Shift is now covered.`
+      `${contact.name} has accepted coverage for the ${outreach.shift_info.shift_name} shift (${outreach.shift_info.role}) on ${formatShortDate(outreach.shift_date)}. Shift is now covered.${scheduleNote}`
     );
 
     await logActivity({
@@ -1273,6 +1380,8 @@ export async function handleEmployeeCoverageResponse(
         shift_name: outreach.shift_info.shift_name,
         role: outreach.shift_info.role,
         late_response: new Date() > new Date(outreach.window_expires_at),
+        schedule_updated: scheduleResult.updated,
+        schedule_update_reason: scheduleResult.reason ?? null,
       },
     });
   } else {

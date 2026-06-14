@@ -48,6 +48,7 @@ export interface PendingEdit {
   create_fields?: Record<string, unknown>;
   schedule_id?: string;
   availability_slots?: AvailabilitySlot[]; // for entity_type 'availability' (manager-set)
+  raw_request?: string; // original request text, so a conversational correction can fold into it
   expires_at: string;
 }
 
@@ -399,16 +400,33 @@ async function handleExperienceRuleEdit(
   message: InboundMessage,
   contact: VerifiedContact
 ): Promise<void> {
+  const built = await buildExperienceRulePending(message, contact, message.body);
+  if (!built) return;
+  await storePendingEdit(built.pending);
+  await reply(contact, message, built.confirmMsg);
+}
+
+// Parses a request into a pending experience-rule edit + a warm confirmation,
+// or returns null after sending the manager a friendly clarification. Shared by
+// the first request and the conversational correction path, so "from this time
+// to this time" style tweaks re-read against the original request.
+async function buildExperienceRulePending(
+  message: InboundMessage,
+  contact: VerifiedContact,
+  requestText: string
+): Promise<{ pending: PendingEdit; confirmMsg: string } | null> {
+  const firstName = (contact.name || '').trim().split(/\s+/)[0] || 'there';
   const today = new Date().toISOString().slice(0, 10);
   const parseSystem =
     `You are parsing a manager's request to set a VETERAN/EXPERIENCE staffing requirement on a shift. Today is ${today}. ` +
+    `If the text includes an earlier request plus a later clarification, MERGE them — the clarification overrides. ` +
     `Return ONLY JSON: {"mode":"all_veterans"|"min_veterans","min_count":number|null,"shift_name":string|null,"days_of_week":number[]|null,"role":string|null,"season_start":"YYYY-MM-DD"|null,"season_end":"YYYY-MM-DD"|null}. ` +
     `mode "all_veterans" = every position on that shift must be a veteran; "min_veterans" = at least min_count veterans (min_count required, >= 1). ` +
     `shift_name = the shift they named, in their words (e.g. "PM Lifeguard", "Saturday night", "closing shift"); null if not specified. ` +
     `days_of_week (0=Sun..6=Sat) when they limit to certain days ("Saturday nights" -> [6], "weekends" -> [0,6]); null = all days. ` +
     `role = a single role if scoped ("lifeguards" -> "Lifeguard"); null = all roles. ` +
     `season_start/season_end = the window if mentioned ("this summer" -> roughly 06-01..08-31 of the current year, "until Sept 1" -> end only, "on June 20"/"June 20th" -> both = that date); null = open-ended.`;
-  const parseText = await generateReply(parseSystem, message.body, []);
+  const parseText = await generateReply(parseSystem, requestText, []);
   const r = coerceJsonObject<{
     mode?: string;
     min_count?: number | null;
@@ -420,12 +438,12 @@ async function handleExperienceRuleEdit(
   }>(parseText);
 
   if (!r || (r.mode !== 'all_veterans' && r.mode !== 'min_veterans')) {
-    await reply(contact, message, `I couldn't quite read that staffing rule. Try something like "Saturday night lifeguards should be all veterans this summer" or "at least 2 veterans on the morning shift".`);
-    return;
+    await reply(contact, message, `Hmm, I didn't quite catch that one, ${firstName}. Tell me the shift and what you need — something like "Saturday night lifeguards should be all veterans this summer" or "at least 2 veterans on the morning shift" — and I'll set it up.`);
+    return null;
   }
   if (r.mode === 'min_veterans' && (typeof r.min_count !== 'number' || r.min_count < 1)) {
-    await reply(contact, message, `How many veterans should that shift need at minimum? For example: "at least 2 veterans on the PM shift".`);
-    return;
+    await reply(contact, message, `How many veterans should that shift need at a minimum, ${firstName}? For example, "at least 2 veterans on the PM shift."`);
+    return null;
   }
 
   // Resolve the named shift to a shift type (null = applies to every shift).
@@ -445,8 +463,8 @@ async function handleExperienceRuleEdit(
       shiftLabel = match.name;
     } else {
       const names = types.map(t => t.name).join(', ');
-      await reply(contact, message, `Which shift do you mean? I have: ${names || '(no shifts set up yet)'}. Send the rule again naming one of those.`);
-      return;
+      await reply(contact, message, `Which shift did you have in mind, ${firstName}? I've got: ${names || '(no shifts set up yet)'}. Just name one and I'll take care of it.`);
+      return null;
     }
   }
 
@@ -457,16 +475,20 @@ async function handleExperienceRuleEdit(
   const seasonStart = typeof r.season_start === 'string' && DATE_RE.test(r.season_start) ? r.season_start : null;
   const seasonEnd = typeof r.season_end === 'string' && DATE_RE.test(r.season_end) ? r.season_end : null;
 
-  const DAY = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-  const fmt = (d: string) => new Date(d + 'T12:00:00Z').toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+  const DAY = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+  const fmt = (d: string) => new Date(d + 'T12:00:00Z').toLocaleDateString('en-US', { month: 'long', day: 'numeric' });
   const need = r.mode === 'all_veterans' ? 'all veterans' : `at least ${r.min_count} veteran${r.min_count === 1 ? '' : 's'}`;
-  const dayLabel = days && days.length ? ` on ${days.map(d => DAY[d]).join(', ')}` : '';
-  const roleLabel = r.role ? ` (${r.role} positions)` : '';
+  const dayLabel = days && days.length ? ` on ${days.map(d => DAY[d]).join(' and ')}` : '';
+  const roleLabel = r.role ? ` ${r.role.toLowerCase()} positions` : '';
   const seasonLabel =
-    seasonStart || seasonEnd
-      ? ` from ${seasonStart ? fmt(seasonStart) : 'now'}${seasonEnd ? ` through ${fmt(seasonEnd)}` : ' onward'}`
-      : ' (ongoing)';
-  const confirmMsg = `Set a staffing rule: the ${shiftLabel} shift${dayLabel}${roleLabel} needs ${need}${seasonLabel}. The schedule will staff it that way from now on. Confirm? (yes/no)`;
+    seasonStart && seasonEnd && seasonStart === seasonEnd
+      ? ` just for ${fmt(seasonStart)}`
+      : seasonStart || seasonEnd
+        ? ` from ${seasonStart ? fmt(seasonStart) : 'now'}${seasonEnd ? ` through ${fmt(seasonEnd)}` : ' on'}`
+        : '';
+  const confirmMsg =
+    `Hey ${firstName} — happy to get that sorted. Just so I've got it right: you want the ${shiftLabel}${dayLabel} staffed with ${need}${roleLabel}${seasonLabel}. ` +
+    `Sound right? Say the word and I'll write it in across your systems — or just tell me what to tweak.`;
 
   const pending: PendingEdit = {
     company_id: contact.company_id,
@@ -476,6 +498,7 @@ async function handleExperienceRuleEdit(
     entity_type: 'experience_rule',
     entity_name: shiftLabel,
     entity_id: null,
+    raw_request: requestText,
     create_fields: {
       shift_type_id: shiftTypeId,
       days_of_week: days && days.length ? days : null,
@@ -487,8 +510,55 @@ async function handleExperienceRuleEdit(
     },
     expires_at: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
   };
-  await storePendingEdit(pending);
-  await reply(contact, message, confirmMsg);
+  return { pending, confirmMsg };
+}
+
+// Conversational confirm for an experience rule. "Yes" writes it; a plain "no"
+// warmly sets it aside and invites a change; anything else is treated as a
+// correction — folded into the original request and re-confirmed, so it's a
+// real back-and-forth, not a dead-ended yes/no gate.
+async function handleExperienceRuleConfirm(
+  message: InboundMessage,
+  contact: VerifiedContact,
+  pending: PendingEdit
+): Promise<void> {
+  const firstName = (contact.name || '').trim().split(/\s+/)[0] || 'there';
+  const trimmed = message.body.trim();
+  const pureYes = /^(yes|yep|yeah|yup|confirm|confirmed|correct|do it|go ahead|sounds? good|perfect|looks good|that'?s? right|great|👍)\b[\s.!]*$/i.test(trimmed);
+  const pureCancel = /^(no|nope|cancel|stop|never ?mind|nevermind|forget it|nah|scrap that|drop it)\b[\s.!]*$/i.test(trimmed);
+
+  if (pureYes) {
+    await clearPendingEdit(contact.company_id, contact.matched_identifier);
+    try {
+      await executeEdit(pending, contact.company_id);
+      await logActivity({
+        company_id: contact.company_id,
+        action: 'homebase_edit_create',
+        entity_type: 'experience_rule',
+        summary: `Manager set a veteran staffing rule for the ${pending.entity_name} shift`,
+        metadata: { table: pending.table, create_fields: pending.create_fields },
+      });
+      await reply(contact, message, `All set, ${firstName} — I've written that ${pending.entity_name} rule in across your systems, and I'll hold every schedule to it from here on.`);
+    } catch (err) {
+      console.error('[experience-rule] execute failed:', err);
+      await reply(contact, message, `Ah, something tripped up saving that one, ${firstName}. Mind setting it in Homebase, or give me another minute and try again?`);
+    }
+    return;
+  }
+
+  if (pureCancel) {
+    await clearPendingEdit(contact.company_id, contact.matched_identifier);
+    await reply(contact, message, `No worries, ${firstName} — set that one aside. Want to adjust it instead? Just tell me what's different and I'll redo it.`);
+    return;
+  }
+
+  // Treat anything else as a correction: fold it into the original request and re-confirm.
+  const original = pending.raw_request ?? `a veteran staffing rule for the ${pending.entity_name} shift`;
+  const combined = `Original request: ${original}\n\nThe manager then clarified: "${message.body}"`;
+  const built = await buildExperienceRulePending(message, contact, combined);
+  if (!built) return; // a friendly clarification reply was already sent
+  await storePendingEdit(built.pending);
+  await reply(contact, message, `Got it — ${built.confirmMsg}`);
 }
 
 // Manager changes a named employee's availability by message. Reuses the same
@@ -685,6 +755,13 @@ export async function handleEditConfirmation(
   contact: VerifiedContact,
   pending: PendingEdit & { _memory_id?: string }
 ): Promise<void> {
+  // Experience rules get a conversational confirm (yes / set-aside / correction)
+  // and a warm voice, instead of the rigid yes-no gate below.
+  if (pending.table === 'shift_experience_rules') {
+    await handleExperienceRuleConfirm(message, contact, pending);
+    return;
+  }
+
   const body = message.body.trim().toLowerCase();
   const isYes = /^(yes|yeah|yep|confirm|correct|ok|okay|do it|go ahead|sure)/.test(body);
   const isNo = /^(no|nope|cancel|stop|don'?t|wait|never mind|nevermind)/.test(body);

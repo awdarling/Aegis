@@ -339,8 +339,9 @@ export async function handleHomebaseEdit(
   // Step 1: Parse the edit intent
   const parseSystem =
     `You are parsing a Homebase data edit request from a manager. ` +
-    `Return ONLY valid JSON: {"entity_type":"employee|event|policy|wage_rate|shift_type|shift_requirement|availability|schedule","entity_name":"...","action":"update|create|delete","field":"column_name_or_null","new_value":"...or null","create_fields":{} }. ` +
+    `Return ONLY valid JSON: {"entity_type":"employee|event|policy|wage_rate|shift_type|shift_requirement|availability|schedule|experience_rule","entity_name":"...","action":"update|create|delete","field":"column_name_or_null","new_value":"...or null","create_fields":{} }. ` +
     `For an availability change to an employee ("Maria can't work Wednesdays anymore", "set Maria to Mondays 9am-5pm", "give Jordan mornings off until Sept 1"), entity_type="availability", entity_name=the employee's name, action="update" — the day/time details stay in the message and are parsed downstream. ` +
+    `For a VETERAN / EXPERIENCE staffing requirement on a shift ("Saturday nights should be all veterans", "at least two veterans on the morning shift", "veterans only on the closing shift this summer", "June 20 needs veteran lifeguards"), entity_type="experience_rule", action="create" — the shift, count, days, and season details stay in the message and are parsed downstream. ` +
     `For schedule edits (move/add/remove employee from shift), entity_type="schedule".`;
 
   const parseText = await generateReply(parseSystem, message.body, []);
@@ -358,6 +359,13 @@ export async function handleHomebaseEdit(
   // handler (reuses the availability engine) rather than the generic field editor.
   if (parsed.entity_type === 'availability') {
     await handleAvailabilityEdit(message, contact, parsed);
+    return;
+  }
+
+  // Veteran/experience staffing rules get their own parse (mode, shift, days,
+  // season) + confirm, then write a shift_experience_rules row the engine reads.
+  if (parsed.entity_type === 'experience_rule') {
+    await handleExperienceRuleEdit(message, contact);
     return;
   }
 
@@ -381,6 +389,106 @@ export async function handleHomebaseEdit(
   } else {
     await handleUpdateEdit(message, contact, parsed, table, personality);
   }
+}
+
+// Manager sets a veteran/experience staffing rule on a shift by message
+// ("Saturday nights should be all veterans this summer"). Parses the rule,
+// resolves the named shift to a shift type, confirms in plain English, then on
+// "yes" writes a shift_experience_rules row that the schedule engine enforces.
+async function handleExperienceRuleEdit(
+  message: InboundMessage,
+  contact: VerifiedContact
+): Promise<void> {
+  const today = new Date().toISOString().slice(0, 10);
+  const parseSystem =
+    `You are parsing a manager's request to set a VETERAN/EXPERIENCE staffing requirement on a shift. Today is ${today}. ` +
+    `Return ONLY JSON: {"mode":"all_veterans"|"min_veterans","min_count":number|null,"shift_name":string|null,"days_of_week":number[]|null,"role":string|null,"season_start":"YYYY-MM-DD"|null,"season_end":"YYYY-MM-DD"|null}. ` +
+    `mode "all_veterans" = every position on that shift must be a veteran; "min_veterans" = at least min_count veterans (min_count required, >= 1). ` +
+    `shift_name = the shift they named, in their words (e.g. "PM Lifeguard", "Saturday night", "closing shift"); null if not specified. ` +
+    `days_of_week (0=Sun..6=Sat) when they limit to certain days ("Saturday nights" -> [6], "weekends" -> [0,6]); null = all days. ` +
+    `role = a single role if scoped ("lifeguards" -> "Lifeguard"); null = all roles. ` +
+    `season_start/season_end = the window if mentioned ("this summer" -> roughly 06-01..08-31 of the current year, "until Sept 1" -> end only, "on June 20"/"June 20th" -> both = that date); null = open-ended.`;
+  const parseText = await generateReply(parseSystem, message.body, []);
+  const r = coerceJsonObject<{
+    mode?: string;
+    min_count?: number | null;
+    shift_name?: string | null;
+    days_of_week?: number[] | null;
+    role?: string | null;
+    season_start?: string | null;
+    season_end?: string | null;
+  }>(parseText);
+
+  if (!r || (r.mode !== 'all_veterans' && r.mode !== 'min_veterans')) {
+    await reply(contact, message, `I couldn't quite read that staffing rule. Try something like "Saturday night lifeguards should be all veterans this summer" or "at least 2 veterans on the morning shift".`);
+    return;
+  }
+  if (r.mode === 'min_veterans' && (typeof r.min_count !== 'number' || r.min_count < 1)) {
+    await reply(contact, message, `How many veterans should that shift need at minimum? For example: "at least 2 veterans on the PM shift".`);
+    return;
+  }
+
+  // Resolve the named shift to a shift type (null = applies to every shift).
+  let shiftTypeId: string | null = null;
+  let shiftLabel = 'every shift';
+  if (r.shift_name) {
+    const { data: sts } = await supabase
+      .from('shift_types')
+      .select('id, name')
+      .eq('company_id', contact.company_id)
+      .eq('active', true);
+    const types = (sts ?? []) as { id: string; name: string }[];
+    const want = r.shift_name.toLowerCase();
+    const match = types.find(t => want.includes(t.name.toLowerCase()) || t.name.toLowerCase().includes(want));
+    if (match) {
+      shiftTypeId = match.id;
+      shiftLabel = match.name;
+    } else {
+      const names = types.map(t => t.name).join(', ');
+      await reply(contact, message, `Which shift do you mean? I have: ${names || '(no shifts set up yet)'}. Send the rule again naming one of those.`);
+      return;
+    }
+  }
+
+  const days = Array.isArray(r.days_of_week)
+    ? r.days_of_week.filter(n => Number.isInteger(n) && n >= 0 && n <= 6)
+    : null;
+  const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+  const seasonStart = typeof r.season_start === 'string' && DATE_RE.test(r.season_start) ? r.season_start : null;
+  const seasonEnd = typeof r.season_end === 'string' && DATE_RE.test(r.season_end) ? r.season_end : null;
+
+  const DAY = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  const fmt = (d: string) => new Date(d + 'T12:00:00Z').toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+  const need = r.mode === 'all_veterans' ? 'all veterans' : `at least ${r.min_count} veteran${r.min_count === 1 ? '' : 's'}`;
+  const dayLabel = days && days.length ? ` on ${days.map(d => DAY[d]).join(', ')}` : '';
+  const roleLabel = r.role ? ` (${r.role} positions)` : '';
+  const seasonLabel =
+    seasonStart || seasonEnd
+      ? ` from ${seasonStart ? fmt(seasonStart) : 'now'}${seasonEnd ? ` through ${fmt(seasonEnd)}` : ' onward'}`
+      : ' (ongoing)';
+  const confirmMsg = `Set a staffing rule: the ${shiftLabel} shift${dayLabel}${roleLabel} needs ${need}${seasonLabel}. The schedule will staff it that way from now on. Confirm? (yes/no)`;
+
+  const pending: PendingEdit = {
+    company_id: contact.company_id,
+    manager_id: contact.matched_identifier,
+    table: 'shift_experience_rules',
+    action: 'create',
+    entity_type: 'experience_rule',
+    entity_name: shiftLabel,
+    entity_id: null,
+    create_fields: {
+      shift_type_id: shiftTypeId,
+      days_of_week: days && days.length ? days : null,
+      role: r.role?.trim() || null,
+      mode: r.mode,
+      min_count: r.mode === 'min_veterans' ? r.min_count : null,
+      season_start: seasonStart,
+      season_end: seasonEnd,
+    },
+    expires_at: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+  };
+  await storePendingEdit(pending);
+  await reply(contact, message, confirmMsg);
 }
 
 // Manager changes a named employee's availability by message. Reuses the same
@@ -613,9 +721,11 @@ export async function handleEditConfirmation(
       },
     });
 
-    const isStructural = ['policies', 'wage_rates', 'shift_types', 'shift_requirements'].includes(pending.table);
+    const isStructural = ['policies', 'wage_rates', 'shift_types', 'shift_requirements', 'shift_experience_rules'].includes(pending.table);
     const doneMsg = pending.table === 'availability'
       ? `Done — ${pending.entity_name}'s availability updated.`
+      : pending.table === 'shift_experience_rules'
+        ? `Done — the staffing rule for the ${pending.entity_name} shift is set. I'll enforce it on every build going forward.`
       : pending.action === 'create'
         ? `Done — ${pending.entity_type} "${pending.entity_name}" created.`
         : pending.action === 'delete'
@@ -651,8 +761,8 @@ async function executeEdit(pending: PendingEdit, companyId: string): Promise<voi
         fields['qualified_roles'] = fields['primary_role'] ? [fields['primary_role']] : [];
       }
     }
-    // For events created by Aegis
-    if (pending.table === 'events') {
+    // For events / experience rules created by Aegis
+    if (pending.table === 'events' || pending.table === 'shift_experience_rules') {
       fields['created_by'] = 'aegis';
     }
     await supabase.from(pending.table).insert(fields);

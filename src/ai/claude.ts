@@ -244,6 +244,19 @@ User: "cant work the morning of july 3"
 User: "I'm busy the morning of June 21st. I can work at night though"
 {"intent":"submit_time_off","confidence":"high","extracted":{"dates":[{"start_date":"${currentYear}-06-21","end_date":"${currentYear}-06-21","time_off_type":"partial","period_label":"morning","start_time":null,"end_time":null}],"reason":null}}
 
+## Manager edits and staffing rules → homebase_edit
+
+When a MANAGER asks to CHANGE company data OR set a scheduling rule, classify it as homebase_edit. This includes employee / role / wage / shift / policy changes ("change Jordan's max hours to 32", "mark Marcus inactive", "set the lifeguard wage to $16") AND, importantly, VETERAN / EXPERIENCE staffing requirements on a shift — phrasings like "should be all veterans", "veterans only", "at least N veterans", "I want my experienced/senior staff on" a given shift, day, or event.
+
+User (manager): "Saturday night lifeguards should be all veterans this summer"
+{"intent":"homebase_edit","confidence":"high","extracted":{"entity_type":"experience_rule"}}
+
+User (manager): "at least two veterans on the morning shift"
+{"intent":"homebase_edit","confidence":"high","extracted":{"entity_type":"experience_rule"}}
+
+User (manager): "I want experienced staff covering the closing shift on weekends"
+{"intent":"homebase_edit","confidence":"high","extracted":{"entity_type":"experience_rule"}}
+
 Respond with ONLY valid JSON in this exact shape — no markdown, no explanation:
 {
   "intent": "<intent_name>",

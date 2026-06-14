@@ -151,6 +151,28 @@ export interface Database {
           shift_type_id: string | null;
         };
       };
+      shift_experience_rules: {
+        Row: {
+          id: string;
+          company_id: string;
+          // The shift this rule targets. null = applies to every shift.
+          shift_type_id: string | null;
+          // Days of the week the rule applies to (0=Sun..6=Sat). null/empty = all days the shift runs.
+          days_of_week: number[] | null;
+          // Optional role scope within the shift. null = all roles on the shift.
+          role: string | null;
+          // 'all_veterans' = every matching position must be a veteran.
+          // 'min_veterans' = at least `min_count` veterans among the matching positions.
+          mode: string;
+          min_count: number | null;
+          // Season window (inclusive). null bounds = open-ended.
+          season_start: string | null;
+          season_end: string | null;
+          active: boolean;
+          created_by: string | null;
+          created_at: string;
+        };
+      };
       wage_rates: {
         Row: {
           id: string;
@@ -382,6 +404,7 @@ export type CustomAvailability = Database['public']['Tables']['custom_availabili
 export type TimeOffRequest = Database['public']['Tables']['time_off_requests']['Row'];
 export type ShiftType = Database['public']['Tables']['shift_types']['Row'];
 export type ShiftRequirement = Database['public']['Tables']['shift_requirements']['Row'];
+export type ShiftExperienceRule = Database['public']['Tables']['shift_experience_rules']['Row'];
 export type WageRate = Database['public']['Tables']['wage_rates']['Row'];
 export type Policy = Database['public']['Tables']['policies']['Row'];
 export type Schedule = Database['public']['Tables']['schedules']['Row'];

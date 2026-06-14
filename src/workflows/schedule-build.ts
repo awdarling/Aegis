@@ -30,6 +30,7 @@ import {
 import { rankCandidates } from '../lib/engine/ranker';
 import { resolveBannedPairConflict } from '../lib/engine/cascade';
 import { buildAttributeShortageReason, enforceAttributeMixForShift } from '../lib/engine/attribute-mix';
+import { veteranTargetsForGroup, type EngineExperienceRule } from '../lib/engine/experience-rules';
 import { evaluateSexCoverage } from '../lib/engine/sex-coverage';
 import {
   classifyEmployeeForSlot,
@@ -46,6 +47,7 @@ import type {
   PartialDayDetail,
   ShiftType,
   ShiftRequirement,
+  ShiftExperienceRule,
   EmployeeConflict,
   Policy,
   Event,
@@ -134,6 +136,9 @@ export interface BuildData {
   conflicts: EmployeeConflict[];
   policies: Policy[];
   events: Event[];
+  // Veteran/experience staffing rules. Optional so lightweight engine test
+  // fixtures don't have to set it; production loaders always populate it.
+  experienceRules?: EngineExperienceRule[];
   companyName: string;
   companyTimezone: string;
 }
@@ -200,7 +205,7 @@ async function loadBuildData(
 ): Promise<BuildData> {
   const [
     companyRes, empRes, availRes, toRes,
-    stRes, reqRes, conflictRes, polRes,
+    stRes, reqRes, conflictRes, polRes, expRes,
   ] = await Promise.all([
     supabase.from('companies').select('name, timezone').eq('id', companyId).single(),
     supabase.from('employees').select('*').eq('company_id', companyId).eq('active', true),
@@ -213,6 +218,7 @@ async function loadBuildData(
     supabase.from('shift_requirements').select('*').eq('company_id', companyId),
     supabase.from('employee_conflicts').select('*').eq('company_id', companyId),
     supabase.from('policies').select('*').eq('company_id', companyId),
+    supabase.from('shift_experience_rules').select('*').eq('company_id', companyId).eq('active', true),
   ]);
 
   const employees = (empRes.data ?? []) as Employee[];
@@ -245,6 +251,16 @@ async function loadBuildData(
     conflicts: (conflictRes.data ?? []) as EmployeeConflict[],
     policies: (polRes.data ?? []) as Policy[],
     events: [],
+    experienceRules: ((expRes.data ?? []) as ShiftExperienceRule[]).map(r => ({
+      shift_type_id: r.shift_type_id,
+      days_of_week: r.days_of_week,
+      role: r.role,
+      mode: r.mode === 'all_veterans' ? 'all_veterans' as const : 'min_veterans' as const,
+      min_count: r.min_count,
+      season_start: r.season_start,
+      season_end: r.season_end,
+      active: r.active,
+    })),
     companyName: company?.name ?? 'Your Company',
     companyTimezone: company?.timezone ?? 'America/New_York',
   };
@@ -819,6 +835,110 @@ function buildScheduleForWeek(ctx: BuildContext): BuildResult {
             per_employee_dispositions: veteranReason.per_employee,
           },
         });
+      }
+    }
+  }
+
+  // Shift experience (veteran) requirements: per-shift, day-of-week + season
+  // scoped rules that require ALL veterans or a MINIMUM number on a given shift.
+  // Mirrors the veteranMode swap/flag above, but driven by stored rules per
+  // group, and ALWAYS flags a shortfall (the manager needs to know the shift
+  // couldn't meet its veteran requirement).
+  const experienceRules = data.experienceRules ?? [];
+  if (experienceRules.length > 0) {
+    for (const group of shiftGroups.values()) {
+      if (group.indices.length === 0) continue;
+      const groupAssignments = group.indices.map(i => ({ index: i, role: weekState.assignments[i].role }));
+      const targets = veteranTargetsForGroup(experienceRules, group.date, group.shift_type_id, groupAssignments);
+
+      for (const target of targets) {
+        const isVet = (i: number) => !!employeeById.get(weekState.assignments[i].employee_id)?.is_veteran;
+        let currentVets = target.indices.filter(isVet).length;
+        if (currentVets >= target.need) continue;
+
+        const placedVets = new Set<string>(
+          target.indices.map(i => weekState.assignments[i].employee_id).filter(id => employeeById.get(id)?.is_veteran)
+        );
+        let stillNeed = target.need - currentVets;
+
+        // Swap the lowest-hours non-veterans out for eligible veterans.
+        const sortedNonVet = [...target.indices]
+          .filter(i => !isVet(i))
+          .sort((a, b) =>
+            (weekState.weeklyHoursMap.get(weekState.assignments[a].employee_id) ?? 0) -
+            (weekState.weeklyHoursMap.get(weekState.assignments[b].employee_id) ?? 0)
+          );
+
+        for (const idx of sortedNonVet) {
+          if (stillNeed <= 0) break;
+          const cur = weekState.assignments[idx];
+          const slot = canvas.find(s => s.date === cur.date && s.shift_name === cur.shift_name && s.role === cur.role);
+          if (!slot) continue;
+          const elig = buildEligibility(slot, data.employees, data.availByEmp, data.toMap, veteranOnlyDates);
+          const cohabIds = group.indices.filter(i => i !== idx).map(i => weekState.assignments[i].employee_id);
+          const viewState: WeekState = {
+            ...weekState,
+            assignments: weekState.assignments.filter((_, i) => i !== idx),
+          };
+          const candidate = elig.employees.find(e => {
+            if (!e.is_veteran) return false;
+            if (placedVets.has(e.id)) return false;
+            if (cohabIds.includes(e.id)) return false;
+            if (hasHardBannedPair(e.id, cohabIds, data.conflicts)) return false;
+            if ((weekState.weeklyHoursMap.get(e.id) ?? 0) + slot.hours > e.max_weekly_hours) return false;
+            if (
+              settings.maxConsecutiveDaysWorked != null &&
+              consecutiveDaysRunIncluding(e.id, slot.date, viewState) > settings.maxConsecutiveDaysWorked
+            ) return false;
+            if (sameDayDoubleReason(e.id, slot, viewState, settings) !== null) return false;
+            return true;
+          });
+          if (!candidate) continue;
+
+          const prevId = cur.employee_id;
+          weekState.weeklyHoursMap.set(prevId, (weekState.weeklyHoursMap.get(prevId) ?? 0) - slot.hours);
+          weekState.weeklyHoursMap.set(candidate.id, (weekState.weeklyHoursMap.get(candidate.id) ?? 0) + slot.hours);
+          weekState.assignments[idx] = { ...cur, employee_id: candidate.id, employee_name: candidate.name };
+          placedVets.add(candidate.id);
+          stillNeed--;
+          currentVets++;
+        }
+
+        if (stillNeed > 0) {
+          const reason = buildAttributeShortageReason({
+            shift: { date: group.date, shift_type_id: group.shift_type_id, shift_name: group.shift_name },
+            missingAttribute: 'is_veteran',
+            missingValue: 'true',
+            needed: target.need,
+            weekState,
+            deps: {
+              employees: data.employees,
+              employeeById,
+              availByEmp: data.availByEmp,
+              toMap: data.toMap,
+              conflicts: data.conflicts,
+              veteranOnlyDates,
+              canvasSlots: canvas,
+              settings,
+            },
+          });
+          weekState.flagged_issues.push({
+            type: 'unsatisfied_attribute_mix',
+            date: group.date,
+            shift_name: group.shift_name,
+            description:
+              target.mode === 'all_veterans'
+                ? `This shift is set to require all veterans, but only ${currentVets} of ${target.indices.length} position(s) could be filled by veterans. ${reason.description}`
+                : `This shift requires at least ${target.need} veteran(s), but only ${currentVets} could be placed. ${reason.description}`,
+            metadata: {
+              attribute: 'is_veteran',
+              value: 'true',
+              required: target.need,
+              actual: currentVets,
+              per_employee_dispositions: reason.per_employee,
+            },
+          });
+        }
       }
     }
   }

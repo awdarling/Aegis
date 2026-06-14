@@ -104,8 +104,8 @@ export async function routeIntent(
     if (err instanceof AnthropicOverloadError) {
       const overloadMsg =
         contact.role === 'employee'
-          ? 'Aegis is temporarily unavailable due to high demand on our servers. Please try again in a few minutes.'
-          : "Aegis couldn't complete that request right now — our AI provider is experiencing high load. Please try again in 2-3 minutes. Your request was not processed.";
+          ? "Sorry — I'm a little swamped at the moment and couldn't get to that. Give me a couple of minutes and send it again?"
+          : "Sorry about that — I'm under heavy load right now and couldn't finish your request. Nothing went through, so give it 2-3 minutes and resend and I'll take care of it.";
       console.error('[router] Anthropic overloaded after retries; notifying sender');
       try {
         await reply(contact, message, overloadMsg);
@@ -256,14 +256,14 @@ async function routeIntentInner(
     await reply(
       contact,
       message,
-      "That's something your manager handles. Contact them directly if you need help with this."
+      "Ah, that one's a manager call — they can get it sorted for you. Happy to help with anything on your end, though: time off, your availability, your shifts, swaps, that kind of thing."
     );
     return;
   }
 
   // Authorization: manager attempting a quria-only action
   if (contact.role === 'manager' && QURIA_ONLY_INTENTS.has(classification.intent)) {
-    await reply(contact, message, 'That action requires Quria administrator access.');
+    await reply(contact, message, "That one's reserved for a Quria administrator, sorry — reach out to them and they can take it from here.");
     return;
   }
 
@@ -392,7 +392,7 @@ async function routeIntentInner(
         await reply(
           contact,
           message,
-          "I didn't quite understand that. Could you rephrase? For help, reply with \"help\"."
+          "Hmm, I didn't quite follow that one — mind putting it another way? And if you're not sure what I can do for you, just reply \"help\" and I'll walk you through it."
         );
     }
   } catch (err) {

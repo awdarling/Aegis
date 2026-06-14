@@ -2040,9 +2040,9 @@ export async function handleUpdateAvailability(
       `Here's what I'd set:\n${proposedDisplay}\n\n` +
       `Reply YES to send it to your manager — or NO to redo it, then just tell me the exact days and times you CAN work.`;
   } else if (customEndDate) {
-    confirmBody = `Got it — through ${formatDateRange(customEndDate, customEndDate)}, you'd be available:\n${proposedDisplay}\nAfter that you'd go back to your normal availability. I'll send this to your manager to approve. Is that right? Reply YES or NO.`;
+    confirmBody = `Got it — through ${formatDateRange(customEndDate, customEndDate)} you'd be available:\n${proposedDisplay}\nThen you're back to your normal hours. Look right? Reply YES and I'll send it to your manager to approve — or NO and we'll fix it.`;
   } else {
-    confirmBody = `You want to change your availability to:\n${proposedDisplay}\nI'll send this to your manager for approval. Is that correct? Reply YES or NO.`;
+    confirmBody = `Got it — here's what I'd set your availability to:\n${proposedDisplay}\nLook right? Reply YES and I'll pass it to your manager to approve — or NO and we'll tweak it.`;
   }
   await reply(contact, message, confirmBody);
 }
@@ -2424,7 +2424,7 @@ export async function applyAvailabilityDecision(input: AvailabilityDecisionInput
 
     await notifyEmployeeOfAvailabilityDecision(
       notifyContext,
-      `Your availability update has been approved. Your new schedule reflects the change.`
+      `Good news — your availability change is approved. Your schedule will reflect it from here on. Thanks!`
     );
   } else {
     await logActivity({
@@ -2438,7 +2438,7 @@ export async function applyAvailabilityDecision(input: AvailabilityDecisionInput
 
     await notifyEmployeeOfAvailabilityDecision(
       notifyContext,
-      `Your availability update was not approved. Please speak with your manager directly if you'd like to discuss.`
+      `Your availability change wasn't approved this time — give your manager a shout if you'd like to talk it through.`
     );
   }
 }
@@ -2532,7 +2532,7 @@ export async function applyCustomAvailabilityDecision(input: CustomAvailabilityD
       });
       await notifyEmployeeOfAvailabilityDecision(
         notifyContext,
-        `Your rotating availability is approved — it's set on a ${rot.cycle_weeks}-week cycle${rot.end_date ? ` through ${formatDateRange(rot.end_date, rot.end_date)}` : ''}.`
+        `Nice — your rotating availability is approved, set on a ${rot.cycle_weeks}-week cycle${rot.end_date ? ` through ${formatDateRange(rot.end_date, rot.end_date)}` : ''}. I'll work your schedule around it. Thanks!`
       );
       return;
     }
@@ -2571,7 +2571,7 @@ export async function applyCustomAvailabilityDecision(input: CustomAvailabilityD
 
     await notifyEmployeeOfAvailabilityDecision(
       notifyContext,
-      `Your temporary availability change is approved — it's set through ${throughLabel}, then you'll go back to your normal availability.`
+      `Good news — your temporary availability is approved, set through ${throughLabel}. After that you're back to your normal hours. Thanks!`
     );
   } else {
     await logActivity({
@@ -2585,7 +2585,7 @@ export async function applyCustomAvailabilityDecision(input: CustomAvailabilityD
 
     await notifyEmployeeOfAvailabilityDecision(
       notifyContext,
-      `Your availability change wasn't approved. Please speak with your manager directly if you'd like to discuss.`
+      `That change wasn't approved this time — give your manager a shout if you'd like to talk it through.`
     );
   }
 }

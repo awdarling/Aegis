@@ -200,7 +200,7 @@ describe('applyAvailabilityDecision', () => {
 
     expect(h.replyMock).toHaveBeenCalledTimes(1);
     const body = h.replyMock.mock.calls[0][2] as string;
-    expect(body).toMatch(/not approved/i);
+    expect(body).toMatch(/wasn'?t approved|not approved/i);
     expect(body).not.toMatch(/homebase/i);
     expect(body).not.toMatch(/https?:\/\//);
   });

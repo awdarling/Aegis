@@ -1,6 +1,12 @@
 import { generateActionToken } from '../lib/aegis-actions/tokens';
-import { greeting } from '../messaging/greeting';
+import { greeting, firstName } from '../messaging/greeting';
 import { getHomebaseUrl } from '../config/urls';
+import {
+  BRAND,
+  brandedEmailShell,
+  brandedButtonRow,
+  brandActionCard,
+} from '../messaging/brand';
 import type { Employee, PartialDayDetail, TimeOffRequest } from '../db/types';
 import type { SimulationResult } from '../lib/schedule-simulator';
 import type { TimeOffViolations } from '../lib/time-off-policies';
@@ -138,12 +144,11 @@ function buildPartialSummaryText(partialDays: PartialDayDetail[]): string {
 
 function headerSectionHtml(employeeName: string, dateRange: string): string {
   return `
-<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:0 0 20px;">
+<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:0 0 18px;">
   <tr>
     <td style="vertical-align:middle;">
-      <div style="font-size:12px;font-weight:600;color:#6b7280;text-transform:uppercase;letter-spacing:0.08em;">Time-off request</div>
-      <div style="font-size:20px;font-weight:600;color:#111827;line-height:1.2;margin-top:4px;">${escapeHtml(employeeName)}</div>
-      <div style="font-size:14px;color:#6b7280;margin-top:4px;">${escapeHtml(dateRange)}</div>
+      <div style="font-size:21px;font-weight:700;color:${BRAND.textPrimary};line-height:1.2;">${escapeHtml(employeeName)}</div>
+      <div style="font-size:14px;color:${BRAND.textSecondary};margin-top:5px;">${escapeHtml(dateRange)}</div>
     </td>
   </tr>
 </table>`;
@@ -166,24 +171,24 @@ function requestDetailsHtml(
   let typeBlock: string;
   if (isPartial && tor.partial_days) {
     const items = tor.partial_days
-      .map(d => `<li style="margin:0 0 4px;font-size:14px;color:#374151;">${escapeHtml(describePartialDay(d))}</li>`)
+      .map(d => `<li style="margin:0 0 4px;font-size:14px;color:${BRAND.textPrimary};">${escapeHtml(describePartialDay(d))}</li>`)
       .join('');
     typeBlock = `
-    <div style="font-size:13px;font-weight:600;color:#6b7280;text-transform:uppercase;letter-spacing:0.05em;margin-top:12px;margin-bottom:6px;">Partial days</div>
+    <div style="font-size:13px;font-weight:600;color:${BRAND.silver};text-transform:uppercase;letter-spacing:0.05em;margin-top:12px;margin-bottom:6px;">Partial days</div>
     <ul style="margin:0;padding-left:18px;">${items}</ul>`;
   } else {
     typeBlock = `
-    <div style="font-size:14px;color:#374151;margin-top:8px;"><strong>Full day${dayCount === 1 ? '' : 's'}</strong> requested (${dayCount} day${dayCount === 1 ? '' : 's'} total).</div>`;
+    <div style="font-size:14px;color:${BRAND.textPrimary};margin-top:8px;"><strong>Full day${dayCount === 1 ? '' : 's'}</strong> requested (${dayCount} day${dayCount === 1 ? '' : 's'} total).</div>`;
   }
 
   const reason = (tor.reason ?? '').trim();
   const reasonBlock = reason
-    ? `<div style="font-size:14px;color:#374151;margin-top:12px;"><strong>Reason:</strong> ${escapeHtml(reason)}</div>`
+    ? `<div style="font-size:14px;color:${BRAND.textPrimary};margin-top:12px;"><strong>Reason:</strong> ${escapeHtml(reason)}</div>`
     : '';
 
   return `
-<div style="margin:0 0 20px;padding:16px;background:#f9fafb;border:1px solid #e5e7eb;border-radius:6px;">
-  <div style="font-size:14px;color:#374151;"><strong>Dates:</strong> ${escapeHtml(dateRange)}</div>
+<div style="margin:0 0 20px;padding:16px;background:${BRAND.surface2};border:1px solid ${BRAND.borderDefault};border-radius:8px;">
+  <div style="font-size:14px;color:${BRAND.textPrimary};"><strong>Dates:</strong> ${escapeHtml(dateRange)}</div>
   ${typeBlock}
   ${reasonBlock}
 </div>`;
@@ -212,11 +217,11 @@ function violationLines(violations: TimeOffViolations | null | undefined): strin
 
 function policyConsiderationsHtml(lines: string[]): string {
   if (lines.length === 0) return '';
-  const items = lines.map(l => `<li style="margin:0 0 6px;font-size:14px;color:#92400e;">${escapeHtml(l)}</li>`).join('');
+  const items = lines.map(l => `<li style="margin:0 0 6px;font-size:14px;color:${BRAND.warnText};">${escapeHtml(l)}</li>`).join('');
   return `
 <div style="margin:0 0 20px;">
-  <div style="font-size:13px;font-weight:600;color:#92400e;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px;">Policy considerations</div>
-  <div style="padding:14px 16px;background:#fffbeb;border:1px solid #fde68a;border-left:4px solid #d97706;border-radius:6px;">
+  <div style="font-size:13px;font-weight:600;color:${BRAND.warnText};text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px;">Policy considerations</div>
+  <div style="padding:14px 16px;background:${BRAND.warnBg};border:1px solid ${BRAND.warnBorder};border-left:4px solid ${BRAND.warnRule};border-radius:8px;">
     <ul style="margin:0;padding-left:18px;">${items}</ul>
   </div>
 </div>`;
@@ -227,8 +232,8 @@ function coverageImpactHtml(simulation: SimulationResult): string {
   if (gaps.length === 0) {
     return `
 <div style="margin:0 0 20px;">
-  <div style="font-size:13px;font-weight:600;color:#6b7280;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px;">Coverage impact</div>
-  <div style="padding:12px 14px;background:#ecfdf5;border:1px solid #a7f3d0;border-radius:6px;font-size:14px;color:#065f46;">
+  <div style="font-size:13px;font-weight:600;color:${BRAND.silver};text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px;">Coverage impact</div>
+  <div style="padding:12px 14px;background:${BRAND.goodBg};border:1px solid ${BRAND.goodBorder};border-radius:8px;font-size:14px;color:${BRAND.goodText};">
     No coverage impact — all shifts would still be filled.
   </div>
 </div>`;
@@ -236,29 +241,29 @@ function coverageImpactHtml(simulation: SimulationResult): string {
   const items = gaps.map(g => {
     const dateLabel = `${formatWeekdayShort(g.date)} ${formatShortDate(g.date)}`;
     return `
-    <li style="margin:0 0 6px;font-size:14px;color:#374151;">
+    <li style="margin:0 0 6px;font-size:14px;color:${BRAND.textPrimary};">
       <strong>${escapeHtml(dateLabel)} — ${escapeHtml(g.shift_name)} ${escapeHtml(g.role)}</strong>:
       short by ${g.shortfall} ${g.shortfall === 1 ? 'person' : 'people'}
     </li>`;
   }).join('');
   return `
 <div style="margin:0 0 20px;">
-  <div style="font-size:13px;font-weight:600;color:#6b7280;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px;">Coverage impact</div>
-  <div style="padding:12px 14px;background:#fef2f2;border:1px solid #fecaca;border-radius:6px;font-size:14px;color:#991b1b;margin-bottom:10px;">
+  <div style="font-size:13px;font-weight:600;color:${BRAND.silver};text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px;">Coverage impact</div>
+  <div style="padding:12px 14px;background:${BRAND.badBg};border:1px solid ${BRAND.badBorder};border-radius:8px;font-size:14px;color:${BRAND.badText};margin-bottom:10px;">
     If approved, this would create ${gaps.length} coverage gap${gaps.length === 1 ? '' : 's'}:
   </div>
   <ul style="margin:0;padding-left:18px;">${items}</ul>
 </div>`;
 }
 
-function recommendationBadgeStyles(t: TimeOffRecommendationType): { bg: string; fg: string; label: string } {
+function recommendationBadgeStyles(t: TimeOffRecommendationType): { bg: string; fg: string; border: string; label: string } {
   switch (t) {
     case 'approve':
-      return { bg: '#d1fae5', fg: '#065f46', label: 'Approve' };
+      return { bg: BRAND.goodBg, fg: BRAND.goodText, border: BRAND.goodBorder, label: 'Approve' };
     case 'deny':
-      return { bg: '#fee2e2', fg: '#991b1b', label: 'Deny' };
+      return { bg: BRAND.badBg, fg: BRAND.badText, border: BRAND.badBorder, label: 'Deny' };
     case 'neutral':
-      return { bg: '#e5e7eb', fg: '#374151', label: 'Neutral' };
+      return { bg: BRAND.surface3, fg: BRAND.textSecondary, border: BRAND.borderStrong, label: 'Neutral' };
   }
 }
 
@@ -266,38 +271,69 @@ function recommendationHtml(rec: TimeOffRecommendation): string {
   const s = recommendationBadgeStyles(rec.type);
   return `
 <div style="margin:0 0 20px;">
-  <div style="font-size:13px;font-weight:600;color:#6b7280;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px;">Aegis recommendation</div>
-  <div style="padding:14px 16px;background:#ffffff;border:1px solid #e5e7eb;border-left:4px solid ${s.fg};border-radius:6px;">
-    <span style="display:inline-block;padding:4px 10px;font-size:12px;font-weight:600;background:${s.bg};color:${s.fg};border-radius:9999px;margin-bottom:8px;">${escapeHtml(s.label)}</span>
-    <div style="font-size:14px;color:#374151;line-height:1.5;">${escapeHtml(rec.reasoning)}</div>
+  <div style="font-size:13px;font-weight:600;color:${BRAND.silver};text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px;">Aegis recommendation</div>
+  <div style="padding:14px 16px;background:${BRAND.surface2};border:1px solid ${BRAND.borderDefault};border-left:4px solid ${s.fg};border-radius:8px;">
+    <span style="display:inline-block;padding:4px 10px;font-size:12px;font-weight:600;background:${s.bg};color:${s.fg};border:1px solid ${s.border};border-radius:9999px;margin-bottom:8px;">${escapeHtml(s.label)}</span>
+    <div style="font-size:14px;color:${BRAND.textPrimary};line-height:1.5;">${escapeHtml(rec.reasoning)}</div>
   </div>
 </div>`;
 }
 
-function ctaSectionHtml(
+// Buttons + the Homebase link live INSIDE the action card (they're the action).
+// The warm "I'll let them know" reassurance is Aegis talking, so it sits outside
+// the card — see renderTimeOffManagerBodyHtml.
+function ctaButtonsHtml(
   approveUrl: string,
   denyUrl: string,
-  homebaseUrl: string,
-  employeeName: string
+  homebaseUrl: string
 ): string {
   return `
-<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:0 0 14px;">
-  <tr>
-    <td align="left">
-      <a href="${escapeHtml(approveUrl)}"
-         style="display:inline-block;padding:12px 24px;background:#16a34a;color:#ffffff;font-size:15px;font-weight:600;text-decoration:none;border-radius:6px;margin-right:8px;">Approve</a>
-      <a href="${escapeHtml(denyUrl)}"
-         style="display:inline-block;padding:12px 24px;background:#dc2626;color:#ffffff;font-size:15px;font-weight:600;text-decoration:none;border-radius:6px;">Deny</a>
-    </td>
-  </tr>
-</table>
-<div style="margin:0 0 14px;">
-  <a href="${escapeHtml(homebaseUrl)}/data?tab=time-off"
-     style="font-size:14px;color:#4b5563;text-decoration:underline;">Review in Homebase</a>
-</div>
-<div style="margin:0 0 20px;font-size:12px;color:#6b7280;line-height:1.5;">
-  Clicking Approve or Deny will record your decision. Until full magic-link wiring is complete, please also confirm the status in Homebase to finalize the notification to ${escapeHtml(employeeName)}.
+<div style="border-top:1px solid ${BRAND.borderDefault};margin:6px 0 0;padding-top:18px;">
+${brandedButtonRow([
+  { url: approveUrl, label: 'Approve', variant: 'primary' },
+  { url: denyUrl, label: 'Deny', variant: 'secondary' },
+])}
+  <div style="margin:2px 0 6px;">
+    <a href="${escapeHtml(homebaseUrl)}/data?tab=time-off"
+       style="font-size:14px;color:${BRAND.accent};text-decoration:underline;">Review it in Homebase</a>
+  </div>
 </div>`;
+}
+
+// Pure HTML body assembly (no token generation / no DB) so previews and tests
+// can render the exact same markup the live email ships. `buildTimeOffManagerEmail`
+// generates the magic-link tokens, then calls this with the resolved URLs.
+export function renderTimeOffManagerBodyHtml(args: {
+  employeeName: string;
+  managerName?: string;
+  tor: TimeOffRequest;
+  dateRange: string;
+  approveUrl: string;
+  denyUrl: string;
+  homebaseUrl: string;
+  policyLines: string[];
+  simulation?: SimulationResult;
+  recommendation?: TimeOffRecommendation;
+}): string {
+  const employeeFirst = firstName(args.employeeName);
+  // Conclusion-first: the greeting + the whole ask (what it is, what to do, that
+  // I'll handle the notification) all sit ABOVE the card, so the manager never
+  // has to read anything below the action card to know what's going on.
+  const introHtml = `
+<p style="margin:0 0 12px;font-size:16px;color:${BRAND.textPrimary};">${escapeHtml(greeting(args.managerName))}</p>
+<p style="margin:0;font-size:16px;color:${BRAND.textPrimary};line-height:1.65;">${escapeHtml(employeeFirst)} just put in a time-off request, and I wanted to get it in front of you. Everything's in the card below — either button records your decision right away, and I'll let ${escapeHtml(employeeFirst)} know which way it went, so there's nothing else you'll need to do.</p>`;
+
+  const cardInner = `${headerSectionHtml(args.employeeName, args.dateRange)}
+${policyConsiderationsHtml(args.policyLines)}
+${requestDetailsHtml(args.tor, args.dateRange)}
+${args.simulation ? coverageImpactHtml(args.simulation) : ''}
+${args.recommendation ? recommendationHtml(args.recommendation) : ''}
+${ctaButtonsHtml(args.approveUrl, args.denyUrl, args.homebaseUrl)}`;
+
+  const card = brandActionCard('Action needed · Time off', cardInner);
+
+  return `${introHtml}
+${card}`;
 }
 
 // ── Plain-text builder ────────────────────────────────────────────────────────
@@ -377,8 +413,6 @@ function buildPlainText(params: {
   lines.push('');
   lines.push('Review in Homebase:');
   lines.push(`${params.homebaseUrl}/data?tab=time-off`);
-  lines.push('');
-  lines.push(`Clicking Approve or Deny will record your decision. Until full magic-link wiring is complete, please also confirm the status in Homebase to finalize the notification to ${params.employeeName}.`);
 
   return lines.join('\n');
 }
@@ -430,32 +464,29 @@ export async function buildTimeOffManagerEmail(
 
   const policyLines = violationLines(params.violations);
 
-  const html = `<!DOCTYPE html>
-<html><head><meta charset="utf-8"></head>
-<body style="margin:0;padding:0;background:#f3f4f6;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;color:#111827;">
-<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="background:#f3f4f6;padding:24px 0;">
-  <tr>
-    <td align="center">
-      <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="640" style="max-width:640px;background:#ffffff;border-radius:8px;padding:28px;border:1px solid #e5e7eb;">
-        <tr><td>
-          <p style="margin:0 0 16px;font-size:15px;color:#111827;">${escapeHtml(greeting(params.manager_name))}</p>
-          ${headerSectionHtml(employee.name, dateRange)}
-          ${policyConsiderationsHtml(policyLines)}
-          ${requestDetailsHtml(tor, dateRange)}
-          ${params.simulation ? coverageImpactHtml(params.simulation) : ''}
-          ${params.recommendation ? recommendationHtml(params.recommendation) : ''}
-          ${ctaSectionHtml(approveTok.url, denyTok.url, homebaseUrl, employee.name)}
-          <div style="margin-top:24px;padding-top:16px;border-top:1px solid #e5e7eb;font-size:12px;color:#9ca3af;">
-            Aegis · Quria Solutions · ${escapeHtml(params.company_name)}
-          </div>
-        </td></tr>
-      </table>
-    </td>
-  </tr>
-</table>
-</body></html>`;
+  const bodyHtml = renderTimeOffManagerBodyHtml({
+    employeeName: employee.name,
+    managerName: params.manager_name,
+    tor,
+    dateRange,
+    approveUrl: approveTok.url,
+    denyUrl: denyTok.url,
+    homebaseUrl,
+    policyLines,
+    simulation: params.simulation,
+    recommendation: params.recommendation,
+  });
 
-  const text = `${greeting(params.manager_name)}\n\n` + buildPlainText({
+  const html = brandedEmailShell({
+    bodyHtml,
+    companyName: params.company_name,
+    preheader: `Time-off request from ${employee.name} — ${dateRange}`,
+  });
+
+  const text =
+    `${greeting(params.manager_name)}\n\n` +
+    `${firstName(employee.name)} just put in a time-off request, and I wanted to get it in front of you. The details are below — either link records your decision right away, and I'll let ${firstName(employee.name)} know which way it went, so there's nothing else you'll need to do.\n\n` +
+    buildPlainText({
     employeeName: employee.name,
     companyName: params.company_name,
     dateRange,

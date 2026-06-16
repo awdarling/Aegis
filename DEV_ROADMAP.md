@@ -878,6 +878,21 @@ Built on branch `feat/voice-pass-1` (Aegis) + `feat/veteran-shift-rules` (Homeba
 - **Verification:** previews rendered to static HTML and reviewed (`scripts/preview-branded-email.ts`): time-off, distribute report, simple reply — logo + dark theme + action card confirmed. `npx tsc --noEmit` clean (both repos); `npx vitest run` 47/47 green.
 - **NOT done in this entry:** push/merge/deploy (Alexander, gated), and a live sandbox round-trip (send a real sandbox email to eyeball in Gmail) — recommended before merge.
 
+### 2026-06-16 (cont. 2) — INBOUND-SIG-1: inbound replies failing ECDSA verification — ROOT-CAUSED + FIXED (branch `feat/voice-pass-1`)
+**Repo:** Aegis · **Status:** `FIXED (IN REVIEW — not pushed)` · **Severity:** HIGH (blocks the entire reply-based workflow for any inbound email carrying non-UTF-8 bytes)
+
+**Surfaced by the live sandbox branding test (2026-06-16).** Branding verified live in Gmail ✅. But the employee's confirmation reply ("Yes!") never processed. Railway logs: the original request (5,311 B) verified; the reply (12,297 B) failed **every** retry with `[sendgrid-verify] invalid ECDSA signature`, and `bodyBytes` equalled `content-length` — so the raw body was captured in full (capture-raw-body is byte-exact; not the cause).
+
+**Root cause (confirmed in library source):** `@sendgrid/eventwebhook`'s `verifySignature` does `Buffer.isBuffer(payload) ? payload.toString() : payload` — decoding the body as **UTF-8** — then `crypto.createHash('sha256').update(string)` re-encodes as UTF-8. SendGrid signs sha256 over the EXACT request bytes (`timestamp` || `rawBody`). Any inbound body containing non-UTF-8 bytes (invalid sequences → replaced with U+FFFD) hashes to the wrong digest → verification fails. Text-only emails are valid UTF-8 → pass; a **reply that quotes a prior email carrying an inline image** (or any non-UTF-8 charset part) contains binary bytes → fail. The voice/branding pass added an **inline CID logo** to every email, so quoted replies now reliably carry binary — which is why this surfaced now (the inbound code itself was never touched by the branding pass).
+
+**Fix:** new `src/security/sendgrid-signature.ts → verifySendGridSignature(pem, rawBody, signature, timestamp)` hashes the exact bytes (`Buffer.concat([Buffer.from(timestamp), rawBody])`) using the SAME proven primitives (`PublicKey.fromPem` / `Signature.fromBase64` / `Ecdsa.verify` with a Buffer message → raw-byte hashing, no string round-trip). For valid-UTF-8 bodies this is byte-identical to the old path; for binary-bearing bodies it is correct where the old path failed. `verify-signature.ts` now calls it; `@sendgrid/eventwebhook` is no longer used for inbound verification. Ambient types: `src/types/starkbank-ecdsa.d.ts`.
+
+**Test:** `src/security/__tests__/sendgrid-signature.test.ts` (5 cases) — generates an EC keypair, signs the exact bytes, asserts: plain ASCII verifies, a **binary/non-UTF-8 body verifies**, tampered body + wrong timestamp reject, and a **regression case proving the OLD `@sendgrid/eventwebhook` path returns false on the same binary input while the new path passes**. `npx tsc --noEmit` clean; `npx vitest run` **52/52 green**.
+
+**Sweep (other rabbits — all clear):** no other caller of the lossy `verifySignature` / no other inbound `rawBody.toString()` anywhere in `src`. SMS verification uses `twilio.validateRequest` over parsed params (unaffected). `captureRawBody` is byte-exact (prod `bodyBytes == content-length`) and the sole consumer is the signed email route. Verified messages return HTTP 200 *before* async processing, so SendGrid won't re-deliver a verified message (no duplicate-processing from this fix). **Watch item (pre-existing, not fixed):** confirm-reply idempotency if two retries ever land simultaneously — low risk, logged for later.
+
+**Handoff note for Alexander:** after this deploys, SendGrid may have already exhausted its retries on the original "Yes!" — so **re-send the confirmation reply** (trimming the quoted text is no longer required, but fine) to complete the sandbox round-trip. Deploy is Aegis-only (Railway); no Homebase or DB change.
+
 ---
 
 ## HOMEBASE UI OVERHAUL (backlog — end of roadmap; set 2026-06-16)

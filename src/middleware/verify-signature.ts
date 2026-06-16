@@ -1,7 +1,7 @@
 import type { Request, Response, NextFunction } from 'express';
 import twilio from 'twilio';
-import { EventWebhook } from '@sendgrid/eventwebhook';
 import { env } from '../config/env';
+import { verifySendGridSignature } from '../security/sendgrid-signature';
 
 // Twilio signs every webhook with HMAC-SHA1 using the auth token.
 // Reject any request that doesn't pass this check — not just log it.
@@ -84,9 +84,11 @@ export function verifySendGridRequest(req: Request, res: Response, next: NextFun
     }
 
     try {
-      const eventWebhook = new EventWebhook();
-      const ecdsaKey = eventWebhook.convertPublicKeyToECDSA(publicKey);
-      const valid = eventWebhook.verifySignature(ecdsaKey, req.rawBody, signature, timestamp);
+      // Byte-exact verification (see src/security/sendgrid-signature.ts). The
+      // @sendgrid/eventwebhook helper decodes the body as UTF-8 first, which
+      // corrupts non-UTF-8 bytes (e.g. an inline image in a quoted reply) and
+      // makes those inbound messages fail verification.
+      const valid = verifySendGridSignature(publicKey, req.rawBody, signature, timestamp);
 
       if (!valid) {
         console.warn('[sendgrid-verify] invalid ECDSA signature', {

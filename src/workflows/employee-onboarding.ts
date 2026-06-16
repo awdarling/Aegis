@@ -13,7 +13,14 @@ import { logActivity } from '../logger/activity-log';
 import { sendSms } from '../messaging/sms';
 import { sendEmail } from '../messaging/email';
 import { reply, sendInThreadAck } from '../messaging/reply';
-import { greeting } from '../messaging/greeting';
+import { greeting, firstName as firstNameOf } from '../messaging/greeting';
+import {
+  BRAND,
+  brandedEmailShell,
+  brandedButtonRow,
+  brandActionCard,
+  brandSectionLabel,
+} from '../messaging/brand';
 import { env } from '../config/env';
 import { withAnthropicRetry } from '../ai/claude';
 import { generateActionToken } from '../lib/aegis-actions/tokens';
@@ -2304,51 +2311,56 @@ export async function buildAvailabilityManagerEmail(params: {
     ? `AVAILABLE THROUGH ${throughLabel.toUpperCase()}`
     : 'PROPOSED';
 
+  const employeeFirst = firstNameOf(params.employee_name);
+
   const text =
     `${greeting(params.manager_name)}\n\n` +
-    `${intro}\n\n` +
+    `${intro} I wanted to get it in front of you — the details are below, and either link records your decision right away. I'll let ${employeeFirst} know which way it went, so there's nothing else you'll need to do.\n\n` +
     `CURRENT:\n${currentDisplay}\n\n${proposedHeading}:\n${proposedDisplay}\n\n` +
     `Approve: ${approveTok.url}\n\nDeny: ${denyTok.url}\n\n` +
     `(You can also just reply YES to approve or NO to deny.)`;
 
-  const html = `<!DOCTYPE html>
-<html><head><meta charset="utf-8"></head>
-<body style="margin:0;padding:0;background:#f3f4f6;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;color:#111827;">
-<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="background:#f3f4f6;padding:24px 0;">
-  <tr><td align="center">
-    <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="640" style="max-width:640px;background:#ffffff;border-radius:8px;padding:28px;border:1px solid #e5e7eb;">
-      <tr><td style="font-size:16px;line-height:1.5;">
-        <p style="margin:0 0 14px;">${escAvail(greeting(params.manager_name))}</p>
-        <p style="margin:0 0 18px;">${escAvail(intro)}</p>
-        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:0 0 22px;">
-          <tr>
-            <td valign="top" width="48%" style="padding:12px 14px;background:#f9fafb;border:1px solid #e5e7eb;border-radius:6px;font-size:13px;line-height:1.5;">
-              <div style="font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:.04em;font-size:11px;margin-bottom:6px;">Current</div>
-              ${availMultiline(currentDisplay)}
-            </td>
-            <td width="4%">&nbsp;</td>
-            <td valign="top" width="48%" style="padding:12px 14px;background:#eff6ff;border:1px solid #bfdbfe;border-radius:6px;font-size:13px;line-height:1.5;">
-              <div style="font-weight:700;color:#1d4ed8;text-transform:uppercase;letter-spacing:.04em;font-size:11px;margin-bottom:6px;">${escAvail(proposedHeading)}</div>
-              ${availMultiline(proposedDisplay)}
-            </td>
-          </tr>
-        </table>
-        <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin:0 auto 18px;">
-          <tr>
-            <td style="padding:0 6px;">
-              <a href="${escAvail(approveTok.url)}" style="display:inline-block;background:#059669;color:#ffffff;text-decoration:none;font-weight:700;font-size:15px;padding:12px 28px;border-radius:6px;">Approve</a>
-            </td>
-            <td style="padding:0 6px;">
-              <a href="${escAvail(denyTok.url)}" style="display:inline-block;background:#dc2626;color:#ffffff;text-decoration:none;font-weight:700;font-size:15px;padding:12px 28px;border-radius:6px;">Deny</a>
-            </td>
-          </tr>
-        </table>
-        <p style="margin:0;font-size:13px;color:#6b7280;">You can also just reply <strong>YES</strong> to approve or <strong>NO</strong> to deny.</p>
-      </td></tr>
-    </table>
-  </td></tr>
+  // Conclusion-first: greeting + the whole ask (what it is, what to do, that I'll
+  // handle the notification) sit ABOVE the action card, so the manager never has
+  // to read anything below the card to know what's going on.
+  const introHtml = `
+<p style="margin:0 0 12px;font-size:16px;color:${BRAND.textPrimary};">${escAvail(greeting(params.manager_name))}</p>
+<p style="margin:0;font-size:16px;color:${BRAND.textPrimary};line-height:1.65;">${escAvail(intro)} I wanted to get it in front of you — everything's in the card below, and either button records your decision right away. I'll let ${escAvail(employeeFirst)} know which way it went, so there's nothing else you'll need to do.</p>`;
+
+  const cardInner = `
+<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:0 0 20px;">
+  <tr>
+    <td valign="top" width="48%" style="padding:14px 16px;background:${BRAND.surface2};border:1px solid ${BRAND.borderDefault};border-radius:8px;font-size:14px;line-height:1.5;color:${BRAND.textPrimary};">
+      ${brandSectionLabel('Current')}
+      ${availMultiline(currentDisplay)}
+    </td>
+    <td width="4%">&nbsp;</td>
+    <td valign="top" width="48%" style="padding:14px 16px;background:${BRAND.surface2};border:1px solid ${BRAND.borderDefault};border-left:4px solid ${BRAND.accent};border-radius:8px;font-size:14px;line-height:1.5;color:${BRAND.textPrimary};">
+      ${brandSectionLabel(proposedHeading)}
+      ${availMultiline(proposedDisplay)}
+    </td>
+  </tr>
 </table>
-</body></html>`;
+<div style="border-top:1px solid ${BRAND.borderDefault};margin:6px 0 0;padding-top:18px;">
+${brandedButtonRow([
+  { url: approveTok.url, label: 'Approve', variant: 'primary' },
+  { url: denyTok.url, label: 'Deny', variant: 'secondary' },
+])}
+  <p style="margin:2px 0 6px;font-size:13px;color:${BRAND.textSecondary};">You can also just reply <strong>YES</strong> to approve or <strong>NO</strong> to deny.</p>
+</div>`;
+
+  const card = brandActionCard(
+    isCustom ? 'Action needed · Temporary availability' : 'Action needed · Availability',
+    cardInner
+  );
+
+  const bodyHtml = `${introHtml}
+${card}`;
+
+  const html = brandedEmailShell({
+    bodyHtml,
+    preheader: subject,
+  });
 
   return { subject, text, html };
 }

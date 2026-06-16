@@ -3,6 +3,7 @@ import { logActivity } from '../logger/activity-log';
 import { reply, sendInThreadAck } from '../messaging/reply';
 import { sendEmail } from '../messaging/email';
 import { greeting } from '../messaging/greeting';
+import { BRAND, brandedEmailShell } from '../messaging/brand';
 import { isAlreadyDistributed } from '../lib/distribute-guard';
 import { sendSms } from '../messaging/sms';
 import { computeWageEstimate } from '../lib/schedule-simulator';
@@ -1381,6 +1382,7 @@ export async function handleBuildSchedule(
       week_end: weekEnd,
       manager_email: message.sender,
       manager_user_id: contact.user_id ?? undefined,
+      manager_name: contact.name,
       wages,
       employee_max_hours: employeeMaxHours,
     });
@@ -1484,21 +1486,21 @@ function buildFullScheduleGridHtml(args: {
 
   // No shifts at all → a plain inline-styled line, still a fragment (no wrapper).
   if (shiftNames.length === 0) {
-    return `<p style="margin:0;font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#6b7280;">No shifts are on the schedule for this week.</p>`;
+    return `<p style="margin:0;font-family:Arial,Helvetica,sans-serif;font-size:14px;color:${BRAND.textSecondary};">No shifts are on the schedule for this week.</p>`;
   }
 
   const headerCells = days.map(d => {
     const closure = closedByDate.get(d);
     const sub = closure
-      ? `<div style="font-size:11px;color:#b91c1c;font-weight:bold;">CLOSED — ${esc(closure)}</div>`
+      ? `<div style="font-size:11px;color:${BRAND.badText};font-weight:bold;">CLOSED — ${esc(closure)}</div>`
       : '';
-    return `<th style="padding:8px 10px;border:1px solid #d1d5db;background-color:#1f2937;color:#f9fafb;text-align:left;font-size:12px;font-weight:bold;">${esc(formatWeekday(d))}<div style="font-weight:normal;color:#cbd5e1;font-size:11px;">${esc(formatShortDate(d))}</div>${sub}</th>`;
+    return `<th style="padding:8px 10px;border:1px solid ${BRAND.borderStrong};background-color:${BRAND.surface3};color:${BRAND.silver};text-align:left;font-size:12px;font-weight:bold;">${esc(formatWeekday(d))}<div style="font-weight:normal;color:${BRAND.textSecondary};font-size:11px;">${esc(formatShortDate(d))}</div>${sub}</th>`;
   }).join('');
 
   const bodyRows = shiftNames.map(shiftName => {
     const cells = days.map(d => {
       if (closedByDate.has(d)) {
-        return `<td style="padding:8px 10px;border:1px solid #e5e7eb;background-color:#f3f4f6;color:#9ca3af;font-size:12px;text-align:center;vertical-align:top;">—</td>`;
+        return `<td style="padding:8px 10px;border:1px solid ${BRAND.borderDefault};background-color:${BRAND.bgBase};color:${BRAND.textMuted};font-size:12px;text-align:center;vertical-align:top;">—</td>`;
       }
       const key = `${shiftName}||${d}`;
       const asgs = (asgByKey.get(key) ?? []).slice().sort((a, b) =>
@@ -1507,26 +1509,26 @@ function buildFullScheduleGridHtml(args: {
       const cellGaps = gapByKey.get(key) ?? [];
       const lines: string[] = [];
       for (const a of asgs) {
-        lines.push(`<div style="color:#111827;"><strong>${esc(a.employee_name ?? '')}</strong> <span style="color:#6b7280;">${esc(a.role)}</span></div>`);
+        lines.push(`<div style="color:${BRAND.textPrimary};"><strong>${esc(a.employee_name ?? '')}</strong> <span style="color:${BRAND.textSecondary};">${esc(a.role)}</span></div>`);
       }
       for (const g of cellGaps) {
         const missing = g.required_count - g.filled_count;
         for (let i = 0; i < missing; i++) {
-          lines.push(`<div style="color:#b91c1c;font-weight:bold;">UNFILLED — ${esc(g.role)}</div>`);
+          lines.push(`<div style="color:${BRAND.badText};font-weight:bold;">UNFILLED — ${esc(g.role)}</div>`);
         }
       }
-      const inner = lines.length > 0 ? lines.join('') : `<span style="color:#d1d5db;">·</span>`;
-      return `<td style="padding:8px 10px;border:1px solid #e5e7eb;font-size:12px;text-align:left;vertical-align:top;">${inner}</td>`;
+      const inner = lines.length > 0 ? lines.join('') : `<span style="color:${BRAND.textMuted};">·</span>`;
+      return `<td style="padding:8px 10px;border:1px solid ${BRAND.borderDefault};background-color:${BRAND.surface2};font-size:12px;text-align:left;vertical-align:top;">${inner}</td>`;
     }).join('');
     const startLabel = shiftStart.get(shiftName);
     const sub = startLabel && startLabel !== '99:99'
-      ? `<div style="font-weight:normal;color:#6b7280;font-size:11px;">${esc(formatTime(startLabel))}</div>`
+      ? `<div style="font-weight:normal;color:${BRAND.textSecondary};font-size:11px;">${esc(formatTime(startLabel))}</div>`
       : '';
-    return `<tr><th style="padding:8px 10px;border:1px solid #d1d5db;background-color:#f9fafb;color:#111827;text-align:left;font-size:12px;font-weight:bold;vertical-align:top;">${esc(shiftName)}${sub}</th>${cells}</tr>`;
+    return `<tr><th style="padding:8px 10px;border:1px solid ${BRAND.borderStrong};background-color:${BRAND.surface3};color:${BRAND.textPrimary};text-align:left;font-size:12px;font-weight:bold;vertical-align:top;">${esc(shiftName)}${sub}</th>${cells}</tr>`;
   }).join('');
 
   return `<table style="border-collapse:collapse;width:100%;font-family:Arial,Helvetica,sans-serif;">
-<thead><tr><th style="padding:8px 10px;border:1px solid #d1d5db;background-color:#1f2937;color:#f9fafb;text-align:left;font-size:12px;font-weight:bold;">Shift</th>${headerCells}</tr></thead>
+<thead><tr><th style="padding:8px 10px;border:1px solid ${BRAND.borderStrong};background-color:${BRAND.surface3};color:${BRAND.silver};text-align:left;font-size:12px;font-weight:bold;">Shift</th>${headerCells}</tr></thead>
 <tbody>${bodyRows}</tbody>
 </table>`;
 }
@@ -1547,14 +1549,14 @@ function buildWeekEventsHtml(events: Event[]): string {
           ? `${formatShortDate(start)}–${formatShortDate(e.end_date)}`
           : formatShortDate(start))
       : 'This week';
-    const closed = e.event_type === 'closure' ? ' <span style="color:#b91c1c;font-weight:bold;">(closed)</span>' : '';
+    const closed = e.event_type === 'closure' ? ` <span style="color:${BRAND.badText};font-weight:bold;">(closed)</span>` : '';
     const note = e.staffing_notes
-      ? `<div style="color:#6b7280;font-size:13px;">${esc(e.staffing_notes)}</div>`
+      ? `<div style="color:${BRAND.textSecondary};font-size:13px;">${esc(e.staffing_notes)}</div>`
       : '';
     return `<li style="margin:0 0 8px;"><strong>${esc(label)}</strong> — ${esc(e.title)}${closed}${note}</li>`;
   }).join('');
-  return `<h3 style="margin:24px 0 8px;font-size:16px;color:#111827;">This week:</h3>
-<ul style="margin:0 0 4px;padding-left:20px;font-size:14px;line-height:1.5;color:#374151;">${rows}</ul>`;
+  return `<h3 style="margin:24px 0 8px;font-size:16px;color:${BRAND.textPrimary};">This week:</h3>
+<ul style="margin:0 0 4px;padding-left:20px;font-size:14px;line-height:1.5;color:${BRAND.textPrimary};">${rows}</ul>`;
 }
 
 function buildWeekEventsText(events: Event[]): string {
@@ -1668,41 +1670,45 @@ export async function distributeScheduleCore(
 
         const shiftRows = hasShifts
           ? myShifts.map(s =>
-              `<tr>` +
-              `<td style="padding:10px 12px;border:1px solid #e5e7eb;">${formatDisplayDate(s.date)}</td>` +
-              `<td style="padding:10px 12px;border:1px solid #e5e7eb;">${s.role}` +
-                `<br><span style="color:#9ca3af;font-size:12px;">${s.shift_name}</span></td>` +
-              `<td style="padding:10px 12px;border:1px solid #e5e7eb;white-space:nowrap;">${formatTime(s.start_time)} – ${formatTime(s.end_time)}</td>` +
-              `<td style="padding:10px 12px;border:1px solid #e5e7eb;text-align:right;">${s.hours}h</td>` +
+              `<tr style="background:${BRAND.surface2};">` +
+              `<td style="padding:10px 12px;border:1px solid ${BRAND.borderDefault};color:${BRAND.textPrimary};">${formatDisplayDate(s.date)}</td>` +
+              `<td style="padding:10px 12px;border:1px solid ${BRAND.borderDefault};color:${BRAND.textPrimary};">${s.role}` +
+                `<br><span style="color:${BRAND.textSecondary};font-size:12px;">${s.shift_name}</span></td>` +
+              `<td style="padding:10px 12px;border:1px solid ${BRAND.borderDefault};color:${BRAND.textPrimary};white-space:nowrap;">${formatTime(s.start_time)} – ${formatTime(s.end_time)}</td>` +
+              `<td style="padding:10px 12px;border:1px solid ${BRAND.borderDefault};color:${BRAND.textPrimary};text-align:right;">${s.hours}h</td>` +
               `</tr>`
             ).join('')
           : '';
 
         const shiftTable = hasShifts
           ? `<table style="width:100%;border-collapse:collapse;margin:4px 0 18px;font-size:14px;">
-<thead><tr style="background:#f9fafb;">
-<th style="padding:8px 12px;border:1px solid #e5e7eb;text-align:left;">Day</th>
-<th style="padding:8px 12px;border:1px solid #e5e7eb;text-align:left;">Position</th>
-<th style="padding:8px 12px;border:1px solid #e5e7eb;text-align:left;">Time</th>
-<th style="padding:8px 12px;border:1px solid #e5e7eb;text-align:right;">Hours</th>
+<thead><tr style="background:${BRAND.surface3};">
+<th style="padding:8px 12px;border:1px solid ${BRAND.borderDefault};color:${BRAND.silver};text-align:left;">Day</th>
+<th style="padding:8px 12px;border:1px solid ${BRAND.borderDefault};color:${BRAND.silver};text-align:left;">Position</th>
+<th style="padding:8px 12px;border:1px solid ${BRAND.borderDefault};color:${BRAND.silver};text-align:left;">Time</th>
+<th style="padding:8px 12px;border:1px solid ${BRAND.borderDefault};color:${BRAND.silver};text-align:right;">Hours</th>
 </tr></thead>
 <tbody>${shiftRows}</tbody>
 </table>
-<p style="margin:0 0 20px;color:#374151;">That's <strong>${totalHours}h</strong> across the week.</p>`
+<p style="margin:0 0 20px;color:${BRAND.textSecondary};">That's <strong style="color:${BRAND.textPrimary};">${totalHours}h</strong> across the week.</p>`
           : '';
 
-        const html = `<!DOCTYPE html><html><body style="font-family:Arial,Helvetica,sans-serif;max-width:600px;margin:0 auto;padding:24px;color:#111827;">
-<h2 style="margin:0 0 12px;font-size:20px;">Your shifts for ${weekLabel}</h2>
-<p style="margin:0 0 16px;line-height:1.5;">${greetingLine}</p>
-<p style="margin:0 0 18px;line-height:1.5;color:#374151;">${intro}</p>
+        const bodyHtml = `<h2 style="margin:0 0 12px;font-size:20px;color:${BRAND.textPrimary};">Your shifts for ${weekLabel}</h2>
+<p style="margin:0 0 16px;line-height:1.5;color:${BRAND.textPrimary};">${greetingLine}</p>
+<p style="margin:0 0 18px;line-height:1.5;color:${BRAND.textPrimary};">${intro}</p>
 ${shiftTable}
 ${weekEventsHtml}
-<h3 style="margin:26px 0 10px;font-size:16px;color:#111827;">Here's the whole team's week:</h3>
+<h3 style="margin:26px 0 10px;font-size:16px;color:${BRAND.textPrimary};">Here's the whole team's week:</h3>
 ${teamGridHtml}
-<p style="margin:8px 0 0;line-height:1.5;color:#9ca3af;font-size:12px;">Positions are in grey next to each name. <span style="color:#b91c1c;font-weight:bold;">UNFILLED</span> marks an open slot.</p>
-<p style="margin:20px 0 4px;line-height:1.5;color:#374151;">If anything here doesn't look right, just reply to this email or reach out to your manager — we'll get it fixed.</p>
-<p style="margin:18px 0 0;color:#6b7280;">See you this week,<br>${companyName}</p>
-</body></html>`;
+<p style="margin:8px 0 0;line-height:1.5;color:${BRAND.textMuted};font-size:12px;">Positions are in grey next to each name. <span style="color:${BRAND.badText};font-weight:bold;">UNFILLED</span> marks an open slot.</p>
+<p style="margin:20px 0 4px;line-height:1.5;color:${BRAND.textSecondary};">If anything here doesn't look right, just reply to this email or reach out to your manager — we'll get it fixed.</p>
+<p style="margin:18px 0 0;color:${BRAND.textSecondary};">See you this week,<br>${companyName}</p>`;
+
+        const html = brandedEmailShell({
+          bodyHtml,
+          companyName,
+          preheader: `Your shifts for ${weekLabel}`,
+        });
 
         const eventsBlock = weekEventsText ? `\n\n${weekEventsText}` : '';
         const text = hasShifts

@@ -2,6 +2,7 @@ import { supabase } from '../db/client';
 import { logActivity } from '../logger/activity-log';
 import { reply } from '../messaging/reply';
 import { sendEmail } from '../messaging/email';
+import { BRAND, brandedEmailShell } from '../messaging/brand';
 import { reconcilePayroll } from '../lib/payroll-reconciler';
 import { getTimeClockAdapter, getPayrollAdapter } from '../lib/integrations/factory';
 import type { ScheduledShift, ReconciliationResult, DiscrepancyRecord } from '../lib/payroll-reconciler';
@@ -405,31 +406,31 @@ function renderIssueCard(r: DiscrepancyRecord): string {
   const scheduledHrs = r.scheduled_hours !== null ? `${r.scheduled_hours.toFixed(2)} hrs` : '—';
   const actualHrs = r.actual_hours !== null ? `${r.actual_hours.toFixed(2)} hrs` : '—';
   const diff = r.difference >= 0 ? `+${r.difference.toFixed(2)}` : r.difference.toFixed(2);
-  const diffColor = r.difference >= 0 ? '#16a34a' : '#dc2626';
+  const diffColor = r.difference >= 0 ? BRAND.goodText : BRAND.badText;
 
   return `
-<div style="border:1px solid #e5e7eb;border-radius:8px;padding:16px;margin-bottom:12px;">
+<div style="background:${BRAND.surface2};border:1px solid ${BRAND.borderDefault};border-radius:8px;padding:16px;margin-bottom:12px;">
   <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px;">
-    <strong style="font-size:15px;">${r.employee_name}</strong>
+    <strong style="font-size:15px;color:${BRAND.textPrimary};">${r.employee_name}</strong>
     ${badge}
   </div>
-  <div style="font-size:13px;color:#374151;margin-bottom:4px;">${r.date}${r.scheduled_shift ? ` · ${r.scheduled_shift}` : ''}</div>
-  <div style="display:flex;gap:24px;font-size:13px;margin-bottom:8px;">
+  <div style="font-size:13px;color:${BRAND.textSecondary};margin-bottom:4px;">${r.date}${r.scheduled_shift ? ` · ${r.scheduled_shift}` : ''}</div>
+  <div style="display:flex;gap:24px;font-size:13px;margin-bottom:8px;color:${BRAND.textPrimary};">
     <span>Scheduled: <strong>${scheduledHrs}</strong></span>
     <span>Actual: <strong>${actualHrs}</strong></span>
     <span>Variance: <strong style="color:${diffColor};">${diff} hrs</strong></span>
   </div>
-  ${r.actual_clock_in || r.actual_clock_out ? `<div style="font-size:12px;color:#6b7280;margin-bottom:4px;">Clock in: ${r.actual_clock_in ?? '—'} · Clock out: ${r.actual_clock_out ?? '—'}</div>` : ''}
-  <div style="font-size:13px;color:#374151;font-style:italic;">${r.notes}</div>
+  ${r.actual_clock_in || r.actual_clock_out ? `<div style="font-size:12px;color:${BRAND.textMuted};margin-bottom:4px;">Clock in: ${r.actual_clock_in ?? '—'} · Clock out: ${r.actual_clock_out ?? '—'}</div>` : ''}
+  <div style="font-size:13px;color:${BRAND.textSecondary};font-style:italic;">${r.notes}</div>
 </div>`;
 }
 
 function renderCleanRow(r: DiscrepancyRecord): string {
   const hrs = r.actual_hours !== null ? `${r.actual_hours.toFixed(2)} hrs` : '—';
-  return `<tr><td style="padding:6px 8px;font-size:13px;">${r.employee_name}</td><td style="padding:6px 8px;font-size:13px;color:#374151;">${r.date}</td><td style="padding:6px 8px;font-size:13px;color:#374151;">${hrs}</td><td style="padding:6px 8px;font-size:13px;color:#16a34a;">Clean</td></tr>`;
+  return `<tr style="background:${BRAND.surface2};"><td style="padding:6px 8px;font-size:13px;color:${BRAND.textPrimary};border-bottom:1px solid ${BRAND.borderDefault};">${r.employee_name}</td><td style="padding:6px 8px;font-size:13px;color:${BRAND.textSecondary};border-bottom:1px solid ${BRAND.borderDefault};">${r.date}</td><td style="padding:6px 8px;font-size:13px;color:${BRAND.textSecondary};border-bottom:1px solid ${BRAND.borderDefault};">${hrs}</td><td style="padding:6px 8px;font-size:13px;color:${BRAND.goodText};border-bottom:1px solid ${BRAND.borderDefault};">Clean</td></tr>`;
 }
 
-function buildReconciliationEmail(result: ReconciliationResult): string {
+function buildReconciliationEmail(result: ReconciliationResult, companyName?: string): string {
   const runDate = new Date().toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' });
   const variance = result.estimated_wage_variance >= 0
     ? `+$${result.estimated_wage_variance.toFixed(2)}`
@@ -438,66 +439,77 @@ function buildReconciliationEmail(result: ReconciliationResult): string {
   const issueCards = result.issue_records.map(renderIssueCard).join('');
   const cleanRows = result.clean_records.map(renderCleanRow).join('');
 
-  return `<!DOCTYPE html>
-<html>
-<head><meta charset="utf-8"><style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#111827;max-width:680px;margin:0 auto;padding:24px;}</style></head>
-<body>
-<h2 style="font-size:22px;font-weight:700;margin-bottom:4px;">Payroll Reconciliation Report</h2>
-<p style="color:#6b7280;margin-top:0;margin-bottom:24px;">Pay period: <strong>${result.period_start}</strong> to <strong>${result.period_end}</strong> · Run: ${runDate}</p>
+  // Conclusion-first intro: what I checked and what (if anything) needs a look.
+  const intro = result.issue_count > 0
+    ? `I reconciled the schedule against the time clock for ${result.period_start}–${result.period_end}. ${result.issue_count} record${result.issue_count === 1 ? '' : 's'} need${result.issue_count === 1 ? 's' : ''} a second look — they're flagged below, with the rest coming back clean.`
+    : `I reconciled the schedule against the time clock for ${result.period_start}–${result.period_end}, and everything came back clean — nothing needs your attention.`;
+
+  const bodyHtml = `
+<h2 style="font-size:22px;font-weight:700;margin:0 0 6px;color:${BRAND.textPrimary};">Payroll reconciliation</h2>
+<p style="margin:0 0 16px;font-size:16px;line-height:1.65;color:${BRAND.textPrimary};">${intro}</p>
+<p style="color:${BRAND.textSecondary};margin:0 0 24px;font-size:13px;">Pay period: <strong style="color:${BRAND.textPrimary};">${result.period_start}</strong> to <strong style="color:${BRAND.textPrimary};">${result.period_end}</strong> · Run: ${runDate}</p>
 
 <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:28px;">
-  <div style="flex:1;min-width:120px;border-radius:8px;background:#f3f4f6;padding:12px 16px;">
-    <div style="font-size:24px;font-weight:700;">${result.total_employees}</div>
-    <div style="font-size:12px;color:#6b7280;">Total Employees</div>
+  <div style="flex:1;min-width:120px;border-radius:8px;background:${BRAND.surface2};border:1px solid ${BRAND.borderDefault};padding:12px 16px;">
+    <div style="font-size:24px;font-weight:700;color:${BRAND.textPrimary};">${result.total_employees}</div>
+    <div style="font-size:12px;color:${BRAND.textSecondary};">Total Employees</div>
   </div>
-  <div style="flex:1;min-width:120px;border-radius:8px;background:#dcfce7;padding:12px 16px;">
-    <div style="font-size:24px;font-weight:700;color:#16a34a;">${result.clean_count}</div>
-    <div style="font-size:12px;color:#16a34a;">Clean</div>
+  <div style="flex:1;min-width:120px;border-radius:8px;background:${BRAND.goodBg};border:1px solid ${BRAND.goodBorder};padding:12px 16px;">
+    <div style="font-size:24px;font-weight:700;color:${BRAND.goodText};">${result.clean_count}</div>
+    <div style="font-size:12px;color:${BRAND.goodText};">Clean</div>
   </div>
-  <div style="flex:1;min-width:120px;border-radius:8px;background:#fee2e2;padding:12px 16px;">
-    <div style="font-size:24px;font-weight:700;color:#dc2626;">${result.issue_count}</div>
-    <div style="font-size:12px;color:#dc2626;">Need Attention</div>
+  <div style="flex:1;min-width:120px;border-radius:8px;background:${BRAND.badBg};border:1px solid ${BRAND.badBorder};padding:12px 16px;">
+    <div style="font-size:24px;font-weight:700;color:${BRAND.badText};">${result.issue_count}</div>
+    <div style="font-size:12px;color:${BRAND.badText};">Need Attention</div>
   </div>
-  <div style="flex:1;min-width:120px;border-radius:8px;background:#f3f4f6;padding:12px 16px;">
-    <div style="font-size:24px;font-weight:700;">${variance}</div>
-    <div style="font-size:12px;color:#6b7280;">Est. Wage Variance</div>
+  <div style="flex:1;min-width:120px;border-radius:8px;background:${BRAND.surface2};border:1px solid ${BRAND.borderDefault};padding:12px 16px;">
+    <div style="font-size:24px;font-weight:700;color:${BRAND.textPrimary};">${variance}</div>
+    <div style="font-size:12px;color:${BRAND.textSecondary};">Est. Wage Variance</div>
   </div>
 </div>
 
 ${result.issue_count > 0 ? `
-<h3 style="font-size:16px;font-weight:600;margin-bottom:12px;color:#dc2626;">⚠ Issues Requiring Attention (${result.issue_count})</h3>
+<h3 style="font-size:16px;font-weight:600;margin-bottom:12px;color:${BRAND.badText};">Issues requiring attention (${result.issue_count})</h3>
 ${issueCards}
 ` : ''}
 
 ${result.clean_count > 0 ? `
-<h3 style="font-size:16px;font-weight:600;margin-bottom:12px;color:#16a34a;">✓ Clean Records (${result.clean_count})</h3>
-<table style="width:100%;border-collapse:collapse;font-size:13px;">
+<h3 style="font-size:16px;font-weight:600;margin-bottom:12px;color:${BRAND.goodText};">Clean records (${result.clean_count})</h3>
+<table style="width:100%;border-collapse:collapse;font-size:13px;border:1px solid ${BRAND.borderDefault};border-radius:6px;">
   <thead>
-    <tr style="background:#f9fafb;">
-      <th style="text-align:left;padding:6px 8px;font-weight:600;">Employee</th>
-      <th style="text-align:left;padding:6px 8px;font-weight:600;">Date</th>
-      <th style="text-align:left;padding:6px 8px;font-weight:600;">Hours</th>
-      <th style="text-align:left;padding:6px 8px;font-weight:600;">Status</th>
+    <tr style="background:${BRAND.surface3};">
+      <th style="text-align:left;padding:8px;font-weight:600;color:${BRAND.silver};">Employee</th>
+      <th style="text-align:left;padding:8px;font-weight:600;color:${BRAND.silver};">Date</th>
+      <th style="text-align:left;padding:8px;font-weight:600;color:${BRAND.silver};">Hours</th>
+      <th style="text-align:left;padding:8px;font-weight:600;color:${BRAND.silver};">Status</th>
     </tr>
   </thead>
   <tbody>${cleanRows}</tbody>
 </table>
 ` : ''}
 
-<hr style="margin:28px 0;border:none;border-top:1px solid #e5e7eb;">
-<p style="font-size:13px;color:#6b7280;">
-  Scheduled: <strong>${result.total_scheduled_hours.toFixed(2)} hrs</strong> ·
-  Actual: <strong>${result.total_actual_hours.toFixed(2)} hrs</strong> ·
-  Variance: <strong>${result.total_hour_variance >= 0 ? '+' : ''}${result.total_hour_variance.toFixed(2)} hrs</strong> ·
-  Est. wage variance: <strong>${variance}</strong>
-</p>
-<p style="font-size:12px;color:#9ca3af;">Generated by Aegis · ${runDate}</p>
-</body>
-</html>`;
+<hr style="margin:28px 0;border:none;border-top:1px solid ${BRAND.borderDefault};">
+<p style="font-size:13px;color:${BRAND.textSecondary};">
+  Scheduled: <strong style="color:${BRAND.textPrimary};">${result.total_scheduled_hours.toFixed(2)} hrs</strong> ·
+  Actual: <strong style="color:${BRAND.textPrimary};">${result.total_actual_hours.toFixed(2)} hrs</strong> ·
+  Variance: <strong style="color:${BRAND.textPrimary};">${result.total_hour_variance >= 0 ? '+' : ''}${result.total_hour_variance.toFixed(2)} hrs</strong> ·
+  Est. wage variance: <strong style="color:${BRAND.textPrimary};">${variance}</strong>
+</p>`;
+
+  return brandedEmailShell({
+    bodyHtml,
+    companyName,
+    preheader: `Payroll reconciliation — ${result.period_start} to ${result.period_end}`,
+  });
 }
 
 function buildReconciliationText(result: ReconciliationResult): string {
+  const intro = result.issue_count > 0
+    ? `I reconciled the schedule against the time clock for ${result.period_start}–${result.period_end}. ${result.issue_count} record${result.issue_count === 1 ? '' : 's'} need${result.issue_count === 1 ? 's' : ''} a second look — flagged below, with the rest clean.`
+    : `I reconciled the schedule against the time clock for ${result.period_start}–${result.period_end}, and everything came back clean — nothing needs your attention.`;
   const lines: string[] = [
+    intro,
+    '',
     `PAYROLL RECONCILIATION — ${result.period_start} to ${result.period_end}`,
     `Employees: ${result.total_employees} | Clean: ${result.clean_count} | Issues: ${result.issue_count}`,
     `Scheduled: ${result.total_scheduled_hours.toFixed(2)} hrs | Actual: ${result.total_actual_hours.toFixed(2)} hrs | Variance: ${result.total_hour_variance.toFixed(2)} hrs`,

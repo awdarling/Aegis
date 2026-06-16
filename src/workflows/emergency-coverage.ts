@@ -4,6 +4,11 @@ import { reply } from '../messaging/reply';
 import { sendSms } from '../messaging/sms';
 import { sendEmail } from '../messaging/email';
 import { greeting } from '../messaging/greeting';
+import {
+  BRAND,
+  brandedEmailShell,
+  brandActionCard,
+} from '../messaging/brand';
 import { generateReply } from '../ai/claude';
 import { getSpecialNotes } from './special-notes';
 import type { InboundMessage, VerifiedContact } from '../security/types';
@@ -265,6 +270,16 @@ function formatShortDate(dateStr: string): string {
   return new Date(dateStr + 'T12:00:00Z').toLocaleDateString('en-US', {
     month: 'short', day: 'numeric',
   });
+}
+
+// Escape user-supplied / dynamic text before inlining into branded HTML.
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 async function getCompanyDate(companyId: string): Promise<string> {
@@ -710,7 +725,37 @@ function buildCandidateMessage(
       (reasons.length > 0 ? `• ${reasons.join('\n• ')}\n` : '') +
       (specialNotes.length > 0 ? `\n⚠ Note: ${specialNotes.map(e => e.title).join(', ')} may affect staffing today.` : '') +
       '\n\nYou may need to contact staff directly.';
-    return { text: noOneText, html: `<pre style="font-family:sans-serif">${noOneText}</pre>` };
+
+    // Branded "no one available" body — conclusion-first, then the details in a
+    // dark action card so it matches the rest of the workflow emails.
+    const reasonsListHtml = reasons.length > 0
+      ? `<ul style="margin:6px 0 0;padding-left:18px;">${reasons
+          .map(r => `<li style="margin:0 0 6px;font-size:14px;color:${BRAND.textPrimary};">${escapeHtml(r)}</li>`)
+          .join('')}</ul>`
+      : '';
+    const noOneSpecialHtml = specialNotes.length > 0
+      ? `<div style="margin:14px 0 0;padding:12px 14px;background:${BRAND.warnBg};border:1px solid ${BRAND.warnBorder};border-left:4px solid ${BRAND.warnRule};border-radius:8px;font-size:14px;color:${BRAND.warnText};"><strong>Heads up:</strong> ${escapeHtml(specialNotes.map(e => e.title).join(', '))} may affect staffing today.</div>`
+      : '';
+    const noOneCardInner = `
+<div style="margin:0 0 16px;padding:16px;background:${BRAND.surface2};border:1px solid ${BRAND.borderDefault};border-radius:8px;">
+  <div style="font-size:14px;color:${BRAND.textPrimary};"><strong>Shift:</strong> ${escapeHtml(shiftInfo.shift_name)} — ${escapeHtml(shiftInfo.start_time)}–${escapeHtml(shiftInfo.end_time)} (${escapeHtml(shiftInfo.role)})</div>
+  <div style="font-size:14px;color:${BRAND.textPrimary};margin-top:8px;"><strong>Date:</strong> ${escapeHtml(dateStr)}</div>
+  <div style="font-size:14px;color:${BRAND.textPrimary};margin-top:8px;"><strong>Absent:</strong> ${escapeHtml(calledOutName)}</div>
+</div>
+<div style="margin:0 0 4px;">
+  <div style="font-size:13px;font-weight:600;color:${BRAND.silver};text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px;">Why I came up empty</div>
+  <div style="font-size:14px;color:${BRAND.textPrimary};">Role needed: ${escapeHtml(shiftInfo.role)}.</div>
+  ${reasonsListHtml}
+  ${noOneSpecialHtml}
+</div>`;
+    const noOneBody = `
+<p style="margin:0 0 12px;font-size:16px;color:${BRAND.textPrimary};line-height:1.65;">I went through the whole roster for the ${escapeHtml(shiftInfo.shift_name)} shift on ${escapeHtml(dateStr)} and couldn't find anyone qualified and available to cover for ${escapeHtml(calledOutName)}. You'll likely need to reach out to staff directly — here's what I checked so you're not starting from scratch.</p>
+${brandActionCard('Coverage · No candidates found', noOneCardInner)}`;
+    const noOneHtml = brandedEmailShell({
+      bodyHtml: noOneBody,
+      preheader: `No coverage candidates for ${shiftInfo.shift_name} on ${dateStr}`,
+    });
+    return { text: noOneText, html: noOneHtml };
   }
 
   // Build text sections by tier
@@ -739,14 +784,17 @@ function buildCandidateMessage(
   }
 
   sections.push('');
-  sections.push('Reply ALL to contact everyone on this list, a name (or names) to contact just them, or handle it yourself.');
+  sections.push("Reply ALL and I'll reach out to everyone on this list, a name (or names) to contact just them, or tell me you'll handle it yourself.");
 
   const text = sections.join('\n');
 
-  // HTML version
-  const tierColors: Record<number, string> = { 1: '#16a34a', 2: '#d97706', 3: '#6b7280' };
-  const tierBgs: Record<number, string> = { 1: '#f0fdf4', 2: '#fffbeb', 3: '#f9fafb' };
-  const tierLabels: Record<number, string> = { 1: 'PREFERRED', 2: 'OVERTIME RISK', 3: 'ALREADY WORKING (extend shift)' };
+  // ── Branded (Quria dark theme) HTML ──────────────────────────────────────
+  // Conclusion-first: greeting + how to act sits above the action card; the
+  // ranked candidate list + reply instructions live inside one brandActionCard.
+  // The manager's "action" here is to reply (ALL / a name / handle it), so the
+  // reply guidance is the card's call-to-action.
+  const tierFg: Record<number, string> = { 1: BRAND.goodText, 2: BRAND.warnText, 3: BRAND.textSecondary };
+  const tierLabels: Record<number, string> = { 1: 'Preferred', 2: 'Overtime risk', 3: 'Already working (extend shift)' };
 
   let candidatesHtml = '';
   let lastTier = 0;
@@ -756,38 +804,49 @@ function buildCandidateMessage(
     if (c.tier !== lastTier) {
       if (lastTier !== 0) candidatesHtml += '</div>';
       lastTier = c.tier;
-      candidatesHtml += `<div style="margin:16px 0;"><p style="font-weight:bold;color:${tierColors[c.tier]};margin:0 0 8px;">${tierLabels[c.tier]}</p>`;
+      candidatesHtml += `<div style="margin:0 0 16px;"><div style="font-size:12px;font-weight:600;color:${tierFg[c.tier]};text-transform:uppercase;letter-spacing:0.07em;margin:0 0 8px;">${tierLabels[c.tier]}</div>`;
     }
     const overtimeNote = c.would_exceed_max
-      ? `<span style="color:#dc2626;font-size:12px;"> ⚠ would be ${(c.current_weekly_hours + c.shift_hours).toFixed(1)}h (max ${c.employee.max_weekly_hours}h)</span>`
+      ? `<span style="color:${BRAND.warnText};font-size:12px;"> ⚠ would be ${(c.current_weekly_hours + c.shift_hours).toFixed(1)}h (max ${c.employee.max_weekly_hours}h)</span>`
       : '';
     candidatesHtml +=
-      `<div style="padding:10px 12px;background:${tierBgs[c.tier]};border:1px solid #e5e7eb;border-radius:4px;margin-bottom:6px;">` +
-      `<strong>${htmlRank}. ${c.employee.name}</strong> — ${c.employee.primary_role}<br>` +
-      `<span style="color:#374151;">${formatPhone(c.employee.contact_phone)}</span> &bull; ` +
-      `<span style="color:#6b7280;font-size:13px;">${c.current_weekly_hours.toFixed(1)}h this week${overtimeNote}</span>` +
+      `<div style="padding:10px 12px;background:${BRAND.surface2};border:1px solid ${BRAND.borderDefault};border-radius:8px;margin-bottom:6px;">` +
+      `<strong style="color:${BRAND.textPrimary};">${htmlRank}. ${escapeHtml(c.employee.name)}</strong> <span style="color:${BRAND.textSecondary};">— ${escapeHtml(c.employee.primary_role)}</span><br>` +
+      `<span style="color:${BRAND.silver};">${escapeHtml(formatPhone(c.employee.contact_phone))}</span> &bull; ` +
+      `<span style="color:${BRAND.textSecondary};font-size:13px;">${c.current_weekly_hours.toFixed(1)}h this week${overtimeNote}</span>` +
       `</div>`;
     htmlRank++;
   }
   if (lastTier !== 0) candidatesHtml += '</div>';
 
   const specialNotesHtml = specialNotes.length > 0
-    ? `<div style="background:#fef9c3;border:1px solid #fde047;padding:10px;border-radius:4px;margin:16px 0;">` +
-      `<strong>⚠ Special Notes:</strong> ${specialNotes.map(e => e.title + (e.staffing_notes ? ': ' + e.staffing_notes : '')).join('<br>')}` +
+    ? `<div style="margin:0 0 16px;padding:12px 14px;background:${BRAND.warnBg};border:1px solid ${BRAND.warnBorder};border-left:4px solid ${BRAND.warnRule};border-radius:8px;font-size:14px;color:${BRAND.warnText};">` +
+      `<strong>Special notes:</strong> ${specialNotes.map(e => escapeHtml(e.title + (e.staffing_notes ? ': ' + e.staffing_notes : ''))).join('<br>')}` +
       `</div>`
     : '';
 
-  const html = `<div style="font-family:Arial,sans-serif;max-width:560px;">
-<h3 style="margin:0 0 4px;">Coverage Needed</h3>
-<table style="width:100%;border-collapse:collapse;margin-bottom:16px;">
-  <tr><td style="font-weight:bold;padding:6px 10px;background:#f9fafb;border:1px solid #e5e7eb;">Shift</td><td style="padding:6px 10px;border:1px solid #e5e7eb;">${shiftInfo.shift_name} — ${shiftInfo.start_time}–${shiftInfo.end_time} (${shiftInfo.role})</td></tr>
-  <tr><td style="font-weight:bold;padding:6px 10px;background:#f9fafb;border:1px solid #e5e7eb;">Date</td><td style="padding:6px 10px;border:1px solid #e5e7eb;">${dateStr}</td></tr>
-  <tr><td style="font-weight:bold;padding:6px 10px;background:#f9fafb;border:1px solid #e5e7eb;">Absent</td><td style="padding:6px 10px;border:1px solid #e5e7eb;">${calledOutName}</td></tr>
-</table>
-${candidatesHtml}
-${specialNotesHtml}
-<p style="margin-top:16px;color:#374151;">Reply ALL to contact everyone on this list, a name (or names) to contact just them, or handle it yourself.</p>
+  const detailsHtml = `
+<div style="margin:0 0 16px;padding:16px;background:${BRAND.surface2};border:1px solid ${BRAND.borderDefault};border-radius:8px;">
+  <div style="font-size:14px;color:${BRAND.textPrimary};"><strong>Shift:</strong> ${escapeHtml(shiftInfo.shift_name)} — ${escapeHtml(shiftInfo.start_time)}–${escapeHtml(shiftInfo.end_time)} (${escapeHtml(shiftInfo.role)})</div>
+  <div style="font-size:14px;color:${BRAND.textPrimary};margin-top:8px;"><strong>Date:</strong> ${escapeHtml(dateStr)}</div>
+  <div style="font-size:14px;color:${BRAND.textPrimary};margin-top:8px;"><strong>Absent:</strong> ${escapeHtml(calledOutName)}</div>
 </div>`;
+
+  const replyGuidanceHtml = `
+<div style="border-top:1px solid ${BRAND.borderDefault};margin:6px 0 0;padding-top:16px;font-size:14px;color:${BRAND.textPrimary};line-height:1.6;">
+  Reply <strong>ALL</strong> and I'll reach out to everyone on this list, reply a <strong>name</strong> (or names) to contact just them, or tell me you'll handle it yourself.
+</div>`;
+
+  const cardInner = `${detailsHtml}${specialNotesHtml}${candidatesHtml}${replyGuidanceHtml}`;
+
+  const introHtml = `
+<p style="margin:0;font-size:16px;color:${BRAND.textPrimary};line-height:1.65;">${escapeHtml(calledOutName)} is out for the ${escapeHtml(shiftInfo.shift_name)} shift on ${escapeHtml(dateStr)}, so I pulled together who's qualified and available to cover. Just tell me who to reach out to and I'll take it from there.</p>`;
+
+  const html = brandedEmailShell({
+    bodyHtml: `${introHtml}
+${brandActionCard('Action needed · Coverage', cardInner)}`,
+    preheader: `Coverage needed: ${shiftInfo.shift_name} on ${dateStr}`,
+  });
 
   return { text, html };
 }

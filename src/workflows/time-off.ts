@@ -10,6 +10,13 @@ import { classifyIntent, generateReply } from '../ai/claude';
 import { runSimulation, getWeekBounds, loadTimeOffPolicies as loadAllTimeOffPolicies } from '../lib/schedule-simulator';
 import { computeTimeOffViolations } from '../lib/time-off-policies';
 import { env } from '../config/env';
+import { firstName } from '../messaging/greeting';
+import {
+  BRAND,
+  brandedEmailShell,
+  brandedButtonRow,
+  brandActionCard,
+} from '../messaging/brand';
 import { buildTimeOffManagerEmail, type TimeOffRecommendation } from './time-off-manager-email';
 import type { InboundMessage, VerifiedContact } from '../security/types';
 import type { Employee, PartialDayDetail, Policy, TimeOffRequest } from '../db/types';
@@ -73,6 +80,16 @@ function formatShortDate(dateStr: string): string {
     month: 'short',
     day: 'numeric',
   });
+}
+
+// Escape user-supplied / dynamic text before inlining into branded HTML.
+function escapeHtmlTo(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 function eachDateInRange(startDate: string, endDate: string): string[] {
@@ -364,13 +381,15 @@ function buildManagerEmail(params: {
 
   const dateDisplay = formatDateRange(startDate, endDate);
   const subject = `Time-Off Request — ${employeeName} (${formatShortDate(startDate)}${startDate !== endDate ? ` – ${formatShortDate(endDate)}` : ''})`;
+  const employeeFirst = firstName(employeeName);
 
   // Plain text version. Sim/alternates/recommendation sections are only
   // rendered when the simulator ran (stage1 non-null).
   const text = [
     greeting(managerName),
     '',
-    `${employeeName} has submitted a time-off request.`,
+    `${employeeFirst} just put in a time-off request, and I've taken a first pass at the coverage picture for you. ` +
+      `The details are below — either link records your decision right away, and I'll let ${employeeFirst} know which way it went, so there's nothing else you'll need to do.`,
     '',
     ...(violationLines.length > 0
       ? [
@@ -424,129 +443,178 @@ function buildManagerEmail(params: {
           '',
         ]
       : []),
-    `APPROVE: ${approveUrl}`,
-    `DENY:    ${denyUrl}`,
+    'Approve this request:',
+    approveUrl,
     '',
-    'These links expire in 7 days. — Aegis',
+    'Deny this request:',
+    denyUrl,
+    '',
+    "These links expire in 7 days, and I'll take it from there. — Aegis",
   ]
     .filter(l => l !== undefined)
     .join('\n');
 
-  // HTML version
-  const recColor = recommendation && recommendation.recommendation === 'approve' ? '#16a34a' : '#dc2626';
-  const recLabel = recommendation && recommendation.recommendation === 'approve' ? 'APPROVE' : 'DENY';
+  // ── Branded (Quria dark theme) HTML ──────────────────────────────────────
+  // Mirrors time-off-manager-email.ts: conclusion-first intro above the action
+  // card; all actionable detail + Approve/Deny buttons live inside one
+  // brandActionCard. Colors are BRAND tokens throughout.
 
-  const gapRows = (sim: SimulationResult) =>
+  // Conclusion-first intro — the whole ask sits above the card.
+  const introHtml = `
+<p style="margin:0 0 12px;font-size:16px;color:${BRAND.textPrimary};">${escapeHtmlTo(greeting(managerName))}</p>
+<p style="margin:0;font-size:16px;color:${BRAND.textPrimary};line-height:1.65;">${escapeHtmlTo(employeeFirst)} just put in a time-off request, and I've taken a first pass at the coverage picture for you. Everything's in the card below — either button records your decision right away, and I'll let ${escapeHtmlTo(employeeFirst)} know which way it went, so there's nothing else you'll need to do.</p>`;
+
+  // Policy considerations — warn-tinted callout (omitted when no violations).
+  const policyConsiderationsHtml =
+    violationLines.length > 0
+      ? `
+<div style="margin:0 0 20px;">
+  <div style="font-size:13px;font-weight:600;color:${BRAND.warnText};text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px;">Policy considerations</div>
+  <div style="padding:14px 16px;background:${BRAND.warnBg};border:1px solid ${BRAND.warnBorder};border-left:4px solid ${BRAND.warnRule};border-radius:8px;">
+    <ul style="margin:0;padding-left:18px;">${violationLines
+      .map(l => `<li style="margin:0 0 6px;font-size:14px;color:${BRAND.warnText};">${escapeHtmlTo(l)}</li>`)
+      .join('')}</ul>
+  </div>
+</div>`
+      : '';
+
+  // Request details — dark surface card.
+  const requestDetailsHtml = `
+<div style="margin:0 0 20px;padding:16px;background:${BRAND.surface2};border:1px solid ${BRAND.borderDefault};border-radius:8px;">
+  <div style="font-size:14px;color:${BRAND.textPrimary};"><strong>Employee:</strong> ${escapeHtmlTo(employeeName)}</div>
+  <div style="font-size:14px;color:${BRAND.textPrimary};margin-top:8px;"><strong>Dates:</strong> ${escapeHtmlTo(dateDisplay)}</div>
+  <div style="font-size:14px;color:${BRAND.textPrimary};margin-top:8px;"><strong>Reason:</strong> ${escapeHtmlTo(reason)}</div>
+</div>`;
+
+  // Coverage simulation gaps (good = no gaps, bad = shortfalls).
+  const gapRowsTo = (sim: SimulationResult) =>
     sim.coverage_gaps.length === 0
-      ? '<p style="color:#16a34a;margin:4px 0;">No coverage gaps.</p>'
-      : sim.coverage_gaps
+      ? `<div style="padding:12px 14px;background:${BRAND.goodBg};border:1px solid ${BRAND.goodBorder};border-radius:8px;font-size:14px;color:${BRAND.goodText};">No coverage gaps.</div>`
+      : `<ul style="margin:6px 0 0;padding-left:18px;">${sim.coverage_gaps
           .map(
             g =>
-              `<p style="color:#dc2626;margin:4px 0;">&#9888; ${g.shift_name} (${g.role}) on ${g.date} — short ${g.shortfall} employee${g.shortfall !== 1 ? 's' : ''}</p>`
+              `<li style="margin:0 0 6px;font-size:14px;color:${BRAND.badText};"><strong>${escapeHtmlTo(g.shift_name)} (${escapeHtmlTo(g.role)}) on ${escapeHtmlTo(g.date)}</strong> — short ${g.shortfall} employee${g.shortfall !== 1 ? 's' : ''}</li>`
           )
-          .join('');
+          .join('')}</ul>`;
+
+  const stageHeading = (text: string) =>
+    `<div style="font-size:13px;font-weight:600;color:${BRAND.silver};text-transform:uppercase;letter-spacing:0.05em;margin:0 0 8px;">${escapeHtmlTo(text)}</div>`;
+
+  const stageStatus = (sim: SimulationResult) => {
+    const ok = sim.overall_feasible;
+    const fg = ok ? BRAND.goodText : BRAND.badText;
+    return `<div style="font-size:14px;color:${BRAND.textPrimary};margin:0 0 4px;">Status: <strong style="color:${fg};">${ok ? 'Staffable' : 'Cannot cover'}</strong></div>
+<div style="font-size:13px;color:${BRAND.textSecondary};margin:0 0 8px;">Coverage: ${sim.coverage_rate_before.toFixed(1)}% &rarr; ${sim.coverage_rate_after.toFixed(1)}%</div>`;
+  };
 
   const altSource = stage2 ?? stage1;
   const alternatesHtml = altSource
     ? altSource.available_alternates.length > 0
-      ? `<ul style="margin:8px 0;padding-left:20px;">${altSource.available_alternates
+      ? `<ul style="margin:6px 0 0;padding-left:18px;">${altSource.available_alternates
           .map(
             a =>
-              `<li><strong>${a.name}</strong> — ${a.qualified_roles.join(', ')} — available on ${a.available_dates.map(formatShortDate).join(', ')}</li>`
+              `<li style="margin:0 0 6px;font-size:14px;color:${BRAND.textPrimary};"><strong>${escapeHtmlTo(a.name)}</strong> — ${escapeHtmlTo(a.qualified_roles.join(', '))} — available on ${a.available_dates.map(d => escapeHtmlTo(formatShortDate(d))).join(', ')}</li>`
           )
           .join('')}</ul>`
-      : '<p style="color:#6b7280;">No alternates identified for affected shifts.</p>'
+      : `<div style="font-size:14px;color:${BRAND.textSecondary};">No alternates identified for affected shifts.</div>`
     : '';
 
   const specialNotesHtml = stage1
     ? stage1.special_notes_affecting_period.length > 0
-      ? `<ul style="margin:8px 0;padding-left:20px;">${stage1.special_notes_affecting_period
+      ? `<ul style="margin:6px 0 0;padding-left:18px;">${stage1.special_notes_affecting_period
           .map(
             e =>
-              `<li><strong>${e.title}</strong>${e.staffing_notes ? ': ' + e.staffing_notes : e.description ? ': ' + e.description : ''}</li>`
+              `<li style="margin:0 0 6px;font-size:14px;color:${BRAND.textPrimary};"><strong>${escapeHtmlTo(e.title)}</strong>${e.staffing_notes ? ': ' + escapeHtmlTo(e.staffing_notes) : e.description ? ': ' + escapeHtmlTo(e.description) : ''}</li>`
           )
           .join('')}</ul>`
-      : '<p style="color:#6b7280;">None for this period.</p>'
+      : `<div style="font-size:14px;color:${BRAND.textSecondary};">None for this period.</div>`
     : '';
 
-  const policiesHtml =
+  const coverageHtml = stage1
+    ? `
+<div style="margin:0 0 20px;">
+  ${stageHeading('Stage 1 — target day(s)')}
+  ${stageStatus(stage1)}
+  ${gapRowsTo(stage1)}
+</div>
+<div style="margin:0 0 20px;">
+  ${stageHeading('Stage 2 — full week')}
+  ${
+    stage2
+      ? `${stageStatus(stage2)}${gapRowsTo(stage2)}`
+      : `<div style="font-size:14px;color:${BRAND.textSecondary};">Not evaluated — Stage 1 already shows this request cannot be covered.</div>`
+  }
+</div>
+<div style="margin:0 0 20px;">
+  ${stageHeading('Available alternates')}
+  ${alternatesHtml}
+</div>
+<div style="margin:0 0 20px;">
+  ${stageHeading('Special notes / events')}
+  ${specialNotesHtml}
+</div>`
+    : '';
+
+  const policiesHtml = `
+<div style="margin:0 0 20px;">
+  ${stageHeading('Time-off policies')}
+  ${
     policies.length > 0
-      ? `<ul style="margin:8px 0;padding-left:20px;">${policies
+      ? `<ul style="margin:6px 0 0;padding-left:18px;">${policies
           .map(
             p =>
-              `<li><strong>${p.policy_key}:</strong> ${p.policy_value}${p.description ? ' — ' + p.description : ''}</li>`
+              `<li style="margin:0 0 6px;font-size:14px;color:${BRAND.textPrimary};"><strong>${escapeHtmlTo(p.policy_key)}:</strong> ${escapeHtmlTo(p.policy_value)}${p.description ? ' — ' + escapeHtmlTo(p.description) : ''}</li>`
           )
           .join('')}</ul>`
-      : '<p style="color:#6b7280;">No time-off policies configured.</p>';
+      : `<div style="font-size:14px;color:${BRAND.textSecondary};">No time-off policies configured.</div>`
+  }
+</div>`;
 
-  const html = `<!DOCTYPE html>
-<html lang="en">
-<body style="font-family:Arial,sans-serif;max-width:620px;margin:0 auto;padding:24px;color:#111;">
+  // Aegis recommendation — accent-left card with a status pill.
+  const recommendationHtml = recommendation
+    ? (() => {
+        const isApprove = recommendation.recommendation === 'approve';
+        const fg = isApprove ? BRAND.goodText : BRAND.badText;
+        const bg = isApprove ? BRAND.goodBg : BRAND.badBg;
+        const border = isApprove ? BRAND.goodBorder : BRAND.badBorder;
+        const label = isApprove ? 'Approve' : 'Deny';
+        return `
+<div style="margin:0 0 20px;">
+  ${stageHeading('Aegis recommendation')}
+  <div style="padding:14px 16px;background:${BRAND.surface2};border:1px solid ${BRAND.borderDefault};border-left:4px solid ${fg};border-radius:8px;">
+    <span style="display:inline-block;padding:4px 10px;font-size:12px;font-weight:600;background:${bg};color:${fg};border:1px solid ${border};border-radius:9999px;margin-bottom:8px;">${label}</span>
+    <div style="font-size:14px;color:${BRAND.textPrimary};line-height:1.5;">${escapeHtmlTo(recommendation.reasoning)}</div>
+    ${recommendation.policy_notes ? `<div style="font-size:13px;color:${BRAND.textSecondary};margin-top:6px;">${escapeHtmlTo(recommendation.policy_notes)}</div>` : ''}
+  </div>
+</div>`;
+      })()
+    : '';
 
-<p style="margin:0 0 16px;font-size:15px;">${greeting(managerName)}</p>
-<h2 style="margin:0 0 4px;font-size:20px;">Time-Off Request</h2>
-<p style="margin:0 0 24px;color:#6b7280;font-size:14px;">Submitted by ${employeeName} and reviewed by Aegis</p>
+  // Buttons live inside the action card — Approve is the primary orange action,
+  // Deny the cautious silver outline.
+  const ctaHtml = `
+<div style="border-top:1px solid ${BRAND.borderDefault};margin:6px 0 0;padding-top:18px;">
+${brandedButtonRow([
+  { url: approveUrl, label: 'Approve', variant: 'primary' },
+  { url: denyUrl, label: 'Deny', variant: 'secondary' },
+])}
+  <div style="font-size:13px;color:${BRAND.textMuted};margin:2px 0 6px;">These links expire in 7 days.</div>
+</div>`;
 
-${
-  violationLines.length > 0
-    ? `<div style="background:#fffbeb;border:1px solid #fde68a;border-left:4px solid #d97706;padding:14px 16px;margin:0 0 24px;border-radius:4px;">
-  <p style="margin:0 0 8px;font-weight:bold;font-size:14px;color:#92400e;">&#9888; Policy Considerations</p>
-  <ul style="margin:0;padding-left:20px;color:#92400e;font-size:14px;">${violationLines.map(l => `<li style="margin:2px 0;">${l}</li>`).join('')}</ul>
-</div>`
-    : ''
-}
-
-<table style="width:100%;border-collapse:collapse;margin-bottom:24px;">
-  <tr><td style="padding:8px 12px;background:#f9fafb;font-weight:bold;width:100px;border:1px solid #e5e7eb;">Employee</td><td style="padding:8px 12px;border:1px solid #e5e7eb;">${employeeName}</td></tr>
-  <tr><td style="padding:8px 12px;background:#f9fafb;font-weight:bold;border:1px solid #e5e7eb;">Dates</td><td style="padding:8px 12px;border:1px solid #e5e7eb;">${dateDisplay}</td></tr>
-  <tr><td style="padding:8px 12px;background:#f9fafb;font-weight:bold;border:1px solid #e5e7eb;">Reason</td><td style="padding:8px 12px;border:1px solid #e5e7eb;">${reason}</td></tr>
-</table>
-
-${
-  stage1
-    ? `<h3 style="margin:0 0 8px;font-size:15px;border-bottom:2px solid #e5e7eb;padding-bottom:6px;">Stage 1 — Target Day(s)</h3>
-<p style="margin:4px 0;">Status: <strong style="color:${stage1.overall_feasible ? '#16a34a' : '#dc2626'};">${stage1.overall_feasible ? '&#10003; Staffable' : '&#10007; Cannot cover'}</strong></p>
-<p style="margin:4px 0;color:#6b7280;font-size:13px;">Coverage: ${stage1.coverage_rate_before.toFixed(1)}% &rarr; ${stage1.coverage_rate_after.toFixed(1)}%</p>
-${gapRows(stage1)}
-
-${
-  stage2
-    ? `<h3 style="margin:20px 0 8px;font-size:15px;border-bottom:2px solid #e5e7eb;padding-bottom:6px;">Stage 2 — Full Week</h3>
-<p style="margin:4px 0;">Status: <strong style="color:${stage2.overall_feasible ? '#16a34a' : '#dc2626'};">${stage2.overall_feasible ? '&#10003; Staffable' : '&#10007; Cannot cover'}</strong></p>
-<p style="margin:4px 0;color:#6b7280;font-size:13px;">Coverage: ${stage2.coverage_rate_before.toFixed(1)}% &rarr; ${stage2.coverage_rate_after.toFixed(1)}%</p>
-${gapRows(stage2)}`
-    : '<h3 style="margin:20px 0 8px;font-size:15px;border-bottom:2px solid #e5e7eb;padding-bottom:6px;">Stage 2 — Full Week</h3><p style="color:#6b7280;">Not evaluated — Stage 1 already shows this request cannot be covered.</p>'
-}
-
-<h3 style="margin:20px 0 8px;font-size:15px;border-bottom:2px solid #e5e7eb;padding-bottom:6px;">Available Alternates</h3>
-${alternatesHtml}
-
-<h3 style="margin:20px 0 8px;font-size:15px;border-bottom:2px solid #e5e7eb;padding-bottom:6px;">Special Notes / Events</h3>
-${specialNotesHtml}`
-    : ''
-}
-
-<h3 style="margin:20px 0 8px;font-size:15px;border-bottom:2px solid #e5e7eb;padding-bottom:6px;">Time-Off Policies</h3>
+  const cardInner = `${policyConsiderationsHtml}
+${requestDetailsHtml}
+${coverageHtml}
 ${policiesHtml}
+${recommendationHtml}
+${ctaHtml}`;
 
-${
-  recommendation
-    ? `<div style="background:#f9fafb;border:1px solid #e5e7eb;border-left:4px solid ${recColor};padding:16px;margin:24px 0;border-radius:4px;">
-  <p style="margin:0 0 6px;font-weight:bold;font-size:15px;color:${recColor};">Aegis Recommendation: ${recLabel}</p>
-  <p style="margin:0 0 6px;">${recommendation.reasoning}</p>
-  ${recommendation.policy_notes ? `<p style="margin:0;color:#6b7280;font-size:13px;">${recommendation.policy_notes}</p>` : ''}
-</div>`
-    : ''
-}
+  const bodyHtml = `${introHtml}
+${brandActionCard('Action needed · Time off', cardInner)}`;
 
-<div style="text-align:center;margin:32px 0;">
-  <a href="${approveUrl}" style="background:#16a34a;color:#fff;padding:12px 32px;text-decoration:none;border-radius:6px;font-weight:bold;font-size:15px;margin:0 8px;display:inline-block;">&#10003; Approve</a>
-  <a href="${denyUrl}" style="background:#dc2626;color:#fff;padding:12px 32px;text-decoration:none;border-radius:6px;font-weight:bold;font-size:15px;margin:0 8px;display:inline-block;">&#10007; Deny</a>
-</div>
-
-<p style="color:#9ca3af;font-size:12px;text-align:center;margin-top:32px;">These links expire in 7 days &bull; Generated by Aegis on behalf of your company</p>
-</body>
-</html>`;
+  const html = brandedEmailShell({
+    bodyHtml,
+    preheader: `Time-off request from ${employeeName} — ${dateDisplay}`,
+  });
 
   return { subject, text, html };
 }

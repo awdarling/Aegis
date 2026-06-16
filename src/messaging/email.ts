@@ -7,6 +7,7 @@ import sgMail from '@sendgrid/mail';
 import { env } from '../config/env';
 import { supabase } from '../db/client';
 import { saveConversation } from '../logger/conversation';
+import { BRAND, brandedEmailShell, quriaLogoInlineAttachment, QURIA_LOGO_CID } from './brand';
 
 sgMail.setApiKey(env.SENDGRID_API_KEY);
 
@@ -59,15 +60,12 @@ export function htmlFromText(text: string): string {
   const bolded = escaped.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
   const paragraphs = bolded
     .split(/\n{2,}/)
-    .map((p) => `<p style="margin: 0 0 12px;">${p.replace(/\n/g, '<br>')}</p>`)
+    .map((p) => `<p style="margin:0 0 14px;color:${BRAND.textPrimary};">${p.replace(/\n/g, '<br>')}</p>`)
     .join('');
 
-  return `<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 14px; line-height: 1.6; color: #1a1a1a; max-width: 600px; margin: 0 auto; padding: 24px;">
-  ${paragraphs}
-  <div style="margin-top: 32px; padding-top: 16px; border-top: 1px solid #e5e5e5; font-size: 12px; color: #888;">
-    Aegis · Quria Solutions
-  </div>
-</div>`;
+  // Every simple reply now rides the same Quria dark shell as the rich
+  // workflow emails, so branding is consistent across all outbound mail.
+  return brandedEmailShell({ bodyHtml: paragraphs });
 }
 
 export async function sendEmail(options: EmailOptions): Promise<void> {
@@ -80,9 +78,21 @@ export async function sendEmail(options: EmailOptions): Promise<void> {
   }
   const replyToAddress = tenantReplyTo ?? FALLBACK_REPLY_TO_EMAIL;
 
+  const html = options.html ?? htmlFromText(options.text);
+
+  // Every branded email references the logo as `cid:quria-logo`. Attach the
+  // inline logo image whenever the HTML uses it (and a caller hasn't already
+  // supplied it), so the mark renders in-client without external hosting.
+  const attachments: EmailAttachment[] = [...(options.attachments ?? [])];
+  const usesLogoCid = html.includes(`cid:${QURIA_LOGO_CID}`);
+  const alreadyHasLogo = attachments.some((a) => a.content_id === QURIA_LOGO_CID);
+  if (usesLogoCid && !alreadyHasLogo) {
+    attachments.push(quriaLogoInlineAttachment());
+  }
+
   // Map our EmailAttachment shape onto SendGrid's. SendGrid expects the file
   // body as a base64 string, so we encode here — callers pass raw text/Buffer.
-  const sgAttachments = options.attachments?.map((a) => ({
+  const sgAttachments = attachments.map((a) => ({
     filename: a.filename,
     content: Buffer.isBuffer(a.content)
       ? a.content.toString('base64')
@@ -102,7 +112,7 @@ export async function sendEmail(options: EmailOptions): Promise<void> {
       replyTo: replyToAddress,
       subject: options.subject,
       text: options.text,
-      html: options.html ?? htmlFromText(options.text),
+      html,
       ...(sgAttachments && sgAttachments.length > 0
         ? { attachments: sgAttachments }
         : {}),

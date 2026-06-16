@@ -6,7 +6,7 @@
 
 **Last updated**: June 9, 2026.
 
-> **Push state (top-of-file):** Aegis is pushed and live (`46eaa70`). Homebase is pushed and live (`29ed00e`). **48-hour sprint COMPLETE (2026-06-09):** SCHED-EDIT-1 round-trip persists corrected hours; `unsatisfied_sex_coverage` flag renders in BOTH the manager schedule-preview email AND the Homebase Preview & Edit view; S3 in-tab TO approval verified in sandbox (notify fired, `decided_by` written, manager toast).
+> **Push state (top-of-file):** Aegis is pushed and live (`46eaa70`). Homebase is pushed and live (`29ed00e`). **48-hour sprint COMPLETE (2026-06-09):** SCHED-EDIT-1 round-trip persists corrected hours; `unsatisfied_sex_coverage` flag renders in BOTH the manager schedule-preview email AND the Homebase Preview & Edit view; S3 in-tab TO approval verified in sandbox (notify fired, `decided_by` written, manager toast). **2026-06-12:** schedule download DONE on Watermark (Piece 1 colors + full-name/role content fix both merged; live-verified); **`DOWNLOAD-500` RESOLVED** (symptom gone in prod — mechanism caveat: exact root-cause line not independently re-confirmed); **`distribute_schedule` fan-out ran successfully to the full Watermark roster** (warm per-employee shift-assignment message + inline full-week schedule) — only remaining distribute piece is a visual-consistency fix vs. the Homebase render (= template-unification **Piece 3**); **DELIV-1 downgraded BLOCKER → MONITOR / client-education** (fan-out ran with no spam problem; kept as a watch item, not a gate). **Active priority: build + test the remaining Aegis email workflows at Watermark** (AEGIS-EMAIL-1).
 
 > **AEGIS-EMAIL-1 umbrella (set 2026-06-10) — current Now/Next #2 in `DEV_ROADMAP.md`.** Verify + fix + **test** every Aegis email-action workflow end-to-end (email → magic-link → `/api/aegis-action` → correct DB effect + notify): the 8 `ActionType`s in `src/lib/aegis-actions/types.ts` — `approve_to`, `deny_to`, `approve_availability`, `deny_availability`, `accept_emergency_coverage`, `decline_emergency_coverage`, `confirm_distribution`, `request_additional_batch`. Per-workflow status to be tracked below as each is exercised; each `DONE` requires (a) a sandbox round-trip producing the expected DB effect + notification AND (b) a committed automated test. Homebase has no test runner yet (tracked Tier-3) — standing one up may be a prerequisite. Token layer itself is sound (SEC-4 verified); this is the workflows themselves.
 
@@ -24,6 +24,17 @@ Per-action status of the 8 `ActionType`s in `src/lib/aegis-actions/types.ts`. Dr
 | `accept_emergency_coverage` | **STUB** | Fake success; never minted by any email. |
 | `decline_emergency_coverage` | **STUB** | Fake success; never minted by any email. |
 | `request_additional_batch` | **STUB** | Fake success; never minted by any email. |
+
+---
+
+## 2026-06-16 batch — voice/branding pass + publish-status reconciliation
+
+Cross-references the NEXT BATCH 2026-06-16 directive in `DEV_ROADMAP.md`. Affects this tracker as follows:
+- **Voice + branding pass (all emails).** Every Aegis HTML email gets the Quria look (dark header, orchid logo, orange `#f97316` action buttons + glow, brushed-silver/charcoal type) AND a warm assistant-manager voice rewrite. Rollout is **sample-first**: one workflow email rebranded + rewritten for Alexander's sign-off, then applied across time-off, availability, emergency-coverage, swap, day-closure, distribution, and the operational-inquiry replies. **Constraint:** preserve any substrings the vitest suite asserts on when rewriting copy.
+- **`confirm_distribution` → Publish.** Reinforces work-list item #2 (retire the magic-link `confirm_distribution` path): distribute becomes a Homebase **Publish** button that also flips the schedule to a `published` state. Reconcile the `distributed`/`published` status-clobber bug by keying the re-distribution guard on a single timestamp field (`published_at`/`distributed_at`) rather than the ambiguous status enum.
+- **Published schedule = current-week live source of truth.** Closed-day texts, swap shift-adjustments, and emergency-coverage edits read + write the published current-week schedule; mid-week changes notify **affected people only**.
+
+**STATUS — voice + branding pass BUILT 2026-06-16 (IN REVIEW, not pushed).** New brand kit `src/messaging/brand.ts` + inline CID logo. Rebranded + re-voiced (dark shell + "Action needed" action card + conclusion-first warm voice): time-off (manager + SMS-channel), build/distribute report, employee shifts distribution + team grid, availability + custom/rotating availability, emergency coverage, shift swap, payroll, and all `htmlFromText` plain replies; Homebase magic-link Approve/Deny/error pages (`aegis-action/route.ts`). Test-asserted substrings (`>Approve</a>`, `>Deny</a>`, `reply YES`) preserved — 47/47 vitest green, tsc clean both repos. Branch: Aegis `feat/voice-pass-1`, Homebase `feat/veteran-shift-rules`. Pending: Alexander push/PR/merge + a live sandbox eyeball.
 
 ---
 
@@ -49,7 +60,7 @@ Inbound email is authenticated (ECDSA signature verification) and verified. Both
 | Availability manager-notify fan-out to ALL managers | DONE — fixed June 5 (was `.limit(1).maybeSingle()`) |
 | Reply threading (single-tenant) | DONE via Reply-To; multi-tenant From open (TENANT-1) |
 | Diagnostic logging stripped (`[email-trace]`, `[req]`) | TODO (fast-follow) |
-| Risky fan-outs (distribute, onboard) | DEFERRED — Phase 7, gated on DELIV-1 + coordination |
+| Risky fan-outs (distribute, onboard) | **`distribute_schedule` ran successfully in prod 2026-06-12** to the full Watermark roster (no spam problem observed; DELIV-1 downgraded to MONITOR). `initiate_onboarding` + `notify_day_closure` fan-outs still DEFERRED — Phase 7, gated on manager coordination. |
 
 ---
 
@@ -70,13 +81,13 @@ Inbound email is authenticated (ECDSA signature verification) and verified. Both
 
 Outbound `From` is still the apex `aegis@quriasolutions.com` with `Reply-To` carrying the routing address. Works for single-tenant Watermark; **breaks reply routing the moment a second tenant onboards.** Fix: `sendEmail()` accepts `companyId` (or precomputed `fromAddress`); look up the tenant's email channel from `company_channels` (`channel_type='email'`, column `channel_value`); set `From` and `Reply-To` to it; verify `In-Reply-To`/`References` propagate; audit every `sendEmail` call site to pass tenant context. Not launch-blocking for Watermark alone.
 
-### Phase 6.5 — Email deliverability hardening (DELIV-1) — OPEN
+### Phase 6.5 — Email deliverability hardening (DELIV-1) — MONITOR (downgraded 2026-06-12)
 
-Outbound from `aegis.quriasolutions.com` must inbox, not spam. First-contact sends to Gmail landed in spam during sandbox testing. Required before the 30-person `distribute_schedule` fan-out. Work: verify SPF includes SendGrid IPs; confirm DKIM signing; add DMARC (`p=none` → escalate); SendGrid event webhook → `email_events` table for delivery/bounce/spam monitoring; staggered sender warm-up runbook. Done when ≥80% of first-contact sends to major providers inbox.
+**Downgraded BLOCKER → MONITOR / client-education on 2026-06-12.** The full ~30-person `distribute_schedule` fan-out ran in production 2026-06-12 with no spam problem observed, so DELIV-1 is no longer a pre-fan-out gate. Original work (verify SPF includes SendGrid IPs; confirm DKIM signing; add DMARC `p=none` → escalate; SendGrid event webhook → `email_events` for delivery/bounce/spam monitoring; staggered sender warm-up runbook) is kept as a watch item / client-education work, not a launch gate. Re-escalate to BLOCKER if any future fan-out shows spam-folder placement at meaningful rates.
 
-### Phase 7 — Risky workflow staged validation — DEFERRED (gated on DELIV-1 + manager coordination)
+### Phase 7 — Risky workflow staged validation — partial (distribute live; onboard/day-closure still deferred)
 
-`distribute_schedule` (emails all ~30 Watermark employees), `initiate_onboarding` fan-out, `notify_day_closure` fan-out. **Never run without coordinating with Carolyn and Jack**, and not before DELIV-1.
+**`distribute_schedule`: ran successfully in prod 2026-06-12** to the full Watermark roster (warm per-employee shift-assignment message + inline full-week schedule; no spam problem observed). DELIV-1 no longer gates it. Only remaining piece is a visual-consistency fix so the emailed schedule matches the Homebase render exactly = template-unification **Piece 3**. **`initiate_onboarding` + `notify_day_closure` fan-outs: still DEFERRED** — never run without coordinating with Carolyn and Jack.
 
 ---
 
@@ -122,7 +133,7 @@ Outbound from `aegis.quriasolutions.com` must inbox, not spam. First-contact sen
 | Wrong Homebase URL (BUG-3) | DONE |
 | Employee emails reference Homebase (BUG-4) | OPEN |
 | Stale pending TO blocks new requests (BUG-5) | OPEN |
-| Email deliverability hardening (DELIV-1) | OPEN (before Phase 7 fan-out) |
+| Email deliverability hardening (DELIV-1) | MONITOR (downgraded 2026-06-12 — distribute fan-out ran in prod with no spam problem; kept as a watch item, not a gate) |
 
 ### Launch fast-follows (post June 5)
 
@@ -140,6 +151,10 @@ Outbound from `aegis.quriasolutions.com` must inbox, not spam. First-contact sen
 **2026-06-10 verification update (Phase 1, branch-only — still IN REVIEW, not live):** `xlsx → exceljs` schedule-download → **VERIFIED WORKING** (sample `.xlsx` from the new exceljs renderer opened/inspected: dark header, red `UNFILLED` gap cells, grey merged `CLOSED` column, frozen panes present in the file). The `/api/*` auth audit (4 guarded routes) + SEC-1 `create-user` → **LOGIC VERIFIED via automated test, 22/22 cases** (anon=401 / own-company=allowed / cross-company=403 on the 4 guarded routes; `create-user` role-cap + owner company-binding / quria-any-company / garbage-role=400); the two security branches proven clean-merge via `git merge-tree`. Remaining gate to DONE for all three: merge + deploy (+ deploy-time real-login smoke for the security routes). NOTE: verification used a **throwaway** `test/security-verify` branch (vitest harness) — do NOT merge it; merge the two original security branches. Homebase still has no committed test runner — see `DEV_ROADMAP.md` Tier-3 (adopt vitest + port the auth test).
 
 **2026-06-10 PRODUCTION DEPLOY + 2 post-deploy bugs:** Phase-1 batch merged into Homebase `main` via **PR** → Watermark production (Vercel). **DONE (deployed + verified):** `/api/*` auth audit (4 route guards) + SEC-1 `create-user` authz. **DEPLOYED but not DONE:** `xlsx → exceljs` schedule download — styling not observable in prod because the download 500s on real data (`DOWNLOAD-500`). **Operating-model change:** Homebase `main` is now PROTECTED (PR required, not a direct push); `05_Development_Guide` §4 ("push to main") is now wrong — flagged for reference-doc refresh. **New PRE-EXISTING bugs (neither caused by the deploy):** `DOWNLOAD-500` (Excel AND PDF 500 on real data — throw in shared `buildScheduleGrid`, prime suspect null/empty `employee_name`, likely SCHED-EDIT-1 residue; DIAGNOSED, fix in flight) and `DELETE-USER` (Access-page `handleRevoke` uses anon client, swallows the error, deletes only `public.users`; old users blocked by FK constraints; DIAGNOSED, needs soft-delete-vs-reassign decision + server route + `auth.admin.deleteUser`). Full diagnoses + proposed fixes in `DEV_ROADMAP.md` Phase 1.
+
+**2026-06-12 (template-unification Piece 1 — MERGED + live):** with `DOWNLOAD-500` fixed (merged 2026-06-12), the remaining gap was that the exceljs/PDF download rendered all-blue and didn't match the on-screen schedule. Piece 1 closes it: `resolveCellAppearance` (Homebase `fix/download-template-colors` @ `4a813e5`) is now the single shared cell-color resolver across the on-screen grid + both download renderers — per-day header colors + per-day cell tints restored, deleting the forked kind-only palettes. **MERGED 2026-06-12 to Homebase `main` and deployed to Watermark prod via Vercel; all-blue fix confirmed live (downloads now match the screen's per-day colors). DONE.** **Originally logged in this paragraph as "one known regression open from the merge" — that framing was wrong and has been reframed (2026-06-12):** the missing last-name + role text in the download was a **PRE-EXISTING content gap, NOT caused by Piece 1** (evidence on record: `git diff 4a813e5^ 4a813e5` touches zero text-path lines; first-name-only display + no per-assignment role text predate Piece 1). A separate **download full-name/role content fix** was scoped and **merged 2026-06-12**; real Watermark download verified live the same day with full names + per-assignment role text rendering in both Excel and PDF. Cross-ref `DEV_ROADMAP.md` → template-unification Piece 1 + the Tier-3 entry "Download full-name + role content gap (was logged 'Piece 1 follow-up' — reframed 2026-06-12)".
+
+**2026-06-12 (distribute fan-out — LIVE SUCCESS in production):** `distribute_schedule` ran successfully against the live Watermark tenant 2026-06-12, fanning out to the full ~30-person roster with the warm per-employee shift-assignment message AND the inline full-week schedule. No spam problem observed. **Schedule download is DONE on Watermark (Piece 1 colors + full-name/role content fix both merged + live-verified).** **`DOWNLOAD-500` RESOLVED** (symptom gone in prod; mechanism caveat: the exact root-cause line was NOT independently re-confirmed against the post-fix path — recording only that the symptom is gone, not over-claiming which line cured it). **DELIV-1 downgraded BLOCKER → MONITOR / client-education** in this tracker (Phase 6.5, Phase 7, Tier 0 row updated) and in `DEV_ROADMAP.md` (Phase 1 table + Tier-2 backlog). Only remaining piece on distribute is a **visual-consistency fix** so the emailed schedule matches the Homebase render exactly = template-unification **Piece 3**. **Active priority is now the remaining AEGIS-EMAIL-1 workflows** (verify `deny_to` via the email-button path; build `approve_availability` / `deny_availability` magic-link buttons + the shared employee-notify-back; emergency coverage accept/decline; `request_additional_batch`; manager labor-force queries; employee shift queries; employee shift-swap). The comprehensive system-document rewrite is deferred until those are verified live.
 
 ---
 

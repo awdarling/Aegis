@@ -1,5 +1,12 @@
 import { generateActionToken } from '../lib/aegis-actions/tokens';
 import { getHomebaseUrl } from '../config/urls';
+import { greeting } from '../messaging/greeting';
+import {
+  BRAND,
+  brandedEmailShell,
+  brandedButtonRow,
+  brandActionCard,
+} from '../messaging/brand';
 import type {
   RunScheduleBuildResult,
   ScheduleAssignment,
@@ -22,6 +29,8 @@ export interface BuildScheduleResultEmailParams {
   week_end: string;
   manager_email: string;
   manager_user_id?: string;
+  /** Manager's name for the greeting line; falls back to "there" when absent. */
+  manager_name?: string;
   wages: WageEstimate;
   // Optional list of all active employees so we can resolve max_weekly_hours
   // for the "Top staff hours" table. When missing, hours are still shown but
@@ -126,16 +135,16 @@ function computeCoverage(result: RunScheduleBuildResult): CoverageInfo {
   let badgeFg: string;
   if (rate >= 100) {
     badgeLabel = 'Fully Staffed';
-    badgeBg = '#d1fae5';
-    badgeFg = '#065f46';
+    badgeBg = BRAND.goodBg;
+    badgeFg = BRAND.goodText;
   } else if (rate >= 75) {
     badgeLabel = 'Partial Coverage';
-    badgeBg = '#fef3c7';
-    badgeFg = '#92400e';
+    badgeBg = BRAND.warnBg;
+    badgeFg = BRAND.warnText;
   } else {
     badgeLabel = 'Critical Gaps';
-    badgeBg = '#fee2e2';
-    badgeFg = '#991b1b';
+    badgeBg = BRAND.badBg;
+    badgeFg = BRAND.badText;
   }
   return { rate, filled, required, badgeLabel, badgeBg, badgeFg };
 }
@@ -145,35 +154,35 @@ function headerSectionHtml(companyName: string, weekRange: string, cov: Coverage
 <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:0 0 20px;">
   <tr>
     <td style="vertical-align:middle;">
-      <div style="font-size:20px;font-weight:600;color:#111827;line-height:1.2;">${escapeHtml(companyName)}</div>
-      <div style="font-size:14px;color:#6b7280;margin-top:4px;">Schedule — week of ${escapeHtml(weekRange)}</div>
+      <div style="font-size:20px;font-weight:600;color:${BRAND.textPrimary};line-height:1.2;">${escapeHtml(companyName)}</div>
+      <div style="font-size:14px;color:${BRAND.textSecondary};margin-top:4px;">Schedule — week of ${escapeHtml(weekRange)}</div>
     </td>
     <td style="vertical-align:middle;text-align:right;white-space:nowrap;">
-      <span style="display:inline-block;padding:6px 12px;font-size:12px;font-weight:600;background:${cov.badgeBg};color:${cov.badgeFg};border-radius:9999px;">${escapeHtml(cov.badgeLabel)}</span>
+      <span style="display:inline-block;padding:6px 12px;font-size:12px;font-weight:600;background:${cov.badgeBg};color:${cov.badgeFg};border:1px solid ${cov.badgeFg};border-radius:9999px;">${escapeHtml(cov.badgeLabel)}</span>
     </td>
   </tr>
 </table>`;
 }
 
 function coverageSectionHtml(cov: CoverageInfo, gaps: ScheduleGap[]): string {
-  const headline = `<div style="font-size:15px;color:#111827;margin-bottom:8px;"><strong>${cov.filled}</strong> of <strong>${cov.required}</strong> slots filled (${cov.rate}%)</div>`;
+  const headline = `<div style="font-size:15px;color:${BRAND.textPrimary};margin-bottom:8px;"><strong>${cov.filled}</strong> of <strong>${cov.required}</strong> slots filled (${cov.rate}%)</div>`;
   if (gaps.length === 0) {
     return `
 <div style="margin:0 0 20px;">
   ${headline}
-  <div style="font-size:14px;color:#065f46;">All shifts fully covered.</div>
+  <div style="font-size:14px;color:${BRAND.goodText};">All shifts fully covered.</div>
 </div>`;
   }
   const items = gaps.map(g => {
     const dateLabel = `${formatWeekdayShort(g.date)} ${formatShortDate(g.date)}`;
     const shortReason = (g.reason ?? '').split('.')[0] || 'no eligible candidates';
     const dispList = g.per_employee_dispositions.length > 0
-      ? `<ul style="margin:6px 0 0;padding-left:18px;color:#4b5563;font-size:13px;">${g.per_employee_dispositions.map(d => `<li style="margin:0 0 2px;">${escapeHtml(d.name)} — ${escapeHtml(dispositionLabel(d.reason))}</li>`).join('')}</ul>`
+      ? `<ul style="margin:6px 0 0;padding-left:18px;color:${BRAND.textSecondary};font-size:13px;">${g.per_employee_dispositions.map(d => `<li style="margin:0 0 2px;">${escapeHtml(d.name)} — ${escapeHtml(dispositionLabel(d.reason))}</li>`).join('')}</ul>`
       : '';
     return `
-    <li style="margin:0 0 10px;font-size:14px;color:#374151;line-height:1.5;">
+    <li style="margin:0 0 10px;font-size:14px;color:${BRAND.textPrimary};line-height:1.5;">
       <strong>${escapeHtml(dateLabel)} — ${escapeHtml(g.shift_name)} ${escapeHtml(g.role)}</strong>
-      <span style="color:#6b7280;"> (${g.filled_count}/${g.required_count})</span>:
+      <span style="color:${BRAND.textSecondary};"> (${g.filled_count}/${g.required_count})</span>:
       ${escapeHtml(shortReason)}
       ${dispList}
     </li>`;
@@ -181,7 +190,7 @@ function coverageSectionHtml(cov: CoverageInfo, gaps: ScheduleGap[]): string {
   return `
 <div style="margin:0 0 20px;">
   ${headline}
-  <div style="font-size:13px;color:#6b7280;margin-bottom:8px;">${gaps.length} unfilled slot${gaps.length === 1 ? '' : 's'}:</div>
+  <div style="font-size:13px;color:${BRAND.textSecondary};margin-bottom:8px;">${gaps.length} unfilled slot${gaps.length === 1 ? '' : 's'}:</div>
   <ul style="margin:0;padding-left:18px;">${items}</ul>
 </div>`;
 }
@@ -191,13 +200,13 @@ function closedDatesSectionHtml(closedDates: ClosedDate[]): string {
   const items = closedDates.map(c => {
     const dateLabel = `${formatWeekdayShort(c.date)} ${formatShortDate(c.date)}`;
     return `
-    <li style="margin:0 0 4px;font-size:14px;color:#374151;">
+    <li style="margin:0 0 4px;font-size:14px;color:${BRAND.textPrimary};">
       <strong>${escapeHtml(dateLabel)}</strong>: ${escapeHtml(c.event_title)}
     </li>`;
   }).join('');
   return `
 <div style="margin:0 0 20px;">
-  <div style="font-size:13px;font-weight:600;color:#6b7280;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px;">Closed dates honored</div>
+  <div style="font-size:13px;font-weight:600;color:${BRAND.silver};text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px;">Closed dates honored</div>
   <ul style="margin:0;padding-left:18px;">${items}</ul>
 </div>`;
 }
@@ -216,19 +225,19 @@ function flaggedIssuesSectionHtml(issues: FlaggedIssue[]): string {
     const meta = (issue.metadata ?? {}) as Record<string, unknown>;
     const dispositions = (meta.per_employee_dispositions as EmployeeDisposition[] | undefined) ?? [];
     const dispList = dispositions.length > 0
-      ? `<ul style="margin:8px 0 0;padding-left:18px;color:#4b5563;font-size:13px;">${dispositions.map(d => `<li style="margin:0 0 2px;">${escapeHtml(d.name)} — ${escapeHtml(dispositionLabel(d.reason))}</li>`).join('')}</ul>`
+      ? `<ul style="margin:8px 0 0;padding-left:18px;color:${BRAND.textSecondary};font-size:13px;">${dispositions.map(d => `<li style="margin:0 0 2px;">${escapeHtml(d.name)} — ${escapeHtml(dispositionLabel(d.reason))}</li>`).join('')}</ul>`
       : '';
     const dateLabel = `${formatWeekdayShort(issue.date)} ${formatShortDate(issue.date)}`;
     return `
-<div style="margin:0 0 12px;padding:14px 16px;background:#fffbeb;border:1px solid #fde68a;border-radius:6px;">
-  <div style="font-size:14px;font-weight:600;color:#92400e;margin-bottom:4px;">${escapeHtml(dateLabel)} — ${escapeHtml(flaggedIssueSubLabel(issue))}</div>
-  <div style="font-size:13px;color:#374151;line-height:1.5;">${escapeHtml(issue.description)}</div>
+<div style="margin:0 0 12px;padding:14px 16px;background:${BRAND.warnBg};border:1px solid ${BRAND.warnBorder};border-left:4px solid ${BRAND.warnRule};border-radius:6px;">
+  <div style="font-size:14px;font-weight:600;color:${BRAND.warnText};margin-bottom:4px;">${escapeHtml(dateLabel)} — ${escapeHtml(flaggedIssueSubLabel(issue))}</div>
+  <div style="font-size:13px;color:${BRAND.textPrimary};line-height:1.5;">${escapeHtml(issue.description)}</div>
   ${dispList}
 </div>`;
   }).join('');
   return `
 <div style="margin:0 0 20px;">
-  <div style="font-size:13px;font-weight:600;color:#6b7280;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px;">Flagged issues</div>
+  <div style="font-size:13px;font-weight:600;color:${BRAND.silver};text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px;">Flagged issues</div>
   ${cards}
 </div>`;
 }
@@ -283,31 +292,31 @@ function topHoursSectionHtml(rows: HoursRow[]): string {
   const body = rows.map(r => {
     const pct = r.pct_of_max === null ? '—' : `${r.pct_of_max}%`;
     const pctColor = r.pct_of_max !== null && r.pct_of_max >= 90
-      ? '#b91c1c'
+      ? BRAND.badText
       : r.pct_of_max !== null && r.pct_of_max >= 80
-        ? '#b45309'
-        : '#374151';
+        ? BRAND.warnText
+        : BRAND.textPrimary;
     const maxLabel = r.max_hours === null ? '—' : `${r.max_hours}h`;
     return `
-    <tr>
-      <td style="padding:6px 8px;border-bottom:1px solid #f3f4f6;font-size:13px;color:#111827;">${escapeHtml(r.name)}</td>
-      <td style="padding:6px 8px;border-bottom:1px solid #f3f4f6;font-size:13px;color:#6b7280;">${escapeHtml(r.role)}</td>
-      <td style="padding:6px 8px;border-bottom:1px solid #f3f4f6;font-size:13px;color:#374151;text-align:right;">${r.hours}h</td>
-      <td style="padding:6px 8px;border-bottom:1px solid #f3f4f6;font-size:13px;color:#6b7280;text-align:right;">${maxLabel}</td>
-      <td style="padding:6px 8px;border-bottom:1px solid #f3f4f6;font-size:13px;color:${pctColor};text-align:right;font-weight:600;">${pct}</td>
+    <tr style="background:${BRAND.surface2};">
+      <td style="padding:6px 8px;border-bottom:1px solid ${BRAND.borderDefault};font-size:13px;color:${BRAND.textPrimary};">${escapeHtml(r.name)}</td>
+      <td style="padding:6px 8px;border-bottom:1px solid ${BRAND.borderDefault};font-size:13px;color:${BRAND.textSecondary};">${escapeHtml(r.role)}</td>
+      <td style="padding:6px 8px;border-bottom:1px solid ${BRAND.borderDefault};font-size:13px;color:${BRAND.textPrimary};text-align:right;">${r.hours}h</td>
+      <td style="padding:6px 8px;border-bottom:1px solid ${BRAND.borderDefault};font-size:13px;color:${BRAND.textSecondary};text-align:right;">${maxLabel}</td>
+      <td style="padding:6px 8px;border-bottom:1px solid ${BRAND.borderDefault};font-size:13px;color:${pctColor};text-align:right;font-weight:600;">${pct}</td>
     </tr>`;
   }).join('');
   return `
 <div style="margin:0 0 20px;">
-  <div style="font-size:13px;font-weight:600;color:#6b7280;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px;">Top staff hours</div>
-  <table cellpadding="0" cellspacing="0" border="0" width="100%" style="border-collapse:collapse;border:1px solid #e5e7eb;border-radius:6px;">
+  <div style="font-size:13px;font-weight:600;color:${BRAND.silver};text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px;">Top staff hours</div>
+  <table cellpadding="0" cellspacing="0" border="0" width="100%" style="border-collapse:collapse;border:1px solid ${BRAND.borderDefault};border-radius:6px;">
     <thead>
-      <tr style="background:#f9fafb;">
-        <th align="left" style="padding:8px;font-size:12px;font-weight:600;color:#6b7280;text-transform:uppercase;letter-spacing:0.05em;">Name</th>
-        <th align="left" style="padding:8px;font-size:12px;font-weight:600;color:#6b7280;text-transform:uppercase;letter-spacing:0.05em;">Role</th>
-        <th align="right" style="padding:8px;font-size:12px;font-weight:600;color:#6b7280;text-transform:uppercase;letter-spacing:0.05em;">Hours</th>
-        <th align="right" style="padding:8px;font-size:12px;font-weight:600;color:#6b7280;text-transform:uppercase;letter-spacing:0.05em;">Max</th>
-        <th align="right" style="padding:8px;font-size:12px;font-weight:600;color:#6b7280;text-transform:uppercase;letter-spacing:0.05em;">% of max</th>
+      <tr style="background:${BRAND.surface3};">
+        <th align="left" style="padding:8px;font-size:12px;font-weight:600;color:${BRAND.silver};text-transform:uppercase;letter-spacing:0.05em;">Name</th>
+        <th align="left" style="padding:8px;font-size:12px;font-weight:600;color:${BRAND.silver};text-transform:uppercase;letter-spacing:0.05em;">Role</th>
+        <th align="right" style="padding:8px;font-size:12px;font-weight:600;color:${BRAND.silver};text-transform:uppercase;letter-spacing:0.05em;">Hours</th>
+        <th align="right" style="padding:8px;font-size:12px;font-weight:600;color:${BRAND.silver};text-transform:uppercase;letter-spacing:0.05em;">Max</th>
+        <th align="right" style="padding:8px;font-size:12px;font-weight:600;color:${BRAND.silver};text-transform:uppercase;letter-spacing:0.05em;">% of max</th>
       </tr>
     </thead>
     <tbody>${body}</tbody>
@@ -322,14 +331,14 @@ function wagesSectionHtml(wages: WageEstimate): string {
   });
   const missing: MissingWage[] = wages.missing_wages ?? [];
   const missingBlock = missing.length === 0 ? '' : `
-  <div style="margin-top:8px;padding:10px 12px;background:#fef3c7;border:1px solid #fde68a;border-radius:6px;font-size:13px;color:#92400e;">
+  <div style="margin-top:8px;padding:10px 12px;background:${BRAND.warnBg};border:1px solid ${BRAND.warnBorder};border-left:4px solid ${BRAND.warnRule};border-radius:6px;font-size:13px;color:${BRAND.warnText};">
     <strong>${missing.length} employee${missing.length === 1 ? '' : 's'} have no wage configured</strong> — their hours are excluded from the labor estimate:
-    <div style="margin-top:4px;color:#78350f;">${escapeHtml(missing.map(m => m.name).join(', '))}</div>
+    <div style="margin-top:4px;color:${BRAND.textSecondary};">${escapeHtml(missing.map(m => m.name).join(', '))}</div>
   </div>`;
   return `
 <div style="margin:0 0 20px;">
-  <div style="font-size:13px;font-weight:600;color:#6b7280;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px;">Estimated labor</div>
-  <div style="font-size:18px;font-weight:600;color:#111827;">$${total}</div>
+  <div style="font-size:13px;font-weight:600;color:${BRAND.silver};text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px;">Estimated labor</div>
+  <div style="font-size:18px;font-weight:600;color:${BRAND.textPrimary};">$${total}</div>
   ${missingBlock}
 </div>`;
 }
@@ -337,40 +346,82 @@ function wagesSectionHtml(wages: WageEstimate): string {
 function overrideMismatchesSectionHtml(mismatches: ShiftOverrideMismatch[]): string {
   if (mismatches.length === 0) return '';
   const items = mismatches.map(m => `
-    <li style="margin:0 0 4px;font-size:13px;color:#374151;">
+    <li style="margin:0 0 4px;font-size:13px;color:${BRAND.textPrimary};">
       <strong>${escapeHtml(formatShortDate(m.date))} ${escapeHtml(m.shift_name)}</strong>: override key
-      <code style="background:#f3f4f6;padding:1px 4px;border-radius:3px;">${escapeHtml(m.override_key)}</code>
+      <code style="background:${BRAND.surface3};color:${BRAND.textPrimary};padding:1px 4px;border-radius:3px;">${escapeHtml(m.override_key)}</code>
       didn't match any requirement role
       (available: ${escapeHtml(m.available_roles.join(', '))})
     </li>`).join('');
   return `
 <div style="margin:0 0 20px;">
-  <div style="font-size:13px;font-weight:600;color:#6b7280;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px;">Shift override mismatches</div>
+  <div style="font-size:13px;font-weight:600;color:${BRAND.silver};text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px;">Shift override mismatches</div>
   <ul style="margin:0;padding-left:18px;">${items}</ul>
 </div>`;
 }
 
+// The Distribute button + the Homebase link live INSIDE the action card (they
+// ARE the action). The conversational framing sits above the card — see
+// renderScheduleResultBodyHtml.
 function ctaSectionHtml(distributeUrl: string, homebaseUrl: string): string {
   return `
-<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:0 0 12px;">
-  <tr>
-    <td align="left">
-      <a href="${escapeHtml(distributeUrl)}"
-         style="display:inline-block;padding:12px 22px;background:#f97316;color:#ffffff;font-size:15px;font-weight:600;text-decoration:none;border-radius:6px;">Distribute Schedule</a>
-      <a href="${escapeHtml(homebaseUrl)}/schedule"
-         style="display:inline-block;margin-left:14px;padding:12px 0;font-size:14px;color:#4b5563;text-decoration:underline;">View in Homebase</a>
-    </td>
-  </tr>
-</table>
-<div style="margin:0 0 20px;font-size:12px;color:#6b7280;line-height:1.5;">
-  Distribute Schedule will send the week's shifts to all assigned employees. Distribution can take a moment — confirmation will appear in Homebase.
+<div style="border-top:1px solid ${BRAND.borderDefault};margin:6px 0 0;padding-top:18px;">
+${brandedButtonRow([
+  { url: distributeUrl, label: 'Distribute Schedule', variant: 'primary' },
+])}
+  <div style="margin:2px 0 6px;">
+    <a href="${escapeHtml(homebaseUrl)}/schedule"
+       style="font-size:14px;color:${BRAND.accent};text-decoration:underline;">View in Homebase</a>
+  </div>
+  <div style="margin:12px 0 0;font-size:12px;color:${BRAND.textSecondary};line-height:1.5;">
+    Distribute Schedule will send the week's shifts to all assigned employees. Distribution can take a moment — confirmation will appear in Homebase.
+  </div>
 </div>`;
+}
+
+// ── Body assembly (HTML) ──────────────────────────────────────────────────────
+
+// Pure HTML body assembly (no token generation / no DB) so previews and tests
+// can render the exact same markup the live email ships. Conclusion-first: the
+// greeting + what-it-is + what-to-do sit ABOVE the action card, and the whole
+// report + the Distribute button live inside the action card.
+export function renderScheduleResultBodyHtml(args: {
+  companyName: string;
+  managerName?: string;
+  weekRange: string;
+  cov: CoverageInfo;
+  result: RunScheduleBuildResult;
+  hoursRows: HoursRow[];
+  wages: WageEstimate;
+  distributeUrl: string;
+  homebaseUrl: string;
+}): string {
+  const gapNote = args.cov.rate >= 100
+    ? `Everyone's covered for the week`
+    : `It came in at ${args.cov.rate}% coverage, so there are a few gaps worth a look`;
+  const introHtml = `
+<p style="margin:0 0 12px;font-size:16px;color:${BRAND.textPrimary};">${escapeHtml(greeting(args.managerName))}</p>
+<p style="margin:0;font-size:16px;color:${BRAND.textPrimary};line-height:1.65;">I've built the schedule for the week of ${escapeHtml(args.weekRange)}. ${gapNote} — the full breakdown is in the card below. When it looks good to you, hit <strong>Distribute Schedule</strong> and I'll send each person their shifts; there's nothing else you'll need to do.</p>`;
+
+  const cardInner = `${headerSectionHtml(args.companyName, args.weekRange, args.cov)}
+${coverageSectionHtml(args.cov, args.result.gaps)}
+${closedDatesSectionHtml(args.result.closed_dates)}
+${flaggedIssuesSectionHtml(args.result.flagged_issues)}
+${topHoursSectionHtml(args.hoursRows)}
+${wagesSectionHtml(args.wages)}
+${overrideMismatchesSectionHtml(args.result.shift_override_mismatches)}
+${ctaSectionHtml(args.distributeUrl, args.homebaseUrl)}`;
+
+  const card = brandActionCard('Action needed · Distribute', cardInner);
+
+  return `${introHtml}
+${card}`;
 }
 
 // ── Plain-text builder ────────────────────────────────────────────────────────
 
 function buildPlainText(params: {
   companyName: string;
+  managerName?: string;
   weekRange: string;
   cov: CoverageInfo;
   gaps: ScheduleGap[];
@@ -384,6 +435,13 @@ function buildPlainText(params: {
 }): string {
   const lines: string[] = [];
 
+  const gapNote = params.cov.rate >= 100
+    ? `Everyone's covered for the week`
+    : `It came in at ${params.cov.rate}% coverage, so there are a few gaps worth a look`;
+  lines.push(greeting(params.managerName));
+  lines.push('');
+  lines.push(`I've built the schedule for the week of ${params.weekRange}. ${gapNote} — the full breakdown is below. When it looks good to you, use the Distribute link and I'll send each person their shifts; there's nothing else you'll need to do.`);
+  lines.push('');
   lines.push(`${params.companyName} — Schedule for week of ${params.weekRange}`);
   lines.push(`Status: ${params.cov.badgeLabel}`);
   lines.push('');
@@ -492,34 +550,27 @@ export async function buildScheduleResultEmail(
 
   const subject = `Schedule built for ${params.company_name} — week of ${weekRange}`;
 
-  const html = `<!DOCTYPE html>
-<html><head><meta charset="utf-8"></head>
-<body style="margin:0;padding:0;background:#f3f4f6;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;color:#111827;">
-<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="background:#f3f4f6;padding:24px 0;">
-  <tr>
-    <td align="center">
-      <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="640" style="max-width:640px;background:#ffffff;border-radius:8px;padding:28px;border:1px solid #e5e7eb;">
-        <tr><td>
-          ${headerSectionHtml(params.company_name, weekRange, cov)}
-          ${coverageSectionHtml(cov, params.result.gaps)}
-          ${closedDatesSectionHtml(params.result.closed_dates)}
-          ${flaggedIssuesSectionHtml(params.result.flagged_issues)}
-          ${topHoursSectionHtml(hoursRows)}
-          ${wagesSectionHtml(params.wages)}
-          ${overrideMismatchesSectionHtml(params.result.shift_override_mismatches)}
-          ${ctaSectionHtml(tokenResult.url, homebaseUrl)}
-          <div style="margin-top:24px;padding-top:16px;border-top:1px solid #e5e7eb;font-size:12px;color:#9ca3af;">
-            Aegis · Quria Solutions
-          </div>
-        </td></tr>
-      </table>
-    </td>
-  </tr>
-</table>
-</body></html>`;
+  const bodyHtml = renderScheduleResultBodyHtml({
+    companyName: params.company_name,
+    managerName: params.manager_name,
+    weekRange,
+    cov,
+    result: params.result,
+    hoursRows,
+    wages: params.wages,
+    distributeUrl: tokenResult.url,
+    homebaseUrl,
+  });
+
+  const html = brandedEmailShell({
+    bodyHtml,
+    companyName: params.company_name,
+    preheader: `Schedule built for ${params.company_name} — week of ${weekRange}`,
+  });
 
   const text = buildPlainText({
     companyName: params.company_name,
+    managerName: params.manager_name,
     weekRange,
     cov,
     gaps: params.result.gaps,

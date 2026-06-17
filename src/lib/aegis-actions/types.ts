@@ -8,7 +8,8 @@ export type ActionType =
   | 'accept_emergency_coverage'
   | 'decline_emergency_coverage'
   | 'confirm_distribution'
-  | 'request_additional_batch';
+  | 'request_additional_batch'
+  | 'recheck_to';
 
 export interface GenerateTokenParams {
   action_type: ActionType;

@@ -11,6 +11,7 @@ import {
   handleDenyTimeOff,
   handlePendingTimeOffConfirmation,
   handleQueryMyTimeOff,
+  handleRecheckTimeOff,
   getPendingTimeOff,
 } from '../workflows/time-off';
 import { handleBuildSchedule, handleDistributeSchedule } from '../workflows/schedule-build';
@@ -77,6 +78,7 @@ const MANAGER_ONLY_INTENTS = new Set([
   'homebase_edit',
   'run_payroll_check',
   'notify_day_closure',
+  'recheck_time_off',
 ]);
 
 // Intents available only to quria_admin — managers attempting these are blocked.
@@ -304,6 +306,11 @@ async function routeIntentInner(
       case 'deny_time_off':
         console.log('[router] dispatching to handleDenyTimeOff');
         await handleDenyTimeOff(message, contact, classification.extracted);
+        break;
+
+      case 'recheck_time_off':
+        console.log('[router] dispatching to handleRecheckTimeOff');
+        await handleRecheckTimeOff(message, contact, classification.extracted);
         break;
 
       case 'build_schedule':

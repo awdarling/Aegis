@@ -1,6 +1,6 @@
 import express, { Router, type Request, type Response } from 'express';
 import { requireInternalAuth } from '../security/internal-auth';
-import { sendDecisionNotification } from '../workflows/time-off';
+import { sendDecisionNotification, recomputeTimeOffRecommendation } from '../workflows/time-off';
 import { distributeScheduleCore } from '../workflows/schedule-build';
 import {
   applyAvailabilityDecision,
@@ -49,6 +49,35 @@ internalRouter.post('/notify-to-decision', async (req: Request, res: Response) =
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[internal] notify-to-decision failed:', msg);
+    serverError(res, msg);
+  }
+});
+
+// POST /internal/recompute-to-recommendation  (TO-RERUN-1)
+// Re-runs the coverage simulation + AI recommendation for an existing time-off
+// request against CURRENT approvals and persists the refreshed recommendation.
+// Called by the Homebase "Re-run check" button, the email-card re-check link
+// (via the aegis-action dispatcher), and the conversational re-run command.
+// Read-only w.r.t. the decision — only rewrites aegis_recommendation/reasoning.
+internalRouter.post('/recompute-to-recommendation', async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const requestId = body.time_off_request_id;
+
+  if (typeof requestId !== 'string' || requestId.length === 0) {
+    badRequest(res, 'time_off_request_id is required');
+    return;
+  }
+
+  try {
+    const result = await recomputeTimeOffRecommendation(requestId);
+    if (result.status === 'not_found') {
+      res.status(404).json({ ok: false, error: 'time_off_request not found' });
+      return;
+    }
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[internal] recompute-to-recommendation failed:', msg);
     serverError(res, msg);
   }
 });

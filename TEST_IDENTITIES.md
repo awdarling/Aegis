@@ -57,7 +57,7 @@ Reference for who/what is configured in each tenant. Append-only — when identi
 ### Sandbox seed data
 | Table | Notes |
 |---|---|
-| shift_requirements | PM Lifeguard 15:00-21:00 all days, accepted_roles=ARRAY['Lifeguard'] (seeded June 4 for BUG-2) |
+| shift_requirements | PM Lifeguard 15:00-21:00 all days, accepted_roles=ARRAY['Lifeguard'] (seeded June 4 for BUG-2). **`required_count` is raised 1→2 by `SANDBOX_RERUN_SEED.sql` for the TO-RERUN-1 flip-test** (3 lifeguards: one off OK, two off = gap). The seed includes a revert back to 1. |
 | time_off_requests | Pre-existing seed: employee 00000000-0000-0000-0000-000000000010, dates 2026-07-15 to 2026-07-17, status approved (unknown origin, test fixture data) |
 | time_off_requests | **Transient test fixture** — request id `13759531-86fe-43fa-a200-dfb9b2bf3339` (Shmubba Sploosh, 2026-06-20) seeded 2026-06-09 to verify S3 in-tab approve round-trip. Safe to clean up at any time. |
 | policies | max_consecutive_days_off=7, min_notice_period_days=7 (TO-R1 setup) |

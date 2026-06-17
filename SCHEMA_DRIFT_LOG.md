@@ -182,3 +182,8 @@ Any time a future Claude Code session or live debugging surfaces a difference be
 
 ### `public.aegis_action_tokens.issued_at` — DB-defaulted, never app-set
 - Column is `timestamptz NOT NULL`; Aegis `generateActionToken` does NOT set it on insert (relies on the DB `DEFAULT now()`). In practice `issued_at` always equals row-insert time — fine, but worth knowing that any audit logic that needs "when did the email mint this token" should read `issued_at` rather than expect an explicitly-passed value. No bug; documenting for the next builder.
+
+### 2026-06-17 — no schema changes this session (TO-RERUN-1 / branding / inbound fix)
+- The voice+branding pass, INBOUND-SIG-1, and TO-RERUN-1 (re-check recommendations, in-thread reply, resolution notices, click-guards) added **no migrations and no new columns/tables/enums**. TO-RERUN-1 only re-writes existing `time_off_requests.aegis_recommendation` / `aegis_reasoning` and reads existing tables.
+- `aegis_action_tokens` gained a new `action_type` VALUE `'recheck_to'` at the application level (the `ActionType` union in both repos). The DB column is free-text `text`, so no DDL was required — but note this enum-by-convention if a CHECK constraint is ever added to that column.
+- Sandbox-only data note (not drift): `SANDBOX_RERUN_SEED.sql` raises the sandbox PM Lifeguard `required_count` 1→2 and deactivates stale `custom_availability` for the 3 test guards. Production untouched.

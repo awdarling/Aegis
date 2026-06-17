@@ -2,8 +2,10 @@
 
 **Patterns, Active State & Backlog**
 
-**Version 3.1 — June 10, 2026**
+**Version 3.2 — June 16, 2026**
 
+> **v3.2 changelog (2026-06-16):** Documented this session's shipped work — the **Quria email brand kit + voice pass** (`src/messaging/brand.ts` + `brand-logo.ts`, CID-inline logo), **INBOUND-SIG-1** (byte-exact inbound ECDSA via `src/security/sendgrid-signature.ts`), and **TO-RERUN-1** (re-check stale TO recommendations + email threading + "✓ Resolved" notices). Updated the §5 file-structure table, added the new shipped items to §6.1, and noted the closed fast-follows. See doc 04 §1.2 / §3.1 / §9 for the reference detail.
+>
 > **v3.1 changelog (2026-06-10):** §4 Deployment corrected — Homebase `main` is **protected**; the real flow is branch → PR → merge → Vercel auto-deploy (the old "push to `main`" line was wrong as of 2026-06-10). Added a NEW §4.1 with the exact terminal sequence. NEW §9 "Remote Control (run/steer a session from your phone)" documents Claude Code v2.1.51+ remote-control setup, sign-in requirements, gotchas (laptop awake/online, sandboxing OFF).
 
 ---
@@ -34,7 +36,7 @@ For larger builds, split into a read-only **audit session** then a **build sessi
 
 - **Homebase data not loading** → check `public.users` row exists with matching `id`/`company_id`; check `NEXT_PUBLIC_SUPABASE_*` envs.
 - **Aegis not responding** → Railway running? Twilio inbound webhook URL correct + account funded? `ANTHROPIC_API_KEY` set? `curl …/health`.
-- **Inbound email rejected** → check `[sendgrid-verify]` logs; if legitimate mail is 403'd, the signature key/policy or IP allowlist is the cause; `SKIP_SENDGRID_VERIFICATION` must be `false` in prod.
+- **Inbound email rejected** → check `[sendgrid-verify]` logs; if legitimate mail is 403'd, the signature key/policy or IP allowlist is the cause; `SKIP_SENDGRID_VERIFICATION` must be `false` in prod. NB: verification is now **byte-exact** (`verifySendGridSignature`, INBOUND-SIG-1) — replies carrying non-UTF-8 bytes (e.g. an inline image in a quoted reply) used to fail under the old `toString()` path; if a reply specifically is 403'd, confirm `captureRawBody` runs first and `req.rawBody.length` matches content-length.
 - **Schedule build wrong/empty** → check both `shift_types` and `shift_requirements` are populated; read the gap `per_employee_dispositions`; check the `[schedule-build]` log lines (absence ⇒ intent extraction missed a parameter).
 - **Soteria action card missing** → max_tokens truncation (missing `</action>`) or "action JSON parse failed" in logs.
 - **Stripe** → live vs test mode mismatch; `billing_model` must be `one_time`/`subscription`; `subscription_price` in cents.
@@ -74,12 +76,15 @@ git push -u origin <branch>            # publish the feature branch
 | `src/lib/engine/` | `week-bounds`, `canvas`, `eligibility`, `ranker`, `cascade`, `attribute-mix`, `dispositions`, `types` |
 | `src/lib/constraints/` | `parser`, `types` (constraint vocabulary, `EngineSettings`) |
 | `src/lib/to-window.ts`, `custom-availability.ts`, `schedule-simulator.ts` | TO windows, custom availability, coverage sim + wage estimate |
-| `src/workflows/time-off.ts` | TO submit/confirm/approve/deny/query; `notifyManagersByEmail` |
-| `src/workflows/employee-onboarding.ts` | onboarding + opt-in; availability update/confirm/manager-approval |
+| `src/workflows/time-off.ts` | TO submit/confirm/approve/deny/query; `notifyManagersByEmail`; `recomputeTimeOffRecommendation`, `recheckAndReplyToManager`, `sendDecisionNotification`, `sendManagerResolutionReplies`, `toThreadMessageId` (TO-RERUN-1) |
+| `src/workflows/time-off-manager-email.ts` | `buildTimeOffManagerEmail` (manager action-card email w/ approve/deny/recheck magic-links), `buildTimeOffResolutionEmail` ("✓ Resolved" reply) |
+| `src/workflows/employee-onboarding.ts` | onboarding + opt-in; availability update/confirm/manager-approval; `applyAvailabilityDecision`, `applyCustomAvailabilityDecision` |
 | `src/workflows/day-closure.ts` | closure notifications |
-| `src/messaging/sms.ts`, `email.ts` | `sendSms`, `sendEmail`; `reply`, `sendInThreadAck` |
-| `src/middleware/capture-raw-body.ts`, `verify-signature.ts` | inbound SendGrid ECDSA verification |
-| `src/webhooks/sms.ts`, `email.ts` | inbound endpoints |
+| `src/messaging/brand.ts`, `brand-logo.ts` | Quria email brand kit (`brandedEmailShell`, `brandedButtonRow`, `brandActionCard`, `BRAND`) + base64 CID logo |
+| `src/messaging/sms.ts`, `email.ts` | `sendSms`, `sendEmail` (gained `message_id`/`in_reply_to` threading; auto-attaches CID logo), `htmlFromText`; `reply`, `sendInThreadAck` |
+| `src/security/sendgrid-signature.ts` | `verifySendGridSignature` — byte-exact inbound ECDSA (INBOUND-SIG-1) |
+| `src/middleware/capture-raw-body.ts`, `verify-signature.ts` | inbound SendGrid ECDSA verification (calls `verifySendGridSignature`) |
+| `src/webhooks/sms.ts`, `email.ts`, `internal.ts` | inbound endpoints; `internal.ts` = Bearer-auth internal routes (`/notify-to-decision`, `/recompute-to-recommendation`, `/recheck-to-reply`, availability + distribute) |
 | `src/db/client.ts`, `types.ts` | Supabase service-role client; generated types (incomplete — verify) |
 | `scripts/dry-run-schedule.ts`, `test-cascade.ts` | engine harnesses |
 
@@ -97,6 +102,9 @@ The 48-hour post-launch sprint **closed 2026-06-09**: ENGINE-2 (gender rule), S2
 - **Time-off email workflow** — full chain verified on Watermark (submit → confirm → fan-out to all managers → magic-link or Homebase approve → employee notified; violations rendered in the manager email).
 - **Availability email workflow** — full chain verified (submit → confirm → fan-out to all managers → reply-YES approve → `availability` updated → employee notified).
 - **Inbound signature verification** ("wax seal") — live, `SKIP_SENDGRID_VERIFICATION=false`.
+- **INBOUND-SIG-1 — byte-exact inbound ECDSA fix (shipped this session).** Replaced `@sendgrid/eventwebhook`'s `verifySignature` (which UTF-8-decoded the body before hashing and corrupted non-UTF-8 bytes — e.g. the inline logo image in a quoted **reply** — so inbound replies were 403'd) with `src/security/sendgrid-signature.ts → verifySendGridSignature`, which hashes the exact `timestamp ‖ rawBody` bytes via the same ECDSA primitives. `verify-signature.ts` now calls it; covered by a unit test incl. a binary-body regression. (See doc 04 §1.2.)
+- **Quria email brand kit + voice pass (shipped this session).** New `src/messaging/brand.ts` (`brandedEmailShell`, `brandedButtonRow`, `brandActionCard`, `BRAND` palette) is the single source of truth for outbound HTML email — dark Quria frame matching Homebase. Logo is an **inline CID attachment** (`brand-logo.ts`; `email.ts sendEmail` auto-attaches it when the HTML references `cid:quria-logo`) — a hosted-URL logo did not render and was replaced by CID. Every Aegis email + every plain reply (`htmlFromText`) was rebranded and re-voiced to a warm, conclusion-first assistant-manager tone (ask + reassurance ABOVE the action card). (See doc 04 §9.)
+- **TO-RERUN-1 — re-check stale TO recommendations + threading + resolution notices (shipped this session).** `recomputeTimeOffRecommendation` re-runs the sim + AI recommendation against current approvals (guards already-decided requests); surfaced via the Homebase "Re-run check" button (`POST /internal/recompute-to-recommendation`), an email-card "Re-run check" magic-link (`recheck_to` → `POST /internal/recheck-to-reply`, responds instantly + recomputes/replies in the background), and the conversational `recheck_time_off` command. Email threading via deterministic per-manager `Message-ID` (`toThreadMessageId`) + `in_reply_to`/"Re:" replies (new `email.ts` `message_id`/`in_reply_to` options). On any-channel approval/denial, `sendDecisionNotification` also posts a "✓ Resolved" reply into each manager's thread (`buildTimeOffResolutionEmail`). Click-guards return a clear "already decided" outcome. (See doc 04 §3.1.)
 - **Schedule Engine V2 (2.0.0)** — deployed, dry-run + cascade + banned-pair validated.
 - **ENGINE-2 / gender rule (DONE, live).** The bimodal-Headguard-hours cause — the per-shift `attribute_mix` sex swap displacing ranker picks without backfill — was replaced by the facility-wide `sex_coverage` (`scope=concurrent_coverage`, validate-and-flag, no swap). Policy `policy_value_json` flipped; the 6/15 build flattened hours (Lucas 26.3h→15.3h, Erin 6.3h→10.8h) and surfaced a coalesced `unsatisfied_sex_coverage` flag in both the manager email and Homebase `CoverageFlags`.
 - **SCHED-EDIT-1 (DONE, Homebase `f28cb30`, live-verified).** Manual schedule moves now persist corrected hours to `schedules.data.assignments` via the shared `resolveAssignment` + `hours` helpers (move handler + save chokepoint).

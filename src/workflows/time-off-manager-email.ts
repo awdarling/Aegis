@@ -285,7 +285,8 @@ function recommendationHtml(rec: TimeOffRecommendation): string {
 function ctaButtonsHtml(
   approveUrl: string,
   denyUrl: string,
-  homebaseUrl: string
+  homebaseUrl: string,
+  recheckUrl: string
 ): string {
   return `
 <div style="border-top:1px solid ${BRAND.borderDefault};margin:6px 0 0;padding-top:18px;">
@@ -293,6 +294,11 @@ ${brandedButtonRow([
   { url: approveUrl, label: 'Approve', variant: 'primary' },
   { url: denyUrl, label: 'Deny', variant: 'secondary' },
 ])}
+  <div style="margin:0 0 12px;">
+    <a href="${escapeHtml(recheckUrl)}"
+       style="font-size:14px;font-weight:600;color:${BRAND.accent};text-decoration:underline;">Re-run check</a>
+    <div style="font-size:13px;color:${BRAND.textSecondary};margin-top:4px;line-height:1.5;">If this has been sitting a while, re-run the check and I&#39;ll recompute it against everything that&#39;s been approved since.</div>
+  </div>
   <div style="margin:2px 0 6px;">
     <a href="${escapeHtml(homebaseUrl)}/data?tab=time-off"
        style="font-size:14px;color:${BRAND.accent};text-decoration:underline;">Review it in Homebase</a>
@@ -310,6 +316,7 @@ export function renderTimeOffManagerBodyHtml(args: {
   dateRange: string;
   approveUrl: string;
   denyUrl: string;
+  recheckUrl: string;
   homebaseUrl: string;
   policyLines: string[];
   simulation?: SimulationResult;
@@ -328,7 +335,7 @@ ${policyConsiderationsHtml(args.policyLines)}
 ${requestDetailsHtml(args.tor, args.dateRange)}
 ${args.simulation ? coverageImpactHtml(args.simulation) : ''}
 ${args.recommendation ? recommendationHtml(args.recommendation) : ''}
-${ctaButtonsHtml(args.approveUrl, args.denyUrl, args.homebaseUrl)}`;
+${ctaButtonsHtml(args.approveUrl, args.denyUrl, args.homebaseUrl, args.recheckUrl)}`;
 
   const card = brandActionCard('Action needed · Time off', cardInner);
 
@@ -348,6 +355,7 @@ function buildPlainText(params: {
   policyLines: string[];
   approveUrl: string;
   denyUrl: string;
+  recheckUrl: string;
   homebaseUrl: string;
 }): string {
   const lines: string[] = [];
@@ -411,6 +419,8 @@ function buildPlainText(params: {
   lines.push('Deny this request:');
   lines.push(params.denyUrl);
   lines.push('');
+  lines.push(`Re-run Aegis's coverage check: ${params.recheckUrl}`);
+  lines.push('');
   lines.push('Review in Homebase:');
   lines.push(`${params.homebaseUrl}/data?tab=time-off`);
 
@@ -438,7 +448,10 @@ export async function buildTimeOffManagerEmail(
     company_name: params.company_name,
   };
 
-  const [approveTok, denyTok] = await Promise.all([
+  // The recheck token is single-use (like the approve/deny tokens), so the email
+  // button re-checks once; the Homebase tab button and the conversational command
+  // allow repeated re-checks. That's acceptable for v1 (TO-RERUN-1).
+  const [approveTok, denyTok, recheckTok] = await Promise.all([
     generateActionToken({
       action_type: 'approve_to',
       payload: sharedPayload,
@@ -450,6 +463,14 @@ export async function buildTimeOffManagerEmail(
     generateActionToken({
       action_type: 'deny_to',
       payload: sharedPayload,
+      company_id: params.company_id,
+      issued_to_email: params.manager_email,
+      issued_to_user_id: params.manager_user_id,
+      ttl_minutes: 4320,
+    }),
+    generateActionToken({
+      action_type: 'recheck_to',
+      payload: { time_off_request_id: tor.id },
       company_id: params.company_id,
       issued_to_email: params.manager_email,
       issued_to_user_id: params.manager_user_id,
@@ -471,6 +492,7 @@ export async function buildTimeOffManagerEmail(
     dateRange,
     approveUrl: approveTok.url,
     denyUrl: denyTok.url,
+    recheckUrl: recheckTok.url,
     homebaseUrl,
     policyLines,
     simulation: params.simulation,
@@ -496,6 +518,7 @@ export async function buildTimeOffManagerEmail(
     policyLines,
     approveUrl: approveTok.url,
     denyUrl: denyTok.url,
+    recheckUrl: recheckTok.url,
     homebaseUrl,
   });
 

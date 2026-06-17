@@ -92,6 +92,7 @@ export const MANAGER_INTENTS = [
   'run_payroll_check',
   'homebase_edit',
   'notify_day_closure',
+  'recheck_time_off',
 ] as const;
 
 export const QURIA_INTENTS = [
@@ -257,6 +258,25 @@ User (manager): "at least two veterans on the morning shift"
 User (manager): "I want experienced staff covering the closing shift on weekends"
 {"intent":"homebase_edit","confidence":"high","extracted":{"entity_type":"experience_rule"}}
 
+## Manager asks to re-run a time-off coverage check → recheck_time_off
+
+When a MANAGER asks you to re-check, re-run, or re-evaluate a PENDING time-off
+request against the current state — typically because other approvals have
+changed the picture since the request first came in — classify it as
+recheck_time_off. Extract any employee name and/or date mentioned.
+Phrasings: "re-run the check on Shmubba's time off", "recheck the time off for
+June 26", "is that time off still ok to approve?", "can you re-evaluate Maria's
+day off?".
+
+User (manager): "re-run the check on Shmubba's time off"
+{"intent":"recheck_time_off","confidence":"high","extracted":{"employee_name":"Shmubba"}}
+
+User (manager): "recheck the time off for June 26"
+{"intent":"recheck_time_off","confidence":"high","extracted":{"date":"${currentYear}-06-26"}}
+
+User (manager): "is that time off still ok to approve?"
+{"intent":"recheck_time_off","confidence":"medium","extracted":{}}
+
 Respond with ONLY valid JSON in this exact shape — no markdown, no explanation:
 {
   "intent": "<intent_name>",
@@ -288,6 +308,9 @@ Respond with ONLY valid JSON in this exact shape — no markdown, no explanation
     //     they appear in the company context, prefer those exact shift times.
     // For query_my_time_off: {} — used when the employee asks about their own approved
     //   upcoming time off ("what time off do I have approved?", "when is my next day off?").
+    // For recheck_time_off: { "employee_name": "..." | omitted, "date": "YYYY-MM-DD" | omitted }
+    //   Manager asking to re-run the coverage check on a PENDING time-off request.
+    //   Include employee_name and/or date when mentioned; omit either if not stated.
     // For initiate_swap: { "shift_date": "YYYY-MM-DD", "shift_name": "...", "target_employee_name": "..." }
     // For build_schedule: {
     //   "target_week": "this" | "next",

@@ -326,6 +326,116 @@ async function generateTimeOffRecommendation(
   };
 }
 
+// ── Recompute (TO-RERUN-1) ────────────────────────────────────────────────────
+
+export type RecomputeStatus =
+  | 'recomputed'
+  | 'skipped_no_requirements'
+  | 'not_found';
+
+export interface RecomputeRecommendationResult {
+  status: RecomputeStatus;
+  recommendation?: 'approve' | 'deny';
+  reasoning?: string;
+  policy_notes?: string;
+  coverage_gap_count?: number;
+}
+
+// Re-run the coverage simulation + AI recommendation for an EXISTING time-off
+// request against CURRENT state, and persist the refreshed recommendation.
+//
+// WHY THIS EXISTS (TO-REC-STALE): the recommendation a request carries was
+// computed at submission time against whatever was approved THEN. runSimulation
+// always re-reads the live approved-TO set (loadApprovedTimeOff) as its baseline,
+// so calling this later — e.g. after a competing request was approved — yields a
+// recommendation that accounts for everything currently approved. Surfaced via
+// the Homebase "Re-run check" button, the email-card re-check link, and the
+// conversational re-run command. Read-only w.r.t. the decision: it only rewrites
+// aegis_recommendation / aegis_reasoning, never the request's status.
+export async function recomputeTimeOffRecommendation(
+  requestId: string
+): Promise<RecomputeRecommendationResult> {
+  const { data: torRow, error } = await supabase
+    .from('time_off_requests')
+    .select('*')
+    .eq('id', requestId)
+    .maybeSingle();
+  if (error || !torRow) return { status: 'not_found' };
+
+  const tor = torRow as {
+    employee_id: string;
+    company_id: string;
+    start_date: string;
+    end_date: string;
+    reason: string | null;
+  };
+
+  const { data: employeeRow } = await supabase
+    .from('employees')
+    .select('*')
+    .eq('id', tor.employee_id)
+    .maybeSingle();
+  if (!employeeRow) return { status: 'not_found' };
+
+  const policies = await loadAllTimeOffPolicies(tor.company_id);
+
+  // Stage 1 — the requested day(s), against the live approved-TO baseline.
+  let stage1: SimulationResult | null = null;
+  try {
+    stage1 = await runSimulation({
+      company_id: tor.company_id,
+      period_start: tor.start_date,
+      period_end: tor.end_date,
+      new_time_off: { employee_id: tor.employee_id, start_date: tor.start_date, end_date: tor.end_date },
+    });
+  } catch (err) {
+    if ((err instanceof Error ? err.message : String(err)) !== 'NO_SHIFT_REQUIREMENTS') throw err;
+  }
+  if (!stage1) return { status: 'skipped_no_requirements' };
+
+  // Stage 2 — full week, only when stage 1 is feasible (mirrors the submit flow).
+  let stage2: SimulationResult | null = null;
+  if (stage1.overall_feasible) {
+    const { weekStart, weekEnd } = getWeekBounds(tor.start_date, tor.end_date);
+    try {
+      stage2 = await runSimulation({
+        company_id: tor.company_id,
+        period_start: weekStart,
+        period_end: weekEnd,
+        new_time_off: { employee_id: tor.employee_id, start_date: tor.start_date, end_date: tor.end_date },
+      });
+    } catch (err) {
+      if ((err instanceof Error ? err.message : String(err)) !== 'NO_SHIFT_REQUIREMENTS') throw err;
+    }
+  }
+
+  const recommendation = await generateTimeOffRecommendation(
+    employeeRow as Employee,
+    tor.start_date,
+    tor.end_date,
+    tor.reason ?? '',
+    stage1,
+    stage2,
+    policies
+  );
+
+  await supabase
+    .from('time_off_requests')
+    .update({
+      aegis_recommendation: recommendation.recommendation,
+      aegis_reasoning: recommendation.reasoning,
+    })
+    .eq('id', requestId);
+
+  return {
+    status: 'recomputed',
+    recommendation: recommendation.recommendation,
+    reasoning: recommendation.reasoning,
+    policy_notes: recommendation.policy_notes,
+    coverage_gap_count: stage1.coverage_gaps.length,
+  };
+}
+
 // ── Manager email builder ─────────────────────────────────────────────────────
 
 // Returns the bullet lines for the Policy Considerations section, or [] when
@@ -1465,4 +1575,133 @@ export async function handleQueryMyTimeOff(
       : `You have ${rows.length} approved time off periods coming up:`;
 
   await reply(contact, message, `${greeting(contact.name)}\n\n${header}\n\n${lines.join('\n')}`);
+}
+
+// Manager asks: "re-run the check on Shmubba's time off" / "recheck the time off
+// for June 26" / "is that time off still ok to approve?" — TO-RERUN-1.
+//
+// Resolves the relevant PENDING time-off request (scoped to the manager's
+// company, matched by extracted employee name and/or date), re-runs the coverage
+// sim + recommendation via recomputeTimeOffRecommendation, and reports the
+// refreshed recommendation in Aegis's warm voice. Does NOT change the request's
+// status — recompute + report only.
+export async function handleRecheckTimeOff(
+  message: InboundMessage,
+  contact: VerifiedContact,
+  extracted: Record<string, unknown>
+): Promise<void> {
+  const employeeName = (extracted['employee_name'] as string | undefined)?.trim() || null;
+  const date = (extracted['date'] as string | undefined)?.trim() || null;
+
+  // Pull all pending requests for the company, joined to the employee for name
+  // matching. Most-recent first so the "pick the latest" tiebreak is trivial.
+  const { data: pendingRows } = await supabase
+    .from('time_off_requests')
+    .select('id, employee_id, start_date, end_date, requested_at, employees(name)')
+    .eq('company_id', contact.company_id)
+    .eq('status', 'pending')
+    .order('requested_at', { ascending: false });
+
+  type PendingRow = {
+    id: string;
+    employee_id: string;
+    start_date: string;
+    end_date: string;
+    requested_at: string | null;
+    employees: { name: string } | { name: string }[] | null;
+  };
+
+  const rows = (pendingRows ?? []) as PendingRow[];
+
+  const nameOf = (row: PendingRow): string => {
+    const emp = Array.isArray(row.employees) ? row.employees[0] : row.employees;
+    return emp?.name ?? '';
+  };
+
+  // Filter by extracted entities. Name match is a case-insensitive substring on
+  // either side (handles "Shmubba" against "Shmubba Jones" and vice versa).
+  // Date match: the requested range must cover the mentioned date.
+  let candidates = rows;
+  if (employeeName) {
+    const needle = employeeName.toLowerCase();
+    candidates = candidates.filter(row => {
+      const hay = nameOf(row).toLowerCase();
+      return hay.includes(needle) || needle.includes(hay);
+    });
+  }
+  if (date) {
+    candidates = candidates.filter(row => row.start_date <= date && date <= row.end_date);
+  }
+
+  if (candidates.length === 0) {
+    const scope =
+      employeeName && date
+        ? ` matching ${employeeName} around ${formatShortDate(date)}`
+        : employeeName
+          ? ` for ${employeeName}`
+          : date
+            ? ` around ${formatShortDate(date)}`
+            : '';
+    await reply(
+      contact,
+      message,
+      `${greeting(contact.name)}\n\nI looked but couldn't find a pending time-off request${scope} to re-check. ` +
+        "It may have already been approved or denied. If you can point me at the employee or the dates, I'll take another look."
+    );
+    return;
+  }
+
+  // candidates is already sorted most-recent-first; take the latest pending.
+  const target = candidates[0];
+  const targetName = nameOf(target) || 'that employee';
+  const targetFirst = firstName(targetName);
+  const dateDisplay = formatDateRange(target.start_date, target.end_date);
+
+  // Note when we had to disambiguate so the manager knows which one we acted on.
+  const pickedNote =
+    candidates.length > 1
+      ? ` You had a few pending — I went with the most recent, ${targetFirst}'s for ${dateDisplay}.`
+      : '';
+
+  const result = await recomputeTimeOffRecommendation(target.id);
+
+  if (result.status === 'not_found') {
+    await reply(
+      contact,
+      message,
+      `${greeting(contact.name)}\n\nI started to re-check ${targetFirst}'s time off for ${dateDisplay}, but the request seems to have gone missing on me — it may have just been acted on. Mind giving it another try in a moment?`
+    );
+    return;
+  }
+
+  if (result.status === 'skipped_no_requirements') {
+    await reply(
+      contact,
+      message,
+      `${greeting(contact.name)}\n\nI re-checked ${targetFirst}'s time off for ${dateDisplay}, but there's no shift schedule to measure it against yet — so I can't speak to coverage either way.${pickedNote} Once shift requirements are set up, I'll be able to give you a real read.`
+    );
+    return;
+  }
+
+  // status === 'recomputed'
+  const gaps = result.coverage_gap_count ?? 0;
+  const lean =
+    result.recommendation === 'approve'
+      ? gaps > 0
+        ? `I'd still lean toward approving it — it'd leave ${gaps} coverage gap${gaps === 1 ? '' : 's'}, but nothing that should hold it up`
+        : "I'd still lean toward approving it — coverage holds up fine with everything that's been approved so far"
+      : gaps > 0
+        ? `I'd now lean toward NOT approving it: it'd leave ${gaps} coverage gap${gaps === 1 ? '' : 's'}`
+        : "I'd now lean toward NOT approving it";
+
+  const tail =
+    result.recommendation === 'approve'
+      ? ' Want me to hold while you decide, or are you good to approve it?'
+      : ' Want me to deny it, or hold for now?';
+
+  await reply(
+    contact,
+    message,
+    `${greeting(contact.name)}\n\nRe-checked ${targetName}'s time off for ${dateDisplay} against everything approved so far — ${lean}.${pickedNote}${tail}`
+  );
 }

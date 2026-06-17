@@ -1,6 +1,6 @@
 import express, { Router, type Request, type Response } from 'express';
 import { requireInternalAuth } from '../security/internal-auth';
-import { sendDecisionNotification, recomputeTimeOffRecommendation } from '../workflows/time-off';
+import { sendDecisionNotification, recomputeTimeOffRecommendation, recheckAndReplyToManager } from '../workflows/time-off';
 import { distributeScheduleCore } from '../workflows/schedule-build';
 import {
   applyAvailabilityDecision,
@@ -78,6 +78,39 @@ internalRouter.post('/recompute-to-recommendation', async (req: Request, res: Re
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[internal] recompute-to-recommendation failed:', msg);
+    serverError(res, msg);
+  }
+});
+
+// POST /internal/recheck-to-reply  (TO-RERUN-1, email magic-link path)
+// Re-runs the recommendation AND replies to the manager IN THE SAME EMAIL THREAD
+// as the original action-card email, with a refreshed card. Used when a manager
+// clicks "Re-run check" in their inbox, so the conversation stays in one chain.
+internalRouter.post('/recheck-to-reply', async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const requestId = body.time_off_request_id;
+  const managerEmail = body.manager_email;
+
+  if (typeof requestId !== 'string' || requestId.length === 0) {
+    badRequest(res, 'time_off_request_id is required');
+    return;
+  }
+  if (typeof managerEmail !== 'string' || managerEmail.length === 0) {
+    badRequest(res, 'manager_email is required');
+    return;
+  }
+  const managerUserId = typeof body.manager_user_id === 'string' ? body.manager_user_id : undefined;
+
+  try {
+    const result = await recheckAndReplyToManager({ requestId, managerEmail, managerUserId });
+    if (result.status === 'not_found') {
+      res.status(404).json({ ok: false, error: 'time_off_request not found' });
+      return;
+    }
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[internal] recheck-to-reply failed:', msg);
     serverError(res, msg);
   }
 });

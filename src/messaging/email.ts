@@ -33,6 +33,18 @@ interface EmailOptions {
   company_id: string;
   thread_id?: string;
   attachments?: EmailAttachment[];
+  /**
+   * Sets an explicit Message-ID header on this outbound email so a later reply
+   * can thread to it. Used by the time-off manager email so the "Re-run check"
+   * result can land as a reply in the same chain (TO-RERUN-1).
+   */
+  message_id?: string;
+  /**
+   * Threads THIS email as a reply: sets In-Reply-To + References to the given
+   * Message-ID. Pair with a "Re: …" subject for reliable Gmail/Apple Mail
+   * threading.
+   */
+  in_reply_to?: string;
 }
 
 async function resolveTenantEmailAddress(companyId: string): Promise<string | null> {
@@ -102,6 +114,19 @@ export async function sendEmail(options: EmailOptions): Promise<void> {
     ...(a.content_id ? { content_id: a.content_id } : {}),
   }));
 
+  // Assemble threading headers. `in_reply_to` (an explicit Message-ID to reply
+  // to) takes precedence over the legacy `thread_id`; `message_id` stamps this
+  // email's own Message-ID so a future reply can thread to it.
+  const replyTarget = options.in_reply_to ?? options.thread_id;
+  const threadingHeaders: Record<string, string> = {};
+  if (replyTarget) {
+    threadingHeaders['In-Reply-To'] = replyTarget;
+    threadingHeaders['References'] = replyTarget;
+  }
+  if (options.message_id) {
+    threadingHeaders['Message-ID'] = options.message_id;
+  }
+
   try {
     await sgMail.send({
       to: options.to,
@@ -116,14 +141,7 @@ export async function sendEmail(options: EmailOptions): Promise<void> {
       ...(sgAttachments && sgAttachments.length > 0
         ? { attachments: sgAttachments }
         : {}),
-      ...(options.thread_id
-        ? {
-            headers: {
-              'In-Reply-To': options.thread_id,
-              References: options.thread_id,
-            },
-          }
-        : {}),
+      ...(Object.keys(threadingHeaders).length > 0 ? { headers: threadingHeaders } : {}),
     });
 
     await saveConversation({

@@ -470,7 +470,13 @@ export async function buildTimeOffManagerEmail(
     }),
     generateActionToken({
       action_type: 'recheck_to',
-      payload: { time_off_request_id: tor.id },
+      // manager_email/_user_id ride in the payload so the dispatcher can reply
+      // to the right manager's thread with the refreshed card (TO-RERUN-1).
+      payload: {
+        time_off_request_id: tor.id,
+        manager_email: params.manager_email,
+        ...(params.manager_user_id ? { manager_user_id: params.manager_user_id } : {}),
+      },
       company_id: params.company_id,
       issued_to_email: params.manager_email,
       issued_to_user_id: params.manager_user_id,
@@ -522,5 +528,52 @@ export async function buildTimeOffManagerEmail(
     homebaseUrl,
   });
 
+  return { subject, html, text };
+}
+
+// ── Resolution reply (TO-RERUN-1) ─────────────────────────────────────────────
+
+// A short "✓ Resolved" reply sent to each manager in their original request
+// thread once the request is approved/denied (by any channel). Caps the
+// conversation and lets the OTHER managers see it's handled — no action buttons.
+// `subject` is returned WITHOUT a "Re:" prefix; the caller threads it.
+export function buildTimeOffResolutionEmail(args: {
+  employeeName: string;
+  managerName?: string;
+  dateRange: string;
+  decision: 'approved' | 'denied';
+  decidedByName?: string;
+  companyName: string;
+}): BuildTimeOffManagerEmail {
+  const first = firstName(args.employeeName);
+  const approved = args.decision === 'approved';
+  const verb = approved ? 'approved' : 'denied';
+  const actor = args.decidedByName && args.decidedByName.trim() ? args.decidedByName.trim() : 'A manager';
+  const tone = approved
+    ? { bg: BRAND.goodBg, border: BRAND.goodBorder, text: BRAND.goodText, mark: '✓' }
+    : { bg: BRAND.badBg, border: BRAND.badBorder, text: BRAND.badText, mark: '✕' };
+
+  const card = `
+<div style="margin:8px 0 0;padding:16px 18px;background:${tone.bg};border:1px solid ${tone.border};border-radius:12px;">
+  <div style="font-size:13px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;color:${tone.text};">${tone.mark} Resolved · ${verb}</div>
+  <div style="font-size:16px;color:${BRAND.textPrimary};margin-top:8px;line-height:1.5;">
+    ${escapeHtml(actor)} ${verb} ${escapeHtml(first)}'s time off for ${escapeHtml(args.dateRange)}. ${escapeHtml(first)} has been notified — nothing more to do here.
+  </div>
+</div>`;
+
+  const bodyHtml =
+    `<p style="margin:0;font-size:16px;color:${BRAND.textPrimary};">${escapeHtml(greeting(args.managerName))}</p>` + card;
+
+  const html = brandedEmailShell({
+    bodyHtml,
+    companyName: args.companyName,
+    preheader: `Resolved — ${first}'s time off was ${verb}`,
+  });
+
+  const text =
+    `${greeting(args.managerName)}\n\n${actor} ${verb} ${first}'s time off for ${args.dateRange}. ${first} has been notified — nothing more to do here.`;
+
+  // Base subject matches the original request email so a "Re:" reply threads.
+  const subject = `Time-off request from ${args.employeeName} — ${args.dateRange}`;
   return { subject, html, text };
 }

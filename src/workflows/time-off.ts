@@ -17,7 +17,7 @@ import {
   brandedButtonRow,
   brandActionCard,
 } from '../messaging/brand';
-import { buildTimeOffManagerEmail, type TimeOffRecommendation } from './time-off-manager-email';
+import { buildTimeOffManagerEmail, buildTimeOffResolutionEmail, type TimeOffRecommendation } from './time-off-manager-email';
 import type { InboundMessage, VerifiedContact } from '../security/types';
 import type { Employee, PartialDayDetail, Policy, TimeOffRequest } from '../db/types';
 import type { SimulationResult } from '../lib/schedule-simulator';
@@ -331,7 +331,8 @@ async function generateTimeOffRecommendation(
 export type RecomputeStatus =
   | 'recomputed'
   | 'skipped_no_requirements'
-  | 'not_found';
+  | 'not_found'
+  | 'already_decided';
 
 export interface RecomputeRecommendationResult {
   status: RecomputeStatus;
@@ -368,7 +369,21 @@ export async function recomputeTimeOffRecommendation(
     start_date: string;
     end_date: string;
     reason: string | null;
+    status: string;
+    aegis_recommendation: 'approve' | 'deny' | null;
+    aegis_reasoning: string | null;
   };
+
+  // Click-guard: a re-check only makes sense while the request is still pending.
+  // If it's already approved/denied, report that instead of recomputing — the
+  // decision stands and the manager shouldn't be able to "re-run" a closed item.
+  if (tor.status !== 'pending') {
+    return {
+      status: 'already_decided',
+      recommendation: tor.aegis_recommendation ?? undefined,
+      reasoning: tor.aegis_reasoning ?? undefined,
+    };
+  }
 
   const { data: employeeRow } = await supabase
     .from('employees')
@@ -434,6 +449,99 @@ export async function recomputeTimeOffRecommendation(
     policy_notes: recommendation.policy_notes,
     coverage_gap_count: stage1.coverage_gaps.length,
   };
+}
+
+// Deterministic Message-ID for a manager's copy of a TO request email, so the
+// "Re-run check" reply can thread to it (TO-RERUN-1). `salt` makes a reply's own
+// Message-ID unique while still referencing the original.
+function toThreadMessageId(requestId: string, managerKey: string, salt?: number): string {
+  const key = managerKey.replace(/[^a-zA-Z0-9._-]/g, '_');
+  return `<to-${requestId}-${key}${salt ? `.${salt}` : ''}@aegis.quriasolutions.com>`;
+}
+
+// Re-run the recommendation for a request AND reply to the manager IN THE SAME
+// EMAIL THREAD as the original action-card email, with a refreshed card. Used by
+// the email-card "Re-run check" magic-link so the back-and-forth stays in one
+// chain (like the other workflows) instead of opening a new email / web page.
+export async function recheckAndReplyToManager(args: {
+  requestId: string;
+  managerEmail: string;
+  managerUserId?: string;
+  managerName?: string;
+}): Promise<RecomputeRecommendationResult> {
+  const result = await recomputeTimeOffRecommendation(args.requestId);
+  if (result.status !== 'recomputed') return result;
+
+  const { data: torRow } = await supabase
+    .from('time_off_requests').select('*').eq('id', args.requestId).maybeSingle();
+  if (!torRow) return result;
+  const tor = torRow as TimeOffRequest;
+
+  const { data: employeeRow } = await supabase
+    .from('employees').select('*').eq('id', tor.employee_id).maybeSingle();
+  if (!employeeRow) return result;
+  const employee = employeeRow as Employee;
+
+  const { data: companyRow } = await supabase
+    .from('companies').select('name').eq('id', tor.company_id).maybeSingle();
+  const companyName = (companyRow as { name: string } | null)?.name ?? 'Your team';
+
+  // Re-run the sim once more purely to populate the email's coverage section
+  // (the recommendation itself was already refreshed + persisted above).
+  let simulation: SimulationResult | undefined;
+  try {
+    const stage1 = await runSimulation({
+      company_id: tor.company_id, period_start: tor.start_date, period_end: tor.end_date,
+      new_time_off: { employee_id: tor.employee_id, start_date: tor.start_date, end_date: tor.end_date },
+    });
+    simulation = stage1;
+    if (stage1.overall_feasible) {
+      const { weekStart, weekEnd } = getWeekBounds(tor.start_date, tor.end_date);
+      try {
+        simulation = await runSimulation({
+          company_id: tor.company_id, period_start: weekStart, period_end: weekEnd,
+          new_time_off: { employee_id: tor.employee_id, start_date: tor.start_date, end_date: tor.end_date },
+        });
+      } catch { /* keep stage1 */ }
+    }
+  } catch { /* NO_SHIFT_REQUIREMENTS — no coverage section */ }
+
+  let violations: TimeOffViolations | null = null;
+  try {
+    violations = await computeTimeOffViolations({
+      employee_id: employee.id, start_date: tor.start_date, end_date: tor.end_date, company_id: tor.company_id,
+    });
+  } catch { /* advisory only */ }
+
+  const recommendation: TimeOffRecommendation | undefined = result.recommendation
+    ? { type: result.recommendation, reasoning: result.reasoning ?? '' }
+    : undefined;
+
+  const { subject, text, html } = await buildTimeOffManagerEmail({
+    time_off_request: tor,
+    employee,
+    company_id: tor.company_id,
+    company_name: companyName,
+    manager_email: args.managerEmail,
+    manager_user_id: args.managerUserId,
+    manager_name: args.managerName,
+    simulation,
+    recommendation,
+    violations,
+  });
+
+  const threadKey = args.managerUserId ?? args.managerEmail;
+  await sendEmail({
+    to: args.managerEmail,
+    subject: normalizeReSubject(subject),
+    text,
+    html,
+    company_id: tor.company_id,
+    in_reply_to: toThreadMessageId(tor.id, threadKey),
+    message_id: toThreadMessageId(tor.id, threadKey, Date.now()),
+  });
+
+  return result;
 }
 
 // ── Manager email builder ─────────────────────────────────────────────────────
@@ -858,7 +966,78 @@ export async function sendDecisionNotification(
     },
   });
 
+  // Cap each manager's email thread with a "✓ Resolved" reply so the inbox shows
+  // the item is handled and the OTHER managers know action was taken (TO-RERUN-1).
+  // Best-effort — never let this fail the employee notification.
+  try {
+    await sendManagerResolutionReplies({
+      requestId,
+      companyId: tor.company_id,
+      employeeName: employee.name,
+      dateRange,
+      decision,
+    });
+  } catch (err) {
+    console.warn('[time-off] manager resolution replies failed:', err);
+  }
+
   return { channel, sent_to };
+}
+
+// Reply "✓ Resolved" into each manager's original request thread once a decision
+// is recorded (by any channel). Threads via the deterministic Message-ID stamped
+// on the original email. Notifies all managers (not just the actor) so a fan-out
+// request doesn't leave others acting on a closed item.
+async function sendManagerResolutionReplies(args: {
+  requestId: string;
+  companyId: string;
+  employeeName: string;
+  dateRange: string;
+  decision: 'approved' | 'denied';
+}): Promise<void> {
+  // Who decided it (for "approved by …").
+  const { data: torRow } = await supabase
+    .from('time_off_requests').select('decided_by').eq('id', args.requestId).maybeSingle();
+  const decidedById = (torRow as { decided_by: string | null } | null)?.decided_by ?? null;
+  let decidedByName: string | undefined;
+  if (decidedById) {
+    const { data: u } = await supabase
+      .from('users').select('name').eq('id', decidedById).maybeSingle();
+    decidedByName = (u as { name: string | null } | null)?.name ?? undefined;
+  }
+
+  const { data: companyRow } = await supabase
+    .from('companies').select('name').eq('id', args.companyId).maybeSingle();
+  const companyName = (companyRow as { name: string } | null)?.name ?? 'Your team';
+
+  const { data: managersData } = await supabase
+    .from('users').select('id, email, name').eq('company_id', args.companyId);
+  const managers = ((managersData ?? []) as { id: string; email: string | null; name: string | null }[])
+    .filter(m => !!m.email);
+
+  for (const m of managers) {
+    try {
+      const { subject, html, text } = buildTimeOffResolutionEmail({
+        employeeName: args.employeeName,
+        managerName: m.name ?? undefined,
+        dateRange: args.dateRange,
+        decision: args.decision,
+        decidedByName,
+        companyName,
+      });
+      await sendEmail({
+        to: m.email!,
+        subject: normalizeReSubject(subject),
+        html,
+        text,
+        company_id: args.companyId,
+        in_reply_to: toThreadMessageId(args.requestId, m.id),
+        message_id: toThreadMessageId(args.requestId, m.id, Date.now()),
+      });
+    } catch (err) {
+      console.warn('[time-off] resolution reply failed for', m.email, err);
+    }
+  }
 }
 
 // ── Manager notification ───────────────────────────────────────────────────────
@@ -1109,6 +1288,9 @@ async function notifyManagersByEmail(
         text,
         html,
         company_id: companyId,
+        // Stamp a deterministic Message-ID so a later "Re-run check" reply
+        // threads under this email in the manager's inbox (TO-RERUN-1).
+        message_id: toThreadMessageId(torRow.id, manager.id),
       });
       emailed++;
     } catch (err) {

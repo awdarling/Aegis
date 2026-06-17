@@ -2,9 +2,9 @@
 
 **Features, Capabilities & Workflows**
 
-**Version 3.0 — June 8, 2026**
+**Version 3.1 — June 16, 2026**
 
-*Reflects Schedule Engine V2 (2.0.0), the inbound signature-verification security layer, and the live email workflows verified at the Watermark production launch (June 5, 2026).*
+*Reflects Schedule Engine V2 (2.0.0), the inbound signature-verification security layer, and the live email workflows verified at the Watermark production launch (June 5, 2026). v3.1 adds the Quria email brand kit + voice pass (§9), the byte-exact inbound ECDSA fix (INBOUND-SIG-1, §1.2), and the time-off re-check / threading / resolution-notice work (TO-RERUN-1, §3).*
 
 ---
 
@@ -42,11 +42,13 @@ Shipped and verified live June 5, 2026. Inbound email is authenticated before pr
 - `src/middleware/capture-raw-body.ts` buffers the exact raw request bytes (stream-replay so `multer` can still parse the multipart form afterward). Runs on **every** inbound email.
 - `src/middleware/verify-signature.ts` order of precedence:
   1. If `SKIP_SENDGRID_VERIFICATION=true` → bypass (local testing only; **production is `false`**).
-  2. Else if `SENDGRID_WEBHOOK_PUBLIC_KEY` is set → ECDSA-verify via `@sendgrid/eventwebhook` (`EventWebhook.convertPublicKeyToECDSA` + `verifySignature(key, rawBody, sig, ts)`) against headers `x-twilio-email-event-webhook-signature` and `x-twilio-email-event-webhook-timestamp`. Missing/invalid → **403**.
+  2. Else if `SENDGRID_WEBHOOK_PUBLIC_KEY` is set → ECDSA-verify against headers `x-twilio-email-event-webhook-signature` and `x-twilio-email-event-webhook-timestamp`. Missing/invalid → **403**. (`SENDGRID_SIGNATURE_HEADER`/`SENDGRID_TIMESTAMP_HEADER` are exported constants; swap them if SendGrid ever ships Parse-specific header names.)
   3. Else fall back to the SendGrid inbound IP allowlist (159.26.*).
 - Wired in `src/webhooks/email.ts` as `captureRawBody → verifySignature → upload.any()`.
 - SendGrid setup: an Inbound Parse **security policy** (signature-only) is attached to the parse host `aegis.quriasolutions.com`; `send_raw=false` is preserved so the handler still receives parsed fields. Verified by the live log line `[sendgrid-verify] ECDSA signature verified { bodyBytes: N }` (bodyBytes == content-length confirms exact raw capture).
 - *Fast-follow:* add a timestamp-freshness/replay window and remove the now-dead IP-allowlist fallback once stable.
+
+**INBOUND-SIG-1 — byte-exact ECDSA fix (shipped this session).** The verifier no longer uses `@sendgrid/eventwebhook`'s `verifySignature`. That helper called `payload.toString()` (UTF-8 decode) **before** hashing; SendGrid signs sha256 over the EXACT request bytes (`timestamp` ‖ `rawBody`), so any body containing non-UTF-8 bytes — e.g. the inline logo image carried in a quoted email **reply**, or a non-UTF-8 charset part — was mangled (invalid byte sequences → U+FFFD), the recomputed hash no longer matched, and the **inbound reply was 403'd**. That's why short text-only emails verified but replies-with-quoted-content did not. The fix is `src/security/sendgrid-signature.ts → verifySendGridSignature(pem, rawBody, signature, timestamp)`, which builds `Buffer.concat([Buffer.from(timestamp), rawBody])` and verifies with the SAME ECDSA primitives the helper used internally (`PublicKey.fromPem` / `Signature.fromBase64` / `Ecdsa.verify`) — no string round-trip, so for valid-UTF-8 bodies it is identical to the old path and for binary-bearing bodies it is correct where the old path silently failed. `src/middleware/verify-signature.ts` now calls it. Ambient types live in `src/types/starkbank-ecdsa.d.ts`; covered by `src/security/__tests__/sendgrid-signature.test.ts` (incl. a binary-body regression).
 
 ### 1.3 Email body cleaning
 
@@ -71,7 +73,7 @@ After identity verification, Claude classifies the message. Returns JSON with `i
 
 **Employee intents:** `submit_time_off`, `query_my_time_off`, `update_availability`, `initiate_swap`, `respond_swap_accept`, `respond_swap_decline`, `emergency_coverage`, `confirm_pending`, `deny_pending`, `general_query`.
 
-**Manager intents** (employee set plus): `build_schedule`, `distribute_schedule`, `approve_time_off`, `deny_time_off`, `query_schedule`, `homebase_edit`, `notify_day_closure`, `initiate_onboarding`.
+**Manager intents** (employee set plus): `build_schedule`, `distribute_schedule`, `approve_time_off`, `deny_time_off`, `recheck_time_off` (re-run a pending TO's coverage check + recommendation against current state — TO-RERUN-1), `query_schedule`, `homebase_edit`, `notify_day_closure`, `initiate_onboarding`.
 
 ---
 
@@ -154,8 +156,19 @@ Non-policy hard constraints the engine also consults: `employee_conflicts` (`nev
 1. Employee texts/emails (e.g. "I need Friday June 12 off"). Classified `submit_time_off`; dates normalized, partial windows resolved (period labels: morning 09:00–13:00, afternoon 13:00–17:00, evening 17:00–21:00).
 2. A pending confirmation is stored in `aegis_memory` (`memory_type='observation'`); employee gets a "reply YES to confirm" message. On the email channel an in-thread ack (`sendInThreadAck`) lands first.
 3. On YES (`confirm_pending`): INSERT into `time_off_requests` with `requested_at = now()` (NOT NULL), `time_off_type`, `partial_days`.
-4. **`notifyManagersByEmail` fans out to ALL managers** — queries `users` `role IN ('manager','owner')`, filters to those with email, sends each a notification carrying a per-manager **magic-link** Approve/Deny (single-use `aegis_action_tokens`). Success logs silently; only failures/no-managers log.
+4. **`notifyManagersByEmail` fans out to ALL managers** — queries `users` `role IN ('manager','owner')`, filters to those with email, builds each email via `buildTimeOffManagerEmail` (TO-manager-email module), and sends a notification carrying per-manager **magic-link** Approve / Deny / **Re-run check** buttons (single-use `aegis_action_tokens`: `approve_to` / `deny_to` / `recheck_to`, 4320-min TTL). Each manager's send stamps a **deterministic Message-ID** (`toThreadMessageId(requestId, managerId)`) so later replies thread under it. Success logs silently; only failures/no-managers log. (The SMS-channel submit path still uses the older `notifyManager` → `buildManagerEmail`, which was re-voiced + re-branded but notifies only the first manager + an SMS alert.)
 5. Manager approves/denies via magic-link **or** the Homebase Time Off tab (the backstop). Employee is notified. Manager retains final authority — an employee's YES never auto-approves.
+
+### 3.1 TO-RERUN-1 — re-check stale recommendations, threading & resolution notices (NEW)
+
+**Background (TO-REC-STALE).** A request's recommendation is computed at submission time against the live **approved-only** time-off baseline (`runSimulation` → `loadApprovedTimeOff`; custom/rotating availability IS honored). So a recommendation can go stale once a *competing* request is later approved. The re-check re-runs the sim + AI recommendation against current state.
+
+- **`recomputeTimeOffRecommendation(requestId)`** (`time-off.ts`) — re-reads the request, **guards already-decided requests** (returns `already_decided`, never re-acts), re-runs Stage-1 (target days) and, if feasible, Stage-2 (full week) sims against the live approved baseline, regenerates the AI recommendation, and persists `aegis_recommendation` / `aegis_reasoning`. Read-only w.r.t. the decision — it never changes `status`. Returns a `RecomputeStatus` (`recomputed` \| `skipped_no_requirements` \| `not_found` \| `already_decided`).
+- **`recheckAndReplyToManager({requestId, managerEmail, managerUserId?, managerName?})`** — recomputes, then **replies into the manager's original email thread** with a refreshed action card (`buildTimeOffManagerEmail` → `sendEmail` with `in_reply_to: toThreadMessageId(id, key)` + a salted `message_id` + a normalized "Re:" subject). Keeps the back-and-forth in one chain.
+- Exposed three ways: (a) the Homebase **"Re-run check" button** → `POST /internal/recompute-to-recommendation`; (b) the **email-card "Re-run check" magic-link** (`recheck_to` ActionType) → `POST /internal/recheck-to-reply`, which **responds INSTANTLY** (only a cheap status read is synchronous; the recompute + threaded reply run via `void …` in the background) so the magic-link landing page never hangs and managers stop re-clicking into "link already used"; (c) the conversational **`recheck_time_off`** manager command.
+- **Email threading mechanics.** `email.ts sendEmail` gained `message_id` (stamps this email's own `Message-ID`) and `in_reply_to` (sets `In-Reply-To` + `References`, takes precedence over `thread_id`). `toThreadMessageId(requestId, managerKey, salt?)` produces a stable per-manager Message-ID (`<to-<id>-<key>[.<salt>]@aegis.quriasolutions.com>`); the original send omits the salt, replies pass `Date.now()` as salt so their own ID is unique while still referencing the original.
+- **Resolution notices.** When a request is approved/denied by **any** channel, `sendDecisionNotification` (after notifying the employee, best-effort, never blocking the employee notice) calls `sendManagerResolutionReplies`, which posts a short **"✓ Resolved"** reply (`buildTimeOffResolutionEmail`) into **every** manager's thread — caps the thread and tells the *other* managers it's handled (with "approved/denied by …" when `decided_by` resolves to a name). No action buttons.
+- **Click-guards.** Approve/deny or re-run on an already-decided request returns a clear "already decided" outcome instead of acting again (both the conversational path and the fast `/internal/recheck-to-reply` status pre-check).
 
 **BUG-1 fix (June 4, deployed):** TO creation no longer requires `shift_requirements`. The coverage simulator is wrapped in try/catch; if no shifts exist it skips silently (internal log only) and the TO still inserts and the manager is still notified.
 
@@ -217,3 +230,31 @@ curl -X POST https://aegis-production-3220.up.railway.app/webhooks/sms \
 ```
 
 Health check: `GET /health` → 200.
+
+---
+
+## 9. Email brand kit & voice (Quria branding pass) — NEW
+
+This session every Aegis email was rebranded and re-voiced. The single source of truth for how outbound HTML email *looks* is **`src/messaging/brand.ts`**; the *voice* rule is conclusion-first warmth.
+
+### 9.1 Brand kit (`src/messaging/brand.ts`)
+
+A dark "app" theme matching the Homebase web app (black / brushed silver / orange `#f97316`). Before this, each workflow hand-rolled light-theme table markup and branding drifted email to email; now every outbound HTML email wraps its body in one shell.
+
+| Export | What it renders |
+|---|---|
+| `brandedEmailShell({ bodyHtml, companyName?, preheader?, logoSrc? })` | The full dark frame: black header with the Aegis **"A" monogram** + **"Aegis"** text wordmark, a 2px orange underline, dark card body, brushed-silver footer reading **"Aegis · Quria Solutions · <club>"**. Table + inline-style only (Gmail/Outlook-safe), no flexbox/box-shadow. |
+| `brandedButtonRow(buttons[])` | A row of action buttons. `primary` = solid orange; `secondary` = silver-outline. The primary button gets a faked orange "glow" (accent-dim padding ring + accent border) since Gmail strips box-shadow. |
+| `brandedButton(btn)` | A single bulletproof-ish anchor button (label rendered verbatim). |
+| `brandActionCard(label, innerHtml)` | The **"Action needed · <topic>"** panel — a self-contained darker-inset card (details + buttons) set apart from Aegis's conversational text, with an orange uppercase label bar. Reused across every workflow email. |
+| `brandCard(innerHtml, accentLeft?)` | A dark surface card for grouped detail. |
+| `brandSectionLabel(text)` | A small uppercase brushed-silver section heading. |
+| `BRAND` | The palette object (mirrors Homebase `globals.css` tokens: `accent #f97316`, surfaces, borders, text tiers, and status tints `good`/`warn`/`bad`/`review`). |
+
+### 9.2 The logo is an inline CID attachment (NOT a hosted URL)
+
+`brandedEmailShell` defaults the logo `<img src>` to **`cid:quria-logo`**. The mark is embedded as base64 in **`src/messaging/brand-logo.ts`** (the Aegis "A" monogram on black, from `homebase/public/aegis-icon.jpg`). **`email.ts sendEmail` auto-attaches the inline image whenever the rendered HTML references `cid:quria-logo`** (and a caller hasn't already supplied it), via `quriaLogoInlineAttachment()`. This is why the logo renders in Gmail / Apple Mail / iCloud without external hosting — **a hosted-URL logo did NOT render and was replaced by CID**. (`logoUrl()` and `quriaLogoDataUri()` still exist — the data URI is for browser previews where `cid:` won't resolve; pass `logoSrc: null` to fall back to the text wordmark only.) The header pairs the inline image mark with a text "Aegis" wordmark, so the wordmark stays crisp and needs no second attachment.
+
+### 9.3 Voice — conclusion-first, warm assistant-manager
+
+Every Aegis email (and every plain reply via `htmlFromText`, which now also rides the same dark shell) was re-voiced to a warm, conclusion-first assistant-manager tone: greet by **first name** (`firstName`/`greeting`), and put **the ask + the reassurance ABOVE the action card** — the manager never has to read past the card to know what's going on and that Aegis will handle the employee notification ("either button records your decision right away, and I'll let <first> know which way it went, so there's nothing else you'll need to do"). Rebranded + re-voiced surfaces: time-off (manager email + SMS-channel path), build / distribute report, employee "your shifts" distribution + team grid, availability + custom/rotating availability, emergency coverage, shift swap, payroll, and all plain replies.

@@ -102,12 +102,26 @@ internalRouter.post('/recheck-to-reply', async (req: Request, res: Response) => 
   const managerUserId = typeof body.manager_user_id === 'string' ? body.manager_user_id : undefined;
 
   try {
-    const result = await recheckAndReplyToManager({ requestId, managerEmail, managerUserId });
-    if (result.status === 'not_found') {
+    // Respond FAST so the magic-link landing page never hangs (the recompute runs
+    // the AI + sends an email, ~several seconds — long enough that managers were
+    // re-clicking into "link already used"). Only the cheap status read is
+    // synchronous; the recompute + threaded reply run in the background.
+    const { data: row } = await supabase
+      .from('time_off_requests').select('status').eq('id', requestId).maybeSingle();
+    if (!row) {
       res.status(404).json({ ok: false, error: 'time_off_request not found' });
       return;
     }
-    res.json({ ok: true, ...result });
+    if ((row as { status: string }).status !== 'pending') {
+      res.json({ ok: true, status: 'already_decided' });
+      return;
+    }
+
+    // Pending → kick off the recompute + threaded reply, but don't await it.
+    void recheckAndReplyToManager({ requestId, managerEmail, managerUserId }).catch((err) => {
+      console.error('[internal] recheck-to-reply background failed:', err instanceof Error ? err.message : String(err));
+    });
+    res.json({ ok: true, status: 'processing' });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[internal] recheck-to-reply failed:', msg);

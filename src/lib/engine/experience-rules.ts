@@ -17,6 +17,41 @@ export interface EngineExperienceRule {
   active: boolean;
 }
 
+// Short, manager-facing label for a shift that carries a veteran rule — the
+// SAME wording the Homebase schedule grid shows ("Veterans only" / "≥N
+// veterans"). Kept here, next to the rule logic, so the web grid, the emailed
+// report, and any future surface all read from one place and never drift.
+export function veteranRuleLabel(rule: {
+  mode: 'all_veterans' | 'min_veterans';
+  min_count: number | null;
+}): string {
+  return rule.mode === 'all_veterans'
+    ? 'Veterans only'
+    : `≥${rule.min_count ?? 1} veterans`;
+}
+
+// Build the "shift NAME → veteran-rule label" map used to tag constrained
+// shifts. Mirrors the Homebase grid (schedule/page.tsx `shiftRuleLabels`):
+// only active rules scoped to a specific shift type, resolved to that shift's
+// name, first rule per shift wins. `shiftTypes` only needs id + name.
+export function buildShiftRuleLabels(
+  rules: EngineExperienceRule[],
+  shiftTypes: { id: string; name: string }[]
+): Record<string, string> {
+  const nameByTypeId = new Map<string, string>();
+  for (const st of shiftTypes) nameByTypeId.set(st.id, st.name);
+
+  const labels: Record<string, string> = {};
+  for (const r of rules) {
+    if (!r.active) continue;
+    if (!r.shift_type_id) continue;
+    const shiftName = nameByTypeId.get(r.shift_type_id);
+    if (!shiftName || labels[shiftName]) continue; // first rule per shift wins
+    labels[shiftName] = veteranRuleLabel(r);
+  }
+  return labels;
+}
+
 // Does this rule apply to a shift of `shift_type_id` on `date` (YYYY-MM-DD)?
 export function ruleAppliesOnDate(
   rule: EngineExperienceRule,

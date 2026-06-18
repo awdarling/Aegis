@@ -32,7 +32,7 @@ import {
 import { rankCandidates } from '../lib/engine/ranker';
 import { resolveBannedPairConflict } from '../lib/engine/cascade';
 import { buildAttributeShortageReason, enforceAttributeMixForShift } from '../lib/engine/attribute-mix';
-import { veteranTargetsForGroup, type EngineExperienceRule } from '../lib/engine/experience-rules';
+import { veteranTargetsForGroup, buildShiftRuleLabels, type EngineExperienceRule } from '../lib/engine/experience-rules';
 import { evaluateSexCoverage } from '../lib/engine/sex-coverage';
 import {
   classifyEmployeeForSlot,
@@ -1186,6 +1186,8 @@ export type BuildScheduleOutcome =
       employees: Employee[];
       companyName: string;
       specialNotes: Event[];
+      // Shift NAME → veteran-rule tag for the emailed report (grid parity).
+      shiftRuleLabels: Record<string, string>;
     } & RunScheduleBuildResult)
   | { ok: false; reason: 'no_shift_types'; weekStart: string; weekEnd: string }
   | { ok: false; reason: 'save_failed'; weekStart: string; weekEnd: string; error: string };
@@ -1367,6 +1369,7 @@ export async function buildScheduleAndSave(
     employees: data.employees,
     companyName: data.companyName,
     specialNotes,
+    shiftRuleLabels: buildShiftRuleLabels(data.experienceRules ?? [], data.shiftTypes),
     ...runResult,
   };
 }
@@ -1423,7 +1426,7 @@ export async function handleBuildSchedule(
   const {
     scheduleId, weekStart, weekEnd, assignments, gaps, flagged_issues,
     closed_dates, shift_override_mismatches, totalRequired, totalFilled,
-    wages, employees, companyName, specialNotes,
+    wages, employees, companyName, specialNotes, shiftRuleLabels,
   } = outcome;
 
   if (message.channel === 'email') {
@@ -1451,6 +1454,7 @@ export async function handleBuildSchedule(
       manager_name: contact.name,
       wages,
       employee_max_hours: employeeMaxHours,
+      shiftRuleLabels,
     });
     await sendEmail({
       to: message.sender,

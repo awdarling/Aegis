@@ -166,7 +166,7 @@ async function clearSwapOutreach(companyId: string, receiverId: string): Promise
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-function computeShiftHours(start: string, end: string): number {
+export function computeShiftHours(start: string, end: string): number {
   const toMins = (t: string) => { const [h, m] = t.slice(0, 5).split(':').map(Number); return h * 60 + m; };
   let mins = toMins(end) - toMins(start);
   if (mins < 0) mins += 24 * 60;
@@ -195,7 +195,7 @@ function escapeHtml(s: string): string {
     .replace(/'/g, '&#39;');
 }
 
-function parseYesNo(body: string): 'yes' | 'no' | 'unclear' {
+export function parseYesNo(body: string): 'yes' | 'no' | 'unclear' {
   const lower = body.trim().toLowerCase();
   if (/^(yes|yeah|yep|sure|ok|okay|correct|confirm|that'?s right|right)/.test(lower)) return 'yes';
   if (/^(no|nope|can'?t|wrong|incorrect|cancel|nah|don'?t)/.test(lower)) return 'no';
@@ -253,8 +253,28 @@ async function findSchedule(
   return null;
 }
 
-function findRequesterShift(schedData: ScheduleData, requesterId: string, shiftDate: string): ScheduleAssignment | null {
+export function findRequesterShift(schedData: ScheduleData, requesterId: string, shiftDate: string): ScheduleAssignment | null {
   return schedData.assignments.find(a => a.employee_id === requesterId && a.date === shiftDate) ?? null;
+}
+
+// Pure transform: reassign the requester's matching shift (date + shift_name) to
+// the receiver. Returns a new assignments array; everything else is untouched.
+// Extracted from executeScheduleSwap so the swap effect can be unit-tested
+// without a database. Behavior-identical to the previous inline map.
+export function applySwapToAssignments(
+  assignments: ScheduleAssignment[],
+  shiftDate: string,
+  shiftName: string,
+  requesterId: string,
+  receiverId: string,
+  receiverName: string
+): ScheduleAssignment[] {
+  return assignments.map(a => {
+    if (a.date === shiftDate && a.shift_name === shiftName && a.employee_id === requesterId) {
+      return { ...a, employee_id: receiverId, employee_name: receiverName };
+    }
+    return a;
+  });
 }
 
 // Executes an approved swap: updates the schedule data and recalculates wages.
@@ -273,12 +293,9 @@ export async function executeScheduleSwap(
   if (!schedRow) return;
 
   const row = schedRow as { id: string; data: ScheduleData; staffing_report: Record<string, unknown> | null };
-  const updatedAssignments = row.data.assignments.map(a => {
-    if (a.date === shiftDate && a.shift_name === shiftName && a.employee_id === requesterId) {
-      return { ...a, employee_id: receiverId, employee_name: receiverName };
-    }
-    return a;
-  });
+  const updatedAssignments = applySwapToAssignments(
+    row.data.assignments, shiftDate, shiftName, requesterId, receiverId, receiverName
+  );
 
   const updatedData: ScheduleData = { ...row.data, assignments: updatedAssignments };
   const wages = await computeWageEstimate(companyId, updatedAssignments);

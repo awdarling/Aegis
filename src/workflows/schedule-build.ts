@@ -5,6 +5,7 @@ import { sendEmail } from '../messaging/email';
 import { greeting } from '../messaging/greeting';
 import { BRAND, brandedEmailShell } from '../messaging/brand';
 import { isAlreadyDistributed } from '../lib/distribute-guard';
+import { computeChangedEmployeeIds } from '../lib/schedule-diff';
 import { sendSms } from '../messaging/sms';
 import { computeWageEstimate } from '../lib/schedule-simulator';
 import { buildScheduleResultEmail } from './schedule-build-email';
@@ -1166,29 +1167,43 @@ async function buildManagerSummary(
 
 // ── Main handler ──────────────────────────────────────────────────────────────
 
-export async function handleBuildSchedule(
-  message: InboundMessage,
-  contact: VerifiedContact,
-  extracted: Record<string, unknown>
-): Promise<void> {
-  // Conversational ack on email so the manager sees an immediate in-thread
-  // reply while the build runs. The rich HTML result email follows below
-  // as a separate, non-threaded send.
-  if (message.channel === 'email') {
-    const firstName = contact.name?.trim().split(/\s+/)[0] ?? '';
-    const bodyText = firstName
-      ? `Got it, ${firstName}. Building your schedule now — I'll send the full breakdown over in just a moment.`
-      : `Got it. Building your schedule now — I'll send the full breakdown over in just a moment.`;
-    await sendInThreadAck({ message, contact, bodyText });
-    // Brief delay so the ack arrives before the schedule result email.
-    // SendGrid + Outlook deliver within ~1s normally; 5s gives clear separation.
-    await new Promise((resolve) => setTimeout(resolve, 5000));
-  }
+// Wage estimate shape (whatever computeWageEstimate returns) — aliased so the
+// build-core result type can carry it without re-declaring the shape.
+export type WageEstimate = Awaited<ReturnType<typeof computeWageEstimate>>;
 
+// Outcome of buildScheduleAndSave — the build core shared by the email/SMS
+// handler (handleBuildSchedule) and the /internal/build-schedule endpoint that
+// the Homebase "Build" button calls. Keeping it a discriminated union (instead
+// of throwing) lets each caller render the right surface: the email handler
+// turns these into manager replies; the HTTP endpoint into JSON responses.
+export type BuildScheduleOutcome =
+  | ({
+      ok: true;
+      scheduleId: string;
+      weekStart: string;
+      weekEnd: string;
+      wages: WageEstimate;
+      employees: Employee[];
+      companyName: string;
+      specialNotes: Event[];
+    } & RunScheduleBuildResult)
+  | { ok: false; reason: 'no_shift_types'; weekStart: string; weekEnd: string }
+  | { ok: false; reason: 'save_failed'; weekStart: string; weekEnd: string; error: string };
+
+// Build a schedule for a company + target week and SAVE it as a fresh draft row
+// (status 'draft', generated_by 'aegis'). This is the pure build-and-persist
+// core: no message/contact, no email/reply — it only reads inputs, runs the
+// engine, writes the schedule row, and logs build activity. Callers handle
+// notification. Reused by both the conversational handler and the Homebase
+// Build button (item 9).
+export async function buildScheduleAndSave(
+  companyId: string,
+  extracted: Record<string, unknown>,
+): Promise<BuildScheduleOutcome> {
   const { data: policyRows } = await supabase
     .from('policies')
     .select('*')
-    .eq('company_id', contact.company_id);
+    .eq('company_id', companyId);
   const parsedEarly = parseConstraints((policyRows ?? []) as Policy[]);
   console.log('[schedule-build] week start day:', parsedEarly.settings.weekStartDay);
 
@@ -1199,8 +1214,8 @@ export async function handleBuildSchedule(
   );
 
   const [data, specialNotes] = await Promise.all([
-    loadBuildData(contact.company_id, weekStart, weekEnd),
-    getSpecialNotesForRange(contact.company_id, weekStart, weekEnd),
+    loadBuildData(companyId, weekStart, weekEnd),
+    getSpecialNotesForRange(companyId, weekStart, weekEnd),
   ]);
   data.events = specialNotes;
 
@@ -1217,7 +1232,7 @@ export async function handleBuildSchedule(
   const { data: customAvailData } = await supabase
     .from('custom_availability')
     .select('*')
-    .eq('company_id', contact.company_id)
+    .eq('company_id', companyId)
     .eq('active', true)
     .order('created_at', { ascending: false });
 
@@ -1240,10 +1255,7 @@ export async function handleBuildSchedule(
   }
 
   if (data.shiftTypes.length === 0) {
-    await reply(contact, message,
-      `No active shift types are configured for this company. Before Aegis can build a schedule, set up shift types in Homebase under Scheduling → Shift Types, then define shift requirements (which roles are needed for each shift type and on which days).`
-    );
-    return;
+    return { ok: false, reason: 'no_shift_types', weekStart, weekEnd };
   }
 
   const veteranPreferenceRaw = typeof extracted['veteran_preference'] === 'string' && extracted['veteran_preference'].trim() !== ''
@@ -1268,7 +1280,7 @@ export async function handleBuildSchedule(
     console.log('[schedule-build] veteran-only date ranges:', veteranOnlyDates);
   }
 
-  const { assignments, gaps, flagged_issues, closed_dates, shift_override_mismatches, totalRequired, totalFilled } = runScheduleBuild(
+  const runResult = runScheduleBuild(
     data,
     parsed.settings,
     veteranMode,
@@ -1276,8 +1288,9 @@ export async function handleBuildSchedule(
     weekStart,
     weekEnd,
   );
+  const { assignments, gaps, flagged_issues, closed_dates, shift_override_mismatches, totalRequired, totalFilled } = runResult;
 
-  const wages = await computeWageEstimate(contact.company_id, assignments);
+  const wages = await computeWageEstimate(companyId, assignments);
 
   const staffingReport = {
     ...buildStaffingReport(assignments, gaps, totalRequired, totalFilled, data.employees, specialNotes, closed_dates, shift_override_mismatches),
@@ -1289,7 +1302,7 @@ export async function handleBuildSchedule(
   const { data: schedRow, error: schedError } = await supabase
     .from('schedules')
     .insert({
-      company_id: contact.company_id,
+      company_id: companyId,
       week_start: weekStart,
       week_end: weekEnd,
       generated_at: new Date().toISOString(),
@@ -1304,7 +1317,7 @@ export async function handleBuildSchedule(
   if (schedError) {
     console.error('[schedule-build] save failed:', schedError.message);
     await logActivity({
-      company_id: contact.company_id,
+      company_id: companyId,
       action: SCHEDULE_BUILD_SAVE_FAILED,
       entity_type: 'schedule',
       entity_id: 'unsaved',
@@ -1321,28 +1334,13 @@ export async function handleBuildSchedule(
         engine_version: ENGINE_VERSION,
       },
     });
-    const failureText =
-      `Built your schedule for ${weekStart}–${weekEnd} but couldn't save it to Homebase. ` +
-      `DB error: ${schedError.message}. ` +
-      `Please message me again in 5 minutes to retry, or check Homebase to see if it appeared.`;
-    if (message.channel === 'email') {
-      await sendEmail({
-        to: message.sender,
-        subject: 'Schedule build failed',
-        text: failureText,
-        company_id: contact.company_id,
-        thread_id: message.thread_id,
-      });
-    } else {
-      await reply(contact, message, failureText);
-    }
-    return;
+    return { ok: false, reason: 'save_failed', weekStart, weekEnd, error: schedError.message };
   }
 
   const scheduleId = (schedRow as { id: string } | null)?.id ?? 'unknown';
 
   await logActivity({
-    company_id: contact.company_id,
+    company_id: companyId,
     action: 'schedule_built',
     entity_type: 'schedule',
     entity_id: scheduleId,
@@ -1360,9 +1358,77 @@ export async function handleBuildSchedule(
     },
   });
 
+  return {
+    ok: true,
+    scheduleId,
+    weekStart,
+    weekEnd,
+    wages,
+    employees: data.employees,
+    companyName: data.companyName,
+    specialNotes,
+    ...runResult,
+  };
+}
+
+export async function handleBuildSchedule(
+  message: InboundMessage,
+  contact: VerifiedContact,
+  extracted: Record<string, unknown>
+): Promise<void> {
+  // Conversational ack on email so the manager sees an immediate in-thread
+  // reply while the build runs. The rich HTML result email follows below
+  // as a separate, non-threaded send.
+  if (message.channel === 'email') {
+    const firstName = contact.name?.trim().split(/\s+/)[0] ?? '';
+    const bodyText = firstName
+      ? `Got it, ${firstName}. Building your schedule now — I'll send the full breakdown over in just a moment.`
+      : `Got it. Building your schedule now — I'll send the full breakdown over in just a moment.`;
+    await sendInThreadAck({ message, contact, bodyText });
+    // Brief delay so the ack arrives before the schedule result email.
+    // SendGrid + Outlook deliver within ~1s normally; 5s gives clear separation.
+    await new Promise((resolve) => setTimeout(resolve, 5000));
+  }
+
+  const outcome = await buildScheduleAndSave(contact.company_id, extracted);
+
+  if (!outcome.ok && outcome.reason === 'no_shift_types') {
+    await reply(contact, message,
+      `No active shift types are configured for this company. Before Aegis can build a schedule, set up shift types in Homebase under Scheduling → Shift Types, then define shift requirements (which roles are needed for each shift type and on which days).`
+    );
+    return;
+  }
+
+  if (!outcome.ok && outcome.reason === 'save_failed') {
+    const failureText =
+      `Built your schedule for ${outcome.weekStart}–${outcome.weekEnd} but couldn't save it to Homebase. ` +
+      `DB error: ${outcome.error}. ` +
+      `Please message me again in 5 minutes to retry, or check Homebase to see if it appeared.`;
+    if (message.channel === 'email') {
+      await sendEmail({
+        to: message.sender,
+        subject: 'Schedule build failed',
+        text: failureText,
+        company_id: contact.company_id,
+        thread_id: message.thread_id,
+      });
+    } else {
+      await reply(contact, message, failureText);
+    }
+    return;
+  }
+
+  if (!outcome.ok) return;
+
+  const {
+    scheduleId, weekStart, weekEnd, assignments, gaps, flagged_issues,
+    closed_dates, shift_override_mismatches, totalRequired, totalFilled,
+    wages, employees, companyName, specialNotes,
+  } = outcome;
+
   if (message.channel === 'email') {
     const employeeMaxHours = new Map<string, { name: string; max_weekly_hours: number }>();
-    for (const emp of data.employees) {
+    for (const emp of employees) {
       employeeMaxHours.set(emp.id, { name: emp.name, max_weekly_hours: emp.max_weekly_hours });
     }
     const { subject, html, text } = await buildScheduleResultEmail({
@@ -1377,7 +1443,7 @@ export async function handleBuildSchedule(
       },
       schedule_id: scheduleId,
       company_id: contact.company_id,
-      company_name: data.companyName,
+      company_name: companyName,
       week_start: weekStart,
       week_end: weekEnd,
       manager_email: message.sender,
@@ -1399,7 +1465,7 @@ export async function handleBuildSchedule(
 
   const summaryMsg = await buildManagerSummary(
     weekStart, weekEnd, assignments, gaps, totalFilled, totalRequired,
-    specialNotes, data.companyName, wages, closed_dates
+    specialNotes, companyName, wages, closed_dates
   );
 
   await reply(contact, message, summaryMsg);
@@ -1875,4 +1941,242 @@ export async function handleDistributeSchedule(
   }
 
   await reply(contact, message, lines.join('\n'));
+}
+
+// ── Republish: notify only the employees whose shifts changed ──────────────────
+
+export interface NotifyScheduleChangesResult {
+  notified: number;
+  emailed: number;
+  texted: number;
+  changed_employees: string[];   // names whose shifts changed and were notified
+  no_contact: string[];          // changed employees with no contact info
+  errors: Array<{ employee_id: string; reason: string }>;
+  week_label: string;
+}
+
+
+// Republish notify (item 12). Compares the NEW published schedule against the
+// OLD (now-superseded) one and emails/texts ONLY the employees whose shifts
+// actually changed, each with their NEW shifts for the week. Does NOT touch the
+// schedule rows' published/archived state — the atomic swap (publish_schedule_swap)
+// already did that; this only sets distributed_at on the new row so the
+// re-distribution guard treats the republish as sent. Confirmed scope:
+// changed-employees-only, not the whole roster.
+export async function notifyScheduleChangesCore(
+  newScheduleId: string,
+  oldScheduleId: string,
+  companyId: string,
+): Promise<NotifyScheduleChangesResult> {
+  type Row = { id: string; week_start: string; week_end: string; data: ScheduleData };
+
+  const [{ data: newData, error: newErr }, { data: oldData, error: oldErr }] = await Promise.all([
+    supabase.from('schedules')
+      .select('id, week_start, week_end, data')
+      .eq('id', newScheduleId).eq('company_id', companyId).single(),
+    supabase.from('schedules')
+      .select('id, week_start, week_end, data')
+      .eq('id', oldScheduleId).eq('company_id', companyId).single(),
+  ]);
+  if (newErr || !newData) {
+    throw new Error(`new schedule ${newScheduleId} not found for company ${companyId}: ${newErr?.message ?? 'no row'}`);
+  }
+  if (oldErr || !oldData) {
+    throw new Error(`old schedule ${oldScheduleId} not found for company ${companyId}: ${oldErr?.message ?? 'no row'}`);
+  }
+  const newRow = newData as unknown as Row;
+  const oldRow = oldData as unknown as Row;
+  const newSched = newRow.data as unknown as ScheduleData;
+  const oldSched = oldRow.data as unknown as ScheduleData;
+  const weekLabel = `${formatShortDate(newRow.week_start)}–${formatShortDate(newRow.week_end)}`;
+
+  const [companyRes, channelRes, empRes, weekEvents] = await Promise.all([
+    supabase.from('companies').select('name').eq('id', companyId).single(),
+    supabase.from('company_channels').select('channel_value').eq('company_id', companyId).eq('channel_type', 'sms').maybeSingle(),
+    supabase.from('employees').select('id, name, contact_email, contact_phone').eq('company_id', companyId).eq('active', true),
+    getSpecialNotesForRange(companyId, newRow.week_start, newRow.week_end),
+  ]);
+  const companyName = (companyRes.data as { name: string } | null)?.name ?? 'Your Company';
+  const aegisSmsChannel = (channelRes.data as { channel_value: string } | null)?.channel_value ?? null;
+  const employees = (empRes.data ?? []) as Pick<Employee, 'id' | 'name' | 'contact_email' | 'contact_phone'>[];
+
+  // Group the NEW schedule's assignments by employee (for rendering each
+  // changed person's updated shifts), and compute the changed-employee set.
+  const newByEmp = new Map<string, ScheduleAssignment[]>();
+  for (const a of newSched.assignments) {
+    const list = newByEmp.get(a.employee_id) ?? [];
+    list.push(a);
+    newByEmp.set(a.employee_id, list);
+  }
+  const changedIds = computeChangedEmployeeIds(oldSched.assignments, newSched.assignments);
+
+  const teamGridHtml = buildFullScheduleGridHtml({
+    schedData: newSched,
+    weekStart: newRow.week_start,
+    weekEnd: newRow.week_end,
+  });
+  const weekEventsHtml = buildWeekEventsHtml(weekEvents);
+  const weekEventsText = buildWeekEventsText(weekEvents);
+
+  let emailed = 0;
+  let texted = 0;
+  let notified = 0;
+  const changed_employees: string[] = [];
+  const no_contact: string[] = [];
+  const errors: Array<{ employee_id: string; reason: string }> = [];
+
+  for (const emp of employees) {
+    // Skip employees whose week is unchanged (changed-only notify, item 12).
+    if (!changedIds.has(emp.id)) continue;
+    const myNew = (newByEmp.get(emp.id) ?? []).slice().sort((a, b) => a.date.localeCompare(b.date));
+
+    changed_employees.push(emp.name);
+
+    if (!emp.contact_email && !emp.contact_phone) {
+      no_contact.push(emp.name);
+      errors.push({ employee_id: emp.id, reason: 'no contact_email or contact_phone on file' });
+      continue;
+    }
+
+    const hasShifts = myNew.length > 0;
+    const totalHours = myNew.reduce((s, a) => s + a.hours, 0);
+    let empEmailed = false;
+    let empTexted = false;
+
+    if (emp.contact_email) {
+      try {
+        const greetingLine = greeting(emp.name);
+        const shiftCount = myNew.length;
+        const intro = hasShifts
+          ? `Your schedule for ${weekLabel} was just updated. Here are your current shifts — ${shiftCount} shift${shiftCount === 1 ? '' : 's'}, ${totalHours}h in total:`
+          : `Your schedule for ${weekLabel} was just updated, and you're no longer on the schedule this week. If that doesn't look right, just reply to this email or check with your manager.`;
+
+        const shiftRows = hasShifts
+          ? myNew.map(s =>
+              `<tr style="background:${BRAND.surface2};">` +
+              `<td style="padding:10px 12px;border:1px solid ${BRAND.borderDefault};color:${BRAND.textPrimary};">${formatDisplayDate(s.date)}</td>` +
+              `<td style="padding:10px 12px;border:1px solid ${BRAND.borderDefault};color:${BRAND.textPrimary};">${s.role}` +
+                `<br><span style="color:${BRAND.textSecondary};font-size:12px;">${s.shift_name}</span></td>` +
+              `<td style="padding:10px 12px;border:1px solid ${BRAND.borderDefault};color:${BRAND.textPrimary};white-space:nowrap;">${formatTime(s.start_time)} – ${formatTime(s.end_time)}</td>` +
+              `<td style="padding:10px 12px;border:1px solid ${BRAND.borderDefault};color:${BRAND.textPrimary};text-align:right;">${s.hours}h</td>` +
+              `</tr>`
+            ).join('')
+          : '';
+
+        const shiftTable = hasShifts
+          ? `<table style="width:100%;border-collapse:collapse;margin:4px 0 18px;font-size:14px;">
+<thead><tr style="background:${BRAND.surface3};">
+<th style="padding:8px 12px;border:1px solid ${BRAND.borderDefault};color:${BRAND.silver};text-align:left;">Day</th>
+<th style="padding:8px 12px;border:1px solid ${BRAND.borderDefault};color:${BRAND.silver};text-align:left;">Position</th>
+<th style="padding:8px 12px;border:1px solid ${BRAND.borderDefault};color:${BRAND.silver};text-align:left;">Time</th>
+<th style="padding:8px 12px;border:1px solid ${BRAND.borderDefault};color:${BRAND.silver};text-align:right;">Hours</th>
+</tr></thead>
+<tbody>${shiftRows}</tbody>
+</table>
+<p style="margin:0 0 20px;color:${BRAND.textSecondary};">That's <strong style="color:${BRAND.textPrimary};">${totalHours}h</strong> across the week.</p>`
+          : '';
+
+        const bodyHtml = `<h2 style="margin:0 0 12px;font-size:20px;color:${BRAND.textPrimary};">Your updated shifts for ${weekLabel}</h2>
+<p style="margin:0 0 16px;line-height:1.5;color:${BRAND.textPrimary};">${greetingLine}</p>
+<p style="margin:0 0 18px;line-height:1.5;color:${BRAND.textPrimary};">${intro}</p>
+${shiftTable}
+${weekEventsHtml}
+<h3 style="margin:26px 0 10px;font-size:16px;color:${BRAND.textPrimary};">Here's the whole team's updated week:</h3>
+${teamGridHtml}
+<p style="margin:8px 0 0;line-height:1.5;color:${BRAND.textMuted};font-size:12px;">Positions are in grey next to each name. <span style="color:${BRAND.badText};font-weight:bold;">UNFILLED</span> marks an open slot.</p>
+<p style="margin:20px 0 4px;line-height:1.5;color:${BRAND.textSecondary};">If anything here doesn't look right, just reply to this email or reach out to your manager — we'll get it fixed.</p>
+<p style="margin:18px 0 0;color:${BRAND.textSecondary};">Thanks for rolling with the change,<br>${companyName}</p>`;
+
+        const html = brandedEmailShell({
+          bodyHtml,
+          companyName,
+          preheader: `Your updated shifts for ${weekLabel}`,
+        });
+
+        const eventsBlock = weekEventsText ? `\n\n${weekEventsText}` : '';
+        const text = hasShifts
+          ? `${greetingLine}\n\n${intro}\n\n` +
+            myNew.map(s => `• ${formatDisplayDate(s.date)} — ${s.role} (${s.shift_name}), ${formatTime(s.start_time)}–${formatTime(s.end_time)}, ${s.hours}h`).join('\n') +
+            `\n\nThat's ${totalHours}h across the week.${eventsBlock}\n\nIf anything here doesn't look right, just reply to this email or reach out to your manager — we'll get it fixed.\n\nThanks for rolling with the change,\n${companyName}`
+          : `${greetingLine}\n\n${intro}${eventsBlock}\n\nThanks,\n${companyName}`;
+
+        await sendEmail({
+          to: emp.contact_email,
+          subject: `${companyName} — Your Updated Schedule ${weekLabel}`,
+          text,
+          html,
+          company_id: companyId,
+        });
+        emailed++;
+        empEmailed = true;
+      } catch (err) {
+        errors.push({ employee_id: emp.id, reason: `email send failed: ${err instanceof Error ? err.message : String(err)}` });
+      }
+    }
+
+    if (emp.contact_phone && aegisSmsChannel) {
+      try {
+        const smsBody = emp.contact_email
+          ? `${companyName}: Your schedule for ${weekLabel} changed. Check your email for your updated shifts.`
+          : hasShifts
+            ? `${companyName} updated schedule ${weekLabel}: ${myNew.slice(0, 3).map(s => `${new Date(s.date + 'T12:00:00Z').toLocaleDateString('en-US', { weekday: 'short' })} ${s.shift_name}`).join(', ')}${myNew.length > 3 ? ` +${myNew.length - 3} more` : ''}`
+            : `${companyName}: Your shifts for ${weekLabel} changed — you're no longer scheduled this week.`;
+        const ok = await sendSms({ to: emp.contact_phone, from: aegisSmsChannel, body: smsBody, company_id: companyId });
+        if (ok) {
+          texted++;
+          empTexted = true;
+        } else {
+          errors.push({ employee_id: emp.id, reason: 'sms send returned false' });
+        }
+      } catch (err) {
+        errors.push({ employee_id: emp.id, reason: `sms send failed: ${err instanceof Error ? err.message : String(err)}` });
+      }
+    }
+
+    if (empEmailed || empTexted) {
+      notified++;
+      await logActivity({
+        company_id: companyId,
+        action: 'schedule_change_notified',
+        entity_type: 'employee',
+        entity_id: emp.id,
+        summary: `${emp.name} notified of changed shifts for ${weekLabel} (${[empEmailed ? 'email' : null, empTexted ? 'sms' : null].filter(Boolean).join('+')})`,
+        metadata: { schedule_id: newRow.id, superseded_schedule_id: oldRow.id },
+      });
+    }
+  }
+
+  // Mark the new schedule as sent so the re-distribution guard sees it.
+  await supabase.from('schedules').update({
+    status: 'published',
+    distributed_at: new Date().toISOString(),
+  }).eq('id', newRow.id);
+
+  await logActivity({
+    company_id: companyId,
+    action: 'schedule_republished',
+    entity_type: 'schedule',
+    entity_id: newRow.id,
+    summary: `Schedule for ${weekLabel} republished — ${notified} employee(s) with changed shifts notified (${emailed} email, ${texted} sms)${no_contact.length ? `; ${no_contact.length} had no contact info` : ''}`,
+    metadata: {
+      week: weekLabel,
+      superseded_schedule_id: oldRow.id,
+      changed_employees,
+      notified,
+      emailed,
+      texted,
+      no_contact,
+      errors: errors.length,
+    },
+  });
+
+  return {
+    notified,
+    emailed,
+    texted,
+    changed_employees,
+    no_contact,
+    errors,
+    week_label: weekLabel,
+  };
 }

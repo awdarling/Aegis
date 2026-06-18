@@ -30,26 +30,22 @@ export function veteranRuleLabel(rule: {
     : `≥${rule.min_count ?? 1} veterans`;
 }
 
-// Build the "shift NAME → veteran-rule label" map used to tag constrained
-// shifts. Mirrors the Homebase grid (schedule/page.tsx `shiftRuleLabels`):
-// only active rules scoped to a specific shift type, resolved to that shift's
-// name, first rule per shift wins. `shiftTypes` only needs id + name.
-export function buildShiftRuleLabels(
+// Day-accurate label for a specific shift on a specific date. Returns the label
+// of the FIRST active rule that actually applies on that date (honoring the
+// rule's day-of-week + season scope via ruleAppliesOnDate), or null if none do.
+// This keeps the emailed report honest: a Sat/Sun-only rule tags ONLY the
+// Saturday/Sunday rows, never the whole shift — matching the Homebase grid,
+// which shows day-scoped rules as an expandable note rather than a row badge.
+export function veteranLabelForShiftDate(
   rules: EngineExperienceRule[],
-  shiftTypes: { id: string; name: string }[]
-): Record<string, string> {
-  const nameByTypeId = new Map<string, string>();
-  for (const st of shiftTypes) nameByTypeId.set(st.id, st.name);
-
-  const labels: Record<string, string> = {};
+  shiftTypeId: string,
+  date: string
+): string | null {
   for (const r of rules) {
-    if (!r.active) continue;
-    if (!r.shift_type_id) continue;
-    const shiftName = nameByTypeId.get(r.shift_type_id);
-    if (!shiftName || labels[shiftName]) continue; // first rule per shift wins
-    labels[shiftName] = veteranRuleLabel(r);
+    if (!ruleAppliesOnDate(r, date, shiftTypeId)) continue;
+    return veteranRuleLabel(r);
   }
-  return labels;
+  return null;
 }
 
 // Does this rule apply to a shift of `shift_type_id` on `date` (YYYY-MM-DD)?

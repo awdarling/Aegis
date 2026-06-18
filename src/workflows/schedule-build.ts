@@ -32,7 +32,7 @@ import {
 import { rankCandidates } from '../lib/engine/ranker';
 import { resolveBannedPairConflict } from '../lib/engine/cascade';
 import { buildAttributeShortageReason, enforceAttributeMixForShift } from '../lib/engine/attribute-mix';
-import { veteranTargetsForGroup, buildShiftRuleLabels, type EngineExperienceRule } from '../lib/engine/experience-rules';
+import { veteranTargetsForGroup, veteranLabelForShiftDate, type EngineExperienceRule } from '../lib/engine/experience-rules';
 import { evaluateSexCoverage } from '../lib/engine/sex-coverage';
 import {
   classifyEmployeeForSlot,
@@ -1186,8 +1186,10 @@ export type BuildScheduleOutcome =
       employees: Employee[];
       companyName: string;
       specialNotes: Event[];
-      // Shift NAME → veteran-rule tag for the emailed report (grid parity).
-      shiftRuleLabels: Record<string, string>;
+      // Day-accurate veteran-rule label lookup for the emailed report: given a
+      // shift name + date, returns the tag ("Veterans only" / "≥N veterans") if
+      // a rule applies on THAT date, else null.
+      resolveShiftRuleLabel: (shiftName: string, date: string) => string | null;
     } & RunScheduleBuildResult)
   | { ok: false; reason: 'no_shift_types'; weekStart: string; weekEnd: string }
   | { ok: false; reason: 'save_failed'; weekStart: string; weekEnd: string; error: string };
@@ -1369,8 +1371,24 @@ export async function buildScheduleAndSave(
     employees: data.employees,
     companyName: data.companyName,
     specialNotes,
-    shiftRuleLabels: buildShiftRuleLabels(data.experienceRules ?? [], data.shiftTypes),
+    resolveShiftRuleLabel: makeShiftRuleLabelResolver(data.experienceRules ?? [], data.shiftTypes),
     ...runResult,
+  };
+}
+
+// Build the day-accurate label resolver the emailed report uses. Maps a shift
+// NAME (what the email rows carry) back to its shift_type_id, then defers to
+// veteranLabelForShiftDate so day-of-week + season scope are honored per date.
+function makeShiftRuleLabelResolver(
+  rules: EngineExperienceRule[],
+  shiftTypes: ShiftType[]
+): (shiftName: string, date: string) => string | null {
+  const typeIdByName = new Map<string, string>();
+  for (const st of shiftTypes) typeIdByName.set(st.name, st.id);
+  return (shiftName: string, date: string) => {
+    const typeId = typeIdByName.get(shiftName);
+    if (!typeId) return null;
+    return veteranLabelForShiftDate(rules, typeId, date);
   };
 }
 
@@ -1426,7 +1444,7 @@ export async function handleBuildSchedule(
   const {
     scheduleId, weekStart, weekEnd, assignments, gaps, flagged_issues,
     closed_dates, shift_override_mismatches, totalRequired, totalFilled,
-    wages, employees, companyName, specialNotes, shiftRuleLabels,
+    wages, employees, companyName, specialNotes, resolveShiftRuleLabel,
   } = outcome;
 
   if (message.channel === 'email') {
@@ -1454,7 +1472,7 @@ export async function handleBuildSchedule(
       manager_name: contact.name,
       wages,
       employee_max_hours: employeeMaxHours,
-      shiftRuleLabels,
+      resolveShiftRuleLabel,
     });
     await sendEmail({
       to: message.sender,

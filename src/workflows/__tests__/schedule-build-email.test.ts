@@ -18,8 +18,10 @@ import {
   renderScheduleResultBodyHtml,
   buildPlainText,
 } from '../schedule-build-email';
-import { buildShiftRuleLabels } from '../../lib/engine/experience-rules';
-import type { EngineExperienceRule } from '../../lib/engine/experience-rules';
+import {
+  veteranLabelForShiftDate,
+  type EngineExperienceRule,
+} from '../../lib/engine/experience-rules';
 import type {
   RunScheduleBuildResult,
   ScheduleGap,
@@ -29,14 +31,17 @@ import type { WageEstimate } from '../../lib/schedule-simulator';
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
 
-// Three shift types: Morning (all-veterans rule), Evening (≥2 rule),
-// Midday (no rule). The veteran tag must land on the first two and never the
-// third, matching the wording the Homebase grid shows.
-const SHIFT_TYPES = [
-  { id: 'st-morning', name: 'Morning' },
-  { id: 'st-evening', name: 'Evening' },
-  { id: 'st-midday', name: 'Midday' },
-];
+// In June 2026, the 15th is a Monday → 17th = Wednesday, 20th = Saturday,
+// 21st = Sunday. Used to prove day-of-week scoping.
+const WED = '2026-06-17';
+const SAT = '2026-06-20';
+const SUN = '2026-06-21';
+
+const TYPE_ID_BY_NAME: Record<string, string> = {
+  Morning: 'st-morning',
+  Evening: 'st-evening',
+  Midday: 'st-midday',
+};
 
 function rule(partial: Partial<EngineExperienceRule>): EngineExperienceRule {
   return {
@@ -52,14 +57,21 @@ function rule(partial: Partial<EngineExperienceRule>): EngineExperienceRule {
   };
 }
 
+// Morning = all-veterans every day; Evening = ≥2 veterans on weekends only.
 const RULES: EngineExperienceRule[] = [
   rule({ shift_type_id: 'st-morning', mode: 'all_veterans' }),
-  rule({ shift_type_id: 'st-evening', mode: 'min_veterans', min_count: 2 }),
+  rule({ shift_type_id: 'st-evening', mode: 'min_veterans', min_count: 2, days_of_week: [0, 6] }),
 ];
 
-function gap(shift_name: string): ScheduleGap {
+// Day-accurate resolver, exactly like the one schedule-build.ts hands the email.
+function resolve(shiftName: string, date: string): string | null {
+  const id = TYPE_ID_BY_NAME[shiftName];
+  return id ? veteranLabelForShiftDate(RULES, id, date) : null;
+}
+
+function gap(shift_name: string, date: string): ScheduleGap {
   return {
-    date: '2026-06-20', // a Saturday
+    date,
     shift_name,
     role: 'Lifeguard',
     required_count: 2,
@@ -70,11 +82,7 @@ function gap(shift_name: string): ScheduleGap {
   };
 }
 
-const WAGES: WageEstimate = {
-  total_estimated: 1000,
-  by_employee: [],
-  missing_wages: [],
-};
+const WAGES: WageEstimate = { total_estimated: 1000, by_employee: [], missing_wages: [] };
 
 const COV = {
   rate: 80,
@@ -88,7 +96,12 @@ const COV = {
 function makeResult(overrides: Partial<RunScheduleBuildResult> = {}): RunScheduleBuildResult {
   return {
     assignments: [],
-    gaps: [gap('Morning'), gap('Evening'), gap('Midday')],
+    gaps: [
+      gap('Morning', WED), // full-week rule → tagged even on a weekday
+      gap('Evening', SAT), // weekend rule → tagged on Saturday
+      gap('Evening', WED), // weekend rule → NOT tagged on a weekday
+      gap('Midday', SAT),  // no rule → never tagged
+    ],
     flagged_issues: [],
     closed_dates: [],
     shift_override_mismatches: [],
@@ -98,7 +111,10 @@ function makeResult(overrides: Partial<RunScheduleBuildResult> = {}): RunSchedul
   };
 }
 
-function renderHtml(result: RunScheduleBuildResult, labels: Record<string, string>): string {
+function renderHtml(
+  result: RunScheduleBuildResult,
+  r?: (s: string, d: string) => string | null
+): string {
   return renderScheduleResultBodyHtml({
     companyName: 'Watermark Country Club',
     managerName: 'Alexander',
@@ -109,11 +125,14 @@ function renderHtml(result: RunScheduleBuildResult, labels: Record<string, strin
     wages: WAGES,
     distributeUrl: 'https://homebase.test.local/x',
     homebaseUrl: 'https://homebase.test.local',
-    shiftRuleLabels: labels,
+    resolveShiftRuleLabel: r,
   });
 }
 
-function renderText(result: RunScheduleBuildResult, labels: Record<string, string>): string {
+function renderText(
+  result: RunScheduleBuildResult,
+  r?: (s: string, d: string) => string | null
+): string {
   return buildPlainText({
     companyName: 'Watermark Country Club',
     managerName: 'Alexander',
@@ -127,93 +146,76 @@ function renderText(result: RunScheduleBuildResult, labels: Record<string, strin
     mismatches: result.shift_override_mismatches,
     distributeUrl: 'https://homebase.test.local/x',
     homebaseUrl: 'https://homebase.test.local',
-    shiftRuleLabels: labels,
+    resolveShiftRuleLabel: r,
   });
 }
 
-// ── buildShiftRuleLabels ────────────────────────────────────────────────────────
+// ── veteranLabelForShiftDate ────────────────────────────────────────────────────
 
-describe('buildShiftRuleLabels', () => {
-  it('maps all-veterans → "Veterans only" and min-N → "≥N veterans", keyed by shift name', () => {
-    const labels = buildShiftRuleLabels(RULES, SHIFT_TYPES);
-    expect(labels).toEqual({
-      Morning: 'Veterans only',
-      Evening: '≥2 veterans',
-    });
+describe('veteranLabelForShiftDate', () => {
+  it('labels a full-week all-veterans rule on any date', () => {
+    expect(veteranLabelForShiftDate(RULES, 'st-morning', WED)).toBe('Veterans only');
+    expect(veteranLabelForShiftDate(RULES, 'st-morning', SAT)).toBe('Veterans only');
   });
 
-  it('defaults a min rule with no count to ≥1, and ignores inactive / type-less rules', () => {
-    const labels = buildShiftRuleLabels(
-      [
-        rule({ shift_type_id: 'st-morning', mode: 'min_veterans', min_count: null }),
-        rule({ shift_type_id: 'st-evening', mode: 'all_veterans', active: false }),
-        rule({ shift_type_id: null, mode: 'all_veterans' }),
-      ],
-      SHIFT_TYPES
-    );
-    expect(labels).toEqual({ Morning: '≥1 veterans' });
+  it('labels a weekend-scoped min rule only on its days', () => {
+    expect(veteranLabelForShiftDate(RULES, 'st-evening', SAT)).toBe('≥2 veterans');
+    expect(veteranLabelForShiftDate(RULES, 'st-evening', SUN)).toBe('≥2 veterans');
+    expect(veteranLabelForShiftDate(RULES, 'st-evening', WED)).toBeNull();
   });
 
-  it('first rule per shift wins', () => {
-    const labels = buildShiftRuleLabels(
-      [
-        rule({ shift_type_id: 'st-morning', mode: 'all_veterans' }),
-        rule({ shift_type_id: 'st-morning', mode: 'min_veterans', min_count: 3 }),
-      ],
-      SHIFT_TYPES
-    );
-    expect(labels).toEqual({ Morning: 'Veterans only' });
+  it('returns null for a shift with no rule', () => {
+    expect(veteranLabelForShiftDate(RULES, 'st-midday', SAT)).toBeNull();
+  });
+
+  it('honors a season window', () => {
+    const seasonal = [rule({ shift_type_id: 'st-morning', mode: 'all_veterans', season_start: '2026-07-01', season_end: '2026-08-31' })];
+    expect(veteranLabelForShiftDate(seasonal, 'st-morning', '2026-06-20')).toBeNull();
+    expect(veteranLabelForShiftDate(seasonal, 'st-morning', '2026-07-15')).toBe('Veterans only');
   });
 });
 
-// ── Tag rendering in the emailed report ─────────────────────────────────────────
+// ── Day-accurate tag rendering in the emailed report ────────────────────────────
 
-describe('veteran tag in the schedule-build email', () => {
-  it('HTML: tags the constrained gap rows (and only those) with the grid wording', () => {
-    const labels = buildShiftRuleLabels(RULES, SHIFT_TYPES);
-    const html = renderHtml(makeResult(), labels);
+describe('veteran tag in the schedule-build email (day-accurate)', () => {
+  it('HTML: tags full-week rules on any day and day-scoped rules only on their days', () => {
+    const html = renderHtml(makeResult(), resolve);
 
-    // The grid-matching labels appear...
-    expect(html).toContain('Veterans only');
-    expect(html).toContain('≥2 veterans');
-
-    // ...attached to the right shift rows. The Morning row carries the
-    // all-veterans tag right after its <strong> shift label.
+    // Morning's full-week rule tags the weekday row.
     expect(html).toMatch(/Morning Lifeguard<\/strong><span[^>]*>Veterans only<\/span>/);
-    expect(html).toMatch(/Evening Lifeguard<\/strong><span[^>]*>≥2 veterans<\/span>/);
-
-    // The unconstrained Midday row gets no tag.
-    expect(html).toMatch(/Midday Lifeguard<\/strong>\s*<span style="color:/);
+    // Evening's weekend rule tags the Saturday row...
+    expect(html).toMatch(/Sat Jun 20 — Evening Lifeguard<\/strong><span[^>]*>≥2 veterans<\/span>/);
+    // ...but NOT the Wednesday row (no tag span right after the </strong>).
+    expect(html).toMatch(/Wed Jun 17 — Evening Lifeguard<\/strong>\s*<span style="color:/);
+    expect(html).not.toMatch(/Wed Jun 17 — Evening Lifeguard<\/strong><span[^>]*>≥/);
+    // Midday has no rule at all.
     expect(html).not.toMatch(/Midday Lifeguard<\/strong><span[^>]*>(Veterans only|≥)/);
   });
 
-  it('plain text: tags the constrained gap rows (and only those)', () => {
-    const labels = buildShiftRuleLabels(RULES, SHIFT_TYPES);
-    const text = renderText(makeResult(), labels);
-
+  it('plain text: tags follow the same day-accurate rule', () => {
+    const text = renderText(makeResult(), resolve);
     expect(text).toContain('Morning Lifeguard · Veterans only (1/2)');
-    expect(text).toContain('Evening Lifeguard · ≥2 veterans (1/2)');
-    // Midday has no rule, so no tag between the role and the count.
+    expect(text).toContain('Sat Jun 20 — Evening Lifeguard · ≥2 veterans (1/2)');
+    expect(text).toContain('Wed Jun 17 — Evening Lifeguard (1/2)');
+    expect(text).not.toContain('Wed Jun 17 — Evening Lifeguard ·');
     expect(text).toContain('Midday Lifeguard (1/2)');
-    expect(text).not.toContain('Midday Lifeguard ·');
   });
 
-  it('tags a flagged-issue card for a constrained shift', () => {
+  it('tags a flagged-issue card on a constrained day', () => {
     const flagged: FlaggedIssue = {
       type: 'unsatisfied_attribute_mix',
-      date: '2026-06-20',
-      shift_name: 'Morning',
-      description: 'This shift is set to require all veterans, but only 1 of 2 position(s) could be filled by veterans.',
+      date: SAT,
+      shift_name: 'Evening',
+      description: 'This shift requires at least 2 veterans, but only 1 could be placed.',
       metadata: {},
     };
-    const labels = buildShiftRuleLabels(RULES, SHIFT_TYPES);
-    const html = renderHtml(makeResult({ gaps: [], flagged_issues: [flagged] }), labels);
-    expect(html).toMatch(/Morning<span[^>]*>Veterans only<\/span>/);
+    const html = renderHtml(makeResult({ gaps: [], flagged_issues: [flagged] }), resolve);
+    expect(html).toMatch(/Evening<span[^>]*>≥2 veterans<\/span>/);
   });
 
-  it('renders cleanly with no labels (back-compat — no tags anywhere)', () => {
-    const html = renderHtml(makeResult(), {});
-    const text = renderText(makeResult(), {});
+  it('renders cleanly with no resolver (back-compat — no tags anywhere)', () => {
+    const html = renderHtml(makeResult());
+    const text = renderText(makeResult());
     expect(html).not.toContain('Veterans only');
     expect(html).not.toContain('veterans</span>');
     expect(text).not.toContain(' · Veterans only');

@@ -59,6 +59,7 @@ import {
   getActiveBroadcastSession,
 } from '../workflows/broadcast';
 import { handleNotifyDayClosure } from '../workflows/day-closure';
+import { buildCapabilitiesReply, allowedActionsLine, type CapabilityRole } from './capabilities';
 
 // ── Permission sets ───────────────────────────────────────────────────────────
 
@@ -252,13 +253,15 @@ async function routeIntentInner(
     extracted: classification.extracted,
   });
 
-  // Authorization: employee attempting a manager-only action
+  // Authorization: employee attempting a manager-only action. Don't dead-end —
+  // kindly explain it's a manager call, then name what they CAN ask for (the
+  // same canonical list the "help" reply uses).
   if (contact.role === 'employee' && MANAGER_ONLY_INTENTS.has(classification.intent)) {
     await logSecurityUnauthorized(message, contact);
     await reply(
       contact,
       message,
-      "Ah, that one's a manager call — they can get it sorted for you. Happy to help with anything on your end, though: time off, your availability, your shifts, swaps, that kind of thing."
+      `Ah, that one's a manager call — they can get it sorted for you. Happy to help with anything on your end, though: ${allowedActionsLine('employee')}. Just say the word, or reply "help" and I'll lay out everything I can do for you.`
     );
     return;
   }
@@ -386,6 +389,15 @@ async function routeIntentInner(
       case 'quria_diagnostic':
         console.log('[router] dispatching to quria_diagnostic (stub)');
         await reply(contact, message, 'Quria diagnostic is not yet implemented.');
+        break;
+
+      case 'capabilities':
+        console.log('[router] dispatching to capabilities (role-aware help)');
+        await reply(
+          contact,
+          message,
+          buildCapabilitiesReply(contact.role as CapabilityRole, contact.name)
+        );
         break;
 
       case 'operational_query':

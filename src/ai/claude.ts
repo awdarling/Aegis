@@ -77,6 +77,7 @@ export const EMPLOYEE_INTENTS = [
   'respond_swap_decline',
   'operational_query',
   'general_question',
+  'capabilities',
 ] as const;
 
 export const MANAGER_INTENTS = [
@@ -276,6 +277,21 @@ User (manager): "recheck the time off for June 26"
 
 User (manager): "is that time off still ok to approve?"
 {"intent":"recheck_time_off","confidence":"medium","extracted":{}}
+
+## Asking what Aegis can do → capabilities
+
+When the message is asking what you can do, what they can ask you for, or how to
+use you — or is just "help" / "what can you do" / "what can I ask for" / "what
+can Aegis do for me" / "how does this work" — classify it as capabilities.
+
+User: "help"
+{"intent":"capabilities","confidence":"high","extracted":{}}
+
+User: "what can you do for me?"
+{"intent":"capabilities","confidence":"high","extracted":{}}
+
+User: "what can I ask you for?"
+{"intent":"capabilities","confidence":"high","extracted":{}}
 
 Respond with ONLY valid JSON in this exact shape — no markdown, no explanation:
 {

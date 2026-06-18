@@ -48,6 +48,9 @@ Alexander (Lightning MaKigga in some test inboxes) — owns and directs the proj
 - Reusable seed scripts live in `~/Desktop/Aegis/`: `SANDBOX_COVERAGE_SEED.sql`, `SANDBOX_INQUIRY_SEED.sql` (each test that ends in an accept consumes the seed data, so re-run before testing).
 
 ## Where things stand (done + live)
+- **Veteran feature UI (items 3 grid-half + 7)** — DONE & LIVE (HB PR #15). VET badge on the schedule grid + per-shift rule indicator + the Homebase rules-management UI (`ShiftVeteranRulesSection.tsx` on the Rules page). The **emailed-schedule veteran tag (item 3 email half) is still open** — it's quick-win #1 of the next chat.
+- **Publish button + republish/swap (items 9 + 12)** — DONE & LIVE + Alexander-tested (AG PR #38, HB PR #16; migration 016 applied via SQL editor). Publish flips `published_at` (timestamp is the source of truth, not the status enum — that clobber bug is closed). `publish_schedule_swap` atomically unpublishes the old schedule + publishes a new one for the same week, notifies **changed-only** employees, and supersedes the old wage/hours estimates. Old schedule is **archived** (superseded), not deleted.
+- **MANAGER-COMM-1 (item 14)** — DONE & LIVE (AG PR #39). Manager headcount/coverage questions now answer deterministically from `schedule.data.assignments` in plain English — no more truncated-JSON hedging or leaked internals.
 - **Every Aegis email workflow** is built + verified live: time off, availability (permanent, named-period, temporary/date-limited, **rotating**), emergency coverage (parallel blast + manager-gated next batch + writes the accepted shift onto the schedule), shift swaps, manager edits, and operational inquiries. All AI-output JSON parsing was hardened behind one tolerant parser (`src/utils/coerce-json.ts` — use it for any LLM JSON).
 - **Veteran / experience shift rules** — DONE. A manager can say (to Soteria **or** Aegis email/text) "Saturday night lifeguards should be all veterans this summer" or "at least 2 veterans on the morning shift." Stored in `shift_experience_rules` (migration 015); the engine enforces all-veterans / min-N, day-of-week + season scoped (`src/lib/engine/experience-rules.ts` + the post-fill pass in `schedule-build.ts`); Soteria + Aegis (`operational-query.ts` → `handleExperienceRuleEdit` / `handleExperienceRuleConfirm`) both write it. Phase 2 (a custom-time event shift that *replaces* the normal one) is still open.
 - **Quria-branded handout PDFs** (employee + manager) — DONE, built via `outputs_build_handouts.py` (weasyprint).
@@ -61,14 +64,17 @@ Aegis should read like a **smart, warm, understanding assistant-manager — not 
 ## Brand
 Black / brushed-silver / **orange `#f97316`** (with subtle orange glow). Logo: `homebase/public/QuriaSolutionsBlack.jpg` (an orchid mark). The Homebase app theme is in `homebase/src/app/globals.css`.
 
-## Immediate next work (from DEV_ROADMAP "NEXT BATCH"; voice + branding now DONE)
-1. **Veteran VET badge** — a small brand-orange "VET" badge beside veteran employees (`employees.is_veteran`) on the Homebase schedule grid AND in the build/distribute report. (Decided: orange badge. Grid data already loads is_veteran; thread it into `ScheduleRenderer` → the card.)
-2. **Homebase per-shift veteran-rules page** — view/create/edit/delete `shift_experience_rules` (the existing Rules page covers general policies only; the per-shift veteran rules Soteria/Aegis already write aren't surfaced there yet). Verify migration-015 RLS allows manager writes or add a server route.
-3. **Soteria schedule-build trigger** — let Soteria kick off a build conversationally (wire to the Aegis build endpoint).
-4. **Publish button** — a Homebase button that distributes + flips the schedule to a `published` status; published current-week schedule becomes the live source of truth for closed-day texts / swap shift-adjusts / coverage edits (affected-only notify). Reconcile the `distributed`/`published` status clobber.
-5. **Veteran rules Phase 2** — the custom-time event shift that replaces the normal one.
-6. **SMS migration** — port the proven email workflows to text. Needs Alexander's SMS-provider research.
-7. A friendly **privilege-denied / help** message listing what the sender's role can do.
-8. **General Homebase UI overhaul** — parked at the end of DEV_ROADMAP.
+## Immediate next work — QUEUED for the next chat (Alexander-chosen 2026-06-18; build in this order)
+**Full brief + ready-to-paste prompt: `~/Desktop/Aegis/NEXT_CHAT_BRIEF.md`. Build each on its own branch off `main`; the two quick wins ship independently; do #3 last.**
+1. **Veteran tag in the emailed schedule (item 3, email half).** Quick win. The grid badge is done; surface the same "Veterans only / ≥N" tag inside the build/distribute (publish) email report. Aegis-only, isolated. Reads `shift_experience_rules`.
+2. **Plain-English rules explainers (item 13).** Quick win. Rewrite the Homebase Rules-page info/explainer text in dead-simple, no-jargon language (no "min-N," "scope," "attribute mix," "concurrent coverage"). Homebase copy, low-risk.
+3. **Capabilities/help + role-aware scope guard (item 4).** Aegis (+ Soteria mirror). "What can you do for me?" → a clear role-aware list; an out-of-scope request gets a kind redirect to what they CAN ask for, never a dead-end. Largest of the three; foundation for item 19 (dynamic business partner).
 
-Start by reading the three files above, then ask Alexander which of the next-batch items to pick up. The veteran badge (#1) is the most self-contained and is fully decided — a good first pick-up.
+### Backlog after the queue (see DEV_ROADMAP for full detail)
+- **Item 18 — Shift-swap testing + investigation.** The swap workflow is fully BUILT (`shift-swap.ts`, directed + facilitated) but has ZERO tests and isn't live-verified.
+- **Item 19 — Dynamic business partner.** Aegis + Soteria proactively explain themselves + guide users at conversation start (builds on item 4).
+- **Item 8 — Soteria schedule-build trigger** (conversational build, the first concrete piece of item 16 parity).
+- **Item 6 — Veteran rules Phase 2** (custom-time event shift that replaces the normal one).
+- **Item 15 — Consistent assets/styling** across Homebase. **Item 17 — Access-management page** correctness pass (do live with Alexander). **SMS migration** (needs Alexander's provider research). **Item 11 — Homebase UI overhaul** (parked last).
+
+Start by reading the three files above + `NEXT_CHAT_BRIEF.md`, then build the queue top-down. The two quick wins are fully decided — start with the veteran email tag.

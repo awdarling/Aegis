@@ -27,6 +27,15 @@ Per-action status of the 8 `ActionType`s in `src/lib/aegis-actions/types.ts`. Dr
 
 ---
 
+## 2026-06-18 (late) — queue + refinements SHIPPED (all merged to `main`, live)
+
+- **Veteran tag in the emailed schedule (item 3, email half) — day-accurate.** The build/publish report email tags constrained shift rows with the grid wording ("Veterans only" / "≥N veterans"), honoring day-of-week + season scope so a Sat/Sun-only rule tags only those rows. `veteranLabelForShiftDate` (engine) + a `resolveShiftRuleLabel` resolver passed into `schedule-build-email.ts`. Merged AG PR #41 → **#42 (day-accurate)**. Test: `schedule-build-email.test.ts` (8 cases).
+- **Capabilities / help + role-aware scope guard (item 4).** New `capabilities` intent (natural-language only — NOT the bare "help" keyword, see A2P note) returns a role-aware list; the employee→manager-only redirect now names what the employee CAN do instead of dead-ending. One source-of-truth list: `src/router/capabilities.ts` (Aegis) + `src/lib/soteria/capabilities.ts` (Homebase/Soteria). Merged AG PR #43, HB PR #19. Test: `capabilities.test.ts`.
+- **A2P DECISION (Alexander):** the literal **HELP** / **STOP** keywords are reserved for SMS-compliance and are NOT routed to capabilities (left as `unknown` for now). The real A2P HELP/STOP responder is deferred to the SMS phase (handle via Twilio Messaging Service Advanced Opt-Out). Merged AG PR #44, HB PR #20.
+- **Homebase (web) shipped alongside:** plain-English Rules-page copy (item 13, HB PR #18); VET badge unified to orange everywhere + scope-aware day-scoped rule notes on the schedule (item 15 piece, HB PR #17).
+
+---
+
 ## 2026-06-18 — SHIPPED since the 06-16/06-17 batch (all merged to `main`, live)
 
 - **Publish button + republish/swap (DEV_ROADMAP items 9 + 12) — SHIPPED & live (AG PR #38, HB PR #16; migration 016 applied via SQL editor; Alexander-tested).** `confirm_distribution`'s magic-link path is retired as planned. Distribute is now the Homebase **Publish** button: it flips **`published_at`** (the single source of truth — the old `distributed`/`published` status-clobber bug is closed) and distributes to staff. `publish_schedule_swap(p_new_id, p_old_id)` (SECURITY DEFINER) atomically unpublishes the old schedule + publishes a new one for the same week, **archives** the old (superseded, not deleted), supersedes its wage/hours estimates, and notifies **changed-only** employees (diff via `src/lib/schedule-diff.ts`).

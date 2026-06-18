@@ -1,7 +1,7 @@
 import express, { Router, type Request, type Response } from 'express';
 import { requireInternalAuth } from '../security/internal-auth';
 import { sendDecisionNotification, recomputeTimeOffRecommendation, recheckAndReplyToManager } from '../workflows/time-off';
-import { distributeScheduleCore } from '../workflows/schedule-build';
+import { distributeScheduleCore, buildScheduleAndSave, notifyScheduleChangesCore } from '../workflows/schedule-build';
 import {
   applyAvailabilityDecision,
   applyCustomAvailabilityDecision,
@@ -282,6 +282,112 @@ internalRouter.post('/apply-custom-availability-decision', async (req: Request, 
 });
 
 // POST /internal/distribute-schedule
+// POST /internal/build-schedule
+// Homebase "Build" button (item 9). Builds + saves a fresh draft schedule for a
+// company + target week, reusing the same engine core as the email handler.
+// Body: { company_id: string, target_week?: 'this' | 'next', veteran_preference?: string }
+internalRouter.post('/build-schedule', async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const companyId = body.company_id;
+  if (typeof companyId !== 'string' || companyId.length === 0) {
+    badRequest(res, 'company_id is required');
+    return;
+  }
+
+  // Only forward the fields the build core understands.
+  const extracted: Record<string, unknown> = {};
+  if (body.target_week === 'this' || body.target_week === 'next') {
+    extracted['target_week'] = body.target_week;
+  }
+  if (typeof body.veteran_preference === 'string') {
+    extracted['veteran_preference'] = body.veteran_preference;
+  }
+  if (Array.isArray(body.veteran_only_dates)) {
+    extracted['veteran_only_dates'] = body.veteran_only_dates;
+  }
+
+  try {
+    const outcome = await buildScheduleAndSave(companyId, extracted);
+    if (!outcome.ok) {
+      // no_shift_types → 422 (caller misconfigured); save_failed → 500.
+      const status = outcome.reason === 'no_shift_types' ? 422 : 500;
+      res.status(status).json({
+        ok: false,
+        reason: outcome.reason,
+        week_start: outcome.weekStart,
+        week_end: outcome.weekEnd,
+        error: outcome.reason === 'save_failed' ? outcome.error : undefined,
+      });
+      return;
+    }
+    res.json({
+      ok: true,
+      schedule_id: outcome.scheduleId,
+      week_start: outcome.weekStart,
+      week_end: outcome.weekEnd,
+      total_filled: outcome.totalFilled,
+      total_required: outcome.totalRequired,
+      gaps: outcome.gaps.length,
+      flagged_issues: outcome.flagged_issues.length,
+      estimated_wages: outcome.wages.total_estimated,
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[internal] build-schedule failed:', msg);
+    serverError(res, msg);
+  }
+});
+
+// POST /internal/notify-schedule-changes
+// Republish notify (item 12). Emails/texts ONLY the employees whose shifts
+// changed between the previously-published schedule and the newly-published one.
+// The atomic publish swap (Homebase route) must have already run; this only
+// sends the change notifications + sets distributed_at on the new row.
+// Body: { new_schedule_id: string, previous_schedule_id: string }
+internalRouter.post('/notify-schedule-changes', async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const newScheduleId = body.new_schedule_id;
+  const oldScheduleId = body.previous_schedule_id;
+  if (typeof newScheduleId !== 'string' || newScheduleId.length === 0) {
+    badRequest(res, 'new_schedule_id is required');
+    return;
+  }
+  if (typeof oldScheduleId !== 'string' || oldScheduleId.length === 0) {
+    badRequest(res, 'previous_schedule_id is required');
+    return;
+  }
+
+  try {
+    // Resolve company_id from the new schedule row.
+    const { data: schedRow, error: schedErr } = await supabase
+      .from('schedules')
+      .select('company_id')
+      .eq('id', newScheduleId)
+      .single();
+    if (schedErr || !schedRow) {
+      serverError(res, `schedule ${newScheduleId} not found: ${schedErr?.message ?? 'no row'}`);
+      return;
+    }
+    const companyId = (schedRow as { company_id: string }).company_id;
+
+    const result = await notifyScheduleChangesCore(newScheduleId, oldScheduleId, companyId);
+    res.json({
+      ok: true,
+      notified: result.notified,
+      emailed: result.emailed,
+      texted: result.texted,
+      changed_employees: result.changed_employees,
+      no_contact: result.no_contact,
+      errors: result.errors,
+      week_label: result.week_label,
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[internal] notify-schedule-changes failed:', msg);
+    serverError(res, msg);
+  }
+});
+
 internalRouter.post('/distribute-schedule', async (req: Request, res: Response) => {
   const body = (req.body ?? {}) as Record<string, unknown>;
   const scheduleId = body.schedule_id;

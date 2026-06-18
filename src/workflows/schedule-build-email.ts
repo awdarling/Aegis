@@ -36,6 +36,11 @@ export interface BuildScheduleResultEmailParams {
   // for the "Top staff hours" table. When missing, hours are still shown but
   // % of max is rendered as "—".
   employee_max_hours?: Map<string, { name: string; max_weekly_hours: number }>;
+  // Shift NAME → short veteran-rule label (e.g. "Veterans only", "≥2 veterans").
+  // Mirrors the Homebase schedule grid's `shiftRuleLabels` so the emailed report
+  // tags the same constrained shifts the manager sees in the web app. Built in
+  // schedule-build.ts from the active `shift_experience_rules`.
+  shiftRuleLabels?: Record<string, string>;
 }
 
 export interface BuildScheduleResultEmail {
@@ -97,6 +102,21 @@ function escapeHtml(s: string): string {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
+}
+
+// ── Veteran shift-rule tag ────────────────────────────────────────────────────
+
+// Small brand-orange pill appended to a shift row when that shift carries a
+// veteran/experience rule — visually mirrors the `ShiftRuleTag` on the Homebase
+// schedule grid (accent-dim fill, accent border, accent text). `label` is the
+// same wording the grid shows, e.g. "Veterans only" or "≥2 veterans".
+function shiftRuleTagHtml(label: string): string {
+  return `<span style="display:inline-block;margin-left:6px;padding:1px 6px;background:${BRAND.accentDim};border:1px solid ${BRAND.accentBorder};border-radius:9999px;color:${BRAND.accent};font-size:10px;font-weight:700;letter-spacing:0.04em;white-space:nowrap;">${escapeHtml(label)}</span>`;
+}
+
+// Plain-text mirror of the tag, e.g. " · Veterans only".
+function shiftRuleTagText(label: string): string {
+  return ` · ${label}`;
 }
 
 // ── Disposition humanisation ──────────────────────────────────────────────────
@@ -164,7 +184,11 @@ function headerSectionHtml(companyName: string, weekRange: string, cov: Coverage
 </table>`;
 }
 
-function coverageSectionHtml(cov: CoverageInfo, gaps: ScheduleGap[]): string {
+function coverageSectionHtml(
+  cov: CoverageInfo,
+  gaps: ScheduleGap[],
+  shiftRuleLabels?: Record<string, string>
+): string {
   const headline = `<div style="font-size:15px;color:${BRAND.textPrimary};margin-bottom:8px;"><strong>${cov.filled}</strong> of <strong>${cov.required}</strong> slots filled (${cov.rate}%)</div>`;
   if (gaps.length === 0) {
     return `
@@ -179,9 +203,11 @@ function coverageSectionHtml(cov: CoverageInfo, gaps: ScheduleGap[]): string {
     const dispList = g.per_employee_dispositions.length > 0
       ? `<ul style="margin:6px 0 0;padding-left:18px;color:${BRAND.textSecondary};font-size:13px;">${g.per_employee_dispositions.map(d => `<li style="margin:0 0 2px;">${escapeHtml(d.name)} — ${escapeHtml(dispositionLabel(d.reason))}</li>`).join('')}</ul>`
       : '';
+    const ruleLabel = shiftRuleLabels?.[g.shift_name];
+    const ruleTag = ruleLabel ? shiftRuleTagHtml(ruleLabel) : '';
     return `
     <li style="margin:0 0 10px;font-size:14px;color:${BRAND.textPrimary};line-height:1.5;">
-      <strong>${escapeHtml(dateLabel)} — ${escapeHtml(g.shift_name)} ${escapeHtml(g.role)}</strong>
+      <strong>${escapeHtml(dateLabel)} — ${escapeHtml(g.shift_name)} ${escapeHtml(g.role)}</strong>${ruleTag}
       <span style="color:${BRAND.textSecondary};"> (${g.filled_count}/${g.required_count})</span>:
       ${escapeHtml(shortReason)}
       ${dispList}
@@ -219,7 +245,10 @@ function flaggedIssueSubLabel(issue: FlaggedIssue): string {
   return issue.shift_name;
 }
 
-function flaggedIssuesSectionHtml(issues: FlaggedIssue[]): string {
+function flaggedIssuesSectionHtml(
+  issues: FlaggedIssue[],
+  shiftRuleLabels?: Record<string, string>
+): string {
   if (issues.length === 0) return '';
   const cards = issues.map(issue => {
     const meta = (issue.metadata ?? {}) as Record<string, unknown>;
@@ -228,9 +257,12 @@ function flaggedIssuesSectionHtml(issues: FlaggedIssue[]): string {
       ? `<ul style="margin:8px 0 0;padding-left:18px;color:${BRAND.textSecondary};font-size:13px;">${dispositions.map(d => `<li style="margin:0 0 2px;">${escapeHtml(d.name)} — ${escapeHtml(dispositionLabel(d.reason))}</li>`).join('')}</ul>`
       : '';
     const dateLabel = `${formatWeekdayShort(issue.date)} ${formatShortDate(issue.date)}`;
+    const shiftName = 'shift_name' in issue ? issue.shift_name : undefined;
+    const ruleLabel = shiftName ? shiftRuleLabels?.[shiftName] : undefined;
+    const ruleTag = ruleLabel ? shiftRuleTagHtml(ruleLabel) : '';
     return `
 <div style="margin:0 0 12px;padding:14px 16px;background:${BRAND.warnBg};border:1px solid ${BRAND.warnBorder};border-left:4px solid ${BRAND.warnRule};border-radius:6px;">
-  <div style="font-size:14px;font-weight:600;color:${BRAND.warnText};margin-bottom:4px;">${escapeHtml(dateLabel)} — ${escapeHtml(flaggedIssueSubLabel(issue))}</div>
+  <div style="font-size:14px;font-weight:600;color:${BRAND.warnText};margin-bottom:4px;">${escapeHtml(dateLabel)} — ${escapeHtml(flaggedIssueSubLabel(issue))}${ruleTag}</div>
   <div style="font-size:13px;color:${BRAND.textPrimary};line-height:1.5;">${escapeHtml(issue.description)}</div>
   ${dispList}
 </div>`;
@@ -394,6 +426,7 @@ export function renderScheduleResultBodyHtml(args: {
   wages: WageEstimate;
   distributeUrl: string;
   homebaseUrl: string;
+  shiftRuleLabels?: Record<string, string>;
 }): string {
   const gapNote = args.cov.rate >= 100
     ? `Everyone's covered for the week`
@@ -403,9 +436,9 @@ export function renderScheduleResultBodyHtml(args: {
 <p style="margin:0;font-size:16px;color:${BRAND.textPrimary};line-height:1.65;">I've built the schedule for the week of ${escapeHtml(args.weekRange)}. ${gapNote} — the full breakdown is in the card below. When it looks good to you, hit <strong>Distribute Schedule</strong> and I'll send each person their shifts; there's nothing else you'll need to do.</p>`;
 
   const cardInner = `${headerSectionHtml(args.companyName, args.weekRange, args.cov)}
-${coverageSectionHtml(args.cov, args.result.gaps)}
+${coverageSectionHtml(args.cov, args.result.gaps, args.shiftRuleLabels)}
 ${closedDatesSectionHtml(args.result.closed_dates)}
-${flaggedIssuesSectionHtml(args.result.flagged_issues)}
+${flaggedIssuesSectionHtml(args.result.flagged_issues, args.shiftRuleLabels)}
 ${topHoursSectionHtml(args.hoursRows)}
 ${wagesSectionHtml(args.wages)}
 ${overrideMismatchesSectionHtml(args.result.shift_override_mismatches)}
@@ -419,7 +452,7 @@ ${card}`;
 
 // ── Plain-text builder ────────────────────────────────────────────────────────
 
-function buildPlainText(params: {
+export function buildPlainText(params: {
   companyName: string;
   managerName?: string;
   weekRange: string;
@@ -432,6 +465,7 @@ function buildPlainText(params: {
   mismatches: ShiftOverrideMismatch[];
   distributeUrl: string;
   homebaseUrl: string;
+  shiftRuleLabels?: Record<string, string>;
 }): string {
   const lines: string[] = [];
 
@@ -455,7 +489,9 @@ function buildPlainText(params: {
     for (const g of params.gaps) {
       const dateLabel = `${formatWeekdayShort(g.date)} ${formatShortDate(g.date)}`;
       const shortReason = (g.reason ?? '').split('.')[0] || 'no eligible candidates';
-      lines.push(`- ${dateLabel} — ${g.shift_name} ${g.role} (${g.filled_count}/${g.required_count}): ${shortReason}`);
+      const ruleLabel = params.shiftRuleLabels?.[g.shift_name];
+      const ruleTag = ruleLabel ? shiftRuleTagText(ruleLabel) : '';
+      lines.push(`- ${dateLabel} — ${g.shift_name} ${g.role}${ruleTag} (${g.filled_count}/${g.required_count}): ${shortReason}`);
       for (const d of g.per_employee_dispositions) {
         lines.push(`    · ${d.name} — ${dispositionLabel(d.reason)}`);
       }
@@ -475,7 +511,10 @@ function buildPlainText(params: {
     lines.push('FLAGGED ISSUES');
     for (const issue of params.issues) {
       const dateLabel = `${formatWeekdayShort(issue.date)} ${formatShortDate(issue.date)}`;
-      lines.push(`- ${dateLabel} — ${flaggedIssueSubLabel(issue)}: ${issue.description}`);
+      const shiftName = 'shift_name' in issue ? issue.shift_name : undefined;
+      const ruleLabel = shiftName ? params.shiftRuleLabels?.[shiftName] : undefined;
+      const ruleTag = ruleLabel ? shiftRuleTagText(ruleLabel) : '';
+      lines.push(`- ${dateLabel} — ${flaggedIssueSubLabel(issue)}${ruleTag}: ${issue.description}`);
       const meta = (issue.metadata ?? {}) as Record<string, unknown>;
       const dispositions = (meta.per_employee_dispositions as EmployeeDisposition[] | undefined) ?? [];
       for (const d of dispositions) {
@@ -560,6 +599,7 @@ export async function buildScheduleResultEmail(
     wages: params.wages,
     distributeUrl: tokenResult.url,
     homebaseUrl,
+    shiftRuleLabels: params.shiftRuleLabels,
   });
 
   const html = brandedEmailShell({
@@ -581,6 +621,7 @@ export async function buildScheduleResultEmail(
     mismatches: params.result.shift_override_mismatches,
     distributeUrl: tokenResult.url,
     homebaseUrl,
+    shiftRuleLabels: params.shiftRuleLabels,
   });
 
   return { subject, html, text };

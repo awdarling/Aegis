@@ -14,20 +14,23 @@ This is the operational source of truth for active development. It is meant to b
 >
 > **Long-term robust fix (roadmap):** make recommendations never-stale automatically — recompute on **view** of a pending request and/or **re-check at approval time** (warn/block if approving now would breach coverage given everything currently approved). The rerun button is the manual first step toward this. Decide button-only vs auto-recompute when picked up.
 
-> ## ▶ STATE & NEXT UP (set 2026-06-18 — read this first)
+> ## ▶ STATE & NEXT UP (set 2026-06-18, late — read this first)
 >
-> **Everything from the last sessions is merged to `main` and live in both repos.** No open feature branches; the work below is shipped:
-> - ✅ **Veteran feature (items 3 + 7)** — `is_veteran` VET badge on the schedule grid + per-shift rule indicator + Homebase rules-management UI (`ShiftVeteranRulesSection.tsx`). Merged (HB PR #15). LIVE.
-> - ✅ **Publish button + republish/swap (items 9 + 12)** — Publish flips `published_at`; atomic `publish_schedule_swap` (migration 016, applied via SQL editor) unpublishes old + publishes new, notifies changed-only employees, supersedes old wage/hours. Merged (AG PR #38, HB PR #16). LIVE + Alexander-tested.
-> - ✅ **MANAGER-COMM-1 (item 14)** — deterministic plain-English headcount/coverage answers; no more truncated-JSON hedging or leaked internals. Merged (AG PR #39). LIVE.
-> - ✅ **TO-RERUN-1 + recheck fast-response + branded email/voice pass + inbound-signature fix** — all merged + live-verified earlier.
+> **The full 2026-06-18 queue (items 3-email, 13, 4) plus two Alexander-added refinements are merged to `main` and live in both repos.** Shipped this session:
+> - ✅ **Veteran tag in the emailed schedule (item 3, email half) — day-accurate.** The build/publish report email now tags constrained shift rows with the same wording as the web grid ("Veterans only" / "≥N veterans"), but **only on the days a rule actually applies** (a Sat/Sun-only rule tags only Sat/Sun rows, never the whole shift). Engine helper `veteranLabelForShiftDate` + `resolveShiftRuleLabel` resolver. Merged AG PR #41 (initial) → **PR #42 (day-accurate)**. LIVE. Tests: `schedule-build-email.test.ts`.
+> - ✅ **Plain-English Rules-page explainers (item 13).** Every Rules-page label/tooltip/explainer rewritten jargon-free + example-led ("Attribute Mix" → "Required Staff Mix", "Banned Pair Conflict Resolution" → "When Two People Shouldn't Work Together", etc.). Copy-only, no logic change. Merged HB PR #18. LIVE.
+> - ✅ **Capabilities / help + role-aware scope guard (item 4).** "What can you do for me?" → role-aware list (employee vs manager vs owner); out-of-scope asks get a kind redirect naming what they CAN do, never a dead-end. ONE source-of-truth list per repo (`Aegis/src/router/capabilities.ts`, `Homebase/src/lib/soteria/capabilities.ts`) drives the help reply + the redirect in both Aegis and Soteria. Merged AG PR #43, HB PR #19. LIVE. Tests: `capabilities.test.ts`.
+> - ✅ **VET badge unified to brand orange everywhere (item 15 piece).** One shared `VetBadge` component (`Homebase/src/components/common/VetBadge.tsx`) used by the schedule grid AND the employees/data tab (data tab + add/edit toggle were red — now orange). Merged HB PR #17. LIVE.
+> - ✅ **Scope-aware veteran-rule display on the schedule.** Whole-week rules still show the always-on orange row badge; **day-scoped rules now show an expandable "Rules ▾" marker** with a plain-English note ("Veterans only on Saturdays & Sundays") instead of a misleading whole-row badge. Merged HB PR #17. LIVE.
+> - ✅ **A2P DECISION (Alexander, 2026-06-18) — HELP/STOP reserved.** The capabilities answer is triggered by **natural language only** ("what can you do", "what can I ask for"). A bare **"help"** / **"stop"** is deliberately NOT routed to capabilities — those are reserved SMS-compliance keywords. The actual A2P HELP/STOP compliance responder is **deferred to the SMS phase** (standard approach: handle via Twilio Messaging Service Advanced Opt-Out at the carrier level so the keywords never reach Aegis). Merged AG PR #44, HB PR #20. LIVE.
 >
-> **NEXT UP — queued for the next cowork chat (build in this order). Full brief + ready-to-paste prompt: `NEXT_CHAT_BRIEF.md`.**
-> 1. **Veteran tag in the emailed schedule (item 3, email half).** Quick win. The Homebase grid badge half of item 3 is DONE; the **build/distribute email report tag is NOT** — surface the same "Veterans only / ≥N" tag inside the distribute/publish email. Aegis-only, isolated. Reads `shift_experience_rules`.
-> 2. **Item 13 — Plain-English rules explainers.** Quick win. Rewrite the Homebase Rules-page info/explainer text in dead-simple, no-jargon language (no "min-N," "scope," "attribute mix," "concurrent coverage"). Homebase copy, low-risk.
-> 3. **Item 4 — Capabilities/help + role-aware scope guard.** Aegis (+ Soteria mirror). "What can you do for me?" → role-aware list; out-of-scope request → kind redirect, not a dead-end. Foundation for item 19 (dynamic business partner).
+> **NEXT UP — the post-queue backlog (no committed order yet; item 18 is the cleanest next pickup).**
+> 1. **Item 18 — Shift-swap testing + investigation (Aegis).** `shift-swap.ts` (directed + facilitated modes) is fully BUILT but has ZERO automated tests and is not live-verified. Investigate, run a sandbox end-to-end round-trip, add tests for both modes, fix what's broken. Self-contained, green-able — best next pickup.
+> 2. **Item 19 — Dynamic business partner.** Build on item 4: proactively explain capabilities + guide the user at conversation start, role-aware. The item-4 capability lists were structured for exactly this.
+> 3. **Item 8 — Soteria schedule-build trigger.** Let Soteria kick off a schedule build conversationally (wire to the existing Aegis build endpoint), not only via email. First concrete piece of item 16 (Aegis/Soteria parity).
+> 4. **Item 6 — Veteran rules Phase 2** (custom-time event shift that replaces the normal shift). **Item 17 — Access-management page** correctness pass (do live with Alexander). **Item 11 — Homebase UI overhaul** (parked last). **SMS migration** (needs Alexander's provider research; folds in the A2P HELP/STOP responder above).
 >
-> Build each on its own branch off `main`; quick wins (1, 13) can ship independently; do item 4 last since it's the largest of the three. Then update this banner + the trackers per the LOGGING PROTOCOL.
+> Build each on its own branch off `main`; keep `tsc` + `vitest` green; hand Alexander the git steps (sandbox can't push). The comprehensive reference-doc rewrite (`docs/01–06`) remains the deferred big job — living docs (this file + the trackers) are kept current in the meantime.
 >
 > ---
 >

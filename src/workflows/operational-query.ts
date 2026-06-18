@@ -246,6 +246,132 @@ async function executeFetchPlan(
   return results;
 }
 
+// ── Answer-context summarization (MANAGER-COMM-1) ───────────────────────────────
+// Manager headcount/coverage answers were going wrong because the raw fetched
+// rows were dumped as JSON and hard-truncated at 4000 chars — which chopped the
+// schedule's assignments list mid-record, so the model couldn't see who was on
+// duty, hedged, and leaked the mechanics ("the schedule data is truncated", "pull
+// the full slice from Homebase"). Instead we turn the schedule into clean, human
+// staffing facts (per-date headcount + names by role) and never chop a record.
+
+interface AssignmentLite {
+  date: string;
+  employee_id: string;
+  employee_name: string;
+  shift_name: string;
+  role: string;
+  start_time: string;
+  end_time: string;
+}
+
+const WEEKDAY = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+function prettyDate(date: string): string {
+  const d = new Date(date + 'T12:00:00Z');
+  if (Number.isNaN(d.getTime())) return date;
+  return `${WEEKDAY[d.getUTCDay()]} ${d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' })}`;
+}
+
+// Pull every assignment out of the fetched schedule rows (schedules.data.assignments).
+export function collectAssignments(scheduleRows: unknown[]): AssignmentLite[] {
+  const out: AssignmentLite[] = [];
+  for (const row of scheduleRows) {
+    const data = (row as { data?: { assignments?: unknown[] } }).data;
+    const list = Array.isArray(data?.assignments) ? (data!.assignments as unknown[]) : [];
+    for (const a of list) {
+      const x = a as Partial<AssignmentLite>;
+      if (!x.date || !x.employee_name) continue;
+      out.push({
+        date: String(x.date),
+        employee_id: String(x.employee_id ?? ''),
+        employee_name: String(x.employee_name),
+        shift_name: String(x.shift_name ?? ''),
+        role: String(x.role ?? ''),
+        start_time: String(x.start_time ?? ''),
+        end_time: String(x.end_time ?? ''),
+      });
+    }
+  }
+  return out;
+}
+
+// Per-date staffing summary: distinct headcount + a role → names breakdown.
+// This is the deterministic factual answer to "how many people did I have on
+// staff that day" and "who was working" — the model just reads it back.
+export function summarizeStaffingByDate(assignments: AssignmentLite[]): string {
+  if (assignments.length === 0) return '';
+  const byDate = new Map<string, AssignmentLite[]>();
+  for (const a of assignments) {
+    const list = byDate.get(a.date) ?? [];
+    list.push(a);
+    byDate.set(a.date, list);
+  }
+  const lines: string[] = [];
+  for (const date of [...byDate.keys()].sort()) {
+    const dayAssigns = byDate.get(date)!;
+    // Distinct PEOPLE (one person on two shifts the same day counts once).
+    const distinct = new Set(dayAssigns.map(a => a.employee_id || a.employee_name));
+    const byRole = new Map<string, Set<string>>();
+    for (const a of dayAssigns) {
+      const set = byRole.get(a.role) ?? new Set<string>();
+      set.add(a.employee_name);
+      byRole.set(a.role, set);
+    }
+    const roleParts = [...byRole.entries()]
+      .sort((x, y) => x[0].localeCompare(y[0]))
+      .map(([role, names]) => `${role || 'Staff'} (${names.size}): ${[...names].sort().join(', ')}`);
+    lines.push(`${prettyDate(date)}: ${distinct.size} on duty — ${roleParts.join('; ')}`);
+  }
+  return lines.join('\n');
+}
+
+// Unfilled coverage across the fetched schedules, as plain text.
+function summarizeGaps(scheduleRows: unknown[]): string {
+  const lines: string[] = [];
+  for (const row of scheduleRows) {
+    const data = (row as { data?: { gaps?: unknown[] } }).data;
+    const gaps = Array.isArray(data?.gaps) ? (data!.gaps as unknown[]) : [];
+    for (const g of gaps) {
+      const x = g as { date?: string; shift_name?: string; role?: string; required_count?: number; filled_count?: number };
+      const need = (x.required_count ?? 0) - (x.filled_count ?? 0);
+      if (need > 0 && x.date) {
+        lines.push(`${prettyDate(String(x.date))} ${x.shift_name ?? ''} ${x.role ?? ''}: short ${need}`.replace(/\s+/g, ' ').trim());
+      }
+    }
+  }
+  return lines.join('\n');
+}
+
+// Build the answer-prompt context from the fetched tables. Schedules become a
+// readable staffing summary; every other table lists FULL rows (never chopped
+// mid-record), capped by row count rather than character count.
+export function buildDataContext(fetchedData: Record<string, unknown[]>): string {
+  const blocks: string[] = [];
+  for (const [table, rows] of Object.entries(fetchedData)) {
+    if (!rows || rows.length === 0) continue;
+    if (table === 'schedules') {
+      const meta = rows
+        .map(r => {
+          const x = r as { week_start?: string; week_end?: string; status?: string };
+          return `Week ${x.week_start ?? '?'} to ${x.week_end ?? '?'} (${x.status ?? 'draft'})`;
+        })
+        .join('\n');
+      const staffing = summarizeStaffingByDate(collectAssignments(rows));
+      const gaps = summarizeGaps(rows);
+      let block = `schedules:\n${meta}`;
+      if (staffing) block += `\nWho is on duty each day:\n${staffing}`;
+      if (gaps) block += `\nUnfilled coverage:\n${gaps}`;
+      blocks.push(block);
+    } else {
+      const MAX_ROWS = 80;
+      const shown = rows.slice(0, MAX_ROWS).map(r => JSON.stringify(r)).join('\n');
+      const more = rows.length > MAX_ROWS ? `\n…and ${rows.length - MAX_ROWS} more` : '';
+      blocks.push(`${table} (${rows.length}):\n${shown}${more}`);
+    }
+  }
+  return blocks.join('\n\n');
+}
+
 // ── Operational query handler ─────────────────────────────────────────────────
 
 export async function handleOperationalQuery(
@@ -297,11 +423,19 @@ Available Homebase tables (all scoped to this company):
   // Step 2: Execute the fetch plan
   const fetchedData = await executeFetchPlan(plan, contact.company_id, today);
 
-  // Step 3: Ask Claude to answer with the data
-  const dataContext = Object.entries(fetchedData)
-    .filter(([, rows]) => rows.length > 0)
-    .map(([table, rows]) => `${table} (${rows.length} records):\n${JSON.stringify(rows, null, 0).slice(0, 4000)}`)
-    .join('\n\n');
+  // Step 3: Ask Claude to answer with the data. The context is pre-summarized
+  // into clean facts (esp. schedules → per-date headcount + names) so the model
+  // never has to parse — or hedge about — a truncated raw JSON blob.
+  const dataContext = buildDataContext(fetchedData);
+
+  // Never let the answer expose the plumbing. Headcount/coverage questions were
+  // leaking internals ("the data is truncated", "the complete payload", "pull the
+  // June 17 slice from Homebase") — Aegis should sound like a manager, not a
+  // database. If a fact genuinely isn't here, say so plainly and offer to pull it.
+  const noLeakGuard =
+    ` Answer plainly, in your own voice, and NEVER mention how you got the information — ` +
+    `no talk of data, payloads, records, JSON, schedules being "loaded"/"truncated"/"provided", or "pulling from Homebase". ` +
+    `If you genuinely don't have what's needed, say so in one short, natural sentence and offer to pull it up (e.g. "I don't have that week's schedule in front of me — want me to pull it up?") — never explain the internals or apologize for the system.`;
 
   const answerSystem =
     contact.role === 'employee'
@@ -310,12 +444,13 @@ Available Homebase tables (all scoped to this company):
         `Only answer questions about their own schedule, their own time off, their own availability, and their own shifts. ` +
         `You CAN answer things like: when their next shift is, what they're scheduled this week, how many hours they have, and who they're working alongside on a given day. ` +
         `For "who am I working with" you may share coworkers' names and roles on a shift this employee is ALSO on — but never reveal anyone's wages, availability, hours totals, or personal details. ` +
-        `Answer using the Homebase data below. Be direct and specific. If the data doesn't contain what's needed, say so clearly.`
+        `Be direct and specific.${noLeakGuard}`
       : `${personality}\n\nToday is ${today}. ` +
-        `You can answer staffing questions like who's free/available on a given day, where coverage is short (gaps), and who's near their max weekly hours / approaching overtime. ` +
-        `Answer using the Homebase data below. Be direct and specific. If the data doesn't contain what's needed, say so clearly.`;
+        `You can answer staffing questions like how many people were on a given day, who was working (and in what role), who's free/available, where coverage is short, and who's near their max weekly hours. ` +
+        `The staffing summary below already gives you exact per-day headcounts and who was on by role — treat those counts as authoritative and answer with them directly. ` +
+        `Be direct and specific.${noLeakGuard}`;
 
-  const answer = await generateReply(answerSystem, `Question: ${message.body}\n\nData:\n${dataContext || 'No relevant data found.'}`, []);
+  const answer = await generateReply(answerSystem, `Question: ${message.body}\n\nWhat I know:\n${dataContext || 'Nothing on file for this one.'}`, []);
 
   await reply(contact, message, answer);
 

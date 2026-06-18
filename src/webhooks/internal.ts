@@ -9,6 +9,8 @@ import {
   type RotationSpec,
 } from '../workflows/employee-onboarding';
 import { supabase } from '../db/client';
+import { sendEmail } from '../messaging/email';
+import { brandedEmailShell, BRAND } from '../messaging/brand';
 
 // Bearer-auth-gated endpoints called by Homebase /api/aegis-action after a
 // manager clicks an aegis_action_tokens magic-link. Homebase consumes the
@@ -49,6 +51,69 @@ internalRouter.post('/notify-to-decision', async (req: Request, res: Response) =
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[internal] notify-to-decision failed:', msg);
+    serverError(res, msg);
+  }
+});
+
+// POST /internal/notify-access-removed
+// Called by Homebase when a manager sets an employee's Aegis access to
+// "blocked". Aegis already refuses to act on a blocked sender (sender
+// verification returns null); this sends the person a one-time, friendly
+// heads-up so they aren't left wondering why Aegis went quiet. Email-first;
+// if there's no email on file we no-op (SMS notice is a later add).
+internalRouter.post('/notify-access-removed', async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const companyId = body.company_id;
+  const employeeId = body.employee_id;
+  if (typeof companyId !== 'string' || companyId.length === 0) {
+    badRequest(res, 'company_id is required');
+    return;
+  }
+  if (typeof employeeId !== 'string' || employeeId.length === 0) {
+    badRequest(res, 'employee_id is required');
+    return;
+  }
+
+  try {
+    const { data: empRow } = await supabase
+      .from('employees')
+      .select('name, contact_email')
+      .eq('id', employeeId)
+      .eq('company_id', companyId)
+      .maybeSingle();
+    const emp = empRow as { name: string | null; contact_email: string | null } | null;
+    if (!emp) {
+      badRequest(res, 'employee not found');
+      return;
+    }
+
+    const first = (emp.name ?? '').trim().split(/\s+/)[0] || 'there';
+    const text =
+      `Hi ${first} — a quick heads-up: your access to Aegis has been turned off. ` +
+      `If you think that's a mistake, just reach out to your manager and they can get it sorted out.`;
+
+    if (!emp.contact_email) {
+      res.json({ ok: true, channel: null });
+      return;
+    }
+
+    const safe = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const html = brandedEmailShell({
+      bodyHtml: `<p style="margin:0;font-size:16px;color:${BRAND.textPrimary};line-height:1.65;">${safe}</p>`,
+      preheader: 'Your Aegis access has changed',
+    });
+
+    await sendEmail({
+      to: emp.contact_email,
+      subject: 'Your Aegis access has changed',
+      text,
+      html,
+      company_id: companyId,
+    });
+    res.json({ ok: true, channel: 'email' });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[internal] notify-access-removed failed:', msg);
     serverError(res, msg);
   }
 });

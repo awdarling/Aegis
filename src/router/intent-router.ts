@@ -255,13 +255,13 @@ async function routeIntentInner(
 
   // Authorization: employee attempting a manager-only action. Don't dead-end —
   // kindly explain it's a manager call, then name what they CAN ask for (the
-  // same canonical list the "help" reply uses).
+  // same canonical list the capabilities reply uses).
   if (contact.role === 'employee' && MANAGER_ONLY_INTENTS.has(classification.intent)) {
     await logSecurityUnauthorized(message, contact);
     await reply(
       contact,
       message,
-      `Ah, that one's a manager call — they can get it sorted for you. Happy to help with anything on your end, though: ${allowedActionsLine('employee')}. Just say the word, or reply "help" and I'll lay out everything I can do for you.`
+      `Ah, that one's a manager call — they can get it sorted for you. Happy to help with anything on your end, though: ${allowedActionsLine('employee')}. Just say the word — or ask me "what can you do?" and I'll lay out everything I can do for you.`
     );
     return;
   }
@@ -411,7 +411,7 @@ async function routeIntentInner(
         await reply(
           contact,
           message,
-          "Hmm, I didn't quite follow that one — mind putting it another way? And if you're not sure what I can do for you, just reply \"help\" and I'll walk you through it."
+          "Hmm, I didn't quite follow that one — mind putting it another way? And if you're not sure what I can do for you, just ask \"what can you do?\" and I'll walk you through it."
         );
     }
   } catch (err) {

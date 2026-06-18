@@ -239,6 +239,12 @@ export interface Database {
           event_type: 'holiday' | 'special_event' | 'party' | 'fundraiser' | 'closure' | 'custom' | 'schedule' | 'time_off' | 'staffing' | 'manager_pref';
           staffing_notes: string | null;
           shift_overrides: Json | null;
+          // Structured special-event staffing exceptions (item 6). Array of
+          // EventShift (see src/lib/engine/event-shifts.ts): one-off "add" shifts
+          // with custom hours/roles (optionally replacing a normal shift) and
+          // "stretch" changes to an existing shift's hours/counts — applied by the
+          // engine ONLY on the event's dates, so they expire with the event.
+          event_shifts: Json | null;
           created_by: 'manager' | 'aegis' | 'soteria';
           created_at: string;
           updated_at: string;

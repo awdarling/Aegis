@@ -1,5 +1,6 @@
 import type { Event, ShiftRequirement, ShiftType } from '../../db/types';
 import type { CanvasSlot } from './types';
+import { applyEventShifts } from './event-shifts';
 
 const BUSY_DAY_EVENT_TYPES = new Set<Event['event_type']>([
   'holiday',
@@ -109,7 +110,12 @@ export function buildCanvas(
     }
   }
 
-  slots.sort((a, b) => {
+  // Apply special-event staffing exceptions (item 6) — one-off "add" shifts and
+  // "stretch" changes carried on events.event_shifts, scoped to the event's
+  // dates. No-op (returns `slots` untouched) when no event carries them.
+  const withEvents = applyEventShifts(slots, events, weekDates);
+
+  withEvents.sort((a, b) => {
     if (a.is_priority !== b.is_priority) return a.is_priority ? -1 : 1;
     if (a.date !== b.date) return a.date < b.date ? -1 : 1;
     if (a.start_time !== b.start_time) return a.start_time < b.start_time ? -1 : 1;
@@ -118,5 +124,5 @@ export function buildCanvas(
     return a.slot_index - b.slot_index;
   });
 
-  return { slots, closed_dates };
+  return { slots: withEvents, closed_dates };
 }

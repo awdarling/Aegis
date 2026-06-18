@@ -285,11 +285,20 @@ can ask you for, or how to use you — e.g. "what can you do", "what can you do 
 me", "what can I ask for", "what can Aegis do for me", "how does this work" —
 classify it as capabilities.
 
+A bare greeting or opener with no other request — "hi", "hey", "hello", "hey
+Aegis", "what's up", "good morning" on its own — also classifies as capabilities,
+so a new or unsure person gets oriented to what they can do. (If the greeting is
+attached to a real request, e.g. "hi, can I get June 5 off", classify the
+request instead.)
+
 IMPORTANT: do NOT classify a bare "help" or "stop" keyword as capabilities.
 Those are reserved SMS-compliance keywords handled separately — leave them as
 unknown. Only the natural-language questions above are capabilities.
 
 User: "what can you do for me?"
+{"intent":"capabilities","confidence":"high","extracted":{}}
+
+User: "hey Aegis"
 {"intent":"capabilities","confidence":"high","extracted":{}}
 
 User: "what can I ask you for?"

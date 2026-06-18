@@ -280,12 +280,14 @@ User (manager): "is that time off still ok to approve?"
 
 ## Asking what Aegis can do → capabilities
 
-When the message is asking what you can do, what they can ask you for, or how to
-use you — or is just "help" / "what can you do" / "what can I ask for" / "what
-can Aegis do for me" / "how does this work" — classify it as capabilities.
+When the message is a natural-language question about what you can do, what they
+can ask you for, or how to use you — e.g. "what can you do", "what can you do for
+me", "what can I ask for", "what can Aegis do for me", "how does this work" —
+classify it as capabilities.
 
-User: "help"
-{"intent":"capabilities","confidence":"high","extracted":{}}
+IMPORTANT: do NOT classify a bare "help" or "stop" keyword as capabilities.
+Those are reserved SMS-compliance keywords handled separately — leave them as
+unknown. Only the natural-language questions above are capabilities.
 
 User: "what can you do for me?"
 {"intent":"capabilities","confidence":"high","extracted":{}}

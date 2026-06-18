@@ -4,7 +4,7 @@
 
 **Status**: **LAUNCHED June 5, 2026.** Inbound signature verification is live. The **time-off** email round-trip (employee submit → confirm → manager fan-out → manager approve via magic-link button → employee notified) is verified end-to-end on the Watermark production tenant. The **availability** path is **partially verified**: the employee→manager NOTIFY fan-out is live and verified (Phase 4 + the June-5 fan-out fix), but the manager-side **approve/deny magic-link buttons are NOT built** — those handlers are dead stubs that return a fake success page and no email mints availability tokens today. The current manager-approval path for availability is the fragile reply-YES + Homebase-tab path; the magic-link buttons are scoped under AEGIS-EMAIL-1. Remaining work is fast-follows, deferred risky fan-outs, the two newly-surfaced scheduling/Homebase bugs, and the AEGIS-EMAIL-1 umbrella.
 
-**Last updated**: June 9, 2026.
+**Last updated**: June 18, 2026.
 
 > **Push state (top-of-file):** Aegis is pushed and live (`46eaa70`). Homebase is pushed and live (`29ed00e`). **48-hour sprint COMPLETE (2026-06-09):** SCHED-EDIT-1 round-trip persists corrected hours; `unsatisfied_sex_coverage` flag renders in BOTH the manager schedule-preview email AND the Homebase Preview & Edit view; S3 in-tab TO approval verified in sandbox (notify fired, `decided_by` written, manager toast). **2026-06-12:** schedule download DONE on Watermark (Piece 1 colors + full-name/role content fix both merged; live-verified); **`DOWNLOAD-500` RESOLVED** (symptom gone in prod — mechanism caveat: exact root-cause line not independently re-confirmed); **`distribute_schedule` fan-out ran successfully to the full Watermark roster** (warm per-employee shift-assignment message + inline full-week schedule) — only remaining distribute piece is a visual-consistency fix vs. the Homebase render (= template-unification **Piece 3**); **DELIV-1 downgraded BLOCKER → MONITOR / client-education** (fan-out ran with no spam problem; kept as a watch item, not a gate). **Active priority: build + test the remaining Aegis email workflows at Watermark** (AEGIS-EMAIL-1).
 
@@ -18,12 +18,22 @@ Per-action status of the 8 `ActionType`s in `src/lib/aegis-actions/types.ts`. Dr
 |---|---|---|
 | `approve_to` | **WORKING (prod-verified)** | 21 Watermark consumptions; email → magic-link → DB update + employee notify. |
 | `deny_to` | **BUILT, email-button UNVERIFIED** | In-app Time Off tab deny works (S3 / `decideTimeOffRequest`); the email-button path has not been observed consumed. Alexander testing 2026-06-11. |
-| `confirm_distribution` | **SANDBOX-ONLY + status-clobber bug** | Cross-repo conflict: Homebase writes `status='distributed'`, Aegis overwrites to `'published'`, defeating the re-distribution guard. **To be reworked: command + Homebase button; drop the magic-link path entirely** (per AEGIS-EMAIL-1 work list #2). |
+| `confirm_distribution` | **RETIRED → replaced by Publish button (2026-06-18)** | Magic-link path dropped as planned. Distribute is now the Homebase **Publish** button keyed on `published_at` (status-clobber bug closed). See the 2026-06-18 SHIPPED block above. |
 | `approve_availability` | **STUB** | Handler returns fake success; no email mints availability tokens. Real handler + mint = AEGIS-EMAIL-1 work-list #3. |
 | `deny_availability` | **STUB** | Same as above. |
 | `accept_emergency_coverage` | **STUB** | Fake success; never minted by any email. |
 | `decline_emergency_coverage` | **STUB** | Fake success; never minted by any email. |
 | `request_additional_batch` | **STUB** | Fake success; never minted by any email. |
+
+---
+
+## 2026-06-18 — SHIPPED since the 06-16/06-17 batch (all merged to `main`, live)
+
+- **Publish button + republish/swap (DEV_ROADMAP items 9 + 12) — SHIPPED & live (AG PR #38, HB PR #16; migration 016 applied via SQL editor; Alexander-tested).** `confirm_distribution`'s magic-link path is retired as planned. Distribute is now the Homebase **Publish** button: it flips **`published_at`** (the single source of truth — the old `distributed`/`published` status-clobber bug is closed) and distributes to staff. `publish_schedule_swap(p_new_id, p_old_id)` (SECURITY DEFINER) atomically unpublishes the old schedule + publishes a new one for the same week, **archives** the old (superseded, not deleted), supersedes its wage/hours estimates, and notifies **changed-only** employees (diff via `src/lib/schedule-diff.ts`).
+- **MANAGER-COMM-1 (item 14) — SHIPPED & live (AG PR #39).** `handleOperationalQuery` no longer dumps truncated JSON; headcount/coverage answers are computed deterministically from `schedule.data.assignments` and the prompt is hardened against leaking internals. Test: `operational-query.test.ts`.
+- **Veteran feature UI (items 3 grid-half + 7) — SHIPPED & live (HB PR #15).** Grid VET badge + per-shift rule indicator + Rules-page management UI. **Open:** the **veteran tag in the emailed schedule** (item 3 email half) — quick-win #1 of the next chat.
+
+**NEXT CHAT QUEUE (Alexander-chosen 2026-06-18):** (1) veteran tag in the emailed schedule, (2) plain-English Rules-page explainers, (3) capabilities/help + role-aware scope guard. Full brief: `NEXT_CHAT_BRIEF.md`.
 
 ---
 

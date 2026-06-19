@@ -4,7 +4,7 @@ import { logActivity } from '../logger/activity-log';
 import { sendEmail } from '../messaging/email';
 import { sendSms } from '../messaging/sms';
 import { normalizeReSubject } from '../messaging/reply';
-import { executeScheduleSwap } from '../workflows/shift-swap';
+import { executeScheduleSwap, executeScheduleTrade } from '../workflows/shift-swap';
 import { computeWageEstimate } from '../lib/schedule-simulator';
 import type { Employee } from '../db/types';
 
@@ -47,6 +47,13 @@ interface SwapDecisionToken {
   shift_date: string;
   shift_name: string;
   role: string;
+  // Two-way trade (item 18): the target's shift the requester takes in return.
+  // Present → execute a true trade; absent → legacy one-way reassignment.
+  target_shift_date?: string | null;
+  target_shift_name?: string | null;
+  target_role?: string | null;
+  target_shift_start?: string | null;
+  target_shift_end?: string | null;
   expires_at: string;
 }
 
@@ -194,36 +201,62 @@ async function handleSwapDecision(
       .lte('week_start', token.shift_date).gte('week_end', token.shift_date)
       .order('generated_at', { ascending: false }).limit(1).maybeSingle();
 
+    const isTrade = !!(token.target_shift_name && token.target_shift_date);
     if (schedRow && receiver) {
       const row = schedRow as { id: string; data: { assignments: unknown[] } };
-      await executeScheduleSwap(
-        token.company_id, row.id, token.shift_date, token.shift_name,
-        token.requester_id, token.receiver_id, token.receiver_name
-      );
+      if (isTrade) {
+        // True two-way trade: the requester and target switch shifts.
+        await executeScheduleTrade(
+          token.company_id, row.id,
+          { date: token.shift_date, shift_name: token.shift_name, employee_id: token.requester_id, employee_name: token.requester_name },
+          { date: token.target_shift_date!, shift_name: token.target_shift_name!, employee_id: token.receiver_id, employee_name: token.receiver_name },
+        );
+      } else {
+        await executeScheduleSwap(
+          token.company_id, row.id, token.shift_date, token.shift_name,
+          token.requester_id, token.receiver_id, token.receiver_name
+        );
+      }
     }
 
-    // Notify both employees
+    // Notify both employees — for a trade, each person hears the shift they now work.
+    const dateLong = new Date(token.shift_date + 'T12:00:00Z').toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
+    const targetDateLong = token.target_shift_date
+      ? new Date(token.target_shift_date + 'T12:00:00Z').toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' })
+      : dateLong;
     const approvedMsg = (name: string, role: string) =>
-      `Your shift swap has been approved! ${name} will cover the ${token.shift_name} (${role}) shift on ${new Date(token.shift_date + 'T12:00:00Z').toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' })}.`;
+      `Your shift swap has been approved! ${name} will cover the ${token.shift_name} (${role}) shift on ${dateLong}.`;
+    const tradeMsg = (worksShift: string, worksDate: string) =>
+      `Your shift trade has been approved! You're now on the ${worksShift} shift on ${worksDate}.`;
+
+    const requesterMsg = isTrade ? tradeMsg(token.target_shift_name!, targetDateLong) : approvedMsg(token.receiver_name, token.role);
+    const receiverMsg = isTrade ? tradeMsg(token.shift_name, dateLong) : approvedMsg(token.requester_name, token.role);
+    const subj = isTrade ? 'Shift trade approved' : 'Swap approved';
 
     if (requester?.contact_phone && token.aegis_sms_channel) {
-      await sendSms({ to: requester.contact_phone, from: token.aegis_sms_channel, body: approvedMsg(token.receiver_name, token.role), company_id: token.company_id });
+      await sendSms({ to: requester.contact_phone, from: token.aegis_sms_channel, body: requesterMsg, company_id: token.company_id });
     } else if (requester?.contact_email) {
-      await sendEmail({ to: requester.contact_email, subject: 'Swap approved', text: approvedMsg(token.receiver_name, token.role), company_id: token.company_id });
+      await sendEmail({ to: requester.contact_email, subject: subj, text: requesterMsg, company_id: token.company_id });
     }
     if (receiver?.contact_phone && token.aegis_sms_channel) {
-      await sendSms({ to: receiver.contact_phone, from: token.aegis_sms_channel, body: approvedMsg(token.requester_name, token.role), company_id: token.company_id });
+      await sendSms({ to: receiver.contact_phone, from: token.aegis_sms_channel, body: receiverMsg, company_id: token.company_id });
+    } else if (receiver?.contact_email) {
+      await sendEmail({ to: receiver.contact_email, subject: subj, text: receiverMsg, company_id: token.company_id });
     }
   } else {
     // Denied — notify both
-    const deniedMsg = `Your shift swap request for the ${token.shift_name} shift on ${new Date(token.shift_date + 'T12:00:00Z').toLocaleDateString('en-US', { month: 'long', day: 'numeric' })} has been denied by your manager. Please contact them if you have questions.`;
+    const isTrade = !!(token.target_shift_name && token.target_shift_date);
+    const deniedMsg = `Your shift ${isTrade ? 'trade' : 'swap'} request for the ${token.shift_name} shift on ${new Date(token.shift_date + 'T12:00:00Z').toLocaleDateString('en-US', { month: 'long', day: 'numeric' })} has been denied by your manager. Please contact them if you have questions.`;
+    const subj = isTrade ? 'Shift trade denied' : 'Swap denied';
     if (requester?.contact_phone && token.aegis_sms_channel) {
       await sendSms({ to: requester.contact_phone, from: token.aegis_sms_channel, body: deniedMsg, company_id: token.company_id });
     } else if (requester?.contact_email) {
-      await sendEmail({ to: requester.contact_email, subject: 'Swap denied', text: deniedMsg, company_id: token.company_id });
+      await sendEmail({ to: requester.contact_email, subject: subj, text: deniedMsg, company_id: token.company_id });
     }
     if (receiver?.contact_phone && token.aegis_sms_channel) {
       await sendSms({ to: receiver.contact_phone, from: token.aegis_sms_channel, body: deniedMsg, company_id: token.company_id });
+    } else if (receiver?.contact_email) {
+      await sendEmail({ to: receiver.contact_email, subject: subj, text: deniedMsg, company_id: token.company_id });
     }
   }
 

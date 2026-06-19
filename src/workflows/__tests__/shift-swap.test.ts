@@ -33,6 +33,9 @@ import {
   parseYesNo,
   findRequesterShift,
   applySwapToAssignments,
+  applyTradeToAssignments,
+  chooseTradeShift,
+  type TradeSide,
 } from '../shift-swap';
 import type { ScheduleAssignment } from '../schedule-build';
 
@@ -120,5 +123,70 @@ describe('applySwapToAssignments', () => {
   it('is a no-op when no shift matches', () => {
     const out = applySwapToAssignments(assignments, '2026-06-25', 'Afternoon', 'req', 'rcv', 'Receiver');
     expect(out.some(x => x.employee_id === 'rcv')).toBe(false);
+  });
+});
+
+describe('applyTradeToAssignments (true two-way swap)', () => {
+  // Requester works Saturday Afternoon; Joe works Friday Morning. They trade.
+  const base = [
+    a({ employee_id: 'req', employee_name: 'Requester', date: '2026-06-20', shift_name: 'Afternoon' }),
+    a({ employee_id: 'joe', employee_name: 'Joe', date: '2026-06-19', shift_name: 'Morning' }),
+    a({ employee_id: 'other', employee_name: 'Other', date: '2026-06-20', shift_name: 'Morning' }),
+  ];
+  const reqSide: TradeSide = { date: '2026-06-20', shift_name: 'Afternoon', employee_id: 'req', employee_name: 'Requester' };
+  const joeSide: TradeSide = { date: '2026-06-19', shift_name: 'Morning', employee_id: 'joe', employee_name: 'Joe' };
+
+  it('trades BOTH shifts: each person lands on the other’s shift', () => {
+    const out = applyTradeToAssignments(base, reqSide, joeSide);
+    const satAfternoon = out.find(x => x.date === '2026-06-20' && x.shift_name === 'Afternoon')!;
+    const friMorning = out.find(x => x.date === '2026-06-19' && x.shift_name === 'Morning')!;
+    expect(satAfternoon.employee_id).toBe('joe');      // Joe now works the Saturday Afternoon
+    expect(satAfternoon.employee_name).toBe('Joe');
+    expect(friMorning.employee_id).toBe('req');         // Requester now works Joe's Friday Morning
+    expect(friMorning.employee_name).toBe('Requester');
+  });
+
+  it('leaves unrelated assignments alone and never mutates the input', () => {
+    const snapshot = JSON.stringify(base);
+    const out = applyTradeToAssignments(base, reqSide, joeSide);
+    expect(out.find(x => x.employee_id === 'other')).toBeTruthy();
+    expect(JSON.stringify(base)).toBe(snapshot);
+  });
+});
+
+describe('chooseTradeShift (which of the target’s shifts you take)', () => {
+  const data = { assignments: [
+    a({ employee_id: 'joe', date: '2026-06-19', shift_name: 'Morning' }),
+    a({ employee_id: 'joe', date: '2026-06-21', shift_name: 'Evening' }),
+    a({ employee_id: 'sue', date: '2026-06-20', shift_name: 'Morning' }),
+  ] };
+
+  it('returns the one shift when the target has exactly one', () => {
+    const oneShift = { assignments: [a({ employee_id: 'sue', date: '2026-06-20', shift_name: 'Morning' })] };
+    const r = chooseTradeShift(oneShift, 'sue', null);
+    expect(r.kind).toBe('one');
+    if (r.kind === 'one') expect(r.shift.shift_name).toBe('Morning');
+  });
+
+  it('is ambiguous when the target has several and no hint is given', () => {
+    const r = chooseTradeShift(data, 'joe', null);
+    expect(r.kind).toBe('ambiguous');
+    if (r.kind === 'ambiguous') expect(r.shifts).toHaveLength(2);
+  });
+
+  it('narrows to one with a shift-name hint', () => {
+    const r = chooseTradeShift(data, 'joe', { shift_name: 'evening' });
+    expect(r.kind).toBe('one');
+    if (r.kind === 'one') expect(r.shift.shift_name).toBe('Evening');
+  });
+
+  it('narrows to one with a date hint', () => {
+    const r = chooseTradeShift(data, 'joe', { date: '2026-06-19' });
+    expect(r.kind).toBe('one');
+    if (r.kind === 'one') expect(r.shift.date).toBe('2026-06-19');
+  });
+
+  it('returns none when the target has no shifts that week', () => {
+    expect(chooseTradeShift(data, 'nobody', null).kind).toBe('none');
   });
 });

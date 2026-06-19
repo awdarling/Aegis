@@ -46,6 +46,14 @@ export interface PendingSwap {
   // Mode 1 only:
   target_employee_id?: string;
   target_employee_name?: string;
+  // Two-way trade (item 18): the target's shift the requester takes in return.
+  // When present, the swap is a true trade (both employees switch shifts); when
+  // absent, the legacy one-way behavior applies (facilitated / older records).
+  target_shift_date?: string;
+  target_shift_name?: string;
+  target_role?: string;
+  target_shift_start?: string;
+  target_shift_end?: string;
   expires_at: string;
 }
 
@@ -60,14 +68,21 @@ export interface SwapOutreach {
   requester_raw_subject?: string;
   requester_thread_id?: string;
   receiver_id: string;
-  receiver_phone: string;
-  aegis_sms_channel: string;
+  receiver_phone: string;          // '' when reaching the receiver by email only
+  receiver_email?: string;         // email-first outreach target
+  aegis_sms_channel: string;       // '' when there's no SMS channel (email-only)
   shift_date: string;
   shift_name: string;
   role: string;
   shift_start: string;
   shift_end: string;
   schedule_id: string | null;
+  // Two-way trade (item 18): the target's shift the requester takes in return.
+  target_shift_date?: string;
+  target_shift_name?: string;
+  target_role?: string;
+  target_shift_start?: string;
+  target_shift_end?: string;
   // Mode 2: remaining candidates not yet contacted (empty for Mode 1)
   candidate_queue: string[];
   outreach_sent_at: string;
@@ -277,6 +292,36 @@ export function applySwapToAssignments(
   });
 }
 
+// One side of a true two-way swap: a specific person on a specific shift.
+export interface TradeSide {
+  date: string;
+  shift_name: string;
+  employee_id: string;
+  employee_name: string;
+}
+
+// Pure transform for a TRUE swap (item 18 redesign): TRADE two existing
+// assignments between two employees. The person on side A's shift moves onto
+// side B's shift and vice versa — both people stay on the schedule, they just
+// switch places. Returns a new array; every other assignment is untouched, and
+// the input is never mutated. This is the core both swap modes (directed +
+// job-posting) build on, testable without a database.
+export function applyTradeToAssignments(
+  assignments: ScheduleAssignment[],
+  a: TradeSide,
+  b: TradeSide
+): ScheduleAssignment[] {
+  return assignments.map(asg => {
+    if (asg.date === a.date && asg.shift_name === a.shift_name && asg.employee_id === a.employee_id) {
+      return { ...asg, employee_id: b.employee_id, employee_name: b.employee_name };
+    }
+    if (asg.date === b.date && asg.shift_name === b.shift_name && asg.employee_id === b.employee_id) {
+      return { ...asg, employee_id: a.employee_id, employee_name: a.employee_name };
+    }
+    return asg;
+  });
+}
+
 // Executes an approved swap: updates the schedule data and recalculates wages.
 // Exported so the decision webhook can call it after manager approval.
 export async function executeScheduleSwap(
@@ -296,6 +341,62 @@ export async function executeScheduleSwap(
   const updatedAssignments = applySwapToAssignments(
     row.data.assignments, shiftDate, shiftName, requesterId, receiverId, receiverName
   );
+
+  const updatedData: ScheduleData = { ...row.data, assignments: updatedAssignments };
+  const wages = await computeWageEstimate(companyId, updatedAssignments);
+
+  await supabase.from('schedules').update({
+    data: updatedData as unknown as Record<string, unknown>,
+    staffing_report: { ...(row.staffing_report ?? {}), estimated_wages: wages },
+  }).eq('id', scheduleId);
+}
+
+// Which of the target's shifts the requester is trading FOR. Resolves your
+// "I name it; Aegis asks only if it's unclear" rule (item 18): if the named
+// person has exactly one shift that week (or the hint narrows it to one), use
+// it; if several still match, it's ambiguous and the caller should ask which.
+export type TradeShiftChoice =
+  | { kind: 'one'; shift: ScheduleAssignment }
+  | { kind: 'none' }
+  | { kind: 'ambiguous'; shifts: ScheduleAssignment[] };
+
+export function chooseTradeShift(
+  schedData: ScheduleData,
+  targetId: string,
+  hint: { shift_name?: string | null; date?: string | null } | null
+): TradeShiftChoice {
+  const targetShifts = schedData.assignments.filter(a => a.employee_id === targetId);
+  if (targetShifts.length === 0) return { kind: 'none' };
+
+  let candidates = targetShifts;
+  if (hint?.date) candidates = candidates.filter(a => a.date === hint.date);
+  if (hint?.shift_name) {
+    const h = hint.shift_name.toLowerCase();
+    candidates = candidates.filter(a => a.shift_name.toLowerCase().includes(h));
+  }
+
+  if (candidates.length === 1) return { kind: 'one', shift: candidates[0] };
+  if (candidates.length === 0) return { kind: 'none' };
+  return { kind: 'ambiguous', shifts: candidates };
+}
+
+// Executes an approved TRUE swap: TRADES two assignments between two employees
+// (both stay on the schedule, they switch places) and recalculates wages. The
+// redesigned two-way replacement for executeScheduleSwap — called once both
+// employees agree and the manager approves. Built on the unit-tested
+// applyTradeToAssignments core.
+export async function executeScheduleTrade(
+  companyId: string,
+  scheduleId: string,
+  sideA: TradeSide,
+  sideB: TradeSide
+): Promise<void> {
+  const { data: schedRow } = await supabase.from('schedules').select('id, data, staffing_report')
+    .eq('id', scheduleId).is('deleted_at', null).single();
+  if (!schedRow) return;
+
+  const row = schedRow as { id: string; data: ScheduleData; staffing_report: Record<string, unknown> | null };
+  const updatedAssignments = applyTradeToAssignments(row.data.assignments, sideA, sideB);
 
   const updatedData: ScheduleData = { ...row.data, assignments: updatedAssignments };
   const wages = await computeWageEstimate(companyId, updatedAssignments);
@@ -476,15 +577,21 @@ async function extractSwapDetails(body: string, today: string): Promise<{
   shift_date: string | null;
   shift_name: string | null;
   target_employee_name: string | null;
+  target_shift_date: string | null;
+  target_shift_name: string | null;
 }> {
   const system =
     `You are a data extractor for a workforce scheduling system. Today is ${today}. ` +
-    'Extract shift swap details from an employee message. ' +
-    'Respond with ONLY valid JSON: {"shift_date":"YYYY-MM-DD"|null,"shift_name":string|null,"target_employee_name":string|null}';
+    'A shift swap is a TRADE: the sender gives up one of their shifts and takes one of a coworker\'s shifts. ' +
+    'Extract: shift_date/shift_name = the SENDER\'s shift they want to give up; ' +
+    'target_employee_name = the coworker they want to trade with (null if they didn\'t name anyone); ' +
+    'target_shift_date/target_shift_name = the COWORKER\'s shift the sender wants to take in return (null if not stated). ' +
+    'Example: "swap my Saturday AM for Joe\'s Friday PM" → shift_name "Saturday AM", target_employee_name "Joe", target_shift_name "Friday PM". ' +
+    'Respond with ONLY valid JSON: {"shift_date":"YYYY-MM-DD"|null,"shift_name":string|null,"target_employee_name":string|null,"target_shift_date":"YYYY-MM-DD"|null,"target_shift_name":string|null}';
   const text = await generateReply(system, body, []);
   return (
-    coerceJsonObject<{ shift_date: string | null; shift_name: string | null; target_employee_name: string | null }>(text) ??
-    { shift_date: null, shift_name: null, target_employee_name: null }
+    coerceJsonObject<{ shift_date: string | null; shift_name: string | null; target_employee_name: string | null; target_shift_date: string | null; target_shift_name: string | null }>(text) ??
+    { shift_date: null, shift_name: null, target_employee_name: null, target_shift_date: null, target_shift_name: null }
   );
 }
 
@@ -503,8 +610,15 @@ async function sendManagerSwapApprovalRequest(params: {
   shift_start: string;
   shift_end: string;
   aegis_sms_channel: string | null;
+  // Two-way trade: the target's shift the requester takes in return.
+  target_shift_date?: string;
+  target_shift_name?: string;
+  target_role?: string;
+  target_shift_start?: string;
+  target_shift_end?: string;
 }): Promise<void> {
   const { company_id, swap_request_id, requester, receiver, shift_date, shift_name, role, shift_start, shift_end } = params;
+  const isTrade = !!params.target_shift_name;
 
   // Find manager
   const { data: managerData } = await supabase.from('users').select('id, email, name')
@@ -536,6 +650,13 @@ async function sendManagerSwapApprovalRequest(params: {
     shift_date,
     shift_name,
     role,
+    // Two-way trade: when present, the webhook executes a true trade (both
+    // employees switch shifts) instead of a one-way reassignment.
+    target_shift_date: params.target_shift_date ?? null,
+    target_shift_name: params.target_shift_name ?? null,
+    target_role: params.target_role ?? null,
+    target_shift_start: params.target_shift_start ?? null,
+    target_shift_end: params.target_shift_end ?? null,
     expires_at: expires,
   };
 
@@ -559,18 +680,25 @@ async function sendManagerSwapApprovalRequest(params: {
   const denyUrl = `${base}/webhooks/decision?action=deny&requestId=${swap_request_id}&token=${denyToken}`;
 
   const dateStr = formatDisplayDate(shift_date);
+  const targetDateStr = params.target_shift_date ? formatDisplayDate(params.target_shift_date) : dateStr;
   const subject = `Swap Request — ${requester.name} ↔ ${receiver.name} (${formatShortDate(shift_date)})`;
+
+  const detailText = isTrade
+    ? `This is a shift trade:\n` +
+      `  ${requester.name}: gives up ${shift_name} (${role}) on ${dateStr}, ${shift_start}–${shift_end}; takes ${receiver.name}'s ${params.target_shift_name} on ${targetDateStr}\n` +
+      `  ${receiver.name}: gives up ${params.target_shift_name} on ${targetDateStr}; takes ${shift_name} on ${dateStr}\n\n`
+    : `Shift:      ${shift_name} (${role}) on ${dateStr}\n` +
+      `Time:       ${shift_start}–${shift_end}\n` +
+      `Giving up:  ${requester.name}\n` +
+      `Taking on:  ${receiver.name}\n\n`;
 
   const text =
     `${greeting(manager.name)}\n\n` +
-    `${firstName(requester.name)} and ${firstName(receiver.name)} have already agreed to swap a shift — the only thing left is your sign-off. ` +
+    `${firstName(requester.name)} and ${firstName(receiver.name)} have already agreed to ${isTrade ? 'trade shifts' : 'swap a shift'} — the only thing left is your sign-off. ` +
     `The details are below, and either link records your decision right away.\n\n` +
-    `Shift:      ${shift_name} (${role}) on ${dateStr}\n` +
-    `Time:       ${shift_start}–${shift_end}\n` +
-    `Giving up:  ${requester.name}\n` +
-    `Taking on:  ${receiver.name}\n\n` +
-    `Approve this swap:\n${approveUrl}\n\n` +
-    `Deny this swap:\n${denyUrl}\n\n` +
+    detailText +
+    `Approve this ${isTrade ? 'trade' : 'swap'}:\n${approveUrl}\n\n` +
+    `Deny this ${isTrade ? 'trade' : 'swap'}:\n${denyUrl}\n\n` +
     "These links expire in 7 days, and I'll take it from there. — Aegis";
 
   // ── Branded (Quria dark theme) HTML ──────────────────────────────────────
@@ -578,9 +706,15 @@ async function sendManagerSwapApprovalRequest(params: {
   // actionable detail + Approve/Deny buttons live inside one brandActionCard.
   const introHtml = `
 <p style="margin:0 0 12px;font-size:16px;color:${BRAND.textPrimary};">${escapeHtml(greeting(manager.name))}</p>
-<p style="margin:0;font-size:16px;color:${BRAND.textPrimary};line-height:1.65;">${escapeHtml(firstName(requester.name))} and ${escapeHtml(firstName(receiver.name))} have already agreed to swap a shift — the only thing left is your sign-off. Everything's in the card below, and either button records your decision right away, so there's nothing else you'll need to do.</p>`;
+<p style="margin:0;font-size:16px;color:${BRAND.textPrimary};line-height:1.65;">${escapeHtml(firstName(requester.name))} and ${escapeHtml(firstName(receiver.name))} have already agreed to ${isTrade ? 'trade shifts' : 'swap a shift'} — the only thing left is your sign-off. Everything's in the card below, and either button records your decision right away, so there's nothing else you'll need to do.</p>`;
 
-  const detailsHtml = `
+  const detailsHtml = isTrade
+    ? `
+<div style="margin:0 0 20px;padding:16px;background:${BRAND.surface2};border:1px solid ${BRAND.borderDefault};border-radius:8px;">
+  <div style="font-size:14px;color:${BRAND.textPrimary};line-height:1.5;"><strong>${escapeHtml(requester.name)}</strong> gives up <strong>${escapeHtml(shift_name)}</strong> (${escapeHtml(role)}) on ${escapeHtml(dateStr)}, ${escapeHtml(shift_start)}–${escapeHtml(shift_end)} &nbsp;→&nbsp; takes <strong>${escapeHtml(params.target_shift_name ?? '')}</strong> on ${escapeHtml(targetDateStr)}</div>
+  <div style="font-size:14px;color:${BRAND.textPrimary};margin-top:10px;line-height:1.5;"><strong>${escapeHtml(receiver.name)}</strong> gives up <strong>${escapeHtml(params.target_shift_name ?? '')}</strong> on ${escapeHtml(targetDateStr)} &nbsp;→&nbsp; takes <strong>${escapeHtml(shift_name)}</strong> on ${escapeHtml(dateStr)}</div>
+</div>`
+    : `
 <div style="margin:0 0 20px;padding:16px;background:${BRAND.surface2};border:1px solid ${BRAND.borderDefault};border-radius:8px;">
   <div style="font-size:14px;color:${BRAND.textPrimary};"><strong>Shift:</strong> ${escapeHtml(shift_name)} (${escapeHtml(role)}) — ${escapeHtml(shift_start)}–${escapeHtml(shift_end)}</div>
   <div style="font-size:14px;color:${BRAND.textPrimary};margin-top:8px;"><strong>Date:</strong> ${escapeHtml(dateStr)}</div>
@@ -598,7 +732,7 @@ ${brandedButtonRow([
 </div>`;
 
   const bodyHtml = `${introHtml}
-${brandActionCard('Action needed · Shift swap', `${detailsHtml}${ctaHtml}`)}`;
+${brandActionCard(`Action needed · Shift ${isTrade ? 'trade' : 'swap'}`, `${detailsHtml}${ctaHtml}`)}`;
 
   const html = brandedEmailShell({
     bodyHtml,
@@ -746,30 +880,67 @@ export async function handleInitiateSwap(
       return;
     }
 
-    const validation = await validateSwap({
-      company_id: contact.company_id,
-      requester_id: contact.employee_id!,
-      receiver: targetEmployee,
-      shift_date: shiftDate,
-      role: shift.role,
-      shift_hours: shiftHours,
-      policies,
-    });
+    // A swap is a TRADE — find which of the target's shifts the requester takes
+    // in return. They name it; we only ask if more than one still matches.
+    const choice = schedule
+      ? chooseTradeShift(schedule.data, targetEmployee.id, { shift_name: raw.target_shift_name, date: raw.target_shift_date })
+      : ({ kind: 'none' } as TradeShiftChoice);
 
-    if (!validation.valid) {
+    if (choice.kind === 'none') {
       await reply(contact, message,
-        `This swap can't proceed: ${validation.reason} Please choose a different employee or contact your manager.`
+        `${targetEmployee.name} doesn't have a shift on the schedule that week to trade for — a swap trades two shifts, so they'd need one of their own to give you. Want to try a different coworker, or ask "can anyone take my ${shift.shift_name} shift?" instead?`
       );
-      await logActivity({
-        company_id: contact.company_id,
-        action: 'swap_validation_failed',
-        summary: `${contact.name}'s swap request with ${targetEmployee.name} failed validation: ${validation.reason}`,
-        metadata: { requester_id: contact.employee_id, receiver_id: targetEmployee.id, shift_date: shiftDate, reason: validation.reason },
-      });
+      return;
+    }
+    if (choice.kind === 'ambiguous') {
+      const list = choice.shifts
+        .map(s => `${s.shift_name} on ${formatDisplayDate(s.date)} (${s.start_time}–${s.end_time})`)
+        .join('; ');
+      await reply(contact, message,
+        `${targetEmployee.name} has more than one shift that week — which of theirs do you want to take? ${list}. Just tell me which one and I'll set up the trade.`
+      );
+      return;
+    }
+    const targetShift = choice.shift;
+    const targetShiftHours = targetShift.hours ?? computeShiftHours(targetShift.start_time, targetShift.end_time);
+
+    // Load the requester's full record for the reverse-direction validation.
+    const { data: reqEmpData } = await supabase.from('employees').select('*')
+      .eq('id', contact.employee_id!).single();
+    const requesterEmployee = reqEmpData as Employee | null;
+    if (!requesterEmployee) {
+      await reply(contact, message, 'Something went wrong looking up your record — please try again in a moment.');
       return;
     }
 
-    // Validation passed — ask requester to confirm
+    // Validate BOTH directions of the trade: the target must be able to work the
+    // requester's shift, AND the requester must be able to work the target's.
+    const targetTakesYours = await validateSwap({
+      company_id: contact.company_id, requester_id: contact.employee_id!,
+      receiver: targetEmployee, shift_date: shiftDate, role: shift.role, shift_hours: shiftHours, policies,
+    });
+    if (!targetTakesYours.valid) {
+      await reply(contact, message,
+        `This swap can't proceed: ${targetTakesYours.reason} Please choose a different coworker or contact your manager.`);
+      await logActivity({ company_id: contact.company_id, action: 'swap_validation_failed',
+        summary: `${contact.name}'s trade with ${targetEmployee.name} failed (target taking requester's shift): ${targetTakesYours.reason}`,
+        metadata: { requester_id: contact.employee_id, receiver_id: targetEmployee.id, shift_date: shiftDate, reason: targetTakesYours.reason } });
+      return;
+    }
+    const youTakeTheirs = await validateSwap({
+      company_id: contact.company_id, requester_id: targetEmployee.id,
+      receiver: requesterEmployee, shift_date: targetShift.date, role: targetShift.role, shift_hours: targetShiftHours, policies,
+    });
+    if (!youTakeTheirs.valid) {
+      await reply(contact, message,
+        `This swap can't proceed — you wouldn't be able to take ${targetEmployee.name}'s ${targetShift.shift_name} shift: ${youTakeTheirs.reason} Want to try a different shift or coworker?`);
+      await logActivity({ company_id: contact.company_id, action: 'swap_validation_failed',
+        summary: `${contact.name}'s trade with ${targetEmployee.name} failed (requester taking target's shift): ${youTakeTheirs.reason}`,
+        metadata: { requester_id: contact.employee_id, receiver_id: targetEmployee.id, target_shift_date: targetShift.date, reason: youTakeTheirs.reason } });
+      return;
+    }
+
+    // Both directions valid — ask the requester to confirm the trade.
     const pending: PendingSwap = {
       mode: 'directed',
       company_id: contact.company_id,
@@ -788,12 +959,17 @@ export async function handleInitiateSwap(
       schedule_id: schedule?.id ?? null,
       target_employee_id: targetEmployee.id,
       target_employee_name: targetEmployee.name,
+      target_shift_date: targetShift.date,
+      target_shift_name: targetShift.shift_name,
+      target_role: targetShift.role,
+      target_shift_start: targetShift.start_time,
+      target_shift_end: targetShift.end_time,
       expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
     };
     await storePendingSwap(pending);
 
     await reply(contact, message,
-      `You want to swap your ${shift.shift_name} shift on ${formatDisplayDate(shiftDate)} with ${targetEmployee.name}. Is that correct? Reply "yes" to confirm or "no" to cancel.`
+      `Just to confirm the trade: you'd give up your ${shift.shift_name} shift on ${formatDisplayDate(shiftDate)} and pick up ${targetEmployee.name}'s ${targetShift.shift_name} shift on ${formatDisplayDate(targetShift.date)}. Reply "yes" to send it to ${firstName(targetEmployee.name)}, or "no" to cancel.`
     );
   } else {
     // Mode 2: facilitated — quick feasibility check
@@ -837,6 +1013,34 @@ export async function handleInitiateSwap(
   }
 }
 
+// Reach an employee email-first (branded email) with an SMS fallback. Used for
+// swap outreach so the flow works for email-only employees — replies route back
+// via the same swap_outreach record keyed by the employee.
+async function sendOutreachMessage(params: {
+  receiverEmail: string | null;
+  receiverPhone: string | null;
+  aegisSmsNumber: string | null;
+  subject: string;
+  text: string;
+  company_id: string;
+}): Promise<'email' | 'sms' | 'none'> {
+  const { receiverEmail, receiverPhone, aegisSmsNumber, subject, text, company_id } = params;
+  if (receiverEmail) {
+    const safe = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const html = brandedEmailShell({
+      bodyHtml: `<p style="margin:0;font-size:16px;color:${BRAND.textPrimary};line-height:1.65;">${safe}</p>`,
+      preheader: subject,
+    });
+    await sendEmail({ to: receiverEmail, subject, text, html, company_id });
+    return 'email';
+  }
+  if (receiverPhone && aegisSmsNumber) {
+    await sendSms({ to: receiverPhone, from: aegisSmsNumber, body: text, company_id });
+    return 'sms';
+  }
+  return 'none';
+}
+
 // Called from router pre-check when swap_pending:{employeeId} exists.
 export async function handleSwapConfirmation(
   message: InboundMessage,
@@ -871,17 +1075,17 @@ export async function handleSwapConfirmation(
     const { data: receiverData } = await supabase.from('employees').select('*')
       .eq('id', pending.target_employee_id).single();
     const receiver = receiverData as Employee | null;
-
-    if (!receiver || !receiver.contact_phone) {
-      await reply(contact, message,
-        `${pending.target_employee_name} doesn't have a phone number on file. Please contact them directly to arrange the swap.`
-      );
+    if (!receiver) {
+      await reply(contact, message, 'Something went wrong — could not find the target employee. Please try again.');
       return;
     }
 
-    if (!aegisSmsNumber) {
+    // Email-first: reach the target by email if they have one, otherwise by text.
+    const receiverEmail = receiver.contact_email ?? null;
+    const receiverPhone = receiver.contact_phone ?? null;
+    if (!receiverEmail && !(receiverPhone && aegisSmsNumber)) {
       await reply(contact, message,
-        'No SMS channel is configured. Please contact the employee directly to arrange the swap.'
+        `${pending.target_employee_name} doesn't have an email or phone on file, so I can't reach them to set up the trade. You'll need to contact them directly.`
       );
       return;
     }
@@ -897,39 +1101,50 @@ export async function handleSwapConfirmation(
       requester_raw_subject: message.raw_subject,
       requester_thread_id: message.thread_id,
       receiver_id: receiver.id,
-      receiver_phone: receiver.contact_phone,
-      aegis_sms_channel: aegisSmsNumber,
+      receiver_phone: receiverPhone ?? '',
+      receiver_email: receiverEmail ?? undefined,
+      aegis_sms_channel: aegisSmsNumber ?? '',
       shift_date: pending.shift_date,
       shift_name: pending.shift_name,
       role: pending.role,
       shift_start: pending.shift_start,
       shift_end: pending.shift_end,
       schedule_id: pending.schedule_id,
+      target_shift_date: pending.target_shift_date,
+      target_shift_name: pending.target_shift_name,
+      target_role: pending.target_role,
+      target_shift_start: pending.target_shift_start,
+      target_shift_end: pending.target_shift_end,
       candidate_queue: [],
       outreach_sent_at: new Date().toISOString(),
       expires_at: new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString(),
     };
     await storeSwapOutreach(outreach);
 
-    await sendSms({
-      to: receiver.contact_phone,
-      from: aegisSmsNumber,
-      body:
-        `${greeting(receiver.name)} this is Aegis. ` +
-        `${contact.name} would like to swap their ${pending.shift_name} shift (${pending.shift_start}–${pending.shift_end}, ${pending.role}) ` +
-        `on ${formatDisplayDate(pending.shift_date)} with you. Can you take this shift? Reply YES or NO.`,
-      company_id: contact.company_id,
+    // From the target's side: they give up THEIR shift and pick up the requester's.
+    const yourShift = pending.target_shift_name
+      ? `your ${pending.target_shift_name} shift on ${formatDisplayDate(pending.target_shift_date ?? pending.shift_date)}`
+      : 'your shift';
+    const theirShift = `their ${pending.shift_name} shift (${pending.shift_start}–${pending.shift_end}, ${pending.role}) on ${formatDisplayDate(pending.shift_date)}`;
+    const askText =
+      `${greeting(receiver.name)} this is Aegis. ${contact.name} would like to trade shifts with you — ` +
+      `you'd give up ${yourShift} and pick up ${theirShift}. Want to do it? Reply YES or NO.`;
+
+    await sendOutreachMessage({
+      receiverEmail, receiverPhone, aegisSmsNumber,
+      subject: `Shift trade request from ${contact.name}`,
+      text: askText, company_id: contact.company_id,
     });
 
     await reply(contact, message,
-      `I've messaged ${receiver.name} about the swap. I'll let you know when I hear back.`
+      `I've reached out to ${receiver.name} about the trade. I'll let you know as soon as I hear back.`
     );
 
     await logActivity({
       company_id: contact.company_id,
       action: 'swap_outreach_sent',
-      summary: `Outreach sent to ${receiver.name} for swap with ${contact.name} — ${pending.shift_name} on ${pending.shift_date}`,
-      metadata: { requester_id: contact.employee_id, receiver_id: receiver.id, shift_date: pending.shift_date, mode: 'directed' },
+      summary: `Trade outreach sent to ${receiver.name} for ${contact.name} — give ${pending.shift_name} / take ${pending.target_shift_name ?? '?'} on ${pending.shift_date}`,
+      metadata: { requester_id: contact.employee_id, receiver_id: receiver.id, shift_date: pending.shift_date, mode: 'directed', trade: !!pending.target_shift_name },
     });
   } else {
     // Mode 2: facilitated
@@ -1131,6 +1346,9 @@ export async function handleSwapOutreachResponse(
     requiresApproval = parsed?.requires_approval ?? false;
   }
 
+  // A two-way trade ALWAYS needs the manager's sign-off (item 18 design).
+  if (outreach.target_shift_name) requiresApproval = true;
+
   await logActivity({
     company_id: outreach.company_id,
     action: 'swap_accepted',
@@ -1175,11 +1393,14 @@ export async function handleSwapOutreachResponse(
 
     const swapId = (swapRow as { id: string } | null)?.id ?? 'unknown';
 
+    const tradeBack = outreach.target_shift_name
+      ? ` and you'd take their ${outreach.target_shift_name} shift${outreach.target_shift_date ? ` on ${formatShortDate(outreach.target_shift_date)}` : ''}`
+      : '';
     await reply(contact, message,
-      `Thanks for accepting! The swap is pending manager approval. You'll be notified once a decision is made.`
+      `Thanks! The trade is pending your manager's approval — I'll let you know once it's decided.`
     );
     await reply(requesterContact, requesterMsg,
-      `${receiver.name} agreed to take your ${outreach.shift_name} shift on ${formatShortDate(outreach.shift_date)}. The swap is now pending manager approval — I'll notify you once it's decided.`
+      `${receiver.name} agreed to trade: they'll take your ${outreach.shift_name} shift on ${formatShortDate(outreach.shift_date)}${tradeBack}. It's now pending manager approval — I'll notify you once it's decided.`
     );
 
     await sendManagerSwapApprovalRequest({
@@ -1195,6 +1416,11 @@ export async function handleSwapOutreachResponse(
       shift_start: outreach.shift_start,
       shift_end: outreach.shift_end,
       aegis_sms_channel: outreach.aegis_sms_channel,
+      target_shift_date: outreach.target_shift_date,
+      target_shift_name: outreach.target_shift_name,
+      target_role: outreach.target_role,
+      target_shift_start: outreach.target_shift_start,
+      target_shift_end: outreach.target_shift_end,
     });
 
     await logActivity({

@@ -12,6 +12,14 @@ export function verifyTwilioSignature(req: Request, res: Response, next: NextFun
     return;
   }
 
+  // Twilio decommissioned (SMS → Telgorithm): with no auth token we cannot
+  // verify any inbound signature, so reject. No Twilio numbers means no inbound
+  // SMS reaches this route anyway.
+  if (!env.TWILIO_AUTH_TOKEN) {
+    res.status(403).json({ error: 'Twilio not configured' });
+    return;
+  }
+
   const signature = req.headers['x-twilio-signature'] as string | undefined;
 
   if (!signature) {

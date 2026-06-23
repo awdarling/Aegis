@@ -15,9 +15,19 @@ const HELP_RESPONSE =
   'Msg freq varies. Msg & data rates may apply. Reply STOP to opt out. ' +
   'Support: awdarling@quriasolutions.com';
 
-const twilioClient = twilio(env.TWILIO_ACCOUNT_SID, env.TWILIO_AUTH_TOKEN);
+// Optional — null when Twilio is decommissioned (SMS → Telgorithm). With no
+// numbers provisioned no inbound SMS arrives, so this path is inert; the guard
+// keeps it from constructing a client (which throws on undefined creds) at boot.
+const twilioClient =
+  env.TWILIO_ACCOUNT_SID && env.TWILIO_AUTH_TOKEN
+    ? twilio(env.TWILIO_ACCOUNT_SID, env.TWILIO_AUTH_TOKEN)
+    : null;
 
 async function sendHelpResponse(to: string): Promise<void> {
+  if (!twilioClient) {
+    console.warn('[sms] Twilio not configured — cannot send HELP response.');
+    return;
+  }
   const payload: { to: string; body: string; from?: string; messagingServiceSid?: string } = {
     to,
     body: HELP_RESPONSE,

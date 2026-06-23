@@ -9,9 +9,13 @@ const envSchema = z.object({
   SUPABASE_URL: z.string().url(),
   SUPABASE_SERVICE_ROLE_KEY: z.string().min(1),
 
-  // Twilio
-  TWILIO_ACCOUNT_SID: z.string().min(1),
-  TWILIO_AUTH_TOKEN: z.string().min(1),
+  // Twilio — OPTIONAL. SMS is being migrated off Twilio (→ Telgorithm). When
+  // these are unset, Aegis boots normally and runs email-first: SMS sends are
+  // skipped (sendSms returns false) and the inbound SMS webhook is inert. This
+  // lets the Twilio account be fully decommissioned without crashing the server
+  // or breaking any email workflow.
+  TWILIO_ACCOUNT_SID: z.string().optional(),
+  TWILIO_AUTH_TOKEN: z.string().optional(),
   TWILIO_MESSAGING_SERVICE_SID: z.string().optional(),
   TWILIO_FROM_NUMBER: z.string().optional(),
 

@@ -243,6 +243,9 @@ function flaggedIssueSubLabel(issue: FlaggedIssue): string {
     const { start, end } = issue.metadata.time_window;
     return `${start.slice(0, 5)}–${end.slice(0, 5)} (coverage)`;
   }
+  if (issue.type === 'double_booking') {
+    return `${issue.metadata.employee_name} (double-booked)`;
+  }
   return issue.shift_name;
 }
 

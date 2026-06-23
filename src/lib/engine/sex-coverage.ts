@@ -7,10 +7,18 @@ import type { FlaggedIssue, WeekState } from './types';
 // returns FlaggedIssue[] without ever mutating weekState. Per date, segments
 // the day at shift start/end boundaries from the population subset, walks each
 // [t_i, t_{i+1}) block, and flags any required attribute value absent from the
-// on-duty set. Single-staff blocks are skipped — the engine never schedules
-// single-coverage windows among guard roles (single staffing is reserved for
-// Greeter/Flex, which are excluded by population_roles), so a 1-person window
-// among counted roles indicates a boundary artifact, not a real coverage gap.
+// on-duty set.
+//
+// CONFIGURABILITY: which roles count toward coverage is driven ENTIRELY by the
+// constraint's `population_roles` — there is NO hardcoded per-shift exclusion.
+// A guard on ANY shift (Flex included) is counted whenever their assignment's
+// role is in population_roles. (Earlier comments here wrongly claimed Flex was
+// "excluded by population_roles"; it is not — Flex fills as Lifeguard/Headguard,
+// both of which Watermark lists in population_roles, so a Flex guard counts.)
+//
+// Single-staff blocks (onDuty < 2) are skipped: a 1-person boundary segment is
+// treated as an artifact of segmenting, not a real coverage gap. This is a
+// deliberate, role-agnostic choice — it does not single out any shift.
 
 function readAttr(emp: Employee, attribute: string): string {
   const rec = emp as unknown as Record<string, unknown>;

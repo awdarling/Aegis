@@ -27,6 +27,7 @@ import {
   isBlockedByTOForSlot,
   isVeteranOnlyDate as engineIsVeteranOnlyDate,
   sameDayDoubleReason,
+  shiftsOverlap,
   type VeteranOnlyRange,
 } from '../lib/engine/eligibility';
 import { rankCandidates } from '../lib/engine/ranker';
@@ -115,6 +116,19 @@ export type FlaggedIssue =
         time_window: { start: string; end: string };
         missing_sex: string;
         on_duty: Array<{ name: string; role: string; sex: string }>;
+      };
+    }
+  | {
+      // Universal safety invariant (any shift, any client): one person cannot
+      // hold two time-overlapping assignments on the same day. Raised by the
+      // build-level backstop in distributeScheduleCore as a final guard.
+      type: 'double_booking';
+      date: string;
+      description: string;
+      metadata: {
+        employee_id: string;
+        employee_name: string;
+        shifts: Array<{ shift_name: string; role: string; start_time: string; end_time: string }>;
       };
     };
 
@@ -953,6 +967,43 @@ function buildScheduleForWeek(ctx: BuildContext): BuildResult {
     for (const f of flags) weekState.flagged_issues.push(f);
   }
 
+  // ── FINAL SAFETY INVARIANT (configurability backstop) ──────────────────────
+  // No employee may hold two time-overlapping assignments on the same day —
+  // for ANY shift, ANY client, regardless of shift name. The per-slot fill
+  // paths already enforce this; this build-level backstop guarantees a future
+  // change (or stale data fed back through a rebuild) can never silently ship
+  // an impossible schedule. It only FLAGS — it never mutates assignments.
+  {
+    const byEmpDay = new Map<string, ScheduleAssignment[]>();
+    for (const a of weekState.assignments) {
+      const k = `${a.employee_id}|${a.date}`;
+      const list = byEmpDay.get(k);
+      if (list) list.push(a);
+      else byEmpDay.set(k, [a]);
+    }
+    for (const list of byEmpDay.values()) {
+      let overlapFound = false;
+      for (let i = 0; i < list.length && !overlapFound; i++) {
+        for (let j = i + 1; j < list.length; j++) {
+          if (shiftsOverlap(list[i].start_time, list[i].end_time, list[j].start_time, list[j].end_time)) {
+            weekState.flagged_issues.push({
+              type: 'double_booking',
+              date: list[i].date,
+              description: `${list[i].employee_name} is assigned to overlapping shifts on ${list[i].date}: ${list[i].shift_name} (${list[i].start_time}–${list[i].end_time}) and ${list[j].shift_name} (${list[j].start_time}–${list[j].end_time}). This should never happen — rebuild this week.`,
+              metadata: {
+                employee_id: list[i].employee_id,
+                employee_name: list[i].employee_name,
+                shifts: list.map(a => ({ shift_name: a.shift_name, role: a.role, start_time: a.start_time, end_time: a.end_time })),
+              },
+            });
+            overlapFound = true;
+            break;
+          }
+        }
+      }
+    }
+  }
+
   // After post-fill swaps, refresh gap filled_counts.
   for (const gap of weekState.gaps) {
     gap.filled_count = weekState.assignments.filter(
@@ -1529,7 +1580,14 @@ export interface DistributeScheduleResult {
 // attribute using only email-safe properties. Aegis builds this purely from data
 // it already loaded (schedules.data) — no Homebase call, no exceljs/PDF dep. Rows
 // are distinct shifts ordered by start_time; columns are the 7 days of the week.
-function buildFullScheduleGridHtml(args: {
+//
+// EMPLOYEE-FACING — INVARIANT: this grid (and the per-employee email it rides in)
+// must NEVER reveal veteran status or veteran shift requirements. "Who's a
+// veteran" and "Veterans only / ≥N veterans" rules are manager-only. It renders
+// only name + role + time from schedules.data.assignments, which carries no
+// veteran flag. Do not add is_veteran, a VET badge, or any experience-rule tag
+// here. Guarded by schedule-distribution-no-veteran.test.ts.
+export function buildFullScheduleGridHtml(args: {
   schedData: ScheduleData;
   weekStart: string;
   weekEnd: string;

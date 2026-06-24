@@ -6,6 +6,7 @@ import { greeting } from '../messaging/greeting';
 import { BRAND, brandedEmailShell } from '../messaging/brand';
 import { isAlreadyDistributed } from '../lib/distribute-guard';
 import { computeChangedEmployeeIds } from '../lib/schedule-diff';
+import { buildTemplatedScheduleGridHtml, type EmailScheduleTemplate } from './templated-grid';
 import { sendSms } from '../messaging/sms';
 import { computeWageEstimate } from '../lib/schedule-simulator';
 import { buildScheduleResultEmail } from './schedule-build-email';
@@ -1759,26 +1760,31 @@ export async function distributeScheduleCore(
     };
   }
 
-  const [companyRes, channelRes, empRes, weekEvents] = await Promise.all([
+  const [companyRes, channelRes, empRes, weekEvents, templateRes] = await Promise.all([
     supabase.from('companies').select('name').eq('id', companyId).single(),
     supabase.from('company_channels').select('channel_value').eq('company_id', companyId).eq('channel_type', 'sms').maybeSingle(),
     supabase.from('employees').select('id, name, contact_email, contact_phone').eq('company_id', companyId).eq('active', true),
     getSpecialNotesForRange(companyId, scheduleRow.week_start, scheduleRow.week_end),
+    supabase.from('schedule_templates').select('*').eq('company_id', companyId).maybeSingle(),
   ]);
 
   const companyName = (companyRes.data as { name: string } | null)?.name ?? 'Your Company';
   const aegisSmsChannel = (channelRes.data as { channel_value: string } | null)?.channel_value ?? null;
   const employees = (empRes.data ?? []) as Pick<Employee, 'id' | 'name' | 'contact_email' | 'contact_phone'>[];
+  const scheduleTemplate = (templateRes.data as EmailScheduleTemplate | null) ?? null;
 
   // Full all-staff week grid, rendered once as an email-safe inline <table>
   // fragment and embedded in every employee's email body so each person can see
-  // the whole week, not just their own shifts. (Previously sent as an .html
-  // attachment, which Gmail renders as raw source instead of showing the grid.)
-  const teamGridHtml = buildFullScheduleGridHtml({
-    schedData,
-    weekStart: scheduleRow.week_start,
-    weekEnd: scheduleRow.week_end,
-  });
+  // the whole week, not just their own shifts. When the club has configured a
+  // schedule template, render in THAT look (layout, day colors, fields) so the
+  // email matches the on-screen grid + download; otherwise the legacy renderer.
+  const teamGridHtml = scheduleTemplate
+    ? buildTemplatedScheduleGridHtml({ schedData, weekStart: scheduleRow.week_start, weekEnd: scheduleRow.week_end, template: scheduleTemplate })
+    : buildFullScheduleGridHtml({
+        schedData,
+        weekStart: scheduleRow.week_start,
+        weekEnd: scheduleRow.week_end,
+      });
   // "This week:" special-notes / events block (holidays, parties, closures,
   // staffing notes) — empty string when the week has no events.
   const weekEventsHtml = buildWeekEventsHtml(weekEvents);
@@ -2070,15 +2076,17 @@ export async function notifyScheduleChangesCore(
   const oldSched = oldRow.data as unknown as ScheduleData;
   const weekLabel = `${formatShortDate(newRow.week_start)}–${formatShortDate(newRow.week_end)}`;
 
-  const [companyRes, channelRes, empRes, weekEvents] = await Promise.all([
+  const [companyRes, channelRes, empRes, weekEvents, templateRes] = await Promise.all([
     supabase.from('companies').select('name').eq('id', companyId).single(),
     supabase.from('company_channels').select('channel_value').eq('company_id', companyId).eq('channel_type', 'sms').maybeSingle(),
     supabase.from('employees').select('id, name, contact_email, contact_phone').eq('company_id', companyId).eq('active', true),
     getSpecialNotesForRange(companyId, newRow.week_start, newRow.week_end),
+    supabase.from('schedule_templates').select('*').eq('company_id', companyId).maybeSingle(),
   ]);
   const companyName = (companyRes.data as { name: string } | null)?.name ?? 'Your Company';
   const aegisSmsChannel = (channelRes.data as { channel_value: string } | null)?.channel_value ?? null;
   const employees = (empRes.data ?? []) as Pick<Employee, 'id' | 'name' | 'contact_email' | 'contact_phone'>[];
+  const scheduleTemplate = (templateRes.data as EmailScheduleTemplate | null) ?? null;
 
   // Group the NEW schedule's assignments by employee (for rendering each
   // changed person's updated shifts), and compute the changed-employee set.
@@ -2090,11 +2098,14 @@ export async function notifyScheduleChangesCore(
   }
   const changedIds = computeChangedEmployeeIds(oldSched.assignments, newSched.assignments);
 
-  const teamGridHtml = buildFullScheduleGridHtml({
-    schedData: newSched,
-    weekStart: newRow.week_start,
-    weekEnd: newRow.week_end,
-  });
+  // Match the club's configured look when a template exists (see distribute).
+  const teamGridHtml = scheduleTemplate
+    ? buildTemplatedScheduleGridHtml({ schedData: newSched, weekStart: newRow.week_start, weekEnd: newRow.week_end, template: scheduleTemplate })
+    : buildFullScheduleGridHtml({
+        schedData: newSched,
+        weekStart: newRow.week_start,
+        weekEnd: newRow.week_end,
+      });
   const weekEventsHtml = buildWeekEventsHtml(weekEvents);
   const weekEventsText = buildWeekEventsText(weekEvents);
 

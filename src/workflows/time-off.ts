@@ -1010,8 +1010,12 @@ async function sendManagerResolutionReplies(args: {
     .from('companies').select('name').eq('id', args.companyId).maybeSingle();
   const companyName = (companyRow as { name: string } | null)?.name ?? 'Your team';
 
+  // Only actual club managers/owners get the resolution notice — NOT 'quria'
+  // platform admins, whose users row exists for company-scoped access, not to
+  // receive operational manager email. (Matches every other manager lookup.)
   const { data: managersData } = await supabase
-    .from('users').select('id, email, name').eq('company_id', args.companyId);
+    .from('users').select('id, email, name').eq('company_id', args.companyId)
+    .in('role', ['manager', 'owner']);
   const managers = ((managersData ?? []) as { id: string; email: string | null; name: string | null }[])
     .filter(m => !!m.email);
 

@@ -21,9 +21,9 @@ Per-action status of the 8 `ActionType`s in `src/lib/aegis-actions/types.ts`. Dr
 | `confirm_distribution` | **RETIRED → replaced by Publish button (2026-06-18)** | Magic-link path dropped as planned. Distribute is now the Homebase **Publish** button keyed on `published_at` (status-clobber bug closed). See the 2026-06-18 SHIPPED block above. |
 | `approve_availability` | **STUB** | Handler returns fake success; no email mints availability tokens. Real handler + mint = AEGIS-EMAIL-1 work-list #3. |
 | `deny_availability` | **STUB** | Same as above. |
-| `accept_emergency_coverage` | **STUB** | Fake success; never minted by any email. |
-| `decline_emergency_coverage` | **STUB** | Fake success; never minted by any email. |
-| `request_additional_batch` | **STUB** | Fake success; never minted by any email. |
+| `accept_emergency_coverage` | **DELIVERED via Aegis `/webhooks/decision` (2026-06-24)** | The Homebase `aegis-action` ActionType stub is bypassed: emergency-coverage outreach emails now carry branded **Accept/Decline** buttons routed through the Aegis decision route as `decision_type:'coverage'` → `processCoverageButtonDecision` (first-yes-wins, schedule swap, shift-filled fan-out, manager notify). Branch `feat/coverage-email-buttons`; tsc + 128/128. Round-trip eyeball pending. SMS still reply-YES/NO. |
+| `decline_emergency_coverage` | **DELIVERED via Aegis `/webhooks/decision` (2026-06-24)** | See `accept_emergency_coverage` above — same branded-button path (Decline → deny → records decline, batch-exhaust prompt to manager). |
+| `request_additional_batch` | **STUB** | Fake success; never minted by any email. (Coverage's "next batch" is handled conversationally by the manager today — see emergency-coverage flow.) |
 
 ---
 

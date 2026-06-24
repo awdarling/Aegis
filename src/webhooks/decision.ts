@@ -5,6 +5,7 @@ import { sendEmail } from '../messaging/email';
 import { sendSms } from '../messaging/sms';
 import { normalizeReSubject } from '../messaging/reply';
 import { executeScheduleSwap, executeScheduleTrade } from '../workflows/shift-swap';
+import { processCoverageButtonDecision } from '../workflows/emergency-coverage';
 import { computeWageEstimate } from '../lib/schedule-simulator';
 import type { Employee } from '../db/types';
 
@@ -57,7 +58,21 @@ interface SwapDecisionToken {
   expires_at: string;
 }
 
-type DecisionToken = TimeOffDecisionToken | SwapDecisionToken;
+// Coverage token — emergency-coverage Accept/Decline buttons. action is
+// 'approve' (= accept the shift) | 'deny' (= decline), reusing the route's
+// existing action vocabulary. The live outreach is looked up fresh by
+// company_id + employee_id, so the token only needs identity + expiry.
+interface CoverageDecisionToken {
+  decision_type: 'coverage';
+  action: 'approve' | 'deny';
+  request_id: string;
+  company_id: string;
+  employee_id: string;
+  employee_name: string;
+  expires_at: string;
+}
+
+type DecisionToken = TimeOffDecisionToken | SwapDecisionToken | CoverageDecisionToken;
 
 // ── HTML response helpers ─────────────────────────────────────────────────────
 
@@ -282,6 +297,56 @@ async function consumeSwapTokens(companyId: string, requestId: string): Promise<
   if (ids.length > 0) await supabase.from('aegis_memory').delete().in('id', ids);
 }
 
+// ── Coverage Accept/Decline (decision_type: 'coverage') ───────────────────────
+
+function coverageResultPage(employeeName: string, outcome: 'accepted' | 'declined' | 'already_filled' | 'not_found', shiftName: string): string {
+  const map = {
+    accepted: { icon: '✅', color: '#16a34a', title: "You're covered in", body: `Thanks, ${employeeName}! You're confirmed for the ${shiftName} shift. Your manager has been notified.` },
+    declined: { icon: '👍', color: '#6b7280', title: 'Thanks for letting us know', body: `No problem, ${employeeName} — we'll find someone else for the ${shiftName} shift.` },
+    already_filled: { icon: 'ℹ️', color: '#2563eb', title: 'Already covered', body: `Thanks for responding! The ${shiftName} shift has already been filled — no action needed.` },
+    not_found: { icon: '⌛', color: '#dc2626', title: 'No longer active', body: `This coverage request is no longer active. If you think that's a mistake, reply to the email or contact your manager.` },
+  }[outcome];
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Coverage — Aegis</title>
+  <style>
+    body { font-family: Arial, sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; background: #f9fafb; }
+    .card { background: #fff; border-radius: 8px; padding: 40px; max-width: 420px; text-align: center; box-shadow: 0 1px 4px rgba(0,0,0,.12); }
+    .icon { font-size: 48px; }
+    h1 { font-size: 22px; margin: 16px 0 8px; color: ${map.color}; }
+    p { color: #6b7280; font-size: 15px; margin: 0; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon">${map.icon}</div>
+    <h1>${map.title}</h1>
+    <p>${map.body}</p>
+  </div>
+</body>
+</html>`;
+}
+
+async function handleCoverageDecision(
+  res: import('express').Response,
+  requestId: string,
+  action: 'approve' | 'deny',
+  token: CoverageDecisionToken,
+): Promise<void> {
+  const result = await processCoverageButtonDecision({
+    companyId: token.company_id,
+    employeeId: token.employee_id,
+    employeeName: token.employee_name,
+    action: action === 'approve' ? 'accept' : 'decline',
+  });
+  // Single-use: drop both of this request's tokens so the link can't be replayed.
+  await consumeSwapTokens(token.company_id, requestId);
+  res.send(coverageResultPage(token.employee_name, result.outcome, result.shiftName));
+}
+
 // ── Route handler ─────────────────────────────────────────────────────────────
 
 decisionWebhook.get('/', async (req, res) => {
@@ -349,9 +414,14 @@ decisionWebhook.get('/', async (req, res) => {
     return;
   }
 
-  // Branch: swap vs time-off
+  // Branch: swap vs coverage vs time-off
   if (decisionToken.decision_type === 'swap') {
     await handleSwapDecision(res, requestId, action as 'approve' | 'deny', decisionToken);
+    return;
+  }
+
+  if (decisionToken.decision_type === 'coverage') {
+    await handleCoverageDecision(res, requestId, action as 'approve' | 'deny', decisionToken);
     return;
   }
 

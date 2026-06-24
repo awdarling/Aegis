@@ -8,7 +8,10 @@ import {
   BRAND,
   brandedEmailShell,
   brandActionCard,
+  brandedButtonRow,
 } from '../messaging/brand';
+import { randomUUID } from 'node:crypto';
+import { env } from '../config/env';
 import { generateReply } from '../ai/claude';
 import { getSpecialNotes } from './special-notes';
 import type { InboundMessage, VerifiedContact } from '../security/types';
@@ -908,10 +911,45 @@ export async function dispatchOutreach(params: {
   let channel: 'sms' | 'email';
   if (employee.contact_email) {
     channel = 'email';
+    // Email gets branded Accept/Decline BUTTONS (matching time-off & availability),
+    // routed through the shared /webhooks/decision handler (decision_type:
+    // 'coverage'). The plain-text body keeps "reply YES/NO" as a fallback for
+    // clients that strip HTML, and SMS still uses reply YES/NO.
+    const requestId = randomUUID();
+    const acceptToken = randomUUID();
+    const declineToken = randomUUID();
+    // Token outlives the urgency window by 1h so a late click still resolves
+    // cleanly (handled as "already filled" if someone else accepted).
+    const tokenExpiry = new Date(Date.now() + session.urgency_window_minutes * 60 * 1000 + 60 * 60 * 1000).toISOString();
+    const sharedTok = {
+      decision_type: 'coverage' as const,
+      request_id: requestId,
+      company_id: session.company_id,
+      employee_id: employee.id,
+      employee_name: employee.name,
+      expires_at: tokenExpiry,
+    };
+    await Promise.all([
+      supabase.from('aegis_memory').insert({ company_id: session.company_id, memory_type: 'observation', source: `decision_token:${acceptToken}`, content: JSON.stringify({ ...sharedTok, action: 'approve' }) }),
+      supabase.from('aegis_memory').insert({ company_id: session.company_id, memory_type: 'observation', source: `decision_token:${declineToken}`, content: JSON.stringify({ ...sharedTok, action: 'deny' }) }),
+    ]);
+    const acceptUrl = `${env.BASE_URL}/webhooks/decision?action=approve&requestId=${requestId}&token=${acceptToken}`;
+    const declineUrl = `${env.BASE_URL}/webhooks/decision?action=deny&requestId=${requestId}&token=${declineToken}`;
+    const introHtml = `<p style="margin:0 0 14px;color:${BRAND.textPrimary};font-size:15px;line-height:1.5;">${escapeHtml(greeting(employee.name))} this is Aegis. <strong>${escapeHtml(session.callout_employee_name)}</strong> is out and we need coverage for the <strong>${escapeHtml(si.shift_name)}</strong> shift (${escapeHtml(si.start_time)}–${escapeHtml(si.end_time)}, ${escapeHtml(si.role)}) on ${escapeHtml(dateStr)}.</p>`;
+    const cardInner = `${brandedButtonRow([
+      { url: acceptUrl, label: 'Yes, I can cover', variant: 'primary' },
+      { url: declineUrl, label: "Can't make it", variant: 'secondary' },
+    ])}
+<div style="font-size:13px;color:${BRAND.textMuted};margin:10px 0 6px;">First to accept gets the shift. This link is just for you.</div>`;
+    const html = brandedEmailShell({
+      bodyHtml: `${introHtml}${brandActionCard('Coverage needed', cardInner)}`,
+      preheader: `Can you cover the ${si.shift_name} shift on ${formatShortDate(session.shift_date)}?`,
+    });
     await sendEmail({
       to: employee.contact_email,
       subject: `Can you cover the ${si.shift_name} shift on ${formatShortDate(session.shift_date)}?`,
       text: body,
+      html,
       company_id: session.company_id,
     });
   } else if (employee.contact_phone && aegisSmsNumber) {
@@ -1657,4 +1695,132 @@ export async function handleEmployeeCoverageResponse(
       },
     });
   }
+}
+
+// ── Email Accept/Decline buttons (decision_type: 'coverage') ──────────────────
+//
+// The coverage email's branded buttons hit /webhooks/decision, which calls
+// processCoverageButtonDecision below. This path is ISOLATED from the inbound
+// reply handler above (it does not use the employee's inbound message — the
+// branded landing page is the employee's confirmation) but reuses the same
+// in-module helpers, so the schedule swap, "shift filled" fan-out, manager
+// notification, and batch-exhaust logic stay identical.
+
+export type CoverageButtonOutcome = 'accepted' | 'declined' | 'already_filled' | 'not_found';
+
+/** Pure: what a button click resolves to, given the live outreach state. */
+export function classifyCoverageButton(
+  outreach: ActiveOutreach | null,
+  action: 'accept' | 'decline',
+): 'accept' | 'decline' | 'already_filled' | 'not_found' {
+  if (!outreach) return 'not_found';
+  if (action === 'accept' && outreach.coverage_filled) return 'already_filled';
+  return action;
+}
+
+export async function processCoverageButtonDecision(params: {
+  companyId: string;
+  employeeId: string;
+  employeeName: string;
+  action: 'accept' | 'decline';
+}): Promise<{ outcome: CoverageButtonOutcome; shiftName: string; shiftDate: string; scheduleUpdated?: boolean }> {
+  const { companyId, employeeId, employeeName, action } = params;
+  const outreach = await getActiveOutreach(companyId, employeeId);
+  const decision = classifyCoverageButton(outreach, action);
+  if (!outreach || decision === 'not_found') {
+    return { outcome: 'not_found', shiftName: '', shiftDate: '' };
+  }
+  const shiftName = outreach.shift_info.shift_name;
+  const shiftDate = outreach.shift_date;
+
+  if (decision === 'already_filled') {
+    await clearOutreach(companyId, employeeId);
+    await logActivity({
+      company_id: companyId,
+      action: 'emergency_coverage_late_response',
+      summary: `${employeeName} clicked accept after the shift was already filled`,
+      metadata: { via: 'email_button', shift_date: shiftDate },
+    });
+    return { outcome: 'already_filled', shiftName, shiftDate };
+  }
+
+  const { contact: managerContact, message: managerMessage } = managerReplyTarget(outreach);
+  const session = await getActiveCoverageSession(companyId, outreach.manager_contact);
+
+  if (decision === 'accept') {
+    if (session) {
+      await updateSession({
+        ...session,
+        coverage_filled: true,
+        covered_by_employee_id: employeeId,
+        outreach_results: session.outreach_results.map(r =>
+          r.employee_id === employeeId ? { ...r, response: 'yes', responded_at: new Date().toISOString() } : r
+        ),
+      });
+      const remaining = session.outreach_queue.filter(id => id !== employeeId);
+      for (const empId of remaining) {
+        const empOutreach = await getActiveOutreach(companyId, empId);
+        if (empOutreach) {
+          const { data: empData } = await supabase.from('employees').select('*').eq('id', empId).single();
+          const emp = empData as Employee | null;
+          if (emp) { try { await notifyEmployeeShiftFilled(empOutreach, emp); } catch { /* best effort */ } }
+          const { _memory_id: _omit, ...rest } = empOutreach;
+          await storeOutreach({ ...rest, coverage_filled: true });
+        }
+      }
+      await clearSession(companyId);
+    }
+    await clearOutreach(companyId, employeeId);
+
+    const scheduleResult = await applyCoverageToSchedule({
+      company_id: companyId,
+      shift_date: outreach.shift_date,
+      shift_info: outreach.shift_info,
+      absent_employee_id: outreach.callout_employee_id ?? session?.callout_employee_id ?? null,
+      coverer_employee_id: employeeId,
+      coverer_name: employeeName,
+    }).catch(err => {
+      console.error('[coverage] schedule update failed:', err);
+      return { updated: false, reason: 'error' } as { updated: boolean; reason?: string };
+    });
+
+    const scheduleNote = scheduleResult.updated
+      ? ` I've updated the schedule to show ${employeeName} on this shift.`
+      : ` Heads up: I couldn't update the published schedule automatically — please move them onto the shift in Homebase.`;
+    await reply(
+      managerContact,
+      managerMessage,
+      `${employeeName} has accepted coverage for the ${shiftName} shift (${outreach.shift_info.role}) on ${formatShortDate(shiftDate)}. Shift is now covered.${scheduleNote}`
+    );
+    await logActivity({
+      company_id: companyId,
+      action: 'emergency_coverage_accepted',
+      summary: `${employeeName} accepted coverage (email button) for ${outreach.callout_employee_name}'s shift on ${shiftDate}`,
+      metadata: { via: 'email_button', employee_id: employeeId, shift_date: shiftDate, shift_name: shiftName, role: outreach.shift_info.role, schedule_updated: scheduleResult.updated, schedule_update_reason: scheduleResult.reason ?? null },
+    });
+    return { outcome: 'accepted', shiftName, shiftDate, scheduleUpdated: scheduleResult.updated };
+  }
+
+  // decline
+  await clearOutreach(companyId, employeeId);
+  if (session) {
+    const updatedResults = session.outreach_results.map(r =>
+      r.employee_id === employeeId ? { ...r, response: 'no' as const, responded_at: new Date().toISOString() } : r
+    );
+    const anyPending = session.outreach_queue.some(id =>
+      updatedResults.some(r => r.employee_id === id && r.response === 'pending')
+    );
+    if (anyPending) {
+      await updateSession({ ...session, outreach_results: updatedResults });
+    } else {
+      await promptForNextBatchOrExhaust({ session, managerContact, managerMessage, updatedResults });
+    }
+  }
+  await logActivity({
+    company_id: companyId,
+    action: 'emergency_coverage_declined',
+    summary: `${employeeName} declined coverage (email button) for ${outreach.callout_employee_name}'s shift on ${shiftDate}`,
+    metadata: { via: 'email_button', employee_id: employeeId, shift_date: shiftDate, shift_name: shiftName },
+  });
+  return { outcome: 'declined', shiftName, shiftDate };
 }

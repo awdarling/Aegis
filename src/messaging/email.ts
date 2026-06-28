@@ -8,6 +8,7 @@ import { env } from '../config/env';
 import { supabase } from '../db/client';
 import { saveConversation } from '../logger/conversation';
 import { BRAND, brandedEmailShell, quriaLogoInlineAttachment, QURIA_LOGO_CID } from './brand';
+import { resolveMonitoringEmails, buildBccList } from './monitoring';
 
 sgMail.setApiKey(env.SENDGRID_API_KEY);
 
@@ -90,6 +91,17 @@ export async function sendEmail(options: EmailOptions): Promise<void> {
   }
   const replyToAddress = tenantReplyTo ?? FALLBACK_REPLY_TO_EMAIL;
 
+  // Monitoring inboxes (roadmap item 16): BCC any observer addresses configured
+  // for this company so they get a passive copy of every outbound email. Fully
+  // fail-safe — a lookup error or no config means no BCC, never a blocked send.
+  let bccList: string[] = [];
+  try {
+    const monitors = await resolveMonitoringEmails(options.company_id);
+    bccList = buildBccList(monitors, options.to);
+  } catch {
+    bccList = [];
+  }
+
   const html = options.html ?? htmlFromText(options.text);
 
   // Every branded email references the logo as `cid:quria-logo`. Attach the
@@ -135,6 +147,7 @@ export async function sendEmail(options: EmailOptions): Promise<void> {
         name: env.SENDGRID_FROM_NAME,
       },
       replyTo: replyToAddress,
+      ...(bccList.length > 0 ? { bcc: bccList } : {}),
       subject: options.subject,
       text: options.text,
       html,

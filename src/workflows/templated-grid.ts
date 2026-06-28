@@ -84,9 +84,13 @@ function readableText(hex?: string): string {
 interface GridRow { id: string; label: string; sub: string; cellsByDate: Map<string, ScheduleAssignment[]> }
 
 function sortCell(list: ScheduleAssignment[]): ScheduleAssignment[] {
+  // #9: order each cell by ROLE first (grouping roles), then name — matching the
+  // download + on-screen grid. start_time/shift kept as outer tiebreakers for
+  // the rare mixed-shift cell (employee-rows layout).
   return [...list].sort((a, b) =>
     (a.start_time || '').localeCompare(b.start_time || '') ||
     (a.shift_name || '').localeCompare(b.shift_name || '') ||
+    (a.role || '').localeCompare(b.role || '') ||
     (a.employee_name || '').localeCompare(b.employee_name || ''))
 }
 

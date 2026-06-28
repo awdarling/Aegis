@@ -9,7 +9,12 @@ export type ActionType =
   | 'decline_emergency_coverage'
   | 'confirm_distribution'
   | 'request_additional_batch'
-  | 'recheck_to';
+  | 'recheck_to'
+  // #10 undirected swap broadcast — a candidate's two options in the email.
+  // 'swap_pickup' → confirm page (one-way pickup); 'swap_trade_select' → the
+  // action-card shift-picker (two-way trade). Both land on Homebase pages.
+  | 'swap_pickup'
+  | 'swap_trade_select';
 
 export interface GenerateTokenParams {
   action_type: ActionType;

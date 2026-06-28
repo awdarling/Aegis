@@ -114,6 +114,11 @@ function roleRows(assignments: ScheduleAssignment[]): GridRow[] {
   return Array.from(map.values()).sort((x, y) => x.label.localeCompare(y.label))
 }
 
+// INVARIANT (item 8): this grid is EMPLOYEE-FACING (it rides in every employee's
+// distribution email). It must NEVER reveal who is a veteran, or that a shift
+// has a veteran/experience requirement — that is manager-only. Don't add a VET
+// badge, "Veterans only / ≥N" tag, or is_veteran to any cell or header here.
+// Guarded by schedule-distribution-no-veteran.test.ts.
 /** Build the team week grid as an email-safe inline <table>, driven by the template. */
 export function buildTemplatedScheduleGridHtml(input: TemplatedGridInput): string {
   const { schedData, weekStart, weekEnd, template } = input

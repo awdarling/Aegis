@@ -1650,7 +1650,9 @@ export function buildFullScheduleGridHtml(args: {
         return `<td style="padding:8px 10px;border:1px solid ${BRAND.borderDefault};background-color:${BRAND.bgBase};color:${BRAND.textMuted};font-size:12px;text-align:center;vertical-align:top;">—</td>`;
       }
       const key = `${shiftName}||${d}`;
+      // #9: order each cell by role then name (matching download + on-screen).
       const asgs = (asgByKey.get(key) ?? []).slice().sort((a, b) =>
+        (a.role ?? '').localeCompare(b.role ?? '') ||
         (a.employee_name ?? '').localeCompare(b.employee_name ?? '')
       );
       const cellGaps = gapByKey.get(key) ?? [];

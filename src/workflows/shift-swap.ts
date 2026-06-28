@@ -217,6 +217,17 @@ export function parseYesNo(body: string): 'yes' | 'no' | 'unclear' {
   return 'unclear';
 }
 
+// Can we reach this candidate for facilitated (undirected) swap outreach?
+// EMAIL-FIRST: an email address is enough on its own — SMS is only usable once
+// the company has an active SMS channel (post-A2P). Without this, the broadcast
+// was SMS-only and silently did nothing on the live email channel.
+export function isReachableForOutreach(
+  emp: { contact_email?: string | null; contact_phone?: string | null },
+  hasSmsChannel: boolean,
+): boolean {
+  return !!(emp.contact_email || (emp.contact_phone && hasSmsChannel));
+}
+
 async function getAegisSmsChannel(companyId: string): Promise<string | null> {
   const { data } = await supabase.from('company_channels').select('channel_value')
     .eq('company_id', companyId).eq('channel_type', 'sms').maybeSingle();
@@ -808,15 +819,15 @@ async function executeSwapNow(params: {
   };
   await reply(requesterContact, requesterMsg, `${greeting(requester.name)} your swap has been confirmed! ${receiver.name} will cover your ${shiftDesc}.`);
 
-  // Notify receiver via SMS
-  if (receiver.contact_phone && params.aegis_sms_channel) {
-    await sendSms({
-      to: receiver.contact_phone,
-      from: params.aegis_sms_channel,
-      body: `${greeting(receiver.name)} your swap with ${requester.name} is confirmed. You're covering the ${shiftDesc}.`,
-      company_id,
-    });
-  }
+  // Notify receiver — EMAIL-FIRST (SMS only once A2P clears).
+  await sendOutreachMessage({
+    receiverEmail: receiver.contact_email ?? null,
+    receiverPhone: receiver.contact_phone ?? null,
+    aegisSmsNumber: params.aegis_sms_channel,
+    subject: `You're covering a ${shift_name} shift on ${formatShortDate(shift_date)}`,
+    text: `${greeting(receiver.name)} your swap with ${requester.name} is confirmed. You're covering the ${shiftDesc}.`,
+    company_id,
+  });
 
   await logActivity({
     company_id,
@@ -1173,15 +1184,20 @@ export async function handleSwapConfirmation(
       return;
     }
 
-    const firstCandidate = candidates[0];
-    if (!firstCandidate.contact_phone || !aegisSmsNumber) {
+    // EMAIL-FIRST broadcast (SMS only once A2P clears). Contact the first
+    // reachable candidate; the remaining reachable ones queue for first-yes-wins.
+    const hasSms = !!aegisSmsNumber;
+    const firstIdx = candidates.findIndex(c => isReachableForOutreach(c, hasSms));
+    if (firstIdx === -1) {
       await reply(contact, message,
-        `I found candidates but can't send SMS${!aegisSmsNumber ? ' — no SMS channel configured' : ` — ${firstCandidate.name} has no phone number`}. Please contact your manager for help.`
+        `I found qualified employees, but none have an email${hasSms ? ' or phone' : ''} on file I can reach right now. Please contact your manager for help covering this shift.`
       );
       return;
     }
+    const firstCandidate = candidates[firstIdx];
+    const remaining = candidates.slice(firstIdx + 1).filter(c => isReachableForOutreach(c, hasSms)).map(c => c.id);
+    const reachableCount = 1 + remaining.length;
 
-    const remaining = candidates.slice(1).map(c => c.id);
     const outreach: SwapOutreach = {
       mode: 'facilitated',
       company_id: contact.company_id,
@@ -1193,8 +1209,9 @@ export async function handleSwapConfirmation(
       requester_raw_subject: message.raw_subject,
       requester_thread_id: message.thread_id,
       receiver_id: firstCandidate.id,
-      receiver_phone: firstCandidate.contact_phone,
-      aegis_sms_channel: aegisSmsNumber,
+      receiver_phone: firstCandidate.contact_phone ?? '',
+      receiver_email: firstCandidate.contact_email ?? undefined,
+      aegis_sms_channel: aegisSmsNumber ?? '',
       shift_date: pending.shift_date,
       shift_name: pending.shift_name,
       role: pending.role,
@@ -1207,10 +1224,12 @@ export async function handleSwapConfirmation(
     };
     await storeSwapOutreach(outreach);
 
-    await sendSms({
-      to: firstCandidate.contact_phone,
-      from: aegisSmsNumber,
-      body:
+    await sendOutreachMessage({
+      receiverEmail: firstCandidate.contact_email ?? null,
+      receiverPhone: firstCandidate.contact_phone ?? null,
+      aegisSmsNumber,
+      subject: `Can you take a ${pending.shift_name} shift on ${formatShortDate(pending.shift_date)}?`,
+      text:
         `${greeting(firstCandidate.name)} this is Aegis. ` +
         `${contact.name} is looking for someone to take their ${pending.shift_name} shift ` +
         `(${pending.shift_start}–${pending.shift_end}, ${pending.role}) on ${formatDisplayDate(pending.shift_date)}. ` +
@@ -1219,14 +1238,14 @@ export async function handleSwapConfirmation(
     });
 
     await reply(contact, message,
-      `I'm reaching out to ${candidates.length} available employee${candidates.length !== 1 ? 's' : ''}. I'll let you know as soon as someone accepts.`
+      `I'm reaching out to ${reachableCount} available employee${reachableCount !== 1 ? 's' : ''}. I'll let you know as soon as someone accepts.`
     );
 
     await logActivity({
       company_id: contact.company_id,
       action: 'swap_outreach_sent',
       summary: `Facilitated swap outreach started for ${contact.name}'s ${pending.shift_name} on ${pending.shift_date} — contacting ${firstCandidate.name}`,
-      metadata: { requester_id: contact.employee_id, first_candidate: firstCandidate.id, total_candidates: candidates.length, shift_date: pending.shift_date },
+      metadata: { requester_id: contact.employee_id, first_candidate: firstCandidate.id, total_candidates: reachableCount, shift_date: pending.shift_date },
     });
   }
 }
@@ -1276,14 +1295,23 @@ export async function handleSwapOutreachResponse(
       return;
     }
 
-    // Mode 2: try next candidate
-    const { data: nextEmpData } = await supabase.from('employees').select('*')
-      .eq('id', outreach.candidate_queue[0]).single();
-    const nextEmp = nextEmpData as Employee | null;
+    // Mode 2: advance to the next REACHABLE candidate (email-first; SMS post-A2P).
+    // Walk the queue past anyone we can't message so a contactless record never
+    // dead-ends the broadcast.
+    const smsChannel = outreach.aegis_sms_channel || null;
+    let nextEmp: Employee | null = null;
+    let restQueue = outreach.candidate_queue;
+    while (restQueue.length > 0) {
+      const candidateId = restQueue[0];
+      restQueue = restQueue.slice(1);
+      const { data: empData } = await supabase.from('employees').select('*').eq('id', candidateId).single();
+      const emp = empData as Employee | null;
+      if (emp && isReachableForOutreach(emp, !!smsChannel)) { nextEmp = emp; break; }
+    }
 
-    if (!nextEmp || !nextEmp.contact_phone) {
+    if (!nextEmp) {
       await reply(requesterContact, requesterMsg,
-        `${contact.name} wasn't available. The next candidate couldn't be reached. Please speak with your manager.`
+        `${contact.name} wasn't available, and I've now reached everyone I could. Please speak with your manager about covering the ${outreach.shift_name} shift on ${formatShortDate(outreach.shift_date)}.`
       );
       return;
     }
@@ -1291,17 +1319,20 @@ export async function handleSwapOutreachResponse(
     const nextOutreach: SwapOutreach = {
       ...outreach,
       receiver_id: nextEmp.id,
-      receiver_phone: nextEmp.contact_phone,
-      candidate_queue: outreach.candidate_queue.slice(1),
+      receiver_phone: nextEmp.contact_phone ?? '',
+      receiver_email: nextEmp.contact_email ?? undefined,
+      candidate_queue: restQueue,
       outreach_sent_at: new Date().toISOString(),
       expires_at: new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString(),
     };
     await storeSwapOutreach(nextOutreach);
 
-    await sendSms({
-      to: nextEmp.contact_phone,
-      from: outreach.aegis_sms_channel,
-      body:
+    await sendOutreachMessage({
+      receiverEmail: nextEmp.contact_email ?? null,
+      receiverPhone: nextEmp.contact_phone ?? null,
+      aegisSmsNumber: smsChannel,
+      subject: `Can you take a ${outreach.shift_name} shift on ${formatShortDate(outreach.shift_date)}?`,
+      text:
         `${greeting(nextEmp.name)} this is Aegis. ` +
         `${outreach.requester_name} is looking for someone to take their ${outreach.shift_name} shift ` +
         `(${outreach.shift_start}–${outreach.shift_end}, ${outreach.role}) on ${formatDisplayDate(outreach.shift_date)}. ` +
@@ -1310,7 +1341,7 @@ export async function handleSwapOutreachResponse(
     });
 
     await reply(requesterContact, requesterMsg,
-      `${contact.name} wasn't available. I'm now contacting ${nextEmp.name}.`
+      `${contact.name} wasn't available. I'm now reaching out to ${nextEmp.name}.`
     );
     return;
   }

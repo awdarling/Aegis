@@ -35,6 +35,7 @@ import {
   applySwapToAssignments,
   applyTradeToAssignments,
   chooseTradeShift,
+  isReachableForOutreach,
   type TradeSide,
 } from '../shift-swap';
 import type { ScheduleAssignment } from '../schedule-build';
@@ -188,5 +189,31 @@ describe('chooseTradeShift (which of the target’s shifts you take)', () => {
 
   it('returns none when the target has no shifts that week', () => {
     expect(chooseTradeShift(data, 'nobody', null).kind).toBe('none');
+  });
+});
+
+// #10 — the undirected "anyone want my Saturday?" broadcast must work over EMAIL
+// (the live channel), not just SMS. Reachability is the gate that decides who the
+// broadcast can contact; before this fix it required a phone + SMS channel, so the
+// whole broadcast silently did nothing on email.
+describe('isReachableForOutreach (email-first broadcast gate)', () => {
+  it('an email alone makes a candidate reachable, even with no SMS channel', () => {
+    expect(isReachableForOutreach({ contact_email: 'jo@club.com', contact_phone: null }, false)).toBe(true);
+  });
+
+  it('a phone is only reachable when there is an active SMS channel', () => {
+    expect(isReachableForOutreach({ contact_email: null, contact_phone: '+15551112222' }, true)).toBe(true);
+    expect(isReachableForOutreach({ contact_email: null, contact_phone: '+15551112222' }, false)).toBe(false);
+  });
+
+  it('email wins regardless of SMS channel state', () => {
+    expect(isReachableForOutreach({ contact_email: 'jo@club.com', contact_phone: '+15551112222' }, false)).toBe(true);
+    expect(isReachableForOutreach({ contact_email: 'jo@club.com', contact_phone: '+15551112222' }, true)).toBe(true);
+  });
+
+  it('no email and no usable phone means unreachable', () => {
+    expect(isReachableForOutreach({ contact_email: null, contact_phone: null }, true)).toBe(false);
+    expect(isReachableForOutreach({ contact_email: null, contact_phone: null }, false)).toBe(false);
+    expect(isReachableForOutreach({ contact_email: '', contact_phone: '' }, true)).toBe(false);
   });
 });

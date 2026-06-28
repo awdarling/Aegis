@@ -29,6 +29,12 @@ Per-action status of the 8 `ActionType`s in `src/lib/aegis-actions/types.ts`. Dr
 
 ---
 
+## 2026-06-28 — Undirected shift swap (#10) made email-first (BUILT, verified-in-code)
+
+The "anyone want my Saturday?" broadcast (`mode:'facilitated'` in `src/workflows/shift-swap.ts`) existed but was **SMS-only** in three spots (first-candidate contact, decline→next queue advance, auto-execute receiver notify) — so on Watermark's live **email** channel it silently reached no one. All three now use the existing email-first `sendOutreachMessage` helper (email → SMS fallback), gated by a new exported pure helper `isReachableForOutreach(emp, hasSmsChannel)` (email alone is reachable; a phone only counts with an active SMS channel). The broadcast contacts the first *reachable* candidate and walks past contactless records instead of dead-ending. Directed two-way trades and the manager-approval execution (`webhooks/decision.ts`) were already email-capable — untouched. 4 new pure-helper tests (`shift-swap.test.ts`, 22 total); full Aegis suite **147/147** green, tsc clean. **Owed for DONE:** push branch + 1 live sandbox smoke (broadcast → candidate email YES → schedule reassigned + both parties notified).
+
+---
+
 ## 2026-06-18 (late) — queue + refinements SHIPPED (all merged to `main`, live)
 
 - **Veteran tag in the emailed schedule (item 3, email half) — day-accurate.** The build/publish report email tags constrained shift rows with the grid wording ("Veterans only" / "≥N veterans"), honoring day-of-week + season scope so a Sat/Sun-only rule tags only those rows. `veteranLabelForShiftDate` (engine) + a `resolveShiftRuleLabel` resolver passed into `schedule-build-email.ts`. Merged AG PR #41 → **#42 (day-accurate)**. Test: `schedule-build-email.test.ts` (8 cases).

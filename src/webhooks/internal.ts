@@ -8,7 +8,7 @@ import {
   type AvailabilitySlot,
   type RotationSpec,
 } from '../workflows/employee-onboarding';
-import { commitSwapPickup, proposeSwapTrade } from '../workflows/shift-swap';
+import { commitSwapPickup, proposeSwapTrade, resolveSwapProposal } from '../workflows/shift-swap';
 import { supabase } from '../db/client';
 import { sendEmail } from '../messaging/email';
 import { brandedEmailShell, BRAND } from '../messaging/brand';
@@ -425,6 +425,34 @@ internalRouter.post('/swap-propose', async (req: Request, res: Response) => {
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[internal] swap-propose failed:', msg);
+    serverError(res, msg);
+  }
+});
+
+// POST /internal/swap-proposal-decision
+// Called by Homebase when the REQUESTER clicks Agree/Decline on a proposed trade.
+// agree → two-way swap_request + manager approve/deny email; decline → reopen the
+// broadcast to remaining candidates. Returns { ok, message } for the page.
+internalRouter.post('/swap-proposal-decision', async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const companyId = body.company_id;
+  const requesterId = body.requester_id;
+  const decision = body.decision;
+
+  if (typeof companyId !== 'string' || companyId.length === 0) { badRequest(res, 'company_id is required'); return; }
+  if (typeof requesterId !== 'string' || requesterId.length === 0) { badRequest(res, 'requester_id is required'); return; }
+  if (decision !== 'agree' && decision !== 'decline') { badRequest(res, 'decision must be "agree" or "decline"'); return; }
+
+  try {
+    const result = await resolveSwapProposal({
+      company_id: companyId,
+      requester_id: requesterId,
+      decision,
+    });
+    res.json(result);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[internal] swap-proposal-decision failed:', msg);
     serverError(res, msg);
   }
 });

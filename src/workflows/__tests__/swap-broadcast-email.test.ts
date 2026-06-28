@@ -39,7 +39,7 @@ vi.mock('../../messaging/reply', () => ({ reply: vi.fn(), sendInThreadAck: vi.fn
 vi.mock('../../logger/activity-log', () => ({ logActivity: vi.fn() }));
 vi.mock('../../lib/schedule-simulator', () => ({ computeWageEstimate: vi.fn() }));
 
-import { buildSwapBroadcastEmail } from '../shift-swap';
+import { buildSwapBroadcastEmail, buildSwapProposalEmail } from '../shift-swap';
 
 process.env.HOMEBASE_URL = 'https://homebase.test';
 
@@ -105,5 +105,37 @@ describe('buildSwapBroadcastEmail — pickup-only candidate', () => {
     // 2026-07-06 = Monday, Jul 6; 2026-07-07 = Tuesday, Jul 7.
     expect(text).toMatch(/Jul 6/);
     expect(text).toMatch(/Jul 7/);
+  });
+});
+
+describe('buildSwapProposalEmail — requester Agree/Decline', () => {
+  it('mints swap_agree + swap_decline tokens and renders both buttons', async () => {
+    const { subject, text, html } = await buildSwapProposalEmail({
+      company_id: base.company_id,
+      requester: { id: 'r1', name: 'John Jones', email: 'john@club.com' },
+      receiver_id: 'c1',
+      receiver_name: 'Dana Reed',
+      shift_name: 'Saturday AM',
+      shift_date: '2026-07-11',
+      shift_start: '09:00',
+      shift_end: '13:00',
+      shift_role: 'Lifeguard',
+      target_shift_name: 'Monday AM',
+      target_shift_date: '2026-07-06',
+      target_shift_start: '09:00',
+      target_shift_end: '13:00',
+      target_role: 'Lifeguard',
+    });
+
+    expect(h.tokenInserts.map(t => t.action_type).sort()).toEqual(['swap_agree', 'swap_decline']);
+    for (const t of h.tokenInserts) {
+      expect(t.payload.requester_id).toBe('r1');
+      expect(t.payload.receiver_id).toBe('c1');
+    }
+    expect(html).toContain('>Agree to the trade</a>');
+    expect(html).toContain('>Decline</a>');
+    expect(subject).toMatch(/Dana/);
+    expect(text).toMatch(/Monday AM/);
+    expect(html).not.toMatch(/view in homebase/i);
   });
 });

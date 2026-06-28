@@ -461,10 +461,155 @@ export async function proposeSwapTrade(params: {
     metadata: { requester_id: params.requester_id, receiver_id: params.receiver_id, shift_date: b.shift_date, target_shift_date: sel.date, mode: 'swap' },
   });
 
+  // Ask the requester to Agree/Decline the trade (email-first magic-link). Their
+  // email comes from their record; fall back to the channel sender if needed.
+  const { data: reqData } = await supabase.from('employees').select('id, name, contact_email')
+    .eq('id', params.requester_id).single();
+  const requesterRec = reqData as { id: string; name: string; contact_email: string | null } | null;
+  const requesterEmail = requesterRec?.contact_email
+    ?? (b.requester_channel === 'email' ? b.requester_sender : null);
+  if (requesterEmail) {
+    const { subject, text, html } = await buildSwapProposalEmail({
+      company_id: params.company_id,
+      requester: { id: params.requester_id, name: b.requester_name, email: requesterEmail },
+      receiver_id: params.receiver_id,
+      receiver_name: receiver.name,
+      shift_name: b.shift_name,
+      shift_date: b.shift_date,
+      shift_start: b.shift_start,
+      shift_end: b.shift_end,
+      shift_role: b.role,
+      target_shift_name: sel.shift_name,
+      target_shift_date: sel.date,
+      target_shift_start: sel.start_time,
+      target_shift_end: sel.end_time,
+      target_role: sel.role,
+    });
+    await sendEmail({ to: requesterEmail, subject, text, html, company_id: params.company_id });
+  }
+
   return {
     ok: true,
-    message: `Thanks, ${firstName(receiver.name)}! I've recorded your offer to trade your ${sel.shift_name} shift on ${formatDisplayDate(sel.date)} for ${b.requester_name}'s ${b.shift_name}. I'll confirm it with ${firstName(b.requester_name)} and let you know how it shakes out.`,
+    message: `Thanks, ${firstName(receiver.name)}! I've recorded your offer to trade your ${sel.shift_name} shift on ${formatDisplayDate(sel.date)} for ${b.requester_name}'s ${b.shift_name}. I've asked ${firstName(b.requester_name)} to confirm the trade — you'll hear back once it's settled.`,
   };
+}
+
+async function clearSwapProposal(companyId: string, requesterId: string): Promise<void> {
+  await supabase.from('aegis_memory').delete()
+    .eq('company_id', companyId)
+    .eq('source', swapProposalSource(requesterId));
+}
+
+// The requester clicked Agree or Decline on a proposed trade.
+//  • AGREE  → create the two-way swap_request (pending manager) + email the manager
+//             (existing approve/deny path → executeScheduleTrade on approval) +
+//             tell the candidate it's pending manager.
+//  • DECLINE → REOPEN the broadcast (status back to open) so remaining candidates'
+//             email buttons work again, and tell the candidate the trade is off.
+export async function resolveSwapProposal(params: {
+  company_id: string;
+  requester_id: string;
+  decision: 'agree' | 'decline';
+}): Promise<{ ok: boolean; message: string }> {
+  const proposal = await getSwapProposal(params.company_id, params.requester_id);
+  if (!proposal) {
+    return { ok: false, message: 'This trade offer has expired or was already handled. Nothing more to do here.' };
+  }
+  const p = proposal;
+
+  const [{ data: reqData }, { data: recvData }] = await Promise.all([
+    supabase.from('employees').select('*').eq('id', p.requester_id).single(),
+    supabase.from('employees').select('*').eq('id', p.receiver_id).single(),
+  ]);
+  const requester = reqData as Employee | null;
+  const receiver = recvData as Employee | null;
+  if (!requester || !receiver) {
+    return { ok: false, message: 'Something went wrong finding the right records — please contact your manager.' };
+  }
+
+  const aegisSmsNumber = await getAegisSmsChannel(params.company_id);
+
+  if (params.decision === 'decline') {
+    const broadcast = await getSwapBroadcast(params.company_id, params.requester_id);
+    if (broadcast) {
+      await storeSwapBroadcast({ ...broadcast, status: 'open', locked_by: null });
+    }
+    await clearSwapProposal(params.company_id, params.requester_id);
+
+    await sendOutreachMessage({
+      receiverEmail: receiver.contact_email ?? null,
+      receiverPhone: receiver.contact_phone ?? null,
+      aegisSmsNumber,
+      subject: `Update on the ${p.shift_name} trade`,
+      text: `${greeting(receiver.name)} thanks for offering to trade — ${firstName(p.requester_name)} decided to keep their original shift, so this trade won't go ahead. No action needed on your end.`,
+      company_id: params.company_id,
+    });
+
+    await logActivity({
+      company_id: params.company_id,
+      action: 'swap_proposal_declined',
+      summary: `${p.requester_name} declined ${receiver.name}'s trade offer — broadcast reopened`,
+      metadata: { requester_id: p.requester_id, receiver_id: p.receiver_id, mode: 'swap' },
+    });
+
+    return { ok: true, message: `No problem — I've let ${firstName(receiver.name)} know, and your shift is open again for someone else to grab.` };
+  }
+
+  // AGREE → two-way swap_request (pending manager) + manager approve/deny email.
+  const { data: swapRow } = await supabase.from('swap_requests').insert({
+    company_id: params.company_id,
+    requesting_employee_id: p.requester_id,
+    receiving_employee_id: p.receiver_id,
+    shift_date: p.shift_date,
+    shift_name: p.shift_name,
+    role: p.role,
+    status: 'pending_manager',
+    initiated_by: 'aegis',
+    notes: `Two-way trade agreed by both via the broadcast: ${p.requester_name} gives ${p.shift_name} (${p.shift_date}) and takes ${p.target_shift_name} (${p.target_shift_date}).`,
+  }).select('id').single();
+  const swapId = (swapRow as { id: string } | null)?.id ?? 'unknown';
+
+  await sendManagerSwapApprovalRequest({
+    company_id: params.company_id,
+    swap_request_id: swapId,
+    requester,
+    requester_channel: p.requester_channel,
+    requester_sender: p.requester_sender,
+    receiver,
+    shift_date: p.shift_date,
+    shift_name: p.shift_name,
+    role: p.role,
+    shift_start: p.shift_start,
+    shift_end: p.shift_end,
+    aegis_sms_channel: aegisSmsNumber,
+    target_shift_date: p.target_shift_date,
+    target_shift_name: p.target_shift_name,
+    target_role: p.target_role,
+    target_shift_start: p.target_shift_start,
+    target_shift_end: p.target_shift_end,
+  });
+
+  await sendOutreachMessage({
+    receiverEmail: receiver.contact_email ?? null,
+    receiverPhone: receiver.contact_phone ?? null,
+    aegisSmsNumber,
+    subject: `Your trade with ${firstName(p.requester_name)} — pending manager`,
+    text: `${greeting(receiver.name)} ${firstName(p.requester_name)} agreed to the trade! It's with your manager for the final OK now — I'll let you know the moment it's confirmed.`,
+    company_id: params.company_id,
+  });
+
+  await clearSwapProposal(params.company_id, params.requester_id);
+
+  await logActivity({
+    company_id: params.company_id,
+    action: 'swap_proposal_agreed',
+    entity_type: 'swap_request',
+    entity_id: swapId,
+    summary: `${p.requester_name} agreed to trade with ${receiver.name} — pending manager approval`,
+    metadata: { requester_id: p.requester_id, receiver_id: p.receiver_id, shift_date: p.shift_date, target_shift_date: p.target_shift_date, mode: 'swap' },
+  });
+
+  return { ok: true, message: `Great — I've sent the trade to your manager for the final OK. You and ${firstName(receiver.name)} will both hear back once it's approved.` };
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -705,6 +850,79 @@ export async function buildSwapBroadcastEmail(params: {
 
   const html = brandedEmailShell({ bodyHtml, preheader: subject });
   return { subject, text, html };
+}
+
+// Build the REQUESTER's "do you agree to this trade?" email after a candidate
+// proposes a swap on the picker page. Mints swap_agree / swap_decline magic-link
+// tokens (issued to the requester). EMPLOYEE-FACING — no Homebase CTA.
+export async function buildSwapProposalEmail(params: {
+  company_id: string;
+  requester: { id: string; name: string; email: string };
+  receiver_id: string;
+  receiver_name: string;
+  // The requester's shift they'd give up.
+  shift_name: string;
+  shift_date: string;
+  shift_start: string;
+  shift_end: string;
+  shift_role: string;
+  // The receiver's shift the requester would take in return.
+  target_shift_name: string;
+  target_shift_date: string;
+  target_shift_start: string;
+  target_shift_end: string;
+  target_role: string;
+  ttl_minutes?: number;
+}): Promise<{ subject: string; text: string; html: string }> {
+  const ttl = params.ttl_minutes ?? 72 * 60;
+  const payload = {
+    requester_id: params.requester.id,
+    receiver_id: params.receiver_id,
+    receiver_name: params.receiver_name,
+    shift_name: params.shift_name,
+    date: formatDisplayDate(params.shift_date),
+    target_shift_name: params.target_shift_name,
+    target_date: formatDisplayDate(params.target_shift_date),
+  };
+  const [agreeTok, declineTok] = await Promise.all([
+    generateActionToken({
+      action_type: 'swap_agree', payload, company_id: params.company_id,
+      issued_to_email: params.requester.email, issued_to_employee_id: params.requester.id, ttl_minutes: ttl,
+    }),
+    generateActionToken({
+      action_type: 'swap_decline', payload, company_id: params.company_id,
+      issued_to_email: params.requester.email, issued_to_employee_id: params.requester.id, ttl_minutes: ttl,
+    }),
+  ]);
+
+  const giveUp = `${params.shift_name} (${params.shift_start}–${params.shift_end}, ${params.shift_role}) on ${formatDisplayDate(params.shift_date)}`;
+  const getBack = `${params.target_shift_name} (${params.target_shift_start}–${params.target_shift_end}, ${params.target_role}) on ${formatDisplayDate(params.target_shift_date)}`;
+
+  const subject = `${firstName(params.receiver_name)} can take your ${params.shift_name} shift — trade?`;
+  const text =
+    `${greeting(params.requester.name)} good news — ${params.receiver_name} can take your ${giveUp}. ` +
+    `In return, you'd take their ${getBack}. Does that trade work for you? ` +
+    `Tap Agree to send it to your manager for the final OK, or Decline to pass.`;
+
+  const detail =
+    `<p style="margin:0 0 12px;font-size:15px;color:${BRAND.textPrimary};line-height:1.6;">` +
+    `${escapeHtml(params.receiver_name)} can take your <strong>${escapeHtml(params.shift_name)}</strong> ` +
+    `(${escapeHtml(params.shift_start)}–${escapeHtml(params.shift_end)}, ${escapeHtml(params.shift_role)}) on <strong>${escapeHtml(formatDisplayDate(params.shift_date))}</strong>.</p>` +
+    `<p style="margin:0 0 16px;font-size:15px;color:${BRAND.textPrimary};line-height:1.6;">` +
+    `In return, you'd take their <strong>${escapeHtml(params.target_shift_name)}</strong> ` +
+    `(${escapeHtml(params.target_shift_start)}–${escapeHtml(params.target_shift_end)}, ${escapeHtml(params.target_role)}) on <strong>${escapeHtml(formatDisplayDate(params.target_shift_date))}</strong>.</p>` +
+    `<p style="margin:0 0 16px;font-size:14px;color:${BRAND.silver};line-height:1.6;">If you agree, it goes to your manager for the final OK.</p>` +
+    brandedButtonRow([
+      { url: agreeTok.url, label: 'Agree to the trade', variant: 'primary' },
+      { url: declineTok.url, label: 'Decline', variant: 'secondary' },
+    ]);
+
+  const bodyHtml =
+    `<p style="margin:0 0 18px;font-size:16px;color:${BRAND.textPrimary};line-height:1.65;">` +
+    `${escapeHtml(greeting(params.requester.name))} someone can take that shift off your hands — here's the trade.</p>` +
+    brandActionCard('Trade offer', detail);
+
+  return { subject, text, html: brandedEmailShell({ bodyHtml, preheader: subject }) };
 }
 
 async function getAegisSmsChannel(companyId: string): Promise<string | null> {

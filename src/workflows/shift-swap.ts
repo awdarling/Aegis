@@ -15,6 +15,7 @@ import {
   brandedButtonRow,
   brandActionCard,
 } from '../messaging/brand';
+import { generateActionToken } from '../lib/aegis-actions/tokens';
 import type { InboundMessage, VerifiedContact } from '../security/types';
 import type { Employee, Policy } from '../db/types';
 import type { ScheduleAssignment } from './schedule-build';
@@ -179,6 +180,46 @@ async function clearSwapOutreach(companyId: string, receiverId: string): Promise
     .eq('source', `swap_outreach:${receiverId}`);
 }
 
+// ── #10 broadcast state (one in-flight broadcast per requester) ────────────────
+function swapBroadcastSource(requesterId: string): string {
+  return `swap_broadcast:${requesterId}`;
+}
+
+export async function storeSwapBroadcast(broadcast: SwapBroadcast): Promise<void> {
+  await supabase.from('aegis_memory').delete()
+    .eq('company_id', broadcast.company_id)
+    .eq('source', swapBroadcastSource(broadcast.requester_id));
+  await supabase.from('aegis_memory').insert({
+    company_id: broadcast.company_id,
+    memory_type: 'observation',
+    source: swapBroadcastSource(broadcast.requester_id),
+    content: JSON.stringify(broadcast),
+  });
+}
+
+export async function getSwapBroadcast(
+  companyId: string,
+  requesterId: string,
+): Promise<(SwapBroadcast & { _memory_id: string }) | null> {
+  const { data } = await supabase.from('aegis_memory')
+    .select('id, content')
+    .eq('company_id', companyId)
+    .eq('source', swapBroadcastSource(requesterId))
+    .maybeSingle();
+  if (!data) return null;
+  try {
+    const row = data as { id: string; content: string };
+    const broadcast = JSON.parse(row.content) as SwapBroadcast;
+    if (new Date(broadcast.expires_at) < new Date()) {
+      await supabase.from('aegis_memory').delete().eq('id', row.id);
+      return null;
+    }
+    return { ...broadcast, _memory_id: row.id };
+  } catch {
+    return null;
+  }
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 export function computeShiftHours(start: string, end: string): number {
@@ -306,6 +347,95 @@ export function partitionSwapCandidates(
     if (tradeableShifts.length > 0) swap.push({ employee: emp, tradeableShifts });
   }
   return { pickup: pickupEligible, swap };
+}
+
+// Build ONE candidate's two-button broadcast email. The PICKUP button is always
+// present; the SWAP button is rendered ONLY when `swapEligible` (the candidate has
+// a tradeable shift on a requester-willing day). Mints the matching magic-link
+// action tokens (`swap_pickup`, and `swap_trade_select` when eligible) that carry
+// the self-contained broadcast snapshot, so the Homebase landing page works from
+// the token alone. EMPLOYEE-FACING — no "View in Homebase" CTA, warm voice.
+export async function buildSwapBroadcastEmail(params: {
+  company_id: string;
+  candidate: { id: string; name: string; email: string };
+  requester_name: string;
+  shift_name: string;
+  shift_role: string;
+  shift_date: string;
+  shift_start: string;
+  shift_end: string;
+  willing_dates: string[];        // YYYY-MM-DD the requester can work in return
+  swapEligible: boolean;          // render the SWAP button?
+  token_payload: Record<string, unknown>;   // shared broadcast snapshot
+  ttl_minutes?: number;
+}): Promise<{ subject: string; text: string; html: string }> {
+  const ttl = params.ttl_minutes ?? 72 * 60;
+  const pickupTok = await generateActionToken({
+    action_type: 'swap_pickup',
+    payload: { ...params.token_payload, receiver_id: params.candidate.id, mode: 'pickup' },
+    company_id: params.company_id,
+    issued_to_email: params.candidate.email,
+    issued_to_employee_id: params.candidate.id,
+    ttl_minutes: ttl,
+  });
+  let swapUrl: string | null = null;
+  if (params.swapEligible) {
+    const swapTok = await generateActionToken({
+      action_type: 'swap_trade_select',
+      payload: { ...params.token_payload, receiver_id: params.candidate.id, mode: 'swap' },
+      company_id: params.company_id,
+      issued_to_email: params.candidate.email,
+      issued_to_employee_id: params.candidate.id,
+      ttl_minutes: ttl,
+    });
+    swapUrl = swapTok.url;
+  }
+
+  const dateLong = formatDisplayDate(params.shift_date);
+  const shiftDesc = `${params.shift_name} (${params.shift_start}–${params.shift_end}, ${params.shift_role}) on ${dateLong}`;
+  const willingList = params.willing_dates.length > 0
+    ? params.willing_dates.slice().sort().map(formatShortDate).join(', ')
+    : null;
+
+  const subject = `Can you help cover a ${params.shift_name} shift on ${formatShortDate(params.shift_date)}?`;
+
+  // Plain-text version (also the SMS-fallback body).
+  const swapLineText = swapUrl
+    ? ` Or, if you'd rather trade, you can swap one of your own shifts for it.`
+    : '';
+  const text =
+    `${greeting(params.candidate.name)} this is Aegis. ` +
+    `${params.requester_name} can't work their ${shiftDesc} and is hoping a teammate can help out.` +
+    (willingList ? ` In return, ${firstName(params.requester_name)} can work: ${willingList}.` : '') +
+    ` You can pick the shift up and add it to your schedule.${swapLineText} ` +
+    `Just tap the button in this email to let me know.`;
+
+  const buttons = [
+    { url: pickupTok.url, label: "I'll pick it up", variant: 'primary' as const },
+    ...(swapUrl ? [{ url: swapUrl, label: 'I\'d like to swap', variant: 'secondary' as const }] : []),
+  ];
+
+  const detail =
+    `<p style="margin:0 0 12px;font-size:15px;color:${BRAND.textPrimary};line-height:1.6;">` +
+    `${escapeHtml(params.requester_name)} can't work their <strong>${escapeHtml(params.shift_name)}</strong> ` +
+    `(${escapeHtml(params.shift_start)}–${escapeHtml(params.shift_end)}, ${escapeHtml(params.shift_role)}) on <strong>${escapeHtml(dateLong)}</strong>.</p>` +
+    (willingList
+      ? `<p style="margin:0 0 14px;font-size:14px;color:${BRAND.silver};line-height:1.6;">In return, ${escapeHtml(firstName(params.requester_name))} can work: ${escapeHtml(willingList)}.</p>`
+      : '') +
+    `<p style="margin:0 0 16px;font-size:14px;color:${BRAND.silver};line-height:1.6;">` +
+    (swapUrl
+      ? `Pick it up and add it to your schedule, or swap one of your own shifts for it.`
+      : `Pick it up and add it to your schedule.`) +
+    `</p>` +
+    brandedButtonRow(buttons);
+
+  const bodyHtml =
+    `<p style="margin:0 0 18px;font-size:16px;color:${BRAND.textPrimary};line-height:1.65;">` +
+    `${escapeHtml(greeting(params.candidate.name))} ${escapeHtml(params.requester_name)} needs a hand with a shift — can you help?</p>` +
+    brandActionCard('Shift available', detail);
+
+  const html = brandedEmailShell({ bodyHtml, preheader: subject });
+  return { subject, text, html };
 }
 
 async function getAegisSmsChannel(companyId: string): Promise<string | null> {
@@ -670,6 +800,7 @@ async function extractSwapDetails(body: string, today: string): Promise<{
   target_employee_name: string | null;
   target_shift_date: string | null;
   target_shift_name: string | null;
+  willing_days: number[];
 }> {
   const system =
     `You are a data extractor for a workforce scheduling system. Today is ${today}. ` +
@@ -677,13 +808,54 @@ async function extractSwapDetails(body: string, today: string): Promise<{
     'Extract: shift_date/shift_name = the SENDER\'s shift they want to give up; ' +
     'target_employee_name = the coworker they want to trade with (null if they didn\'t name anyone); ' +
     'target_shift_date/target_shift_name = the COWORKER\'s shift the sender wants to take in return (null if not stated). ' +
+    'willing_days = the weekdays the SENDER says they CAN work in return, as integers 0=Sunday..6=Saturday (e.g. "I can work Mon/Tue/Wed" → [1,2,3]); empty array if they did not say. ' +
     'Example: "swap my Saturday AM for Joe\'s Friday PM" → shift_name "Saturday AM", target_employee_name "Joe", target_shift_name "Friday PM". ' +
-    'Respond with ONLY valid JSON: {"shift_date":"YYYY-MM-DD"|null,"shift_name":string|null,"target_employee_name":string|null,"target_shift_date":"YYYY-MM-DD"|null,"target_shift_name":string|null}';
+    'Respond with ONLY valid JSON: {"shift_date":"YYYY-MM-DD"|null,"shift_name":string|null,"target_employee_name":string|null,"target_shift_date":"YYYY-MM-DD"|null,"target_shift_name":string|null,"willing_days":number[]}';
   const text = await generateReply(system, body, []);
-  return (
-    coerceJsonObject<{ shift_date: string | null; shift_name: string | null; target_employee_name: string | null; target_shift_date: string | null; target_shift_name: string | null }>(text) ??
-    { shift_date: null, shift_name: null, target_employee_name: null, target_shift_date: null, target_shift_name: null }
-  );
+  const parsed = coerceJsonObject<{
+    shift_date: string | null; shift_name: string | null; target_employee_name: string | null;
+    target_shift_date: string | null; target_shift_name: string | null; willing_days?: unknown;
+  }>(text);
+  const willing_days = Array.isArray(parsed?.willing_days)
+    ? (parsed!.willing_days as unknown[]).filter((n): n is number => Number.isInteger(n) && (n as number) >= 0 && (n as number) <= 6)
+    : [];
+  return {
+    shift_date: parsed?.shift_date ?? null,
+    shift_name: parsed?.shift_name ?? null,
+    target_employee_name: parsed?.target_employee_name ?? null,
+    target_shift_date: parsed?.target_shift_date ?? null,
+    target_shift_name: parsed?.target_shift_name ?? null,
+    willing_days,
+  };
+}
+
+// Resolve the requester's willing WEEKDAYS (0=Sun..6=Sat) to concrete dates that
+// actually fall in the schedule week of the shift being given up. Pure + deterministic:
+// a swap is within the published week, so a candidate's tradeable shift must land on
+// one of these resolved dates. `weekDates` is the list of YYYY-MM-DD in that week.
+export function resolveWillingDates(
+  willingWeekdays: readonly number[],
+  weekDates: readonly string[],
+): Set<string> {
+  const wanted = new Set(willingWeekdays);
+  const out = new Set<string>();
+  for (const d of weekDates) {
+    const dow = new Date(d + 'T12:00:00Z').getUTCDay();
+    if (wanted.has(dow)) out.add(d);
+  }
+  return out;
+}
+
+// The 7 YYYY-MM-DD dates of the week starting at weekStart (inclusive).
+export function weekDatesFrom(weekStart: string): string[] {
+  const start = new Date(weekStart + 'T12:00:00Z');
+  const dates: string[] = [];
+  for (let i = 0; i < 7; i++) {
+    const d = new Date(start);
+    d.setUTCDate(start.getUTCDate() + i);
+    dates.push(d.toISOString().slice(0, 10));
+  }
+  return dates;
 }
 
 // ── Manager notification ──────────────────────────────────────────────────────

@@ -38,6 +38,8 @@ import {
   isReachableForOutreach,
   tradeableShiftsForCandidate,
   partitionSwapCandidates,
+  resolveWillingDates,
+  weekDatesFrom,
   type TradeSide,
 } from '../shift-swap';
 import type { Employee } from '../../db/types';
@@ -276,5 +278,32 @@ describe('partitionSwapCandidates (button A vs A+B)', () => {
     const part = partitionSwapCandidates([bob], new Map(), willing, requesterRoles);
     expect(part.pickup).toHaveLength(1);
     expect(part.swap).toEqual([]);
+  });
+});
+
+describe('weekDatesFrom + resolveWillingDates', () => {
+  // Week starting Sunday 2026-07-05.
+  const week = weekDatesFrom('2026-07-05');
+
+  it('weekDatesFrom returns the 7 consecutive dates of the week', () => {
+    expect(week).toEqual([
+      '2026-07-05', '2026-07-06', '2026-07-07', '2026-07-08',
+      '2026-07-09', '2026-07-10', '2026-07-11',
+    ]);
+  });
+
+  it('resolves willing weekdays to the matching dates in that week', () => {
+    // Mon(1), Tue(2), Wed(3) → the 6th, 7th, 8th.
+    const dates = resolveWillingDates([1, 2, 3], week);
+    expect([...dates].sort()).toEqual(['2026-07-06', '2026-07-07', '2026-07-08']);
+  });
+
+  it('Sunday(0) and Saturday(6) map to the week ends', () => {
+    const dates = resolveWillingDates([0, 6], week);
+    expect([...dates].sort()).toEqual(['2026-07-05', '2026-07-11']);
+  });
+
+  it('empty willing-days resolves to no dates', () => {
+    expect(resolveWillingDates([], week).size).toBe(0);
   });
 });

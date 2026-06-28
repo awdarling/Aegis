@@ -228,6 +228,86 @@ export function isReachableForOutreach(
   return !!(emp.contact_email || (emp.contact_phone && hasSmsChannel));
 }
 
+// ── #10 two-button broadcast (Alexander's redesign, 2026-06-28) ───────────────
+// The undirected swap becomes a simultaneous broadcast with two options per
+// candidate: PICK UP the requester's shift (one-way), or SWAP (two-way trade).
+// These Stage-1 helpers are the analytical core the later stages consume.
+
+// One in-flight broadcast for a requester's unwanted shift. Stored keyed by the
+// requester; `status` flips open→locked the instant the FIRST candidate commits
+// (a pickup confirm, or a swap proposal the requester then sees), so the shift
+// can't be double-promised. On a requester-declined swap it reopens (status back
+// to 'open', locked_by cleared) so remaining candidates can still act.
+export interface SwapBroadcast {
+  requester_id: string;
+  requester_name: string;
+  company_id: string;
+  requester_channel: 'sms' | 'email';
+  requester_sender: string;
+  requester_recipient: string;
+  requester_raw_subject?: string;
+  requester_thread_id?: string;
+  // The shift the requester wants off their plate.
+  shift_date: string;
+  shift_name: string;
+  role: string;
+  shift_start: string;
+  shift_end: string;
+  schedule_id: string | null;
+  // Dates (YYYY-MM-DD) the requester is willing to WORK in return — drives which
+  // of a candidate's own shifts are tradeable.
+  willing_dates: string[];
+  status: 'open' | 'locked';
+  locked_by?: string | null;   // receiver_id that committed first
+  contacted_ids: string[];     // audit: who the broadcast reached
+  expires_at: string;
+}
+
+// Which of a candidate's OWN shifts could the requester take in a swap? A shift
+// qualifies only if it falls on a day the requester is willing to work AND the
+// requester is qualified for that shift's role. These are exactly the cards shown
+// on the swap landing page; an empty result means this candidate can only PICK UP
+// (button A), not SWAP (button B).
+export function tradeableShiftsForCandidate(
+  candidateAssignments: ScheduleAssignment[],
+  requesterWillingDates: ReadonlySet<string>,
+  requesterQualifiedRoles: readonly string[],
+): ScheduleAssignment[] {
+  const roles = new Set(requesterQualifiedRoles);
+  return candidateAssignments.filter(
+    a => requesterWillingDates.has(a.date) && roles.has(a.role),
+  );
+}
+
+export interface SwapCandidatePartition {
+  // Everyone qualified/available to take the requester's shift — all get button A.
+  pickup: Employee[];
+  // The subset who ALSO have a tradeable shift on a willing day — they get button B
+  // too, and these are the shifts shown as cards on the swap page.
+  swap: { employee: Employee; tradeableShifts: ScheduleAssignment[] }[];
+}
+
+// Split the already-vetted pickup-eligible candidates (upstream filters handle
+// qualification / availability / hours / conflicts) into pickup-only vs also-
+// swappable, attaching each swappable candidate's tradeable shifts.
+export function partitionSwapCandidates(
+  pickupEligible: Employee[],
+  assignmentsByEmployee: ReadonlyMap<string, ScheduleAssignment[]>,
+  requesterWillingDates: ReadonlySet<string>,
+  requesterQualifiedRoles: readonly string[],
+): SwapCandidatePartition {
+  const swap: SwapCandidatePartition['swap'] = [];
+  for (const emp of pickupEligible) {
+    const tradeableShifts = tradeableShiftsForCandidate(
+      assignmentsByEmployee.get(emp.id) ?? [],
+      requesterWillingDates,
+      requesterQualifiedRoles,
+    );
+    if (tradeableShifts.length > 0) swap.push({ employee: emp, tradeableShifts });
+  }
+  return { pickup: pickupEligible, swap };
+}
+
 async function getAegisSmsChannel(companyId: string): Promise<string | null> {
   const { data } = await supabase.from('company_channels').select('channel_value')
     .eq('company_id', companyId).eq('channel_type', 'sms').maybeSingle();

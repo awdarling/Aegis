@@ -8,6 +8,7 @@ import {
   type AvailabilitySlot,
   type RotationSpec,
 } from '../workflows/employee-onboarding';
+import { commitSwapPickup } from '../workflows/shift-swap';
 import { supabase } from '../db/client';
 import { sendEmail } from '../messaging/email';
 import { brandedEmailShell, BRAND } from '../messaging/brand';
@@ -342,6 +343,45 @@ internalRouter.post('/apply-custom-availability-decision', async (req: Request, 
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[internal] apply-custom-availability-decision failed:', msg);
+    serverError(res, msg);
+  }
+});
+
+// POST /internal/swap-pickup-commit
+// Called by Homebase /api/aegis-action when a broadcast candidate clicks
+// "I'll pick it up" and confirms. Locks the broadcast (first-commit-wins),
+// creates the one-way pickup swap_request (pending manager), notifies the
+// requester, and emails the manager the approve/deny. Returns { ok, message }
+// which the landing page shows the candidate.
+internalRouter.post('/swap-pickup-commit', async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const companyId = body.company_id;
+  const requesterId = body.requester_id;
+  const receiverId = body.receiver_id;
+
+  if (typeof companyId !== 'string' || companyId.length === 0) {
+    badRequest(res, 'company_id is required');
+    return;
+  }
+  if (typeof requesterId !== 'string' || requesterId.length === 0) {
+    badRequest(res, 'requester_id is required');
+    return;
+  }
+  if (typeof receiverId !== 'string' || receiverId.length === 0) {
+    badRequest(res, 'receiver_id is required');
+    return;
+  }
+
+  try {
+    const result = await commitSwapPickup({
+      company_id: companyId,
+      requester_id: requesterId,
+      receiver_id: receiverId,
+    });
+    res.json(result);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[internal] swap-pickup-commit failed:', msg);
     serverError(res, msg);
   }
 });

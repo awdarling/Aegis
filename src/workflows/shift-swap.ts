@@ -220,6 +220,114 @@ export async function getSwapBroadcast(
   }
 }
 
+export type SwapCommitGuard = { allowed: true } | { allowed: false; reason: 'expired' | 'locked' };
+
+// First-commit-wins: only an OPEN broadcast accepts a commit. A locked one is
+// already being handled by whoever committed first; a missing one has expired.
+// (Residual race between read + lock is acceptable here — the manager approval is
+// the final gate; a DB-level atomic guard is a logged hardening follow-up.)
+export function swapBroadcastCommitGuard(
+  broadcast: { status: 'open' | 'locked' } | null,
+): SwapCommitGuard {
+  if (!broadcast) return { allowed: false, reason: 'expired' };
+  if (broadcast.status === 'locked') return { allowed: false, reason: 'locked' };
+  return { allowed: true };
+}
+
+// A candidate clicked "I'll pick it up." Lock the broadcast, create a one-way
+// pickup swap_request (pending manager), tell the requester someone grabbed it,
+// and email the manager the approve/deny (reusing the existing swap magic-link
+// path — on approve, webhooks/decision.ts does the one-way reassignment + notifies
+// both). Returns the message the Homebase landing page shows the candidate.
+export async function commitSwapPickup(params: {
+  company_id: string;
+  requester_id: string;
+  receiver_id: string;
+}): Promise<{ ok: boolean; message: string }> {
+  const broadcast = await getSwapBroadcast(params.company_id, params.requester_id);
+  const guard = swapBroadcastCommitGuard(broadcast);
+  if (!guard.allowed) {
+    return {
+      ok: false,
+      message: guard.reason === 'locked'
+        ? "Someone just grabbed this shift — it's being handled now. Thanks for jumping on it!"
+        : "This shift request has expired or already been resolved. Nothing more to do here.",
+    };
+  }
+  const b = broadcast!;
+  // Lock it so no one else can also commit.
+  await storeSwapBroadcast({ ...b, status: 'locked', locked_by: params.receiver_id });
+
+  const [{ data: recvData }, { data: reqData }] = await Promise.all([
+    supabase.from('employees').select('*').eq('id', params.receiver_id).single(),
+    supabase.from('employees').select('*').eq('id', params.requester_id).single(),
+  ]);
+  const receiver = recvData as Employee | null;
+  const requester = reqData as Employee | null;
+  if (!receiver || !requester) {
+    return { ok: false, message: 'Something went wrong finding the right records — please contact your manager.' };
+  }
+
+  // One-way pickup → pending manager.
+  const { data: swapRow } = await supabase.from('swap_requests').insert({
+    company_id: params.company_id,
+    requesting_employee_id: params.requester_id,
+    receiving_employee_id: params.receiver_id,
+    shift_date: b.shift_date,
+    shift_name: b.shift_name,
+    role: b.role,
+    status: 'pending_manager',
+    initiated_by: 'aegis',
+    notes: `${receiver.name} offered to pick up the shift via the broadcast — one-way pickup (no trade).`,
+  }).select('id').single();
+  const swapId = (swapRow as { id: string } | null)?.id ?? 'unknown';
+
+  // Tell the requester someone is picking it up (their channel).
+  const requesterMsg: InboundMessage = {
+    sender: b.requester_sender, recipient: b.requester_recipient, body: '',
+    channel: b.requester_channel, raw_subject: b.requester_raw_subject, thread_id: b.requester_thread_id,
+  };
+  const requesterContact: VerifiedContact = {
+    role: 'employee', company_id: params.company_id, employee_id: params.requester_id,
+    user_id: null, name: requester.name, matched_identifier: b.requester_sender, channel: b.requester_channel,
+  };
+  await reply(requesterContact, requesterMsg,
+    `Good news — ${receiver.name} offered to pick up your ${b.shift_name} shift on ${formatDisplayDate(b.shift_date)}. ` +
+    `It's pending your manager's approval now; I'll let you know the moment it's decided.`
+  );
+
+  // Manager approve/deny email (existing swap magic-link path; one-way = no target_*).
+  const aegisSmsNumber = await getAegisSmsChannel(params.company_id);
+  await sendManagerSwapApprovalRequest({
+    company_id: params.company_id,
+    swap_request_id: swapId,
+    requester,
+    requester_channel: b.requester_channel,
+    requester_sender: b.requester_sender,
+    receiver,
+    shift_date: b.shift_date,
+    shift_name: b.shift_name,
+    role: b.role,
+    shift_start: b.shift_start,
+    shift_end: b.shift_end,
+    aegis_sms_channel: aegisSmsNumber,
+  });
+
+  await logActivity({
+    company_id: params.company_id,
+    action: 'swap_pickup_committed',
+    entity_type: 'swap_request',
+    entity_id: swapId,
+    summary: `${receiver.name} offered to pick up ${requester.name}'s ${b.shift_name} on ${b.shift_date} (pending manager)`,
+    metadata: { requester_id: params.requester_id, receiver_id: params.receiver_id, shift_date: b.shift_date, mode: 'pickup' },
+  });
+
+  return {
+    ok: true,
+    message: `Thanks, ${firstName(receiver.name)}! Your manager has been asked to approve you picking up the ${b.shift_name} shift on ${formatDisplayDate(b.shift_date)}. You'll get a note once it's confirmed.`,
+  };
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 export function computeShiftHours(start: string, end: string): number {
@@ -860,7 +968,7 @@ export function weekDatesFrom(weekStart: string): string[] {
 
 // ── Manager notification ──────────────────────────────────────────────────────
 
-async function sendManagerSwapApprovalRequest(params: {
+export async function sendManagerSwapApprovalRequest(params: {
   company_id: string;
   swap_request_id: string;
   requester: Employee;

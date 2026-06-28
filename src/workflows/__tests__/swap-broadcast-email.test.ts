@@ -53,6 +53,9 @@ const base = {
   shift_start: '09:00',
   shift_end: '13:00',
   willing_dates: ['2026-07-06', '2026-07-07'],
+  tradeableShifts: [
+    { date: '2026-07-06', shift_name: 'Monday AM', role: 'Lifeguard', start_time: '09:00', end_time: '13:00' },
+  ],
   token_payload: { broadcast_id: 'b1', requester_id: 'r1' },
 };
 
@@ -70,7 +73,14 @@ describe('buildSwapBroadcastEmail — swap-eligible candidate', () => {
       expect(t.payload.broadcast_id).toBe('b1');
     }
     expect(h.tokenInserts.find(t => t.action_type === 'swap_pickup')!.payload.mode).toBe('pickup');
-    expect(h.tokenInserts.find(t => t.action_type === 'swap_trade_select')!.payload.mode).toBe('swap');
+    const swapTok = h.tokenInserts.find(t => t.action_type === 'swap_trade_select')!;
+    expect(swapTok.payload.mode).toBe('swap');
+    // The swap token is self-contained: it carries the candidate's tradeable
+    // shifts (the picker-page options) + the requester's shift in human + raw form.
+    expect(swapTok.payload.tradeable_shifts).toEqual(base.tradeableShifts);
+    expect(swapTok.payload.shift_name).toBe('Saturday AM');
+    expect(swapTok.payload.shift_date).toBe('2026-07-11');
+    expect(swapTok.payload.requester_name).toBe('John Jones');
 
     expect(html).toContain(">I'll pick it up</a>");
     expect(html).toContain(">I'd like to swap</a>");

@@ -37,7 +37,8 @@ const h = vi.hoisted(() => {
   }
   const replyMock = vi.fn(async () => {});
   const sendEmailMock = vi.fn(async () => {});
-  return { recorded, makeBuilder, replyMock, sendEmailMock };
+  const withAnthropicRetryMock = vi.fn();
+  return { recorded, makeBuilder, replyMock, sendEmailMock, withAnthropicRetryMock };
 });
 
 vi.mock('@anthropic-ai/sdk', () => ({ default: class MockAnthropic { messages = { create: vi.fn() }; } }));
@@ -51,16 +52,18 @@ vi.mock('../../db/client', () => ({ supabase: { from: (t: string) => h.makeBuild
 vi.mock('../../messaging/email', () => ({ sendEmail: h.sendEmailMock }));
 vi.mock('../../messaging/sms', () => ({ sendSms: vi.fn(async () => {}) }));
 vi.mock('../../messaging/reply', () => ({ reply: h.replyMock, sendInThreadAck: vi.fn(async () => {}) }));
-vi.mock('../../ai/claude', () => ({ withAnthropicRetry: vi.fn() }));
+vi.mock('../../ai/claude', () => ({ withAnthropicRetry: h.withAnthropicRetryMock }));
 
 import {
   buildAvailabilityManagerEmail,
   applyCustomAvailabilityDecision,
+  handleUpdateAvailability,
   isRotatingAvailabilityRequest,
   startOfWeekSunday,
   type AvailabilitySlot,
   type RotationSpec,
 } from '../employee-onboarding';
+import type { InboundMessage, VerifiedContact } from '../../security/types';
 
 const COMPANY_ID = '00000000-0000-0000-0000-000000000001';
 const EMPLOYEE_ID = 'e1684385-ab46-472d-82b8-9009cd705bde';
@@ -269,5 +272,79 @@ describe('applyCustomAvailabilityDecision (rotating)', () => {
     const body = h.replyMock.mock.calls[0][2] as string;
     expect(body).toMatch(/rotating/i);
     expect(body).not.toMatch(/homebase/i);
+  });
+});
+
+// ── INTAKE: does an employee email actually FEED the custom-availability system? ─
+//
+// This is the link the rest of the chain hangs on. The classifier surfaces an
+// "until/through" boundary as extracted.end_date; handleUpdateAvailability must
+// turn that into a TEMPORARY (date-limited) pending — not a permanent change —
+// so the manager email mints the custom buttons. Without this, the email side
+// never feeds custom_availability. The reply parse (withAnthropicRetry) is mocked
+// to a fixed slot set; we assert on the pending snapshot stashed in aegis_memory.
+describe('handleUpdateAvailability (custom intake — email feeds the custom system)', () => {
+  const contact: VerifiedContact = {
+    role: 'employee',
+    company_id: COMPANY_ID,
+    employee_id: EMPLOYEE_ID,
+    user_id: null,
+    name: 'Shmubba Sploosh',
+    matched_identifier: '+15551112222',
+    channel: 'sms',
+  };
+  // SMS channel skips the email in-thread ack + its 5s delay — keeps the test fast.
+  const message: InboundMessage = {
+    sender: '+15551112222',
+    recipient: '+15559998888',
+    body: 'no mornings until september 1',
+    channel: 'sms',
+  };
+
+  function pendingFromMemory(): Record<string, unknown> {
+    const insert = h.recorded.find(r => r.table === 'aegis_memory' && r.op === 'insert');
+    expect(insert).toBeDefined();
+    const content = (insert!.rows as { content: string }).content;
+    return JSON.parse(content) as Record<string, unknown>;
+  }
+
+  beforeEach(() => {
+    h.withAnthropicRetryMock.mockReset();
+    // parseAvailabilityIntent → a plain "set" of afternoon slots.
+    h.withAnthropicRetryMock.mockResolvedValue({
+      content: [{ type: 'text', text: JSON.stringify({ mode: 'set', slots: PROPOSED }) }],
+    });
+  });
+
+  it('an "until <date>" boundary becomes a date-limited pending (custom_end_date set), and the employee sees the temporary framing', async () => {
+    await handleUpdateAvailability(message, contact, { end_date: END_DATE });
+
+    const pending = pendingFromMemory();
+    expect(pending.custom_end_date).toBe(END_DATE);          // ← the date-limited flag
+    expect(pending.rotation ?? null).toBeNull();             // not a rotation
+    expect(pending.proposed_availability).toEqual(PROPOSED);
+    // It must NOT touch the permanent availability table at intake.
+    expect(h.recorded.some(r => r.table === 'availability' && r.op !== 'select')).toBe(false);
+
+    // The YES/NO confirmation tells the employee it's temporary, through the date.
+    const reply = h.replyMock.mock.calls[0][2] as string;
+    expect(reply).toMatch(/through .*September 1/);
+    expect(reply).not.toMatch(/homebase/i);
+  });
+
+  it('a permanent change (no end_date) leaves custom_end_date null — stays the ordinary availability path', async () => {
+    await handleUpdateAvailability(message, contact, {});
+
+    const pending = pendingFromMemory();
+    expect(pending.custom_end_date ?? null).toBeNull();      // ← not date-limited
+    expect(pending.rotation ?? null).toBeNull();
+    expect(pending.proposed_availability).toEqual(PROPOSED);
+  });
+
+  it('ignores a non-date end_date value (only a real YYYY-MM-DD becomes date-limited)', async () => {
+    await handleUpdateAvailability(message, contact, { end_date: 'sometime next month' });
+
+    const pending = pendingFromMemory();
+    expect(pending.custom_end_date ?? null).toBeNull();
   });
 });

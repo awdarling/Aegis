@@ -1112,6 +1112,19 @@ Focused Soteria session against the PURPOSE & DEFINITION-OF-DONE block. Diagnose
 - **Gap closed:** the one untested link was the **intake** — that an employee email actually *feeds* the custom system. Added 3 tests to `src/workflows/__tests__/custom-availability-magic.test.ts` (now 10): an "until \<date\>" email → date-limited pending (`custom_end_date` set, temporary framing in the confirm, permanent table untouched); a plain change → `custom_end_date` null; a non-date `end_date` value → ignored. Made the file's `withAnthropicRetry` mock controllable to drive `parseAvailabilityIntent`.
 - **State:** Aegis tsc clean; full suite **143/143 green**. Change is test-only (no production code touched) on a working copy — needs Alexander to push the branch + open a PR, then one live sandbox smoke (employee → manager approve) to flip #13 to fully DONE. Feature code itself is already deployed.
 
+### 2026-06-28 (cont. 6) — Item #10 redesign: Stage 4a (requester Agree/Decline → manager approve → execute / reopen)
+
+- **Aegis (`shift-swap.ts`, `webhooks/internal.ts`, `aegis-actions/types.ts`):**
+  - Added `swap_agree` / `swap_decline` action types.
+  - `buildSwapProposalEmail(...)` — the REQUESTER's "do you agree to this trade?" email (Agree/Decline magic-link buttons, employee voice, no Homebase CTA).
+  - `proposeSwapTrade` now (after recording the proposal) loads the requester's email and SENDS them the Agree/Decline email — closing the candidate-proposes → requester-asked loop.
+  - `resolveSwapProposal({company_id, requester_id, decision})`: **agree** → create the two-way `swap_request` (pending_manager) + `sendManagerSwapApprovalRequest` with `target_*` (manager approval → existing `webhooks/decision.ts` trade path → `executeScheduleTrade`) + tell the candidate it's pending manager + clear the proposal; **decline** → REOPEN the broadcast (`status:'open'`, `locked_by:null` — other candidates' unconsumed email buttons work again) + tell the candidate the trade's off + clear the proposal.
+  - New endpoint `POST /internal/swap-proposal-decision`.
+- **Homebase (`tokens.ts`, `aegis-internal.ts`, `dispatcher.ts`, `route.ts`):** `swap_agree`/`swap_decline` added to `ActionType` + the endpoint union; `describeAction` confirm copy ("Agree to trade your X for Y? (Then it goes to your manager.)" / "Decline this trade and keep your shift?"); dispatcher `swap_agree`/`swap_decline` cases → `handleSwapProposalDecision` → `POST /internal/swap-proposal-decision`. Standard confirm→dispatch pattern (single button) — no new page needed.
+- **Tests:** added a `buildSwapProposalEmail` test (mints swap_agree/swap_decline, both buttons, no Homebase CTA). Aegis **163/163** green, tsc clean both repos.
+- **Still inert in prod** — the agreement chain is fully built but nothing reaches it until the Stage 4b cut-over turns the broadcast on. Safe to merge. Branches (Alexander to push): Aegis + Homebase `feat/swap-agreement-stage4a`. **Deploy Homebase first.**
+- **Next — Stage 4b (THE CUT-OVER — this one changes live behavior):** in `handleInitiateSwap`, capture the requester's willing-days (ask if missing) for the undirected case; in `handleSwapConfirmation` (facilitated branch), replace the old one-at-a-time outreach with the simultaneous broadcast fan-out — build candidates, `partitionSwapCandidates`, store the `SwapBroadcast` (status open), and `buildSwapBroadcastEmail` to EVERY eligible candidate (tailored buttons). After 4b ships (Homebase already has the pages), the whole feature is live end-to-end — needs a careful sandbox smoke before/after merge.
+
 ### 2026-06-28 (cont. 5) — Item #10 redesign: Stage 3b (SWAP shift-picker landing page + proposal recording)
 
 - **Aegis (`shift-swap.ts`, `webhooks/internal.ts`):**

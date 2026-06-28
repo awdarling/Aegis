@@ -14,7 +14,11 @@ export type ActionType =
   // 'swap_pickup' → confirm page (one-way pickup); 'swap_trade_select' → the
   // action-card shift-picker (two-way trade). Both land on Homebase pages.
   | 'swap_pickup'
-  | 'swap_trade_select';
+  | 'swap_trade_select'
+  // #10 requester's response to a proposed trade: agree (→ manager approval) or
+  // decline (→ reopen the broadcast to remaining candidates).
+  | 'swap_agree'
+  | 'swap_decline';
 
 export interface GenerateTokenParams {
   action_type: ActionType;

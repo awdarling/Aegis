@@ -40,6 +40,7 @@ import {
   partitionSwapCandidates,
   resolveWillingDates,
   weekDatesFrom,
+  swapBroadcastCommitGuard,
   type TradeSide,
 } from '../shift-swap';
 import type { Employee } from '../../db/types';
@@ -305,5 +306,19 @@ describe('weekDatesFrom + resolveWillingDates', () => {
 
   it('empty willing-days resolves to no dates', () => {
     expect(resolveWillingDates([], week).size).toBe(0);
+  });
+});
+
+describe('swapBroadcastCommitGuard (first-commit-wins)', () => {
+  it('allows a commit only while the broadcast is open', () => {
+    expect(swapBroadcastCommitGuard({ status: 'open' })).toEqual({ allowed: true });
+  });
+
+  it('rejects a commit once the broadcast is locked (someone already grabbed it)', () => {
+    expect(swapBroadcastCommitGuard({ status: 'locked' })).toEqual({ allowed: false, reason: 'locked' });
+  });
+
+  it('rejects a commit when the broadcast is gone (expired)', () => {
+    expect(swapBroadcastCommitGuard(null)).toEqual({ allowed: false, reason: 'expired' });
   });
 });

@@ -8,7 +8,7 @@ import {
   type AvailabilitySlot,
   type RotationSpec,
 } from '../workflows/employee-onboarding';
-import { commitSwapPickup } from '../workflows/shift-swap';
+import { commitSwapPickup, proposeSwapTrade } from '../workflows/shift-swap';
 import { supabase } from '../db/client';
 import { sendEmail } from '../messaging/email';
 import { brandedEmailShell, BRAND } from '../messaging/brand';
@@ -382,6 +382,49 @@ internalRouter.post('/swap-pickup-commit', async (req: Request, res: Response) =
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[internal] swap-pickup-commit failed:', msg);
+    serverError(res, msg);
+  }
+});
+
+// POST /internal/swap-propose
+// Called by Homebase when a broadcast candidate selects which of their own shifts
+// to trade on the swap-picker page. Locks the broadcast, records the proposal, and
+// returns { ok, message }. Stage 4 then asks the requester to agree.
+internalRouter.post('/swap-propose', async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const companyId = body.company_id;
+  const requesterId = body.requester_id;
+  const receiverId = body.receiver_id;
+  const sel = body.selected_shift && typeof body.selected_shift === 'object'
+    ? (body.selected_shift as Record<string, unknown>)
+    : null;
+
+  if (typeof companyId !== 'string' || companyId.length === 0) { badRequest(res, 'company_id is required'); return; }
+  if (typeof requesterId !== 'string' || requesterId.length === 0) { badRequest(res, 'requester_id is required'); return; }
+  if (typeof receiverId !== 'string' || receiverId.length === 0) { badRequest(res, 'receiver_id is required'); return; }
+  if (!sel || typeof sel.date !== 'string' || typeof sel.shift_name !== 'string' || typeof sel.role !== 'string'
+    || typeof sel.start_time !== 'string' || typeof sel.end_time !== 'string') {
+    badRequest(res, 'selected_shift {date, shift_name, role, start_time, end_time} is required');
+    return;
+  }
+
+  try {
+    const result = await proposeSwapTrade({
+      company_id: companyId,
+      requester_id: requesterId,
+      receiver_id: receiverId,
+      selected_shift: {
+        date: sel.date as string,
+        shift_name: sel.shift_name as string,
+        role: sel.role as string,
+        start_time: sel.start_time as string,
+        end_time: sel.end_time as string,
+      },
+    });
+    res.json(result);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[internal] swap-propose failed:', msg);
     serverError(res, msg);
   }
 });

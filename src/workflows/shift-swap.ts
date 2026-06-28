@@ -328,6 +328,145 @@ export async function commitSwapPickup(params: {
   };
 }
 
+// ── #10 swap proposal (two-way trade, pending the requester's agreement) ──────
+// Recorded when a candidate selects which of their own shifts to trade on the
+// swap-picker page. Stage 4 reads this to ask the requester to agree, then routes
+// to manager approval + executeScheduleTrade (or reopens on a requester decline).
+export interface SwapProposal {
+  company_id: string;
+  requester_id: string;
+  requester_name: string;
+  receiver_id: string;
+  receiver_name: string;
+  // The requester's shift (being given up).
+  shift_date: string;
+  shift_name: string;
+  role: string;
+  shift_start: string;
+  shift_end: string;
+  schedule_id: string | null;
+  // The receiver's shift the requester would take in return.
+  target_shift_date: string;
+  target_shift_name: string;
+  target_role: string;
+  target_shift_start: string;
+  target_shift_end: string;
+  // Requester contact for the agree/decline notice.
+  requester_channel: 'sms' | 'email';
+  requester_sender: string;
+  requester_recipient: string;
+  requester_raw_subject?: string;
+  requester_thread_id?: string;
+  expires_at: string;
+}
+
+function swapProposalSource(requesterId: string): string {
+  return `swap_proposal:${requesterId}`;
+}
+
+export async function storeSwapProposal(proposal: SwapProposal): Promise<void> {
+  await supabase.from('aegis_memory').delete()
+    .eq('company_id', proposal.company_id)
+    .eq('source', swapProposalSource(proposal.requester_id));
+  await supabase.from('aegis_memory').insert({
+    company_id: proposal.company_id,
+    memory_type: 'observation',
+    source: swapProposalSource(proposal.requester_id),
+    content: JSON.stringify(proposal),
+  });
+}
+
+export async function getSwapProposal(
+  companyId: string,
+  requesterId: string,
+): Promise<(SwapProposal & { _memory_id: string }) | null> {
+  const { data } = await supabase.from('aegis_memory')
+    .select('id, content')
+    .eq('company_id', companyId)
+    .eq('source', swapProposalSource(requesterId))
+    .maybeSingle();
+  if (!data) return null;
+  try {
+    const row = data as { id: string; content: string };
+    const proposal = JSON.parse(row.content) as SwapProposal;
+    if (new Date(proposal.expires_at) < new Date()) {
+      await supabase.from('aegis_memory').delete().eq('id', row.id);
+      return null;
+    }
+    return { ...proposal, _memory_id: row.id };
+  } catch {
+    return null;
+  }
+}
+
+// A candidate picked which of their own shifts to trade on the swap page. Lock the
+// broadcast (first-commit-wins), record the proposal, and return the message the
+// page shows. Stage 4 then asks the requester to agree → manager → execute.
+export async function proposeSwapTrade(params: {
+  company_id: string;
+  requester_id: string;
+  receiver_id: string;
+  selected_shift: { date: string; shift_name: string; role: string; start_time: string; end_time: string };
+}): Promise<{ ok: boolean; message: string }> {
+  const broadcast = await getSwapBroadcast(params.company_id, params.requester_id);
+  const guard = swapBroadcastCommitGuard(broadcast);
+  if (!guard.allowed) {
+    return {
+      ok: false,
+      message: guard.reason === 'locked'
+        ? "Someone just acted on this shift — it's being handled now. Thanks for offering!"
+        : "This shift request has expired or already been resolved. Nothing more to do here.",
+    };
+  }
+  const b = broadcast!;
+  await storeSwapBroadcast({ ...b, status: 'locked', locked_by: params.receiver_id });
+
+  const { data: recvData } = await supabase.from('employees').select('id, name')
+    .eq('id', params.receiver_id).single();
+  const receiver = recvData as { id: string; name: string } | null;
+  if (!receiver) {
+    return { ok: false, message: 'Something went wrong finding your record — please contact your manager.' };
+  }
+
+  const sel = params.selected_shift;
+  await storeSwapProposal({
+    company_id: params.company_id,
+    requester_id: params.requester_id,
+    requester_name: b.requester_name,
+    receiver_id: params.receiver_id,
+    receiver_name: receiver.name,
+    shift_date: b.shift_date,
+    shift_name: b.shift_name,
+    role: b.role,
+    shift_start: b.shift_start,
+    shift_end: b.shift_end,
+    schedule_id: b.schedule_id,
+    target_shift_date: sel.date,
+    target_shift_name: sel.shift_name,
+    target_role: sel.role,
+    target_shift_start: sel.start_time,
+    target_shift_end: sel.end_time,
+    requester_channel: b.requester_channel,
+    requester_sender: b.requester_sender,
+    requester_recipient: b.requester_recipient,
+    requester_raw_subject: b.requester_raw_subject,
+    requester_thread_id: b.requester_thread_id,
+    expires_at: new Date(Date.now() + 72 * 60 * 60 * 1000).toISOString(),
+  });
+
+  await logActivity({
+    company_id: params.company_id,
+    action: 'swap_proposed',
+    summary: `${receiver.name} offered to trade their ${sel.shift_name} (${formatDisplayDate(sel.date)}) for ${b.requester_name}'s ${b.shift_name} (${formatDisplayDate(b.shift_date)}) — pending ${b.requester_name}'s agreement`,
+    metadata: { requester_id: params.requester_id, receiver_id: params.receiver_id, shift_date: b.shift_date, target_shift_date: sel.date, mode: 'swap' },
+  });
+
+  return {
+    ok: true,
+    message: `Thanks, ${firstName(receiver.name)}! I've recorded your offer to trade your ${sel.shift_name} shift on ${formatDisplayDate(sel.date)} for ${b.requester_name}'s ${b.shift_name}. I'll confirm it with ${firstName(b.requester_name)} and let you know how it shakes out.`,
+  };
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 export function computeShiftHours(start: string, end: string): number {
@@ -463,6 +602,15 @@ export function partitionSwapCandidates(
 // action tokens (`swap_pickup`, and `swap_trade_select` when eligible) that carry
 // the self-contained broadcast snapshot, so the Homebase landing page works from
 // the token alone. EMPLOYEE-FACING — no "View in Homebase" CTA, warm voice.
+// A candidate's own shift offered as a trade option on the swap-picker page.
+export interface TradeableShiftOption {
+  date: string;
+  shift_name: string;
+  role: string;
+  start_time: string;
+  end_time: string;
+}
+
 export async function buildSwapBroadcastEmail(params: {
   company_id: string;
   candidate: { id: string; name: string; email: string };
@@ -474,13 +622,28 @@ export async function buildSwapBroadcastEmail(params: {
   shift_end: string;
   willing_dates: string[];        // YYYY-MM-DD the requester can work in return
   swapEligible: boolean;          // render the SWAP button?
+  tradeableShifts?: TradeableShiftOption[];  // the candidate's shifts shown on the swap page
   token_payload: Record<string, unknown>;   // shared broadcast snapshot
   ttl_minutes?: number;
 }): Promise<{ subject: string; text: string; html: string }> {
   const ttl = params.ttl_minutes ?? 72 * 60;
+  const dateLong = formatDisplayDate(params.shift_date);
+  // Enrich both token payloads so the Homebase landing pages are self-contained
+  // (no extra fetch): the requester's shift in human + raw form, plus identity.
+  const sharedSnapshot = {
+    ...params.token_payload,
+    receiver_id: params.candidate.id,
+    requester_name: params.requester_name,
+    shift_name: params.shift_name,
+    role: params.shift_role,
+    date: dateLong,               // human display (describeAction / page copy)
+    shift_date: params.shift_date, // raw YYYY-MM-DD (execution)
+    shift_start: params.shift_start,
+    shift_end: params.shift_end,
+  };
   const pickupTok = await generateActionToken({
     action_type: 'swap_pickup',
-    payload: { ...params.token_payload, receiver_id: params.candidate.id, mode: 'pickup' },
+    payload: { ...sharedSnapshot, mode: 'pickup' },
     company_id: params.company_id,
     issued_to_email: params.candidate.email,
     issued_to_employee_id: params.candidate.id,
@@ -490,7 +653,7 @@ export async function buildSwapBroadcastEmail(params: {
   if (params.swapEligible) {
     const swapTok = await generateActionToken({
       action_type: 'swap_trade_select',
-      payload: { ...params.token_payload, receiver_id: params.candidate.id, mode: 'swap' },
+      payload: { ...sharedSnapshot, mode: 'swap', tradeable_shifts: params.tradeableShifts ?? [] },
       company_id: params.company_id,
       issued_to_email: params.candidate.email,
       issued_to_employee_id: params.candidate.id,
@@ -498,8 +661,6 @@ export async function buildSwapBroadcastEmail(params: {
     });
     swapUrl = swapTok.url;
   }
-
-  const dateLong = formatDisplayDate(params.shift_date);
   const shiftDesc = `${params.shift_name} (${params.shift_start}–${params.shift_end}, ${params.shift_role}) on ${dateLong}`;
   const willingList = params.willing_dates.length > 0
     ? params.willing_dates.slice().sort().map(formatShortDate).join(', ')

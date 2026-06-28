@@ -36,8 +36,11 @@ import {
   applyTradeToAssignments,
   chooseTradeShift,
   isReachableForOutreach,
+  tradeableShiftsForCandidate,
+  partitionSwapCandidates,
   type TradeSide,
 } from '../shift-swap';
+import type { Employee } from '../../db/types';
 import type { ScheduleAssignment } from '../schedule-build';
 
 function a(partial: Partial<ScheduleAssignment> & { employee_id: string; date: string }): ScheduleAssignment {
@@ -215,5 +218,63 @@ describe('isReachableForOutreach (email-first broadcast gate)', () => {
     expect(isReachableForOutreach({ contact_email: null, contact_phone: null }, true)).toBe(false);
     expect(isReachableForOutreach({ contact_email: null, contact_phone: null }, false)).toBe(false);
     expect(isReachableForOutreach({ contact_email: '', contact_phone: '' }, true)).toBe(false);
+  });
+});
+
+// #10 redesign Stage 1 — the analytical core that decides who can SWAP (button B)
+// vs only PICK UP (button A), and which of a candidate's shifts are tradeable.
+const emp = (id: string, name: string): Employee =>
+  ({ id, name } as unknown as Employee);
+
+describe('tradeableShiftsForCandidate', () => {
+  const willing = new Set(['2026-07-06', '2026-07-07']); // Mon + Tue the requester can work
+  const requesterRoles = ['Lifeguard'];
+
+  it('keeps only shifts on a willing day that the requester is qualified for', () => {
+    const shifts = [
+      a({ employee_id: 'c1', date: '2026-07-06', role: 'Lifeguard' }),  // willing + qualified ✓
+      a({ employee_id: 'c1', date: '2026-07-07', role: 'Headguard' }),  // willing but wrong role ✗
+      a({ employee_id: 'c1', date: '2026-07-08', role: 'Lifeguard' }),  // qualified but not a willing day ✗
+    ];
+    const out = tradeableShiftsForCandidate(shifts, willing, requesterRoles);
+    expect(out.map(s => s.date)).toEqual(['2026-07-06']);
+  });
+
+  it('returns empty when the candidate has nothing tradeable (pickup-only)', () => {
+    const shifts = [a({ employee_id: 'c1', date: '2026-07-09', role: 'Lifeguard' })];
+    expect(tradeableShiftsForCandidate(shifts, willing, requesterRoles)).toEqual([]);
+    expect(tradeableShiftsForCandidate([], willing, requesterRoles)).toEqual([]);
+  });
+
+  it('honors multiple requester-qualified roles', () => {
+    const shifts = [a({ employee_id: 'c1', date: '2026-07-06', role: 'Headguard' })];
+    expect(tradeableShiftsForCandidate(shifts, willing, ['Lifeguard', 'Headguard'])).toHaveLength(1);
+  });
+});
+
+describe('partitionSwapCandidates (button A vs A+B)', () => {
+  const willing = new Set(['2026-07-06']);
+  const requesterRoles = ['Lifeguard'];
+
+  it('everyone is pickup-eligible; only those with a tradeable shift can also swap', () => {
+    const ann = emp('a1', 'Ann');   // has a tradeable shift → swap-capable
+    const bob = emp('b1', 'Bob');   // works that week but nothing on a willing day → pickup only
+    const cal = emp('c1', 'Cal');   // not scheduled at all → pickup only
+    const byEmp = new Map([
+      ['a1', [a({ employee_id: 'a1', date: '2026-07-06', role: 'Lifeguard' })]],
+      ['b1', [a({ employee_id: 'b1', date: '2026-07-09', role: 'Lifeguard' })]],
+    ]);
+
+    const part = partitionSwapCandidates([ann, bob, cal], byEmp, willing, requesterRoles);
+    expect(part.pickup.map(e => e.id)).toEqual(['a1', 'b1', 'c1']);
+    expect(part.swap.map(s => s.employee.id)).toEqual(['a1']);
+    expect(part.swap[0].tradeableShifts).toHaveLength(1);
+  });
+
+  it('no swap-capable candidates yields an empty swap list (broadcast still allows pickups)', () => {
+    const bob = emp('b1', 'Bob');
+    const part = partitionSwapCandidates([bob], new Map(), willing, requesterRoles);
+    expect(part.pickup).toHaveLength(1);
+    expect(part.swap).toEqual([]);
   });
 });

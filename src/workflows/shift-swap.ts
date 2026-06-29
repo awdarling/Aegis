@@ -55,6 +55,9 @@ export interface PendingSwap {
   target_role?: string;
   target_shift_start?: string;
   target_shift_end?: string;
+  // Facilitated only: weekdays (0=Sun..6=Sat) the requester can work in return.
+  // Drives the swap option on the broadcast; empty → the broadcast is pickup-only.
+  willing_days?: number[];
   expires_at: string;
 }
 
@@ -1749,16 +1752,22 @@ export async function handleInitiateSwap(
       shift_start: shift.start_time,
       shift_end: shift.end_time,
       schedule_id: schedule?.id ?? null,
+      willing_days: raw.willing_days,
       expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
     };
     await storePendingSwap(pending);
 
     const candidateNote = candidates.length > 0
-      ? `I found ${candidates.length} potential candidate${candidates.length !== 1 ? 's' : ''}. `
-      : 'I didn\'t find any available candidates right now, but ';
+      ? `I found ${candidates.length} teammate${candidates.length !== 1 ? 's' : ''} who could help. `
+      : "I didn't find anyone available right now, but ";
+    // If they told me which days they can work, the broadcast also offers a trade;
+    // otherwise it goes out as pickup-only.
+    const tradeNote = raw.willing_days.length > 0
+      ? `Anyone who'd rather trade can offer you a shift on a day you said you can work. `
+      : `Since you didn't mention days you could work instead, I'll send it as a straight pickup (no trade). If you'd like to allow trades, tell me which days you can work. `;
 
     await reply(contact, message,
-      `You want someone to take your ${shift.shift_name} shift (${shift.role}, ${shift.start_time}–${shift.end_time}) on ${formatDisplayDate(shiftDate)}. ${candidateNote}Confirm? Reply "yes" to proceed or "no" to cancel.`
+      `You want someone to take your ${shift.shift_name} shift (${shift.role}, ${shift.start_time}–${shift.end_time}) on ${formatDisplayDate(shiftDate)}. ${candidateNote}${tradeNote}Reply "yes" to send it to the team, or "no" to cancel.`
     );
   }
 }
@@ -1897,7 +1906,10 @@ export async function handleSwapConfirmation(
       metadata: { requester_id: contact.employee_id, receiver_id: receiver.id, shift_date: pending.shift_date, mode: 'directed', trade: !!pending.target_shift_name },
     });
   } else {
-    // Mode 2: facilitated
+    // Mode 2: facilitated → the SIMULTANEOUS two-button broadcast (#10 Stage 4b).
+    // Email every reachable teammate at once: everyone gets a PICKUP button; those
+    // with a tradeable shift on a day the requester can work also get a SWAP
+    // button. The first to commit locks the shift (enforced at click time).
     const shiftHours = computeShiftHours(pending.shift_start, pending.shift_end);
     const candidates = await buildSwapCandidates({
       company_id: contact.company_id,
@@ -1909,82 +1921,116 @@ export async function handleSwapConfirmation(
       shift_hours: shiftHours,
     });
 
-    if (candidates.length === 0) {
+    const hasSms = !!aegisSmsNumber;
+    const reachable = candidates.filter(c => isReachableForOutreach(c, hasSms));
+    if (reachable.length === 0) {
       await reply(contact, message,
-        `Unfortunately no qualified, available employees were found to cover your ${pending.shift_name} shift on ${formatDisplayDate(pending.shift_date)}. ` +
-        'Please contact your manager directly.'
+        `I couldn't find any teammates I can reach to cover your ${pending.shift_name} shift on ${formatDisplayDate(pending.shift_date)}. Please contact your manager directly.`
       );
       await logActivity({
         company_id: contact.company_id,
         action: 'swap_no_candidates',
-        summary: `No swap candidates found for ${contact.name}'s ${pending.shift_name} on ${pending.shift_date}`,
+        summary: `No reachable swap candidates for ${contact.name}'s ${pending.shift_name} on ${pending.shift_date}`,
         metadata: { requester_id: contact.employee_id, shift_date: pending.shift_date, role: pending.role },
       });
       return;
     }
 
-    // EMAIL-FIRST broadcast (SMS only once A2P clears). Contact the first
-    // reachable candidate; the remaining reachable ones queue for first-yes-wins.
-    const hasSms = !!aegisSmsNumber;
-    const firstIdx = candidates.findIndex(c => isReachableForOutreach(c, hasSms));
-    if (firstIdx === -1) {
+    // Resolve the requester's willing weekdays → concrete dates in the shift's
+    // week, and map each candidate's own shifts so we know who can also trade.
+    const { data: schedRow } = await supabase.from('schedules').select('data, week_start')
+      .is('deleted_at', null).eq('company_id', contact.company_id).eq('status', 'published')
+      .lte('week_start', pending.shift_date).gte('week_end', pending.shift_date)
+      .order('generated_at', { ascending: false }).limit(1).maybeSingle();
+    const schedData = schedRow ? (schedRow as { data: ScheduleData }).data : null;
+    const weekStart = schedRow ? (schedRow as { week_start: string }).week_start : null;
+    const assignmentsByEmployee = new Map<string, ScheduleAssignment[]>();
+    if (schedData) {
+      for (const a of schedData.assignments) {
+        if (!assignmentsByEmployee.has(a.employee_id)) assignmentsByEmployee.set(a.employee_id, []);
+        assignmentsByEmployee.get(a.employee_id)!.push(a);
+      }
+    }
+    const willingDates = weekStart
+      ? resolveWillingDates(pending.willing_days ?? [], weekDatesFrom(weekStart))
+      : new Set<string>();
+
+    // The requester's qualified roles gate which of a candidate's shifts the
+    // requester could actually take in a trade.
+    const { data: reqEmp } = await supabase.from('employees').select('qualified_roles')
+      .eq('id', contact.employee_id!).single();
+    const requesterRoles = (reqEmp as { qualified_roles: string[] } | null)?.qualified_roles ?? [];
+
+    const partition = partitionSwapCandidates(reachable, assignmentsByEmployee, willingDates, requesterRoles);
+    const tradeableById = new Map(partition.swap.map(s => [s.employee.id, s.tradeableShifts]));
+
+    // Fan out the two-button email to every reachable candidate (email-first).
+    const contactedIds: string[] = [];
+    for (const cand of partition.pickup) {
+      if (!cand.contact_email) continue;  // SMS-only candidates skipped (email-first; revisit post-A2P)
+      const tradeable = tradeableById.get(cand.id);
+      const { subject, text, html } = await buildSwapBroadcastEmail({
+        company_id: contact.company_id,
+        candidate: { id: cand.id, name: cand.name, email: cand.contact_email },
+        requester_name: contact.name,
+        shift_name: pending.shift_name,
+        shift_role: pending.role,
+        shift_date: pending.shift_date,
+        shift_start: pending.shift_start,
+        shift_end: pending.shift_end,
+        willing_dates: [...willingDates],
+        swapEligible: !!tradeable,
+        tradeableShifts: tradeable?.map(s => ({
+          date: s.date, shift_name: s.shift_name, role: s.role, start_time: s.start_time, end_time: s.end_time,
+        })),
+        token_payload: { requester_id: contact.employee_id! },
+      });
+      await sendEmail({ to: cand.contact_email, subject, text, html, company_id: contact.company_id });
+      contactedIds.push(cand.id);
+    }
+
+    if (contactedIds.length === 0) {
       await reply(contact, message,
-        `I found qualified employees, but none have an email${hasSms ? ' or phone' : ''} on file I can reach right now. Please contact your manager for help covering this shift.`
+        `I found teammates but couldn't email any of them right now. Please contact your manager for help covering this shift.`
       );
       return;
     }
-    const firstCandidate = candidates[firstIdx];
-    const remaining = candidates.slice(firstIdx + 1).filter(c => isReachableForOutreach(c, hasSms)).map(c => c.id);
-    const reachableCount = 1 + remaining.length;
 
-    const outreach: SwapOutreach = {
-      mode: 'facilitated',
-      company_id: contact.company_id,
+    // Record the open broadcast (first commit locks it at click time).
+    await storeSwapBroadcast({
       requester_id: contact.employee_id!,
       requester_name: contact.name,
+      company_id: contact.company_id,
       requester_channel: message.channel,
       requester_sender: message.sender,
       requester_recipient: message.recipient,
       requester_raw_subject: message.raw_subject,
       requester_thread_id: message.thread_id,
-      receiver_id: firstCandidate.id,
-      receiver_phone: firstCandidate.contact_phone ?? '',
-      receiver_email: firstCandidate.contact_email ?? undefined,
-      aegis_sms_channel: aegisSmsNumber ?? '',
       shift_date: pending.shift_date,
       shift_name: pending.shift_name,
       role: pending.role,
       shift_start: pending.shift_start,
       shift_end: pending.shift_end,
       schedule_id: pending.schedule_id,
-      candidate_queue: remaining,
-      outreach_sent_at: new Date().toISOString(),
-      expires_at: new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString(),
-    };
-    await storeSwapOutreach(outreach);
-
-    await sendOutreachMessage({
-      receiverEmail: firstCandidate.contact_email ?? null,
-      receiverPhone: firstCandidate.contact_phone ?? null,
-      aegisSmsNumber,
-      subject: `Can you take a ${pending.shift_name} shift on ${formatShortDate(pending.shift_date)}?`,
-      text:
-        `${greeting(firstCandidate.name)} this is Aegis. ` +
-        `${contact.name} is looking for someone to take their ${pending.shift_name} shift ` +
-        `(${pending.shift_start}–${pending.shift_end}, ${pending.role}) on ${formatDisplayDate(pending.shift_date)}. ` +
-        'Would you like to take this shift? Reply YES or NO.',
-      company_id: contact.company_id,
+      willing_dates: [...willingDates],
+      status: 'open',
+      locked_by: null,
+      contacted_ids: contactedIds,
+      expires_at: new Date(Date.now() + 72 * 60 * 60 * 1000).toISOString(),
     });
 
+    const swapCount = partition.swap.filter(s => contactedIds.includes(s.employee.id)).length;
     await reply(contact, message,
-      `I'm reaching out to ${reachableCount} available employee${reachableCount !== 1 ? 's' : ''}. I'll let you know as soon as someone accepts.`
+      `Done — I've emailed ${contactedIds.length} teammate${contactedIds.length !== 1 ? 's' : ''} about your ${pending.shift_name} shift on ${formatDisplayDate(pending.shift_date)}` +
+      (swapCount > 0 ? ` (${swapCount} of them can also offer a trade)` : '') +
+      `. The first to accept gets it, and I'll loop in your manager for the final OK. I'll let you know as soon as someone takes it.`
     );
 
     await logActivity({
       company_id: contact.company_id,
-      action: 'swap_outreach_sent',
-      summary: `Facilitated swap outreach started for ${contact.name}'s ${pending.shift_name} on ${pending.shift_date} — contacting ${firstCandidate.name}`,
-      metadata: { requester_id: contact.employee_id, first_candidate: firstCandidate.id, total_candidates: reachableCount, shift_date: pending.shift_date },
+      action: 'swap_broadcast_sent',
+      summary: `Broadcast swap request for ${contact.name}'s ${pending.shift_name} on ${pending.shift_date} — emailed ${contactedIds.length} teammate(s)`,
+      metadata: { requester_id: contact.employee_id, shift_date: pending.shift_date, contacted: contactedIds.length, swap_eligible: swapCount },
     });
   }
 }

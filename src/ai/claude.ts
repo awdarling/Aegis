@@ -301,6 +301,12 @@ User: "cant work the morning of july 3"
 User: "I'm busy the morning of June 21st. I can work at night though"
 {"intent":"submit_time_off","confidence":"high","extracted":{"dates":[{"start_date":"${currentYear}-06-21","end_date":"${currentYear}-06-21","time_off_type":"partial","period_label":"morning","start_time":null,"end_time":null}],"reason":null}}
 
+User: "time off june 29 after 4pm"
+{"intent":"submit_time_off","confidence":"high","extracted":{"dates":[{"start_date":"${currentYear}-06-29","end_date":"${currentYear}-06-29","time_off_type":"partial","period_label":null,"start_time":"16:00","end_time":null}],"reason":null}}
+
+User: "i need june 30 off until 2pm"
+{"intent":"submit_time_off","confidence":"high","extracted":{"dates":[{"start_date":"${currentYear}-06-30","end_date":"${currentYear}-06-30","time_off_type":"partial","period_label":null,"start_time":null,"end_time":"14:00"}],"reason":null}}
+
 ## Manager edits and staffing rules → homebase_edit
 
 When a MANAGER asks to CHANGE company data OR set a scheduling rule, classify it as homebase_edit. This includes employee / role / wage / shift / policy changes ("change Jordan's max hours to 32", "mark Marcus inactive", "set the lifeguard wage to $16") AND, importantly, VETERAN / EXPERIENCE staffing requirements on a shift — phrasings like "should be all veterans", "veterans only", "at least N veterans", "I want my experienced/senior staff on" a given shift, day, or event.
@@ -401,6 +407,15 @@ Respond with ONLY valid JSON in this exact shape — no markdown, no explanation
     //     Named periods map to: morning 09:00–13:00, afternoon 13:00–17:00, evening 17:00–21:00.
     //   - "Friday 10am to 1pm off" → time_off_type=partial, period_label=null,
     //     start_time="10:00", end_time="13:00".
+    //   - OPEN-ENDED partials (one side only):
+    //     - "Friday after 4pm off", "off from 4pm on", "off 4pm onward", "need to leave at 4"
+    //       → time_off_type=partial, period_label=null, start_time="16:00", end_time=null
+    //       (the day's close is filled downstream).
+    //     - "Friday before noon off", "off until 2pm", "off till 2pm", "out till 2"
+    //       → time_off_type=partial, period_label=null, start_time=null, end_time="12:00"/"14:00"
+    //       (the day's open is filled downstream).
+    //     Use a one-sided window like this WHENEVER only one time boundary is given —
+    //     never collapse "after/before <time>" to a full day.
     //   - Multi-day full: single entry with the range. Multi-day partial with the same
     //     period each day: single entry with the range plus the period info.
     //   - Multiple distinct dates with different partial windows: one entry per distinct window.

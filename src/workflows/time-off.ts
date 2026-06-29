@@ -103,9 +103,23 @@ function eachDateInRange(startDate: string, endDate: string): string[] {
   return out;
 }
 
-function resolvePartialWindow(entry: ExtractedDateEntry): { start_time: string; end_time: string } | null {
+// Implicit operating-day bounds for partial time-off, kept in sync with
+// PERIOD_TIMES (morning opens the day, evening closes it). Used to fill the open
+// side of one-sided windows.
+const DAY_OPEN = PERIOD_TIMES.morning.start;  // '09:00'
+const DAY_CLOSE = PERIOD_TIMES.evening.end;   // '21:00'
+
+export function resolvePartialWindow(entry: ExtractedDateEntry): { start_time: string; end_time: string } | null {
   if (entry.start_time && entry.end_time) {
     return { start_time: entry.start_time, end_time: entry.end_time };
+  }
+  // Open-ended partials: one side given → fill the other from the operating day.
+  // "off after 4pm" → 16:00–close; "off before noon" / "off until 2pm" → open–12:00/14:00.
+  if (entry.start_time && !entry.end_time) {
+    return { start_time: entry.start_time, end_time: DAY_CLOSE };
+  }
+  if (!entry.start_time && entry.end_time) {
+    return { start_time: DAY_OPEN, end_time: entry.end_time };
   }
   if (entry.period_label && PERIOD_TIMES[entry.period_label]) {
     const period = PERIOD_TIMES[entry.period_label];

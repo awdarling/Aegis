@@ -307,6 +307,9 @@ User: "time off june 29 after 4pm"
 User: "i need june 30 off until 2pm"
 {"intent":"submit_time_off","confidence":"high","extracted":{"dates":[{"start_date":"${currentYear}-06-30","end_date":"${currentYear}-06-30","time_off_type":"partial","period_label":null,"start_time":null,"end_time":"14:00"}],"reason":null}}
 
+User: "Time off: June 18-21. Availability: 6/22 morning, 6/23 morning, 6/24 all day, 6/25 all day, 6/26 morning"
+{"intent":"submit_time_off","confidence":"high","extracted":{"dates":[{"start_date":"${currentYear}-06-18","end_date":"${currentYear}-06-21","time_off_type":"full_day","period_label":null,"start_time":null,"end_time":null}],"reason":null,"also_mentions_availability":true}}
+
 ## Manager edits and staffing rules → homebase_edit
 
 When a MANAGER asks to CHANGE company data OR set a scheduling rule, classify it as homebase_edit. This includes employee / role / wage / shift / policy changes ("change Jordan's max hours to 32", "mark Marcus inactive", "set the lifeguard wage to $16") AND, importantly, VETERAN / EXPERIENCE staffing requirements on a shift — phrasings like "should be all veterans", "veterans only", "at least N veterans", "I want my experienced/senior staff on" a given shift, day, or event.
@@ -400,8 +403,15 @@ Respond with ONLY valid JSON in this exact shape — no markdown, no explanation
     //       "end_time": "HH:MM" | null
     //     }
     //   ],
-    //   "reason": "..."
+    //   "reason": "...",
+    //   "also_mentions_availability": true | false
     // }
+    //   COMBINED messages — a time-off request AND an availability statement in ONE
+    //   message (e.g. "Time off: June 18-21. Availability: 6/22 morning, 6/23 morning,
+    //   6/24 all day"): extract ONLY the time-off dates into "dates". Do NOT extend the
+    //   time-off range with the availability dates, and do NOT apply availability times
+    //   (e.g. "morning") to the off-days. Set also_mentions_availability=true so we can
+    //   ask for the availability separately. (Omit or false when there's no availability.)
     //   - "I need Friday off" → full_day; period_label/start_time/end_time = null.
     //   - "Friday morning off" → time_off_type=partial, period_label="morning", start_time/end_time=null.
     //     Named periods map to: morning 09:00–13:00, afternoon 13:00–17:00, evening 17:00–21:00.

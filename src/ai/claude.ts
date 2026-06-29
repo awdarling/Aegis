@@ -71,6 +71,7 @@ export interface ClassifyResult {
 export const EMPLOYEE_INTENTS = [
   'submit_time_off',
   'query_my_time_off',
+  'query_my_shifts',
   'update_availability',
   'initiate_swap',
   'respond_swap_accept',
@@ -304,6 +305,15 @@ User: "hey Aegis"
 User: "what can I ask you for?"
 {"intent":"capabilities","confidence":"high","extracted":{}}
 
+User: "what are my shifts this week?"
+{"intent":"query_my_shifts","confidence":"high","extracted":{}}
+
+User: "when do I work?"
+{"intent":"query_my_shifts","confidence":"high","extracted":{}}
+
+User: "am I working saturday?"
+{"intent":"query_my_shifts","confidence":"high","extracted":{"date":"${currentYear}-06-27"}}
+
 Respond with ONLY valid JSON in this exact shape — no markdown, no explanation:
 {
   "intent": "<intent_name>",
@@ -335,6 +345,12 @@ Respond with ONLY valid JSON in this exact shape — no markdown, no explanation
     //     they appear in the company context, prefer those exact shift times.
     // For query_my_time_off: {} — used when the employee asks about their own approved
     //   upcoming time off ("what time off do I have approved?", "when is my next day off?").
+    // For query_my_shifts: { "date": "YYYY-MM-DD" } when they ask about a specific day
+    //   ("am I working Saturday?"), else {} for the general "what are my shifts?" /
+    //   "when do I work this week?" / "what's my schedule?". This is the employee asking
+    //   about their OWN shifts — distinct from operational_query (a MANAGER asking about
+    //   the workforce, e.g. "who's working Saturday?") and from query_my_time_off (their
+    //   time OFF, not their shifts).
     // For recheck_time_off: { "employee_name": "..." | omitted, "date": "YYYY-MM-DD" | omitted }
     //   Manager asking to re-run the coverage check on a PENDING time-off request.
     //   Include employee_name and/or date when mentioned; omit either if not stated.

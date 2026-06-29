@@ -1,6 +1,7 @@
 import { supabase } from '../db/client';
 import { logActivity } from '../logger/activity-log';
 import { reply } from '../messaging/reply';
+import { greeting } from '../messaging/greeting';
 import { generateReply } from '../ai/claude';
 import { coerceJsonObject } from '../utils/coerce-json';
 import { computeWageEstimate } from '../lib/schedule-simulator';
@@ -962,4 +963,109 @@ async function executeEdit(pending: PendingEdit, companyId: string): Promise<voi
       }).eq('id', pending.schedule_id);
     }
   }
+}
+
+// ── #12 — Employee "what are my shifts?" ──────────────────────────────────────
+// An employee asks about their OWN upcoming shifts (distinct from operational_query,
+// which is the manager's workforce question). Warm, plain reply; EMPLOYEE-facing,
+// so never a "View in Homebase" CTA.
+
+export interface MyShift {
+  date: string;
+  role: string;
+  shift_name: string;
+  start_time: string;
+  end_time: string;
+  hours: number;
+}
+type ShiftScope = { kind: 'upcoming' } | { kind: 'date'; date: string };
+
+function fmtShiftDate(d: string): string {
+  return new Date(d + 'T12:00:00Z').toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
+}
+function fmtShiftTime(t: string): string {
+  const [h, m] = t.slice(0, 5).split(':').map(Number);
+  const am = h < 12;
+  const hr = h % 12 === 0 ? 12 : h % 12;
+  return `${hr}:${String(m).padStart(2, '0')} ${am ? 'AM' : 'PM'}`;
+}
+
+// Pure: turn an employee's shift list into a warm reply. Tested directly.
+export function formatMyShiftsReply(employeeName: string, shifts: MyShift[], scope: ShiftScope): string {
+  const hi = greeting(employeeName);
+  if (shifts.length === 0) {
+    return scope.kind === 'date'
+      ? `${hi}\n\nYou're not scheduled on ${fmtShiftDate(scope.date)} — looks like you've got that day off. If you were expecting a shift, reply here or check with your manager and we'll sort it out.`
+      : `${hi}\n\nYou don't have any upcoming shifts on the schedule right now. If that seems off, reply here or check with your manager and we'll take a look.`;
+  }
+  const totalHours = Math.round(shifts.reduce((s, a) => s + a.hours, 0) * 10) / 10;
+  const lead = scope.kind === 'date'
+    ? `Here's what you're on for ${fmtShiftDate(scope.date)}:`
+    : `You're on for ${shifts.length} shift${shifts.length === 1 ? '' : 's'} coming up — ${totalHours}h in total:`;
+  const lines = shifts
+    .map(s => `• ${fmtShiftDate(s.date)} — ${s.role} (${s.shift_name}), ${fmtShiftTime(s.start_time)}–${fmtShiftTime(s.end_time)}, ${s.hours}h`)
+    .join('\n');
+  const tail = scope.kind === 'date' ? '' : `\n\nThat's ${totalHours}h in all.`;
+  return `${hi}\n\n${lead}\n\n${lines}${tail}\n\nIf anything looks off, just reply here or reach out to your manager.`;
+}
+
+export async function handleMyShiftsQuery(
+  message: InboundMessage,
+  contact: VerifiedContact,
+  extracted: Record<string, unknown>,
+): Promise<void> {
+  if (!contact.employee_id) {
+    await reply(contact, message, "I couldn't find your employee record, so I can't pull your shifts. Please contact your manager directly.");
+    return;
+  }
+
+  const today = new Date().toISOString().slice(0, 10);
+  const rawDate = typeof extracted.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(extracted.date)
+    ? extracted.date
+    : null;
+  const scope: ShiftScope = rawDate ? { kind: 'date', date: rawDate } : { kind: 'upcoming' };
+
+  // Published, non-deleted schedules that could hold the relevant shifts.
+  const { data: schedRows } = await supabase
+    .from('schedules')
+    .select('data, week_start, week_end')
+    .eq('company_id', contact.company_id)
+    .eq('status', 'published')
+    .is('deleted_at', null)
+    .gte('week_end', rawDate ?? today)
+    .order('week_start', { ascending: true })
+    .limit(8);
+
+  const schedules = (schedRows ?? []) as Array<{ data: { assignments?: Array<Record<string, unknown>> } | null }>;
+
+  const seen = new Set<string>();
+  const mine: MyShift[] = [];
+  for (const s of schedules) {
+    for (const raw of (s.data?.assignments ?? [])) {
+      const a = raw as { employee_id?: string; date?: string; role?: string; shift_name?: string; start_time?: string; end_time?: string; hours?: number };
+      if (a.employee_id !== contact.employee_id || !a.date) continue;
+      if (rawDate ? a.date !== rawDate : a.date < today) continue;
+      const key = `${a.date}|${a.shift_name ?? ''}|${a.start_time ?? ''}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      mine.push({
+        date: a.date,
+        role: a.role ?? '',
+        shift_name: a.shift_name ?? '',
+        start_time: a.start_time ?? '',
+        end_time: a.end_time ?? '',
+        hours: typeof a.hours === 'number' ? a.hours : 0,
+      });
+    }
+  }
+  mine.sort((x, y) => x.date.localeCompare(y.date) || x.start_time.localeCompare(y.start_time));
+
+  await reply(contact, message, formatMyShiftsReply(contact.name, mine, scope));
+
+  await logActivity({
+    company_id: contact.company_id,
+    action: 'employee_shift_query',
+    summary: `${contact.name} asked about their shifts (${scope.kind === 'date' ? scope.date : 'upcoming'}) — ${mine.length} found`,
+    metadata: { employee_id: contact.employee_id, scope: scope.kind, date: rawDate, count: mine.length },
+  });
 }

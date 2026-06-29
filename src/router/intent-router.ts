@@ -17,6 +17,7 @@ import {
 import { handleBuildSchedule, handleDistributeSchedule } from '../workflows/schedule-build';
 import {
   handleOperationalQuery,
+  handleMyShiftsQuery,
   handleHomebaseEdit,
   handleEditConfirmation,
   getPendingEdit,
@@ -294,6 +295,11 @@ async function routeIntentInner(
       case 'submit_time_off':
         console.log('[router] dispatching to handleSubmitTimeOff');
         await handleSubmitTimeOff(message, contact, classification.extracted);
+        break;
+
+      case 'query_my_shifts':
+        console.log('[router] dispatching to handleMyShiftsQuery');
+        await handleMyShiftsQuery(message, contact, classification.extracted);
         break;
 
       case 'query_my_time_off':

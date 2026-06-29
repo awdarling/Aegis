@@ -16,7 +16,7 @@ vi.mock('../../logger/activity-log', () => ({ logActivity: vi.fn() }));
 vi.mock('../../lib/schedule-simulator', () => ({ computeWageEstimate: vi.fn() }));
 vi.mock('../payroll', () => ({ handleWageRateSync: vi.fn() }));
 
-import { collectAssignments, summarizeStaffingByDate, buildDataContext } from '../operational-query';
+import { collectAssignments, summarizeStaffingByDate, buildDataContext, formatMyShiftsReply, type MyShift } from '../operational-query';
 
 // One Watermark-shaped schedule row. Erin works two shifts on Jun 17 (a double),
 // so she must be counted ONCE in that day's headcount.
@@ -98,5 +98,45 @@ describe('buildDataContext', () => {
 
   it('skips empty tables', () => {
     expect(buildDataContext({ employees: [], schedules: [] })).toBe('');
+  });
+});
+
+// #12 — employee "what are my shifts?" reply formatting.
+describe('formatMyShiftsReply', () => {
+  const shifts: MyShift[] = [
+    { date: '2026-07-04', role: 'Lifeguard', shift_name: 'PM', start_time: '13:00', end_time: '21:00', hours: 8 },
+    { date: '2026-07-06', role: 'Lifeguard', shift_name: 'AM', start_time: '09:00', end_time: '13:00', hours: 4 },
+  ];
+
+  it('lists upcoming shifts with a total-hours summary', () => {
+    const out = formatMyShiftsReply('Dana Reed', shifts, { kind: 'upcoming' });
+    expect(out).toMatch(/2 shifts coming up/);
+    expect(out).toMatch(/12h in total/);
+    expect(out).toMatch(/Saturday, July 4/);
+    expect(out).toMatch(/1:00 PM–9:00 PM/);
+    expect(out).toMatch(/That's 12h in all/);
+    expect(out).not.toMatch(/homebase/i);     // employee-facing: no Homebase CTA
+  });
+
+  it('singular phrasing for one shift', () => {
+    const out = formatMyShiftsReply('Dana Reed', [shifts[0]], { kind: 'upcoming' });
+    expect(out).toMatch(/1 shift coming up/);
+  });
+
+  it('empty upcoming → friendly "nothing scheduled" note', () => {
+    const out = formatMyShiftsReply('Dana Reed', [], { kind: 'upcoming' });
+    expect(out).toMatch(/don't have any upcoming shifts/i);
+    expect(out).not.toMatch(/homebase/i);
+  });
+
+  it('date scope with no shift says they are off that day', () => {
+    const out = formatMyShiftsReply('Dana Reed', [], { kind: 'date', date: '2026-07-05' });
+    expect(out).toMatch(/not scheduled on Sunday, July 5/);
+  });
+
+  it('date scope lists just that day, no weekly total', () => {
+    const out = formatMyShiftsReply('Dana Reed', [shifts[0]], { kind: 'date', date: '2026-07-04' });
+    expect(out).toMatch(/what you're on for Saturday, July 4/);
+    expect(out).not.toMatch(/in all/);
   });
 });

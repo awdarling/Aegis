@@ -1346,6 +1346,83 @@ async function blastNextBatch(
   });
 }
 
+// Pure decision for the manager's "send another batch?" button (#11): given the
+// live session (or null) and which button was clicked, what's the outcome?
+//  • no session            → not_found (expired / already resolved)
+//  • stop                  → stopped
+//  • send, more in pool    → sent
+//  • send, pool exhausted  → exhausted
+export type CoverageBatchOutcome = 'sent' | 'stopped' | 'exhausted' | 'not_found';
+export function classifyCoverageBatchButton(
+  session: { candidate_pool?: { employee_id: string }[]; shown_count?: number } | null,
+  action: 'send' | 'stop',
+): CoverageBatchOutcome {
+  if (!session) return 'not_found';
+  if (action === 'stop') return 'stopped';
+  const pool = session.candidate_pool ?? [];
+  const shown = session.shown_count ?? 0;
+  return shown >= pool.length ? 'exhausted' : 'sent';
+}
+
+// #11 — the email-BUTTON version of the "send another batch?" prompt. Called by
+// /webhooks/decision (decision_type: 'coverage_batch') when a manager clicks
+// "Send next batch" or "No, I've got it". Reconstructs the manager context from
+// the stored session and reuses the same blastNextBatch / clear logic as the
+// reply path. Returns an outcome for the confirmation page.
+export async function processCoverageBatchButton(params: {
+  companyId: string;
+  managerContact: string;
+  action: 'send' | 'stop';
+}): Promise<{ outcome: CoverageBatchOutcome; shiftName: string }> {
+  const session = await getActiveCoverageSession(params.companyId, params.managerContact);
+  const outcome = classifyCoverageBatchButton(session, params.action);
+  if (!session) return { outcome: 'not_found', shiftName: '' };
+  const shiftName = session.shift_info.shift_name;
+
+  if (outcome === 'stopped') {
+    await clearSession(session.company_id);
+    await logActivity({
+      company_id: session.company_id,
+      action: 'emergency_coverage_declined_outreach',
+      summary: `Manager declined another batch (email button) for ${session.callout_employee_name}'s shift`,
+      metadata: { shift_date: session.shift_date, shift_name: shiftName, via: 'button' },
+    });
+    return { outcome, shiftName };
+  }
+
+  if (outcome === 'exhausted') {
+    await clearSession(session.company_id);
+    return { outcome, shiftName };
+  }
+
+  // outcome === 'sent' — reconstruct the manager context and blast the next batch.
+  const managerMessage: InboundMessage = {
+    sender: session.manager_sender,
+    recipient: session.manager_recipient,
+    body: '',
+    channel: session.manager_channel,
+    raw_subject: session.manager_raw_subject,
+    thread_id: session.manager_thread_id,
+  };
+  const managerContact: VerifiedContact = {
+    role: 'manager',
+    company_id: session.company_id,
+    employee_id: null,
+    user_id: null,
+    name: 'Manager',
+    matched_identifier: session.manager_contact,
+    channel: session.manager_channel,
+  };
+  await blastNextBatch(managerMessage, managerContact, session);
+  await logActivity({
+    company_id: session.company_id,
+    action: 'emergency_coverage_additional_batch',
+    summary: `Manager requested another batch (email button) for ${session.callout_employee_name}'s shift`,
+    metadata: { shift_date: session.shift_date, shift_name: shiftName, via: 'button', batch_from: session.shown_count ?? 0 },
+  });
+  return { outcome: 'sent', shiftName };
+}
+
 // The contacted group is exhausted with no acceptance (everyone declined or the
 // window lapsed). Ask the manager whether to send another batch — we never
 // auto-send. Shared by the decline path and the timeout scheduler.
@@ -1366,12 +1443,48 @@ export async function promptForNextBatchOrExhaust(params: {
       outreach_results: updatedResults,
       state: 'awaiting_next_batch_decision',
     });
-    await reply(
-      managerContact,
-      managerMessage,
+    const promptText =
       `No one I reached out to has accepted the ${session.shift_info.shift_name} shift on ${formatShortDate(session.shift_date)}. ` +
-        `Want me to reach out to another batch of employees? Reply YES to send the next group, or NO to handle it yourself.`
-    );
+      `Want me to reach out to another batch of employees?`;
+    // Email managers get one-click buttons (#11); the reply-YES/NO path still
+    // works as a fallback (handled in handleManagerCoverageReply). SMS managers
+    // get the plain reply prompt.
+    if (managerContact.channel === 'email') {
+      const requestId = randomUUID();
+      const sendToken = randomUUID();
+      const stopToken = randomUUID();
+      const sharedTok = {
+        decision_type: 'coverage_batch' as const,
+        request_id: requestId,
+        company_id: session.company_id,
+        manager_contact: session.manager_contact,
+        expires_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+      };
+      await Promise.all([
+        supabase.from('aegis_memory').insert({ company_id: session.company_id, memory_type: 'observation', source: `decision_token:${sendToken}`, content: JSON.stringify({ ...sharedTok, action: 'approve' }) }),
+        supabase.from('aegis_memory').insert({ company_id: session.company_id, memory_type: 'observation', source: `decision_token:${stopToken}`, content: JSON.stringify({ ...sharedTok, action: 'deny' }) }),
+      ]);
+      const sendUrl = `${env.BASE_URL}/webhooks/decision?action=approve&requestId=${requestId}&token=${sendToken}`;
+      const stopUrl = `${env.BASE_URL}/webhooks/decision?action=deny&requestId=${requestId}&token=${stopToken}`;
+      const detail =
+        `<p style="margin:0 0 16px;font-size:15px;color:${BRAND.textPrimary};line-height:1.6;">${escapeHtml(promptText)}</p>` +
+        brandedButtonRow([
+          { url: sendUrl, label: 'Send next batch', variant: 'primary' },
+          { url: stopUrl, label: "No, I've got it", variant: 'secondary' },
+        ]);
+      const bodyHtml =
+        `<p style="margin:0 0 18px;font-size:16px;color:${BRAND.textPrimary};line-height:1.65;">Still looking for coverage on the ${escapeHtml(session.shift_info.shift_name)} shift.</p>` +
+        brandActionCard('Coverage still needed', detail);
+      await sendEmail({
+        to: session.manager_contact,
+        subject: `Coverage still needed — send another batch?`,
+        text: `${promptText} Reply YES to send the next group, or NO to handle it yourself.`,
+        html: brandedEmailShell({ bodyHtml, preheader: 'Send another batch of coverage outreach?' }),
+        company_id: session.company_id,
+      });
+    } else {
+      await reply(managerContact, managerMessage, `${promptText} Reply YES to send the next group, or NO to handle it yourself.`);
+    }
     await logActivity({
       company_id: session.company_id,
       action: 'emergency_coverage_prompt_next_batch',

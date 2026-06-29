@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { classifyCoverageButton } from '../emergency-coverage';
+import { classifyCoverageButton, classifyCoverageBatchButton } from '../emergency-coverage';
 import type { ActiveOutreach } from '../emergency-coverage';
 
 function outreach(over: Partial<ActiveOutreach> = {}): ActiveOutreach {
@@ -44,5 +44,28 @@ describe('classifyCoverageButton', () => {
   it('decline always resolves to decline (even if already filled)', () => {
     expect(classifyCoverageButton(outreach(), 'decline')).toBe('decline');
     expect(classifyCoverageButton(outreach({ coverage_filled: true }), 'decline')).toBe('decline');
+  });
+});
+
+// #11 — the manager's "send another batch?" button outcome.
+describe('classifyCoverageBatchButton', () => {
+  const pool = [{ employee_id: 'a' }, { employee_id: 'b' }, { employee_id: 'c' }];
+
+  it('no active session resolves to not_found', () => {
+    expect(classifyCoverageBatchButton(null, 'send')).toBe('not_found');
+    expect(classifyCoverageBatchButton(null, 'stop')).toBe('not_found');
+  });
+
+  it('stop always resolves to stopped', () => {
+    expect(classifyCoverageBatchButton({ candidate_pool: pool, shown_count: 1 }, 'stop')).toBe('stopped');
+  });
+
+  it('send with more candidates left resolves to sent', () => {
+    expect(classifyCoverageBatchButton({ candidate_pool: pool, shown_count: 1 }, 'send')).toBe('sent');
+  });
+
+  it('send with the pool already exhausted resolves to exhausted', () => {
+    expect(classifyCoverageBatchButton({ candidate_pool: pool, shown_count: 3 }, 'send')).toBe('exhausted');
+    expect(classifyCoverageBatchButton({ candidate_pool: [], shown_count: 0 }, 'send')).toBe('exhausted');
   });
 });

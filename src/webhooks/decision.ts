@@ -5,7 +5,7 @@ import { sendEmail } from '../messaging/email';
 import { sendSms } from '../messaging/sms';
 import { normalizeReSubject } from '../messaging/reply';
 import { executeScheduleSwap, executeScheduleTrade } from '../workflows/shift-swap';
-import { processCoverageButtonDecision } from '../workflows/emergency-coverage';
+import { processCoverageButtonDecision, processCoverageBatchButton } from '../workflows/emergency-coverage';
 import { computeWageEstimate } from '../lib/schedule-simulator';
 import type { Employee } from '../db/types';
 
@@ -72,7 +72,19 @@ interface CoverageDecisionToken {
   expires_at: string;
 }
 
-type DecisionToken = TimeOffDecisionToken | SwapDecisionToken | CoverageDecisionToken;
+// Coverage "send another batch?" token (#11) — the MANAGER's button on the
+// next-batch prompt. action 'approve' = send the next batch | 'deny' = stop.
+// The live session is looked up fresh by company_id + manager_contact.
+interface CoverageBatchDecisionToken {
+  decision_type: 'coverage_batch';
+  action: 'approve' | 'deny';
+  request_id: string;
+  company_id: string;
+  manager_contact: string;
+  expires_at: string;
+}
+
+type DecisionToken = TimeOffDecisionToken | SwapDecisionToken | CoverageDecisionToken | CoverageBatchDecisionToken;
 
 // ── HTML response helpers ─────────────────────────────────────────────────────
 
@@ -347,6 +359,55 @@ async function handleCoverageDecision(
   res.send(coverageResultPage(token.employee_name, result.outcome, result.shiftName));
 }
 
+// ── Coverage "send another batch?" (decision_type: 'coverage_batch') ──────────
+
+function coverageBatchResultPage(outcome: 'sent' | 'stopped' | 'exhausted' | 'not_found', shiftName: string): string {
+  const map = {
+    sent: { icon: '📣', color: '#16a34a', title: 'On it', body: `I'm reaching out to the next batch of employees for the ${shiftName} shift. I'll let you know the moment someone accepts.` },
+    stopped: { icon: '👍', color: '#6b7280', title: "Got it", body: `I'll leave the ${shiftName} shift with you. Reply any time if you'd like me to find more coverage.` },
+    exhausted: { icon: 'ℹ️', color: '#2563eb', title: 'Everyone contacted', body: `I've now reached everyone qualified and available for the ${shiftName} shift. You'll need to contact staff directly.` },
+    not_found: { icon: '⌛', color: '#dc2626', title: 'No longer active', body: `This coverage request is no longer active. If you think that's a mistake, reply to the email or contact Aegis directly.` },
+  }[outcome];
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Coverage — Aegis</title>
+  <style>
+    body { font-family: Arial, sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; background: #f9fafb; }
+    .card { background: #fff; border-radius: 8px; padding: 40px; max-width: 420px; text-align: center; box-shadow: 0 1px 4px rgba(0,0,0,.12); }
+    .icon { font-size: 48px; }
+    h1 { font-size: 22px; margin: 16px 0 8px; color: ${map.color}; }
+    p { color: #6b7280; font-size: 15px; margin: 0; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon">${map.icon}</div>
+    <h1>${map.title}</h1>
+    <p>${map.body}</p>
+  </div>
+</body>
+</html>`;
+}
+
+async function handleCoverageBatchDecision(
+  res: import('express').Response,
+  requestId: string,
+  action: 'approve' | 'deny',
+  token: CoverageBatchDecisionToken,
+): Promise<void> {
+  const result = await processCoverageBatchButton({
+    companyId: token.company_id,
+    managerContact: token.manager_contact,
+    action: action === 'approve' ? 'send' : 'stop',
+  });
+  // Single-use: drop both of this request's tokens so the link can't be replayed.
+  await consumeSwapTokens(token.company_id, requestId);
+  res.send(coverageBatchResultPage(result.outcome, result.shiftName));
+}
+
 // ── Route handler ─────────────────────────────────────────────────────────────
 
 decisionWebhook.get('/', async (req, res) => {
@@ -422,6 +483,11 @@ decisionWebhook.get('/', async (req, res) => {
 
   if (decisionToken.decision_type === 'coverage') {
     await handleCoverageDecision(res, requestId, action as 'approve' | 'deny', decisionToken);
+    return;
+  }
+
+  if (decisionToken.decision_type === 'coverage_batch') {
+    await handleCoverageBatchDecision(res, requestId, action as 'approve' | 'deny', decisionToken);
     return;
   }
 

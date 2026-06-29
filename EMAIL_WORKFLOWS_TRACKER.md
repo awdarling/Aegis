@@ -25,7 +25,7 @@ Per-action status of the 8 `ActionType`s in `src/lib/aegis-actions/types.ts`. Dr
 | `deny_custom_availability` | **BUILT (verified-in-code 2026-06-28)** | Same real path (DENY branch) — no override written, denial logged, employee notified with no Homebase link. |
 | `accept_emergency_coverage` | **DELIVERED via Aegis `/webhooks/decision` (2026-06-24)** | The Homebase `aegis-action` ActionType stub is bypassed: emergency-coverage outreach emails now carry branded **Accept/Decline** buttons routed through the Aegis decision route as `decision_type:'coverage'` → `processCoverageButtonDecision` (first-yes-wins, schedule swap, shift-filled fan-out, manager notify). Branch `feat/coverage-email-buttons`; tsc + 128/128. Round-trip eyeball pending. SMS still reply-YES/NO. |
 | `decline_emergency_coverage` | **DELIVERED via Aegis `/webhooks/decision` (2026-06-24)** | See `accept_emergency_coverage` above — same branded-button path (Decline → deny → records decline, batch-exhaust prompt to manager). |
-| `request_additional_batch` | **STUB** | Fake success; never minted by any email. (Coverage's "next batch" is handled conversationally by the manager today — see emergency-coverage flow.) |
+| `request_additional_batch` | **BUILT via Aegis `/webhooks/decision` (2026-06-28, item #11)** | The coverage "send another batch?" prompt to the manager now carries branded **Send next batch / No, I've got it** buttons (own path: `decision_type: 'coverage_batch'` → `processCoverageBatchButton` → reuses `blastNextBatch`). The Homebase `aegis-action` ActionType stub of this name is bypassed (same approach as the coverage Accept/Decline buttons). Reply-YES/NO fallback still works. Branch `feat/coverage-batch-button`; 167/167. Live eyeball pending. |
 
 ---
 

@@ -131,10 +131,43 @@ export async function classifyIntent(
 
   const text = response.content[0].type === 'text' ? response.content[0].text : '';
 
-  return (
-    coerceJsonObject<ClassifyResult>(text) ??
-    { intent: 'unknown', confidence: 'low', extracted: {} }
-  );
+  const parsed = coerceJsonObject<ClassifyResult>(text) ??
+    { intent: 'unknown', confidence: 'low', extracted: {} };
+
+  return applyAvailabilityBackstop(parsed, message);
+}
+
+// A purely-positive availability statement ("I can work …", "I'm available …")
+// states when the employee CAN work — the opposite of time off. The classifier
+// occasionally mis-fires these to submit_time_off when a specific date/week is
+// present (the "specific date wins" rule). Returns true ONLY for clearly positive
+// statements with NO off/can't/unavailable language, so mixed messages ("I can
+// work Mon but need Fri off") are left to the model.
+export function looksLikePositiveAvailability(body: string): boolean {
+  const positive = /\bi can work\b|\bi can do\b|\bi['’ ]?a?m available\b|\bavailable to work\b|\bput me down for\b|\bi['’ ]?a?m free\b/i.test(body);
+  if (!positive) return false;
+  const negative = /\boff\b|\bcan['’]?t\b|\bcannot\b|\bcan ?not\b|\bunavailable\b|\bno more\b|\btake me off\b|\bneed[s]?\b.*\boff\b/i.test(body);
+  return !negative;
+}
+
+// Deterministic backstop for the availability-vs-time-off bug: if the model picked
+// submit_time_off but the message is a clear positive availability statement,
+// reclassify to update_availability. Carries the date-range end (if the model
+// captured one) into end_date so a week-bounded statement stays date-limited.
+export function applyAvailabilityBackstop(result: ClassifyResult, message: string): ClassifyResult {
+  if (result.intent !== 'submit_time_off' || !looksLikePositiveAvailability(message)) return result;
+  const ex = (result.extracted ?? {}) as Record<string, unknown>;
+  const dates = Array.isArray(ex.dates) ? (ex.dates as Array<Record<string, unknown>>) : [];
+  const ends = dates
+    .map(d => d?.end_date)
+    .filter((s): s is string => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s))
+    .sort();
+  const lastEnd = ends.length ? ends[ends.length - 1] : null;
+  return {
+    intent: 'update_availability',
+    confidence: result.confidence,
+    extracted: lastEnd ? { end_date: lastEnd } : {},
+  };
 }
 
 // Generates a natural language reply to send back to the user.
@@ -199,7 +232,26 @@ recurring availability change (update_availability). Pick by the date signal:
   - the request describes a pattern, not an event
 
 If a message contains BOTH a specific calendar date AND availability-sounding
-language, the specific date wins → submit_time_off.
+language, the specific date wins → submit_time_off — UNLESS it is a POSITIVE
+availability statement (see the next section), which always wins as availability.
+
+## Positive availability statements ("I CAN work …") — ALWAYS update_availability
+
+A message that states ONLY when the employee CAN work / IS available — with NO
+"off", "can't", "cannot", "unavailable", or "need … off" language anywhere — is an
+AVAILABILITY statement, never a time-off request, EVEN when it names a specific
+week or dates. Time-off is about when someone CANNOT work; "I can work …" is the
+exact opposite, so it must NEVER be classified as submit_time_off. Triggers:
+"I can work …", "I'm available …", "I can do …", "put me down for …", "I'm free …".
+- Bounded to a specific week or date range ("for the week of June 29 to July 5",
+  "this week", "next week", "June 29–July 5") → a TEMPORARY availability change:
+  update_availability with extracted.end_date = the LAST date of that range. The
+  days/times themselves are parsed downstream — you only set end_date here.
+- No bound → a permanent availability change: update_availability, no end_date.
+- NEVER treat a positive availability statement as defining an "off-window."
+- Example of the bug to avoid: "For the week of June 29 to July 5 I can work
+  Monday 11am to 3:30pm, Wednesday 11am to 3:30pm, and Thursday" is
+  update_availability (end_date the last day of that week) — NOT submit_time_off.
 
 EXCEPTION — temporary recurring change with an "until/through" boundary:
 when a RECURRING pattern (plural days / a day-period like "mornings") is bounded
@@ -223,9 +275,11 @@ Teen/informal register is common (lowercase, no punctuation, slang). Map:
 - "can someone cover", "trade shifts", "swap" → initiate_swap
 - "yeah" / "yep" / "ok" / "sure" by itself → respond_swap_accept
 - "nah" / "no" / "no wait" / "never mind" by itself → respond_swap_decline
-- Indirect partials: when the user states what they CAN do, the rest of the day
-  is the off-window. "busy the morning of June 21st. I can work at night though"
-  → partial, period_label="morning" (NOT "evening").
+- Indirect partials: ONLY when the message gives an OFF/BUSY context for part of a
+  day and then what they CAN do for the rest. "busy the morning of June 21st. I can
+  work at night though" → partial, period_label="morning" (NOT "evening"). A message
+  with NO off/busy/can't context (purely "I can work …") is update_availability, not
+  a partial day-off.
 
 ## Examples
 
@@ -304,6 +358,15 @@ User: "hey Aegis"
 
 User: "what can I ask you for?"
 {"intent":"capabilities","confidence":"high","extracted":{}}
+
+User: "For the week of June 29 to July 5 I can work Monday 11am to 3:30pm, Wednesday 11am to 3:30pm, and Thursday."
+{"intent":"update_availability","confidence":"high","extracted":{"end_date":"${currentYear}-07-05"}}
+
+User: "next week i can work tuesday and thursday"
+{"intent":"update_availability","confidence":"high","extracted":{}}
+
+User: "i can work mornings from now on"
+{"intent":"update_availability","confidence":"high","extracted":{}}
 
 User: "what are my shifts this week?"
 {"intent":"query_my_shifts","confidence":"high","extracted":{}}

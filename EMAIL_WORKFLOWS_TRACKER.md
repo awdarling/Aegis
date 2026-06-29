@@ -94,6 +94,7 @@ Inbound email is authenticated (ECDSA signature verification) and verified. Both
 | Conversational ack reusable helper (`sendInThreadAck`) | DONE |
 | Manager intents (query_schedule, homebase_edit, approve/deny TO) | DONE |
 | Employee intents (submit_time_off, update_availability) | DONE |
+| Employee `query_my_shifts` ("what are my shifts?" / "am I working Saturday?") | **BUILT 2026-06-28 (#12, Aegis-only, branch `feat/employee-shift-query`)** — `handleMyShiftsQuery` returns the employee's own upcoming/specific-day shifts from published schedules, warm reply, no Homebase CTA. 172/172. Live eyeball pending (11.7). |
 | Availability manager-notify fan-out to ALL managers | DONE — fixed June 5 (was `.limit(1).maybeSingle()`) |
 | Reply threading (single-tenant) | DONE via Reply-To; multi-tenant From open (TENANT-1) |
 | Diagnostic logging stripped (`[email-trace]`, `[req]`) | TODO (fast-follow) |

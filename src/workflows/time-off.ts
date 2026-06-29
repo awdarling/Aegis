@@ -1319,6 +1319,15 @@ async function notifyManagersByEmail(
   return { emailed, total_managers: managers.length };
 }
 
+// When an employee packs a time-off request AND their availability into one
+// message, we confirm only the time-off here and ask them to send the availability
+// on its own (the classifier sets also_mentions_availability). Pure + tested.
+export function availabilityFollowupNote(extracted: Record<string, unknown>): string {
+  return extracted?.['also_mentions_availability'] === true
+    ? `\n\nP.S. — I also saw you included your availability. Send that to me in its own message (like "I can work Monday and Wednesday mornings") and I'll set it up — I kept this one focused on your time off so nothing gets crossed.`
+    : '';
+}
+
 // ── Public workflow handlers ───────────────────────────────────────────────────
 
 // Step 1: Employee submits request — parse, store pending, ask for confirmation.
@@ -1369,7 +1378,8 @@ export async function handleSubmitTimeOff(
   await reply(
     contact,
     message,
-    `${greeting(contact.name)}\n\nGot it — you're requesting ${summary} off for ${reason}. Is that correct? (Reply "yes" to confirm or "no" to restate.)`
+    `${greeting(contact.name)}\n\nGot it — you're requesting ${summary} off for ${reason}. Is that correct? (Reply "yes" to confirm or "no" to restate.)` +
+      availabilityFollowupNote(extracted)
   );
 }
 

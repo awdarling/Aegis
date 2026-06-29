@@ -13,7 +13,7 @@ vi.mock('../../messaging/reply', () => ({ reply: vi.fn(), sendInThreadAck: vi.fn
 vi.mock('../../ai/claude', () => ({ withAnthropicRetry: vi.fn(), generateReply: vi.fn(), classifyIntent: vi.fn() }));
 vi.mock('../../logger/activity-log', () => ({ logActivity: vi.fn() }));
 
-import { resolvePartialWindow } from '../time-off';
+import { resolvePartialWindow, availabilityFollowupNote } from '../time-off';
 
 // Minimal entry shape for the resolver.
 const entry = (over: Record<string, unknown>) => ({
@@ -45,5 +45,20 @@ describe('resolvePartialWindow', () => {
 
   it('returns null when there is nothing partial to resolve (→ treated as full day)', () => {
     expect(resolvePartialWindow(entry({}))).toBeNull();
+  });
+});
+
+// #14.5c — a combined time-off + availability email confirms only the time off and
+// asks for the availability separately.
+describe('availabilityFollowupNote', () => {
+  it('adds a "send availability separately" P.S. when the flag is set', () => {
+    const note = availabilityFollowupNote({ also_mentions_availability: true });
+    expect(note).toMatch(/availability/i);
+    expect(note).toMatch(/separate|its own message/i);
+  });
+
+  it('is empty when no availability was mentioned', () => {
+    expect(availabilityFollowupNote({})).toBe('');
+    expect(availabilityFollowupNote({ also_mentions_availability: false })).toBe('');
   });
 });

@@ -44,7 +44,7 @@ The post-sprint direction is the **Forward Build Sequence (Phases 1–4)** in `D
 - Harnesses: `scripts/dry-run-schedule.ts`, `scripts/test-cascade.ts`.
 
 ## Deploy & danger zones
-- **Aegis (this repo):** push to `main` → Railway auto-deploys. Read the actual diff before pushing.
+- **Aegis (this repo):** `main` is **GitHub branch-protected as of 2026-06-30 — direct pushes are rejected** ("Changes must be made through a pull request"). The flow is now the same as Homebase: **feature branch → push → PR → merge → Railway auto-deploys on merge.** Read the actual diff before merging. *(This corrects the old "push to main → Railway auto-deploys" note — that direct-push path no longer works.)*
 - **Homebase deploy flow (different repo — PR-gated).** As of 2026-06-10, Homebase `main` is **GitHub branch-protected** — direct pushes are rejected. The flow is **feature branch → PR → merge → Vercel auto-deploy on merge**. Exact sequence (run from `~/Desktop/homebase`):
   ```bash
   find .git -name "*.lock" -delete

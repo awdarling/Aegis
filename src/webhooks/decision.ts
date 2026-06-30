@@ -211,11 +211,16 @@ async function handleSwapDecision(
   const requester = requesterRes.data as Employee | null;
   const receiver = receiverRes.data as Employee | null;
 
-  // Update swap_request status
+  // Update swap_request status.
+  // NOTE: decided_by is a UUID column. The manager is identified by the
+  // magic-link email (shared across managers), so we don't have a single
+  // user UUID here — write null rather than a string (which would throw an
+  // invalid-uuid error and silently leave the row stuck at pending_manager).
+  // The decision is still captured by decided_at + the activity log below.
   await supabase.from('swap_requests').update({
     status: action === 'approve' ? 'approved' : 'denied',
     decided_at: new Date().toISOString(),
-    decided_by: 'manager',
+    decided_by: null,
   }).eq('id', requestId);
 
   // Consume both sibling tokens

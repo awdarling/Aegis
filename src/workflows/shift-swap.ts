@@ -1536,7 +1536,7 @@ async function executeSwapNow(params: {
     status: 'approved',
     initiated_by: 'aegis',
     decided_at: new Date().toISOString(),
-    decided_by: 'aegis',
+    decided_by: null, // UUID column — system auto-approval has no manager user; null (decided_at + notes record it). Writing a string here threw invalid-uuid and failed the insert.
     notes: 'Auto-approved — no manager approval required per company policy.',
   }).select('id').single();
 

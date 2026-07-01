@@ -32,6 +32,11 @@ Reference for who/what is configured in each tenant. Append-only — when identi
 
 > **Stray pending test TO (CLEANUP):** at least one pending test time-off row exists on Watermark from launch-day testing and is visible to managers in the Time Off tab. Clear the pending test row(s); do NOT delete the legitimate seed/fixture rows (the ~May 22 batch).
 
+### Watermark monitoring inbox (`company_monitoring_inboxes`)
+| Email | Active | Row id | Notes |
+|---|---|---|---|
+| **monitor1@quriasolutions.com** | true | `c110f0ee-f6e7-47ff-b8ea-666bf4f1c2a4` | Roadmap item #16 (first slice) is **BUILT + LIVE**: `messaging/email.ts` BCCs every outbound Watermark email to the active rows here (`resolveMonitoringEmails` → `buildBccList`). **2026-06-30 (corrected):** target is **monitor1@quriasolutions.com** — a FREE **Microsoft 365 shared mailbox** on our own domain (awdarling@ has Full Access; visible in Outlook). The same-day plan to use a free Gmail (`quriamonitor1@gmail.com`) was **ABANDONED and never created**. ⚠️ The live row read `monitorone@quriasolutions.com` (a NON-EXISTENT mailbox → BCCs were bouncing) until this fix; run `update public.company_monitoring_inboxes set email='monitor1@quriasolutions.com' where id='c110f0ee-f6e7-47ff-b8ea-666bf4f1c2a4'` if not already applied. Receive-only passive audit copy; never a manager, never an authority. ⚠️ **Watermark PRODUCTION tenant** — edits are production writes. |
+
 ---
 
 ## Sandbox Tenant
@@ -43,16 +48,23 @@ Reference for who/what is configured in each tenant. Append-only — when identi
 > **Correction (2026-06-09):** earlier docs implied Bubba Ganush had been the sandbox manager and was "repointed" to Watermark. That framing is wrong. `public.users.id` is 1:1 with `auth.users.id` — one auth user, one `users` row, one company. The sandbox simply never had its own manager `users` row; Bubba's single row has always lived on whichever company it was last set to. As of 2026-06-09 the sandbox has a dedicated manager (below), so Bubba's row can stay on Watermark and sandbox manager-side testing works without juggling the same auth user between tenants.
 
 ### Sandbox managers
-| Name | Email | Role | Notes |
-|---|---|---|---|
-| Sandbox Manager | sandbox-manager@quriasolutions.com | manager | Dedicated sandbox manager login established 2026-06-09 (own auth user / own `users` row). Used to verify S3 in-tab TO approval round-trip in the sandbox tenant. |
-
-### Sandbox employees
-| Name | employee_id | Email | Role | Notes |
+| Name | Notification email (`public.users.email`) | Login email (`auth.users`) | Role | Notes |
 |---|---|---|---|---|
-| Shmubba Sploosh | e1684385-ab46-472d-82b8-9009cd705bde | aegisscheduler@gmail.com | Lifeguard | Primary test employee for TO/availability/swap flows |
-| Test Guard A | aaaa1111-0000-0000-0000-000000000001 | testguarda@example.com | Lifeguard | Added 2026-06-09 for sandbox engine + workflow tests. Safe to use in any sandbox harness; do NOT email a real inbox. |
-| Test Guard B | bbbb2222-0000-0000-0000-000000000002 | testguardb@example.com | Lifeguard | Added 2026-06-09 alongside Test Guard A. Same usage notes. |
+| Sandbox Manager (`3aa0b57d-047a-473b-9e2a-7a00f9191341`) | **sandbox-manager@quriasolutions.com — ⚠️ NOT a real mailbox; notifications go into a void (OPEN)** | sandbox-manager@quriasolutions.com | manager | Dedicated sandbox manager (own auth user / own `users` row, est. 2026-06-09). **2026-06-30 (corrected):** the planned change to a free Gmail (`quriatesting@gmail.com`) was **ABANDONED and never created** (hit Google's phone-verification cap). The live `public.users.email` still reads **sandbox-manager@quriasolutions.com**, which has **NO mailbox** (it's only an auth/login username), so Aegis manager-approval emails (read from `public.users.email` by `notifyManagersByEmail`) are delivered **nowhere**. **⚠️ ACTION before testing the sandbox approval flow:** point this at a real receiving inbox — recommended a FREE M365 **shared mailbox** on our domain (same method as `monitor1@`), e.g. `sandbox-mgr@quriasolutions.com`, then `update public.users set email='sandbox-mgr@quriasolutions.com' where id='3aa0b57d-047a-473b-9e2a-7a00f9191341'`. **Homebase login is unchanged** — it uses `auth.users.email` (still sandbox-manager@quriasolutions.com + password); only where Aegis *delivers* mail needs to move. |
+
+> **Email infrastructure — CORRECTED (2026-06-30):** the earlier "must use a free Gmail" premise was **WRONG**. `@quriasolutions.com` does NOT run on Google Workspace — it runs on **Microsoft 365, managed via GoDaddy** (Exchange Online; tenant admin `awdarling@quriasolutions.com`). The "custom-domain paywall" was Google trying to manage a Google *account* whose username happened to be a quriasolutions.com address — not our actual mail. We can create **FREE M365 shared mailboxes** on our own domain at no per-seat cost (as long as one licensed mailbox exists — `awdarling@` is licensed). Aegis still *sends* from `…@aegis.quriasolutions.com` via SendGrid (separate, unaffected); manager/monitoring inboxes only need to RECEIVE, which shared mailboxes do. **New convention: one FREE M365 shared mailbox per client/role on `@quriasolutions.com`** (e.g. `monitor1@`, `sandbox-mgr@`), accessed from `awdarling@`'s Outlook via Full Access. The free-Gmail plan (`quriatesting@` / `quriamonitor1@gmail.com`) is **ABANDONED — those accounts were never created.**
+
+### Sandbox employees — CURRENT (verified against live DB 2026-06-30)
+| Name | employee_id | Email | Qualified roles | Notes |
+|---|---|---|---|---|
+| Sam Rivera | 11111111-1111-1111-1111-111111111111 | aegisscheduler@gmail.com | guard, Lifeguard | **Real inbox Alexander controls.** Primary test employee (TO / availability / swap requester). |
+| Riley Brooks | 22222222-2222-2222-2222-222222222222 | lightningmakigga@gmail.com | guard, Lifeguard | **Real inbox Alexander controls.** Swap candidate / second test employee. (Same inbox also = Watermark's temp "Bubba Ganush" manager — reused across tenants.) |
+| Casey Kim | 44444444-4444-4444-4444-444444444444 | casey.demo@example.com | Lifeguard, guard | Demo placeholder — NOT a real inbox; fills the roster for builds/coverage. |
+| Jordan Lee | 33333333-3333-3333-3333-333333333333 | jordan.demo@example.com | guard, Lifeguard | Demo placeholder — not a real inbox. |
+| Morgan Tate | 55555555-5555-5555-5555-555555555555 | morgan.demo@example.com | Headguard, Lifeguard, guard | Demo placeholder — not a real inbox. |
+| Taylor Quinn | 66666666-6666-6666-6666-666666666666 | taylor.demo@example.com | guard, Lifeguard | Demo placeholder — not a real inbox. |
+
+> **Superseded roster (pre-2026-06-30):** the sandbox was re-seeded with the six employees above. The earlier identities — **Shmubba Sploosh** (`e1684385-ab46-472d-82b8-9009cd705bde`, aegisscheduler@gmail.com) and **Test Guard A/B** (`aaaa1111…`, `bbbb2222…`, example.com) — are no longer the live sandbox roster. aegisscheduler@gmail.com now maps to **Sam Rivera**; the swap-candidate real inbox is now **Riley Brooks** (lightningmakigga@gmail.com) rather than a Test Guard. Treat the live DB as source of truth.
 
 ### Sandbox seed data
 | Table | Notes |

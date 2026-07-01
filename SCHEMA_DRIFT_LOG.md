@@ -187,3 +187,22 @@ Any time a future Claude Code session or live debugging surfaces a difference be
 - The voice+branding pass, INBOUND-SIG-1, and TO-RERUN-1 (re-check recommendations, in-thread reply, resolution notices, click-guards) added **no migrations and no new columns/tables/enums**. TO-RERUN-1 only re-writes existing `time_off_requests.aegis_recommendation` / `aegis_reasoning` and reads existing tables.
 - `aegis_action_tokens` gained a new `action_type` VALUE `'recheck_to'` at the application level (the `ActionType` union in both repos). The DB column is free-text `text`, so no DDL was required — but note this enum-by-convention if a CHECK constraint is ever added to that column.
 - Sandbox-only data note (not drift): `SANDBOX_RERUN_SEED.sql` raises the sandbox PM Lifeguard `required_count` 1→2 and deactivates stale `custom_availability` for the 3 test guards. Production untouched.
+
+---
+
+## 2026-06-30 — `company_monitoring_inboxes` table exists (item #16 first slice, undocumented in reference docs)
+
+### `public.company_monitoring_inboxes` (NEW table — confirmed live)
+- Columns (all `NOT NULL`): `id uuid`, `company_id uuid`, `email text`, `active boolean`, `created_at timestamptz`.
+- Purpose: roadmap item #16 monitoring/observer inboxes. `src/messaging/email.ts` calls `resolveMonitoringEmails(companyId)` (`src/messaging/monitoring.ts`) and BCCs every outbound email for that company to the `active=true` rows (`buildBccList`). **Fail-safe:** lookup error / no rows → empty list → no BCC, send still goes out. So the feature is LIVE but inert for any company with no rows.
+- Live data: **Watermark** (`a1b2c3d4-…`) has one active row. **2026-06-30 (corrected):** target is `monitor1@quriasolutions.com` — a FREE **Microsoft 365 shared mailbox** on our own domain (the domain runs on M365 via GoDaddy, NOT Google Workspace; the earlier "use a free Gmail / `quriamonitor1@gmail.com`" plan was abandoned and never created). ⚠️ The row read `monitorone@quriasolutions.com` (a non-existent mailbox → BCCs bounced) until this fix; apply `update public.company_monitoring_inboxes set email='monitor1@quriasolutions.com' where id='c110f0ee-f6e7-47ff-b8ea-666bf4f1c2a4'` if not yet run. Sandbox has none.
+- Not represented in `src/db/types.ts` (consistent with the "types file is incomplete" rule). Reference docs (01–06) don't mention this table — fold in on the next doc rewrite (#14).
+
+---
+
+## 2026-07-01 — `swap_requests.decided_by` is a UUID (caused a silent orphan bug)
+
+### `public.swap_requests.decided_by` — `uuid` (nullable)
+- Discovered while testing the undirected-swap manager approval. `decided_by` is a **UUID** FK-style column, NOT free text. `initiated_by` (text) and `status` (text) are free text; `decided_by` and `decided_at (timestamptz)` are the decision-audit columns.
+- **Bug it caused (now fixed):** `src/webhooks/decision.ts` wrote `decided_by: 'manager'` and `src/workflows/shift-swap.ts` (auto-approve path) wrote `decided_by: 'aegis'` — both strings. Postgres rejects a non-UUID string → the whole UPDATE/INSERT throws, and because the result wasn't error-checked it failed silently. Net effect: the schedule trade executed but the `swap_request` row was never closed (stuck at `pending_manager`, decided_at null). Fix: write `null` (branch `fix/swap-decided-by-uuid`, merged 2026-07-01, re-verified — status now flips to `approved`).
+- Lesson: treat `*_by` columns as UUID unless proven text; never write role/name strings to them. If "which manager" matters for swaps later, resolve the approving manager's `users.id` (the swap decision magic-link is currently shared across managers, so we don't know which one clicked → null is correct for now).

@@ -442,7 +442,16 @@ Respond with ONLY valid JSON in this exact shape — no markdown, no explanation
     // For recheck_time_off: { "employee_name": "..." | omitted, "date": "YYYY-MM-DD" | omitted }
     //   Manager asking to re-run the coverage check on a PENDING time-off request.
     //   Include employee_name and/or date when mentioned; omit either if not stated.
-    // For initiate_swap: { "shift_date": "YYYY-MM-DD", "shift_name": "...", "target_employee_name": "..." }
+    // For initiate_swap: { "shift_date": "YYYY-MM-DD", "shift_name": "AM|PM|null", "target_employee_name": "..." }
+    //   shift_date = the date of the shift the employee wants to GIVE UP / can't
+    //   work / wants to trade away. Resolve a bare day-of-week to its UPCOMING
+    //   occurrence relative to today (${today}): "my Saturday shift" / "trade my
+    //   Saturday PM shift" → this coming Saturday's calendar date. NEVER resolve a
+    //   named weekday to today's date.
+    //   If the employee ALSO lists days they CAN work in return (e.g. "I can work a
+    //   Friday AM, a Wednesday PM, or a Thursday PM"), those are OFFERED trade days,
+    //   NOT the shift_date — they must never override the give-up shift's date.
+    //   shift_name = the period (AM/PM) of the give-up shift, or null if unstated.
     // For build_schedule: {
     //   "target_week": "this" | "next",
     //   "veteran_preference": string | null,

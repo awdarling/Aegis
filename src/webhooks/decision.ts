@@ -7,7 +7,49 @@ import { normalizeReSubject } from '../messaging/reply';
 import { executeScheduleSwap, executeScheduleTrade } from '../workflows/shift-swap';
 import { processCoverageButtonDecision, processCoverageBatchButton } from '../workflows/emergency-coverage';
 import { computeWageEstimate } from '../lib/schedule-simulator';
+import { BRAND, logoUrl } from '../messaging/brand';
 import type { Employee } from '../db/types';
+
+// Escape user-supplied text before it lands in an HTML page.
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+// Shared Aegis-branded landing page (dark surface + orange accent + logo header)
+// so the /webhooks/decision pages match the branded emails and the Homebase
+// aegis-action pages, instead of the old plain-white card.
+function brandedPage(opts: { title: string; heading: string; headingColor: string; icon: string; iconColor: string; body: string }): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${escapeHtml(opts.title)} — Aegis</title>
+  <style>
+    body { font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; background: ${BRAND.bgBase}; }
+    .card { background: ${BRAND.surface2}; border: 1px solid ${BRAND.borderDefault}; border-radius: 14px; max-width: 420px; width: 90%; overflow: hidden; box-shadow: 0 8px 30px rgba(0,0,0,.5); }
+    .hdr { display: flex; align-items: center; gap: 12px; padding: 18px 24px; background: ${BRAND.bgBase}; border-bottom: 2px solid ${BRAND.accent}; }
+    .hdr img { width: 34px; height: 34px; border-radius: 8px; }
+    .hdr span { color: ${BRAND.textPrimary}; font-weight: 700; font-size: 20px; }
+    .body { padding: 34px 28px; text-align: center; }
+    .icon { font-size: 30px; color: ${opts.iconColor}; }
+    h1 { font-size: 22px; margin: 14px 0 8px; color: ${opts.headingColor}; }
+    p { color: ${BRAND.textSecondary}; font-size: 15px; margin: 0; line-height: 1.5; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="hdr"><img src="${logoUrl()}" alt="Aegis"><span>Aegis</span></div>
+    <div class="body">
+      <div class="icon">${opts.icon}</div>
+      <h1>${escapeHtml(opts.heading)}</h1>
+      <p>${opts.body}</p>
+    </div>
+  </div>
+</body>
+</html>`;
+}
 
 export const decisionWebhook = Router();
 
@@ -90,51 +132,26 @@ type DecisionToken = TimeOffDecisionToken | SwapDecisionToken | CoverageDecision
 
 function confirmationPage(employeeName: string, action: 'approve' | 'deny'): string {
   const verb = action === 'approve' ? 'approved' : 'denied';
-  const color = action === 'approve' ? '#16a34a' : '#dc2626';
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Decision Recorded — Aegis</title>
-  <style>
-    body { font-family: Arial, sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; background: #f9fafb; }
-    .card { background: #fff; border-radius: 8px; padding: 40px; max-width: 400px; text-align: center; box-shadow: 0 1px 4px rgba(0,0,0,.12); }
-    .icon { font-size: 48px; }
-    h1 { font-size: 22px; margin: 16px 0 8px; color: ${color}; }
-    p { color: #6b7280; font-size: 15px; margin: 0; }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <div class="icon">${action === 'approve' ? '✅' : '❌'}</div>
-    <h1>Decision Recorded</h1>
-    <p>Request ${verb}. Aegis has notified ${employeeName}.</p>
-  </div>
-</body>
-</html>`;
+  const statusColor = action === 'approve' ? BRAND.goodText : BRAND.badText;
+  return brandedPage({
+    title: 'Decision Recorded',
+    heading: 'Decision Recorded',
+    headingColor: statusColor,
+    icon: action === 'approve' ? '✓' : '✕',
+    iconColor: statusColor,
+    body: `Request ${verb}. Aegis has notified ${escapeHtml(employeeName)}.`,
+  });
 }
 
 function errorPage(message: string): string {
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <title>Error — Aegis</title>
-  <style>
-    body { font-family: Arial, sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; background: #f9fafb; }
-    .card { background: #fff; border-radius: 8px; padding: 40px; max-width: 400px; text-align: center; box-shadow: 0 1px 4px rgba(0,0,0,.12); }
-    h1 { font-size: 20px; color: #dc2626; }
-    p { color: #6b7280; font-size: 15px; }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h1>Unable to Process</h1>
-    <p>${message}</p>
-  </div>
-</body>
-</html>`;
+  return brandedPage({
+    title: 'Error',
+    heading: 'Unable to Process',
+    headingColor: BRAND.badText,
+    icon: '⚠️',
+    iconColor: BRAND.warnText,
+    body: escapeHtml(message),
+  });
 }
 
 // ── Time-off notification ─────────────────────────────────────────────────────
@@ -318,33 +335,12 @@ async function consumeSwapTokens(companyId: string, requestId: string): Promise<
 
 function coverageResultPage(employeeName: string, outcome: 'accepted' | 'declined' | 'already_filled' | 'not_found', shiftName: string): string {
   const map = {
-    accepted: { icon: '✅', color: '#16a34a', title: "You're covered in", body: `Thanks, ${employeeName}! You're confirmed for the ${shiftName} shift. Your manager has been notified.` },
-    declined: { icon: '👍', color: '#6b7280', title: 'Thanks for letting us know', body: `No problem, ${employeeName} — we'll find someone else for the ${shiftName} shift.` },
-    already_filled: { icon: 'ℹ️', color: '#2563eb', title: 'Already covered', body: `Thanks for responding! The ${shiftName} shift has already been filled — no action needed.` },
-    not_found: { icon: '⌛', color: '#dc2626', title: 'No longer active', body: `This coverage request is no longer active. If you think that's a mistake, reply to the email or contact your manager.` },
+    accepted: { icon: '✅', color: BRAND.goodText, title: "You're covered in", body: `Thanks, ${employeeName}! You're confirmed for the ${shiftName} shift. Your manager has been notified.` },
+    declined: { icon: '👍', color: BRAND.silver, title: 'Thanks for letting us know', body: `No problem, ${employeeName} — we'll find someone else for the ${shiftName} shift.` },
+    already_filled: { icon: 'ℹ️', color: BRAND.reviewText, title: 'Already covered', body: `Thanks for responding! The ${shiftName} shift has already been filled — no action needed.` },
+    not_found: { icon: '⌛', color: BRAND.badText, title: 'No longer active', body: `This coverage request is no longer active. If you think that's a mistake, reply to the email or contact your manager.` },
   }[outcome];
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Coverage — Aegis</title>
-  <style>
-    body { font-family: Arial, sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; background: #f9fafb; }
-    .card { background: #fff; border-radius: 8px; padding: 40px; max-width: 420px; text-align: center; box-shadow: 0 1px 4px rgba(0,0,0,.12); }
-    .icon { font-size: 48px; }
-    h1 { font-size: 22px; margin: 16px 0 8px; color: ${map.color}; }
-    p { color: #6b7280; font-size: 15px; margin: 0; }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <div class="icon">${map.icon}</div>
-    <h1>${map.title}</h1>
-    <p>${map.body}</p>
-  </div>
-</body>
-</html>`;
+  return brandedPage({ title: 'Coverage', heading: map.title, headingColor: map.color, icon: map.icon, iconColor: map.color, body: map.body });
 }
 
 async function handleCoverageDecision(
@@ -368,33 +364,12 @@ async function handleCoverageDecision(
 
 function coverageBatchResultPage(outcome: 'sent' | 'stopped' | 'exhausted' | 'not_found', shiftName: string): string {
   const map = {
-    sent: { icon: '📣', color: '#16a34a', title: 'On it', body: `I'm reaching out to the next batch of employees for the ${shiftName} shift. I'll let you know the moment someone accepts.` },
-    stopped: { icon: '👍', color: '#6b7280', title: "Got it", body: `I'll leave the ${shiftName} shift with you. Reply any time if you'd like me to find more coverage.` },
-    exhausted: { icon: 'ℹ️', color: '#2563eb', title: 'Everyone contacted', body: `I've now reached everyone qualified and available for the ${shiftName} shift. You'll need to contact staff directly.` },
-    not_found: { icon: '⌛', color: '#dc2626', title: 'No longer active', body: `This coverage request is no longer active. If you think that's a mistake, reply to the email or contact Aegis directly.` },
+    sent: { icon: '📣', color: BRAND.goodText, title: 'On it', body: `I'm reaching out to the next batch of employees for the ${shiftName} shift. I'll let you know the moment someone accepts.` },
+    stopped: { icon: '👍', color: BRAND.silver, title: "Got it", body: `I'll leave the ${shiftName} shift with you. Reply any time if you'd like me to find more coverage.` },
+    exhausted: { icon: 'ℹ️', color: BRAND.reviewText, title: 'Everyone contacted', body: `I've now reached everyone qualified and available for the ${shiftName} shift. You'll need to contact staff directly.` },
+    not_found: { icon: '⌛', color: BRAND.badText, title: 'No longer active', body: `This coverage request is no longer active. If you think that's a mistake, reply to the email or contact Aegis directly.` },
   }[outcome];
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Coverage — Aegis</title>
-  <style>
-    body { font-family: Arial, sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; background: #f9fafb; }
-    .card { background: #fff; border-radius: 8px; padding: 40px; max-width: 420px; text-align: center; box-shadow: 0 1px 4px rgba(0,0,0,.12); }
-    .icon { font-size: 48px; }
-    h1 { font-size: 22px; margin: 16px 0 8px; color: ${map.color}; }
-    p { color: #6b7280; font-size: 15px; margin: 0; }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <div class="icon">${map.icon}</div>
-    <h1>${map.title}</h1>
-    <p>${map.body}</p>
-  </div>
-</body>
-</html>`;
+  return brandedPage({ title: 'Coverage', heading: map.title, headingColor: map.color, icon: map.icon, iconColor: map.color, body: map.body });
 }
 
 async function handleCoverageBatchDecision(

@@ -2501,6 +2501,18 @@ export async function applyCustomAvailabilityDecision(input: CustomAvailabilityD
     ? formatDateRange(input.custom_end_date, input.custom_end_date)
     : '';
 
+  // Clear the pending manager-approval record for this employee. The reply-"YES"
+  // path already deletes it by _memory_id before calling us, but the magic-link
+  // path (Homebase → internal /apply-custom-availability-decision) does NOT — so
+  // without this the stale avail_pending_mgr row lingers and hijacks the
+  // manager's very next email (their message gets read as a YES/NO answer to a
+  // decision they already made). Deleting here makes both paths self-clean.
+  await supabase
+    .from('aegis_memory')
+    .delete()
+    .eq('company_id', input.company_id)
+    .eq('source', availApprovalSource(input.company_id, input.employee_id));
+
   if (input.decision === 'approved') {
     // Switch off any existing active override for this employee, then insert the
     // new one (same write the Employees tab + Soteria do).

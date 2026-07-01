@@ -192,6 +192,24 @@ export async function generateReply(
 
 // ── Classifier system prompt ──────────────────────────────────────────────────
 
+// Deterministic day-of-week → calendar date resolution. LLMs are unreliable at
+// weekday arithmetic ("today is Wednesday, so the coming Saturday is the 4th"),
+// which made bare-weekday phrases ("my Saturday shift") resolve to today. We
+// compute the upcoming occurrence of every weekday in code and hand the model a
+// lookup table so it never has to do the math itself.
+function upcomingWeekdayLines(today: string): string {
+  const base = new Date(today + 'T12:00:00Z');
+  const names = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+  const todayDow = base.getUTCDay();
+  const order = [1, 2, 3, 4, 5, 6, 0]; // Monday-first listing
+  const lines = order.map(d => {
+    const daysAhead = (d - todayDow + 7) % 7;
+    const iso = new Date(base.getTime() + daysAhead * 86400000).toISOString().slice(0, 10);
+    return `${names[d]} → ${iso}${daysAhead === 0 ? ' (today)' : ''}`;
+  });
+  return `Today is ${names[todayDow]}. Upcoming day-of-week dates — use these EXACTLY for any bare weekday (e.g. "Saturday", "my Friday shift"); never compute weekday arithmetic yourself: ${lines.join(', ')}.`;
+}
+
 function buildClassifySystemPrompt(
   role: 'employee' | 'manager' | 'quria_admin',
   companyContext: string,
@@ -211,6 +229,7 @@ Allowed intents: ${allowedIntents.join(', ')}, unknown
 ${companyContext}
 
 Today's date is ${today} in the company's local timezone.
+${upcomingWeekdayLines(today)}
 All extracted dates must use the current year (${currentYear}) unless the user explicitly specifies a different year. If the user says "June 5", resolve it as ${currentYear}-06-05.
 
 ## Time-off vs. availability change — critical disambiguation
@@ -444,10 +463,10 @@ Respond with ONLY valid JSON in this exact shape — no markdown, no explanation
     //   Include employee_name and/or date when mentioned; omit either if not stated.
     // For initiate_swap: { "shift_date": "YYYY-MM-DD", "shift_name": "AM|PM|null", "target_employee_name": "..." }
     //   shift_date = the date of the shift the employee wants to GIVE UP / can't
-    //   work / wants to trade away. Resolve a bare day-of-week to its UPCOMING
-    //   occurrence relative to today (${today}): "my Saturday shift" / "trade my
-    //   Saturday PM shift" → this coming Saturday's calendar date. NEVER resolve a
-    //   named weekday to today's date.
+    //   work / wants to trade away. Resolve a bare day-of-week using the
+    //   "Upcoming day-of-week dates" table above — "my Saturday shift" / "trade my
+    //   Saturday PM shift" → the Saturday date from that table. NEVER resolve a
+    //   named weekday to today's date unless today IS that weekday.
     //   If the employee ALSO lists days they CAN work in return (e.g. "I can work a
     //   Friday AM, a Wednesday PM, or a Thursday PM"), those are OFFERED trade days,
     //   NOT the shift_date — they must never override the give-up shift's date.

@@ -1046,12 +1046,20 @@ export async function executeScheduleSwap(
 ): Promise<void> {
   const { data: schedRow } = await supabase.from('schedules').select('id, data, staffing_report')
     .eq('id', scheduleId).is('deleted_at', null).single();
-  if (!schedRow) return;
+  if (!schedRow) {
+    // Loud on purpose: a silent return here means an approved pickup never lands
+    // on the schedule (the bug we chased). If the schedule can't be resolved, say so.
+    console.warn(`[executeScheduleSwap] schedule ${scheduleId} not found/deleted — pickup for requester ${requesterId} on ${shiftDate} ${shiftName} was NOT applied`);
+    return;
+  }
 
   const row = schedRow as { id: string; data: ScheduleData; staffing_report: Record<string, unknown> | null };
   const updatedAssignments = applySwapToAssignments(
     row.data.assignments, shiftDate, shiftName, requesterId, receiverId, receiverName
   );
+  if (!updatedAssignments.some((a, i) => a.employee_id !== row.data.assignments[i]?.employee_id)) {
+    console.warn(`[executeScheduleSwap] no matching assignment for requester ${requesterId} on ${shiftDate} ${shiftName} in schedule ${scheduleId} — nothing updated`);
+  }
 
   const updatedData: ScheduleData = { ...row.data, assignments: updatedAssignments };
   const wages = await computeWageEstimate(companyId, updatedAssignments);
@@ -1104,10 +1112,16 @@ export async function executeScheduleTrade(
 ): Promise<void> {
   const { data: schedRow } = await supabase.from('schedules').select('id, data, staffing_report')
     .eq('id', scheduleId).is('deleted_at', null).single();
-  if (!schedRow) return;
+  if (!schedRow) {
+    console.warn(`[executeScheduleTrade] schedule ${scheduleId} not found/deleted — trade between ${sideA.employee_id} and ${sideB.employee_id} was NOT applied`);
+    return;
+  }
 
   const row = schedRow as { id: string; data: ScheduleData; staffing_report: Record<string, unknown> | null };
   const updatedAssignments = applyTradeToAssignments(row.data.assignments, sideA, sideB);
+  if (!updatedAssignments.some((a, i) => a.employee_id !== row.data.assignments[i]?.employee_id)) {
+    console.warn(`[executeScheduleTrade] no matching assignments for trade (${sideA.employee_id} ${sideA.date} ${sideA.shift_name} ↔ ${sideB.employee_id} ${sideB.date} ${sideB.shift_name}) in schedule ${scheduleId} — nothing updated`);
+  }
 
   const updatedData: ScheduleData = { ...row.data, assignments: updatedAssignments };
   const wages = await computeWageEstimate(companyId, updatedAssignments);

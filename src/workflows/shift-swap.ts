@@ -1118,6 +1118,56 @@ export async function executeScheduleTrade(
   }).eq('id', scheduleId);
 }
 
+// ── Banned-pair (hard 'never' conflict) guard for pickups & trades ────────────
+// The scheduler engine already blocks banned pairs at build time; pickups and
+// trades bypass the engine, so we re-check here. Unlike validateSwap's
+// requester↔receiver check, this catches the real case: someone joining a shift
+// where a HARD-banned coworker is already assigned.
+
+export interface HardConflictRow { employee_id_1: string; employee_id_2: string; }
+
+/** Load the company's hard ('never') banned pairs. Never throws — returns []. */
+export async function loadHardConflicts(companyId: string): Promise<HardConflictRow[]> {
+  try {
+    const { data } = await supabase
+      .from('employee_conflicts')
+      .select('employee_id_1, employee_id_2')
+      .eq('company_id', companyId)
+      .eq('severity', 'never');
+    return (data ?? []) as HardConflictRow[];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * If placing `empId` onto the (date, shiftName) instance would sit them beside a
+ * hard-banned coworker already assigned there, return that coworker's name; else
+ * null. `excludeEmpId` is the person vacating that shift (the requester on a
+ * pickup), so they don't count as a co-inhabitant.
+ */
+export function bannedCohabPartnerName(
+  empId: string,
+  date: string,
+  shiftName: string,
+  assignments: ScheduleAssignment[],
+  conflicts: HardConflictRow[],
+  excludeEmpId?: string,
+): string | null {
+  const banned = new Set<string>();
+  for (const c of conflicts) {
+    if (c.employee_id_1 === empId) banned.add(c.employee_id_2);
+    else if (c.employee_id_2 === empId) banned.add(c.employee_id_1);
+  }
+  if (banned.size === 0) return null;
+  for (const a of assignments) {
+    if (a.date !== date || a.shift_name !== shiftName) continue;
+    if (a.employee_id === empId || a.employee_id === excludeEmpId) continue;
+    if (banned.has(a.employee_id)) return a.employee_name;
+  }
+  return null;
+}
+
 // ── Swap validation ───────────────────────────────────────────────────────────
 
 async function validateSwap(params: {
@@ -1373,6 +1423,33 @@ export async function sendManagerSwapApprovalRequest(params: {
   const { company_id, swap_request_id, requester, receiver, shift_date, shift_name, role, shift_start, shift_end } = params;
   const isTrade = !!params.target_shift_name;
 
+  // Flag-don't-force: if this swap/pickup would seat someone next to a HARD-
+  // banned coworker on the shift, surface it as a heads-up in the manager's
+  // email — but never block. The manager makes the call. Best-effort; a lookup
+  // failure just omits the flag (the swap still goes for approval).
+  let bannedPairFlag: string | null = null;
+  try {
+    const { data: schedForFlag } = await supabase.from('schedules').select('data').is('deleted_at', null)
+      .eq('company_id', company_id).eq('status', 'published')
+      .lte('week_start', shift_date).gte('week_end', shift_date)
+      .order('generated_at', { ascending: false }).limit(1).maybeSingle();
+    const assignments = schedForFlag ? (schedForFlag as { data: { assignments: ScheduleAssignment[] } }).data.assignments : null;
+    if (assignments) {
+      const conflicts = await loadHardConflicts(company_id);
+      // Receiver joins the requester's shift (requester leaves → excluded).
+      let who = receiver.name;
+      let bannedWith = bannedCohabPartnerName(receiver.id, shift_date, shift_name, assignments, conflicts, requester.id);
+      // On a trade, the requester also joins the receiver's shift.
+      if (!bannedWith && isTrade && params.target_shift_date && params.target_shift_name) {
+        bannedWith = bannedCohabPartnerName(requester.id, params.target_shift_date, params.target_shift_name, assignments, conflicts, receiver.id);
+        who = requester.name;
+      }
+      if (bannedWith) {
+        bannedPairFlag = `${who} and ${bannedWith} are a restricted pair — they normally aren't scheduled together. Approving this would place them on the same shift.`;
+      }
+    }
+  } catch { /* flag is best-effort — never let it block the approval email */ }
+
   // Find manager
   const { data: managerData } = await supabase.from('users').select('id, email, name')
     .eq('company_id', company_id).in('role', ['manager', 'owner'])
@@ -1450,6 +1527,7 @@ export async function sendManagerSwapApprovalRequest(params: {
     `${firstName(requester.name)} and ${firstName(receiver.name)} have already agreed to ${isTrade ? 'trade shifts' : 'swap a shift'} — the only thing left is your sign-off. ` +
     `The details are below, and either link records your decision right away.\n\n` +
     detailText +
+    (bannedPairFlag ? `⚠️  Heads up: ${bannedPairFlag} It's your call — approve or deny below.\n\n` : '') +
     `Approve this ${isTrade ? 'trade' : 'swap'}:\n${approveUrl}\n\n` +
     `Deny this ${isTrade ? 'trade' : 'swap'}:\n${denyUrl}\n\n` +
     "These links expire in 7 days, and I'll take it from there. — Aegis";
@@ -1484,8 +1562,13 @@ ${brandedButtonRow([
   <div style="font-size:13px;color:${BRAND.textMuted};margin:2px 0 6px;">These links expire in 7 days.</div>
 </div>`;
 
+  const flagHtml = bannedPairFlag ? `
+<div style="margin:0 0 18px;padding:12px 14px;background:${BRAND.warnBg};border:1px solid ${BRAND.warnBorder};border-left:3px solid ${BRAND.warnRule};border-radius:8px;">
+  <div style="font-size:14px;color:${BRAND.warnText};line-height:1.5;"><strong>⚠️ Heads up:</strong> ${escapeHtml(bannedPairFlag)} It's your call — approve or deny below.</div>
+</div>` : '';
+
   const bodyHtml = `${introHtml}
-${brandActionCard(`Action needed · Shift ${isTrade ? 'trade' : 'swap'}`, `${detailsHtml}${ctaHtml}`)}`;
+${brandActionCard(`Action needed · Shift ${isTrade ? 'trade' : 'swap'}`, `${detailsHtml}${flagHtml}${ctaHtml}`)}`;
 
   const html = brandedEmailShell({
     bodyHtml,

@@ -1924,6 +1924,23 @@ ${teamGridHtml}
     }
   }
 
+  // Supersede any OTHER already-published schedule for the SAME week before we
+  // publish this one. Without this, re-distributing a week leaves the prior row
+  // ALSO marked 'published', so multiple "published" schedules coexist for one
+  // week — and a writer (the swap executor picks the newest published row) can
+  // land on a different row than a reader (the shift query), which is how an
+  // approved swap can fail to show up on the schedule the employee sees. One
+  // published schedule per week keeps writers and readers on the same row.
+  await supabase
+    .from('schedules')
+    .update({ status: 'archived', archived_at: new Date().toISOString(), superseded_by: scheduleRow.id })
+    .eq('company_id', companyId)
+    .eq('week_start', scheduleRow.week_start)
+    .eq('week_end', scheduleRow.week_end)
+    .eq('status', 'published')
+    .is('deleted_at', null)
+    .neq('id', scheduleRow.id);
+
   await supabase.from('schedules').update({
     status: 'published',
     distributed_at: new Date().toISOString(),
@@ -2238,6 +2255,20 @@ ${teamGridHtml}
       });
     }
   }
+
+  // Collapse to a single published schedule for this week (same reason as the
+  // distribute path): archive the old row and any other published row for this
+  // week before marking the new one published, so writers and readers can't land
+  // on divergent rows.
+  await supabase
+    .from('schedules')
+    .update({ status: 'archived', archived_at: new Date().toISOString(), superseded_by: newRow.id })
+    .eq('company_id', companyId)
+    .eq('week_start', newRow.week_start)
+    .eq('week_end', newRow.week_end)
+    .eq('status', 'published')
+    .is('deleted_at', null)
+    .neq('id', newRow.id);
 
   // Mark the new schedule as sent so the re-distribution guard sees it.
   await supabase.from('schedules').update({

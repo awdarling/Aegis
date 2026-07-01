@@ -313,12 +313,13 @@ async function handleSwapDecision(
     }
   }
 
+  const decisionPast = action === 'approve' ? 'approved' : 'denied';
   await logActivity({
     company_id: token.company_id,
-    action: `swap_${action}d`,
+    action: `swap_${decisionPast}`,
     entity_type: 'swap_request',
     entity_id: requestId,
-    summary: `Swap between ${token.requester_name} and ${token.receiver_name} ${action}d by manager via email`,
+    summary: `Swap between ${token.requester_name} and ${token.receiver_name} ${decisionPast} by manager via email`,
     metadata: { requester_id: token.requester_id, receiver_id: token.receiver_id, shift_date: token.shift_date, shift_name: token.shift_name },
   });
 
@@ -552,12 +553,13 @@ decisionWebhook.get('/', async (req, res) => {
   }
 
   // Log the decision
+  const decisionPast = action === 'approve' ? 'approved' : 'denied';
   await logActivity({
     company_id: decisionToken.company_id,
-    action: `time_off_${action}d`,
+    action: `time_off_${decisionPast}`,
     entity_type: 'time_off_request',
     entity_id: requestId,
-    summary: `Time-off request for ${decisionToken.employee_name} ${action}d via email link`,
+    summary: `Time-off request for ${decisionToken.employee_name} ${decisionPast} via email link`,
     metadata: {
       employee_id: decisionToken.employee_id,
       start_date: tor.start_date,

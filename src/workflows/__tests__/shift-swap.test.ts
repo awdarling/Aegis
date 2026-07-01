@@ -41,6 +41,8 @@ import {
   resolveWillingDates,
   weekDatesFrom,
   swapBroadcastCommitGuard,
+  bannedCohabPartnerName,
+  type HardConflictRow,
   type TradeSide,
 } from '../shift-swap';
 import type { Employee } from '../../db/types';
@@ -320,5 +322,39 @@ describe('swapBroadcastCommitGuard (first-commit-wins)', () => {
 
   it('rejects a commit when the broadcast is gone (expired)', () => {
     expect(swapBroadcastCommitGuard(null)).toEqual({ allowed: false, reason: 'expired' });
+  });
+});
+
+describe('bannedCohabPartnerName', () => {
+  const conflicts: HardConflictRow[] = [{ employee_id_1: 'riley', employee_id_2: 'casey' }];
+  const assignments = [
+    a({ employee_id: 'casey', date: '2026-07-04', shift_name: 'PM' }),
+    a({ employee_id: 'sam', date: '2026-07-04', shift_name: 'PM' }),
+    a({ employee_id: 'jordan', date: '2026-07-04', shift_name: 'AM' }),
+  ];
+
+  it('flags a hard-banned coworker already on the joined shift', () => {
+    // Riley joins Sat PM where Casey (banned) already works.
+    expect(bannedCohabPartnerName('riley', '2026-07-04', 'PM', assignments, conflicts)).toBe('casey');
+  });
+
+  it('returns null when no banned coworker is on that shift instance', () => {
+    // Casey is banned with Riley but works PM, not AM.
+    expect(bannedCohabPartnerName('riley', '2026-07-04', 'AM', assignments, conflicts)).toBeNull();
+  });
+
+  it('ignores the employee vacating the shift (excludeEmpId)', () => {
+    // If the only banned partner is the person LEAVING the shift, no conflict.
+    const conflicts2: HardConflictRow[] = [{ employee_id_1: 'riley', employee_id_2: 'sam' }];
+    expect(bannedCohabPartnerName('riley', '2026-07-04', 'PM', assignments, conflicts2, 'sam')).toBeNull();
+  });
+
+  it('returns null when there are no banned pairs configured', () => {
+    expect(bannedCohabPartnerName('riley', '2026-07-04', 'PM', assignments, [])).toBeNull();
+  });
+
+  it('matches a banned pair regardless of column order', () => {
+    const flipped: HardConflictRow[] = [{ employee_id_1: 'casey', employee_id_2: 'riley' }];
+    expect(bannedCohabPartnerName('riley', '2026-07-04', 'PM', assignments, flipped)).toBe('casey');
   });
 });

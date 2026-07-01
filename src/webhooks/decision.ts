@@ -228,6 +228,10 @@ async function handleSwapDecision(
   const requester = requesterRes.data as Employee | null;
   const receiver = receiverRes.data as Employee | null;
 
+  // NOTE: a banned-pair (hard 'never' conflict) does NOT block the swap here —
+  // per flag-don't-force, the manager was warned in their approval email and
+  // makes the call. See buildSwapManagerApprovalEmail's bannedPairFlag.
+
   // Update swap_request status.
   // NOTE: decided_by is a UUID column. The manager is identified by the
   // magic-link email (shared across managers), so we don't have a single

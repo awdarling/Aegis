@@ -948,6 +948,20 @@ async function sendOptInStep(session: OnboardingSession, companyName: string): P
   );
 }
 
+// Email onboarding kickoff. Email has no TCPA SMS opt-in requirement, so instead
+// of the SMS-consent prompt we open with a warm welcome and go straight to name
+// confirmation. The session is already at step 'name_confirm', so the employee's
+// reply routes to handleNameConfirmStep.
+async function sendEmailWelcomeStep(session: OnboardingSession, companyName: string): Promise<void> {
+  const firstName = session.employee_name.split(' ')[0];
+  await textEmployee(
+    session,
+    `Hi ${firstName}! I'm Aegis, the scheduling assistant for ${companyName}. ` +
+      `Your manager asked me to help get you set up — it only takes a minute, right here over email. ` +
+      `To start, can you reply with your full name so I can confirm I've got the right person?`
+  );
+}
+
 async function sendEmailStep(session: OnboardingSession): Promise<void> {
   const firstName = session.employee_name.split(' ')[0];
   await textEmployee(
@@ -1523,16 +1537,11 @@ export async function handleInitiateOnboarding(
     .eq('channel_type', 'sms')
     .maybeSingle();
 
-  const aegisSmsChannel = (channelData as { channel_value: string } | null)?.channel_value;
-
-  if (!aegisSmsChannel) {
-    await reply(
-      contact,
-      message,
-      `Onboarding requires an Aegis SMS channel configured for your company. Please contact support.`
-    );
-    return;
-  }
+  // SMS is optional. Onboard over SMS only when a company has an SMS channel AND
+  // the employee has a phone; otherwise fall back to email. A company with only
+  // an email channel (e.g. before A2P clears) can still onboard email-reachable
+  // staff. Employees reachable by neither channel are skipped downstream.
+  const aegisSmsChannel = (channelData as { channel_value: string } | null)?.channel_value ?? '';
 
   const companyName = await loadCompanyName(contact.company_id);
   const roles = await loadRoles(contact.company_id);
@@ -1640,14 +1649,19 @@ async function executeOnboardingForCandidates(
   const skippedNoContact: string[] = [];
 
   for (const employee of candidates) {
-    if (!employee.contact_phone && !employee.contact_email) {
+    // Reachability is channel-aware: SMS needs BOTH a phone AND a configured SMS
+    // channel; otherwise the employee is onboarded over email. Skip only when
+    // neither channel is possible.
+    const useSms = !!employee.contact_phone && !!aegisSmsChannel;
+    const isEmail = !useSms;
+    if (isEmail && !employee.contact_email) {
       skippedNoContact.push(employee.name);
       await logActivity({
         company_id: contact.company_id,
         action: 'onboarding_skipped_no_contact',
         entity_type: 'employee',
         entity_id: employee.id,
-        summary: `Onboarding skipped for ${employee.name} — no phone or email on file`,
+        summary: `Onboarding skipped for ${employee.name} — no reachable phone or email on file`,
         metadata: { employee_id: employee.id },
       });
       continue;
@@ -1664,15 +1678,17 @@ async function executeOnboardingForCandidates(
       company_id: contact.company_id,
       employee_id: employee.id,
       employee_name: employee.name,
-      employee_phone: employee.contact_phone ?? null,
+      employee_phone: useSms ? (employee.contact_phone ?? null) : null,
       employee_email: employee.contact_email ?? null,
-      employee_channel: employee.contact_phone ? 'sms' : 'email',
+      employee_channel: isEmail ? 'email' : 'sms',
       aegis_sms_channel: aegisSmsChannel,
       manager_contact: contact.matched_identifier,
       manager_channel: message.channel,
       manager_sender: message.sender,
       manager_recipient: message.recipient,
-      step: 'opt_in',
+      // Email onboarding has no TCPA SMS opt-in gate — start at name_confirm with
+      // opt-in pre-satisfied. SMS still gates on an explicit YES via the opt_in step.
+      step: isEmail ? 'name_confirm' : 'opt_in',
       collected: {
         name_confirmed: false,
         email: null,
@@ -1687,14 +1703,18 @@ async function executeOnboardingForCandidates(
       invalid_email_attempts: 0,
       invalid_availability_attempts: 0,
       warned_24h: false,
-      opt_in_confirmed: false,
+      opt_in_confirmed: isEmail ? true : false,
       opt_in_sent_at: now.toISOString(),
       started_at: now.toISOString(),
       expires_at: new Date(now.getTime() + 48 * 60 * 60 * 1000).toISOString(),
     };
 
     await saveOnboardingSession(session);
-    await sendOptInStep(session, companyName);
+    if (isEmail) {
+      await sendEmailWelcomeStep(session, companyName);
+    } else {
+      await sendOptInStep(session, companyName);
+    }
     started.push(employee.name);
 
     await logActivity({

@@ -29,6 +29,32 @@ Per-action status of the 8 `ActionType`s in `src/lib/aegis-actions/types.ts`. Dr
 
 ---
 
+## 2026-07-01 (session 2) — Full email-workflow test pass + 4 pre-demo bug fixes
+
+Exercised the live email workflows one-by-one on the SANDBOX tenant via real round-trips (employee = Sam `aegisscheduler@gmail.com` / Riley `lightningmakigga@gmail.com`; manager = `sandbox-mgr@quriasolutions.com` M365 shared mailbox; every decision confirmed against Supabase). **7 of 8 verified end-to-end; #11 coverage sent from the manager but not confirmed (SendGrid inbound backlog, not a logic failure).**
+
+| Workflow | Result |
+|---|---|
+| Availability ≠ time-off (temporary) | ✅ classified `update_availability`, parsed days/times, employee-confirm → manager magic-link approve → **`custom_availability` date_limited row written** |
+| Partial time-off ("after 4pm") | ✅ `time_off_type:partial`, `partial_days 16:00–21:00`, manager email renders partial hours + coverage impact, approved |
+| Combined time-off + availability in one message | ✅ processes time-off, P.S. asks for the availability separately ("so nothing gets crossed") |
+| "What are my shifts?" (`query_my_shifts`) | ✅ accurate, human-formatted (faithfully reads the stored schedule) |
+| Banned-pair FLAG on pickup/swap | ✅ manager email shows ⚠️ "Riley & Casey are a restricted pair… it's your call", both Approve/Deny stay live — flag-don't-force exactly as specified |
+| Manager DENIAL notifications | ✅ "Request denied. Notified Sam Rivera & Riley Brooks", `swap_requests.status=denied`, `decided_by=null` |
+| Manager magic-link approvals (availability + time-off) | ✅ branded confirm-interstitial + "All set" pages |
+| #11 Coverage batch "send next batch" | ⏳ manager request sent (Sent Items), awaiting inbound processing — not yet confirmed |
+
+**Four bugs found and fixed** — branch `fix/pre-demo-bugs` (cut from main), tsc clean, **192/192 vitest**. **Status: IN REVIEW** (coded + tested; NOT yet deployed or live-verified):
+
+1. **Weekday resolution → today.** "my Saturday PM shift" resolved to today (Wed Jul 1), not the upcoming Saturday; explicit dates worked. The prompt already said "resolve to the upcoming occurrence" but LLMs are unreliable at weekday arithmetic. Fix (`src/ai/claude.ts`): compute each weekday's date in code and inject a lookup table into the classifier prompt so it never does the math. Reproduced twice; helps all weekday phrasing.
+2. **Approved swaps didn't persist to the schedule.** An approved pickup left the requester on the shift and the picker on none. Root cause: the publish step never superseded the prior published schedule for a week, so multiple `status='published'` rows coexisted and the swap-writer (`decision.ts` picks the newest published) and shift-reader could land on different rows. Fix: both publish paths in `src/workflows/schedule-build.ts` now archive any other published row for that week (one published schedule per week); `executeScheduleSwap`/`executeScheduleTrade` in `src/workflows/shift-swap.ts` no longer `return` silently on a miss — they `console.warn`. **Existing duplicate rows in the DB are pre-existing data; the sandbox reset (#18) or a one-time cleanup SQL collapses them.** Needs a live re-verify after deploy.
+3. **Stale `avail_pending_mgr` hijacked the manager's next email.** After a manager approved availability via the email button, their next message ("I need coverage…") was read as a YES/NO to the already-decided availability. The reply-YES path deleted the pending record but the magic-link path didn't. Fix (`src/workflows/employee-onboarding.ts`): the cleanup now lives in the shared `applyCustomAvailabilityDecision`, so both paths self-clean.
+4. **`swap_denyd` typo.** `swap_${action}d` produced "denyd"/"denyd by manager" on denials (same for time-off). Fix (`src/webhooks/decision.ts`): map to proper past tense.
+
+Owed for DONE on the two behavioral fixes (#1 weekday, #2 swap persistence): merge → Railway deploy → one clean live re-verify each (do it during the #18 sandbox reset).
+
+---
+
 ## 2026-06-28 — Undirected swap (#10) redesign in progress: two-button broadcast (Stages 1–3a built)
 
 > ⚠️ **CORRECTION (2026-06-30):** the paragraph below says Stage 4b is "do not merge until a sandbox smoke passes" / "nothing cut into the live path yet." That is **out of date** — Stage 4b is **already merged and LIVE on `main`** (it rode in with PR #65, `feat/swap-agreement-stage4a`; the 4b commit was stacked on 4a). The undirected broadcast is active in production but still UNTESTED. Only the sandbox smoke (DEV_ROADMAP item 10.5 / 11.7b) remains; there is no merge step left. See DEV_ROADMAP Session Log 2026-06-30.
@@ -127,7 +153,9 @@ Outbound `From` is still the apex `aegis@quriasolutions.com` with `Reply-To` car
 
 ### Phase 7 — Risky workflow staged validation — partial (distribute live; onboard/day-closure still deferred)
 
-**`distribute_schedule`: ran successfully in prod 2026-06-12** to the full Watermark roster (warm per-employee shift-assignment message + inline full-week schedule; no spam problem observed). DELIV-1 no longer gates it. Only remaining piece is a visual-consistency fix so the emailed schedule matches the Homebase render exactly = template-unification **Piece 3**. **`initiate_onboarding` + `notify_day_closure` fan-outs: still DEFERRED** — never run without coordinating with Carolyn and Jack.
+**`distribute_schedule`: ran successfully in prod 2026-06-12** to the full Watermark roster (warm per-employee shift-assignment message + inline full-week schedule; no spam problem observed). DELIV-1 no longer gates it. Only remaining piece is a visual-consistency fix so the emailed schedule matches the Homebase render exactly = template-unification **Piece 3**. **`initiate_onboarding` + `notify_day_closure` fan-outs: still DEFERRED against Watermark** — never run without coordinating with Carolyn and Jack.
+
+**2026-07-05 — `initiate_onboarding` email path unblocked (IN REVIEW).** Onboarding previously hard-required an SMS channel and sent SMS-consent opt-in text on every session, so it couldn't run on an email-only tenant. Fixed in `src/workflows/employee-onboarding.ts`: SMS channel now optional (SMS only when the employee has a phone AND the company has an SMS channel, else email); email sessions skip the TCPA opt-in and open with a new `sendEmailWelcomeStep`. Homebase `OnboardingTab.tsx` no longer mislabels email-only hires as "Skipped". Both repos tsc clean; **not deployed**. **Sandbox** onboarding is now demoable (via `Aegis_Onboarding_Demo_Setup.sql`, repurposing Riley); Watermark fan-out remains human-gated.
 
 ---
 

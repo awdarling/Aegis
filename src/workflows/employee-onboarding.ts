@@ -1652,7 +1652,7 @@ async function executeOnboardingForCandidates(
     // Reachability is channel-aware: SMS needs BOTH a phone AND a configured SMS
     // channel; otherwise the employee is onboarded over email. Skip only when
     // neither channel is possible.
-    const useSms = !!employee.contact_phone && !!aegisSmsChannel;
+    const useSms = !env.EMAIL_ONLY && !!employee.contact_phone && !!aegisSmsChannel;
     const isEmail = !useSms;
     if (isEmail && !employee.contact_email) {
       skippedNoContact.push(employee.name);

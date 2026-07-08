@@ -952,7 +952,7 @@ export async function dispatchOutreach(params: {
       html,
       company_id: session.company_id,
     });
-  } else if (employee.contact_phone && aegisSmsNumber) {
+  } else if (!env.EMAIL_ONLY && employee.contact_phone && aegisSmsNumber) {
     channel = 'sms';
     await sendSms({ to: employee.contact_phone, from: aegisSmsNumber, body, company_id: session.company_id });
   } else {
@@ -998,7 +998,7 @@ async function notifyEmployeeShiftFilled(
       text: body,
       company_id: outreach.company_id,
     });
-  } else if (employee.contact_phone && outreach.aegis_sms_channel) {
+  } else if (!env.EMAIL_ONLY && employee.contact_phone && outreach.aegis_sms_channel) {
     await sendSms({
       to: employee.contact_phone,
       from: outreach.aegis_sms_channel,

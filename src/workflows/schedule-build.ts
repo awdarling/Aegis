@@ -8,6 +8,7 @@ import { isAlreadyDistributed } from '../lib/distribute-guard';
 import { computeChangedEmployeeIds } from '../lib/schedule-diff';
 import { buildTemplatedScheduleGridHtml, type EmailScheduleTemplate } from './templated-grid';
 import { sendSms } from '../messaging/sms';
+import { env } from '../config/env';
 import { computeWageEstimate } from '../lib/schedule-simulator';
 import { buildScheduleResultEmail } from './schedule-build-email';
 import { resolveAvailabilityForWeek } from '../lib/custom-availability';
@@ -1885,7 +1886,7 @@ ${teamGridHtml}
       }
     }
 
-    if (emp.contact_phone && aegisSmsChannel) {
+    if (!env.EMAIL_ONLY && emp.contact_phone && aegisSmsChannel) {
       try {
         const smsBody = emp.contact_email
           ? `${companyName}: Your schedule for ${weekLabel} has been posted. Check your email for details.`
@@ -2224,7 +2225,7 @@ ${teamGridHtml}
       }
     }
 
-    if (emp.contact_phone && aegisSmsChannel) {
+    if (!env.EMAIL_ONLY && emp.contact_phone && aegisSmsChannel) {
       try {
         const smsBody = emp.contact_email
           ? `${companyName}: Your schedule for ${weekLabel} changed. Check your email for your updated shifts.`

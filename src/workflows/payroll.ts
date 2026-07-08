@@ -2,6 +2,7 @@ import { supabase } from '../db/client';
 import { logActivity } from '../logger/activity-log';
 import { reply } from '../messaging/reply';
 import { sendEmail } from '../messaging/email';
+import { env } from '../config/env';
 import { BRAND, brandedEmailShell } from '../messaging/brand';
 import { reconcilePayroll } from '../lib/payroll-reconciler';
 import { getTimeClockAdapter, getPayrollAdapter } from '../lib/integrations/factory';
@@ -186,7 +187,7 @@ export async function handleWageRateSync(params: {
 
     // Notify manager via SMS if aegis_sms_channel exists
     const managerPhone = await getManagerSmsChannel(companyId);
-    if (managerPhone) {
+    if (!env.EMAIL_ONLY && managerPhone) {
       const { sendSms } = await import('../messaging/sms');
       const aegisChannel = await getAegisSmsChannel(companyId);
       if (aegisChannel) {
@@ -209,7 +210,7 @@ export async function handleWageRateSync(params: {
     });
 
     const managerPhone = await getManagerSmsChannel(companyId);
-    if (managerPhone) {
+    if (!env.EMAIL_ONLY && managerPhone) {
       const { sendSms } = await import('../messaging/sms');
       const aegisChannel = await getAegisSmsChannel(companyId);
       if (aegisChannel) {

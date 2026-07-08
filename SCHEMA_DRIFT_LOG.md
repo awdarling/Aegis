@@ -218,3 +218,12 @@ Any time a future Claude Code session or live debugging surfaces a difference be
 - **Fix (branch `fix/pre-demo-bugs`, 2026-07-01, IN REVIEW):** both publish paths now `update({status:'archived', archived_at, superseded_by:<newId>})` on any other `status='published'` non-deleted row for the same `company_id`+`week_start`+`week_end` BEFORE marking the new row published. `executeScheduleSwap`/`executeScheduleTrade` also now `console.warn` instead of silently `return`ing when the schedule can't be resolved or nothing matches.
 - **Existing duplicate rows are NOT auto-fixed** by the code change (it only prevents new ones). Collapse the sandbox's existing duplicates during the #18 reset; for a live tenant, a one-time `update … set status='archived', superseded_by=<newest_id> where status='published' and id <> <newest_id>` per week.
 - Not represented in `src/db/types.ts` (types file is incomplete — consistent).
+
+---
+## July 5, 2026 — discovered during #19 onboarding live-test setup
+
+### `public.employees` — `primary_role` is NOT NULL
+- Attempting to null `primary_role` (to fabricate an "incomplete" employee for an onboarding test) fails with `23502 null value in column "primary_role" ... violates not-null constraint`. **`employees.primary_role` has a NOT NULL constraint.**
+- **Implication for onboarding:** `getIncompleteEmployees` (`src/workflows/employee-onboarding.ts`) treats `!e.primary_role` as one of the "incomplete" signals, but since the column can never be null, **that branch is effectively dead** — incompleteness is driven in practice by missing `contact_phone`, missing `contact_email`, or no `availability` rows. To make an employee an onboarding candidate, clear the phone and/or delete their availability; do not attempt to null the role.
+- **Secondary quirk (logic, not schema):** `getIncompleteEmployees` flags `!contact_phone` as incomplete, so an **email-only** employee (no phone by design) will always read as "incomplete" even after completing onboarding. Harmless for the demo (the Homebase Onboarding tab drives status off the `onboarding_complete` activity log, not this helper), but worth tightening later — "reachable but unconfigured" should probably be phone-OR-email plus role/availability, not phone-AND-everything.
+- Row shape observed (Riley, sandbox): columns include `id, company_id, name, primary_role, qualified_roles(text[]), max_weekly_hours, contact_phone(nullable), contact_email, active, created_at, …, sex`. Consistent with `src/db/types.ts` being incomplete.

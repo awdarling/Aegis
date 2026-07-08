@@ -1591,7 +1591,7 @@ ${brandActionCard(`Action needed · Shift ${isTrade ? 'trade' : 'swap'}`, `${det
 
   await sendEmail({ to: manager.email, subject, text, html, company_id });
 
-  if (managerPhone && params.aegis_sms_channel) {
+  if (!env.EMAIL_ONLY && managerPhone && params.aegis_sms_channel) {
     await sendSms({
       to: managerPhone,
       from: params.aegis_sms_channel,
@@ -1890,7 +1890,7 @@ async function sendOutreachMessage(params: {
     await sendEmail({ to: receiverEmail, subject, text, html, company_id });
     return 'email';
   }
-  if (receiverPhone && aegisSmsNumber) {
+  if (!env.EMAIL_ONLY && receiverPhone && aegisSmsNumber) {
     await sendSms({ to: receiverPhone, from: aegisSmsNumber, body: text, company_id });
     return 'sms';
   }

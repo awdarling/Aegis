@@ -4,6 +4,7 @@ import { coerceJsonObject } from '../utils/coerce-json';
 import { reply } from '../messaging/reply';
 import { sendEmail } from '../messaging/email';
 import { sendSms } from '../messaging/sms';
+import { env } from '../config/env';
 import { generateReply } from '../ai/claude';
 import type { InboundMessage, VerifiedContact } from '../security/types';
 
@@ -345,9 +346,11 @@ export async function handleBroadcastConfirmation(
 
   for (const recipient of session.resolved_recipients) {
     const wantSms = session.channel !== 'email';
-    const wantEmail = session.channel !== 'sms';
+    // Email-only mode: always allow email (so an "sms"/"both" broadcast still
+    // reaches people) and never SMS.
+    const wantEmail = session.channel !== 'sms' || env.EMAIL_ONLY;
 
-    const canSms = wantSms && !!recipient.phone && !!aegisSmsNumber;
+    const canSms = wantSms && !env.EMAIL_ONLY && !!recipient.phone && !!aegisSmsNumber;
     const canEmail = wantEmail && !!recipient.email;
 
     if (!canSms && !canEmail) {

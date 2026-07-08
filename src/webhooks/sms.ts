@@ -57,6 +57,14 @@ smsWebhook.post('/', verifyTwilioSignature, async (req, res) => {
   // We return 200 before awaiting full processing, then process async
   res.status(200).type('text/xml').send('<Response></Response>');
 
+  // Email-only mode: SMS is disabled, so ignore any inbound SMS rather than
+  // routing it as a workflow. Inert in practice (no numbers are provisioned),
+  // but explicit while carrier registration is pending.
+  if (env.EMAIL_ONLY) {
+    console.warn('[sms] EMAIL_ONLY mode — ignoring inbound SMS.');
+    return;
+  }
+
   console.log('[sms] request received, starting async processing');
 
   try {

@@ -18,6 +18,14 @@ interface SmsOptions {
 }
 
 export async function sendSms(options: SmsOptions): Promise<boolean> {
+  // Hard email-only guard. While EMAIL_ONLY is on, no SMS is ever sent regardless
+  // of caller — the single choke point that guarantees the SMS system is dormant
+  // until carrier registration completes. Returns false so any email fallback path
+  // behaves exactly as if the send had failed.
+  if (env.EMAIL_ONLY) {
+    console.warn('[sms] EMAIL_ONLY mode — SMS disabled; skipping send.');
+    return false;
+  }
   if (!twilioClient) {
     console.warn('[sms] Twilio not configured — SMS disabled (email-first mode). Skipping send.');
     return false;

@@ -19,6 +19,14 @@ const envSchema = z.object({
   TWILIO_MESSAGING_SERVICE_SID: z.string().optional(),
   TWILIO_FROM_NUMBER: z.string().optional(),
 
+  // EMAIL-ONLY MODE. While true (the default), every workflow runs over email
+  // and SMS is fully disabled — outbound SMS is skipped, the inbound SMS webhook
+  // is inert, and channel selection always resolves to email so phone-on-file
+  // employees are emailed rather than silently dropped. This is the intended
+  // state until carrier/A2P (Telnyx) registration completes; nothing is deleted,
+  // so setting EMAIL_ONLY=false (and configuring Twilio) restores SMS behavior.
+  EMAIL_ONLY: z.string().default('true').transform((s) => s.toLowerCase() !== 'false'),
+
   // SendGrid
   SENDGRID_API_KEY: z.string().min(1),
   SENDGRID_WEBHOOK_VERIFICATION_KEY: z.string().optional(),

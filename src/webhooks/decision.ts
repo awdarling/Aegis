@@ -3,6 +3,7 @@ import { supabase } from '../db/client';
 import { logActivity } from '../logger/activity-log';
 import { sendEmail } from '../messaging/email';
 import { sendSms } from '../messaging/sms';
+import { env } from '../config/env';
 import { normalizeReSubject } from '../messaging/reply';
 import { executeScheduleSwap, executeScheduleTrade } from '../workflows/shift-swap';
 import { processCoverageButtonDecision, processCoverageBatchButton } from '../workflows/emergency-coverage';
@@ -167,7 +168,7 @@ async function notifyEmployee(
       ? `Great news! Your time-off request has been approved. Enjoy your time off!`
       : `Your time-off request has been denied. Please contact your manager if you have questions or would like to discuss alternatives.`;
 
-  if (token.employee_channel === 'sms' && token.aegis_sms_channel) {
+  if (!env.EMAIL_ONLY && token.employee_channel === 'sms' && token.aegis_sms_channel) {
     await sendSms({
       to: token.employee_contact,
       from: token.aegis_sms_channel,
@@ -286,12 +287,12 @@ async function handleSwapDecision(
     const receiverMsg = isTrade ? tradeMsg(token.shift_name, dateLong) : approvedMsg(token.requester_name, token.role);
     const subj = isTrade ? 'Shift trade approved' : 'Swap approved';
 
-    if (requester?.contact_phone && token.aegis_sms_channel) {
+    if (!env.EMAIL_ONLY && requester?.contact_phone && token.aegis_sms_channel) {
       await sendSms({ to: requester.contact_phone, from: token.aegis_sms_channel, body: requesterMsg, company_id: token.company_id });
     } else if (requester?.contact_email) {
       await sendEmail({ to: requester.contact_email, subject: subj, text: requesterMsg, company_id: token.company_id });
     }
-    if (receiver?.contact_phone && token.aegis_sms_channel) {
+    if (!env.EMAIL_ONLY && receiver?.contact_phone && token.aegis_sms_channel) {
       await sendSms({ to: receiver.contact_phone, from: token.aegis_sms_channel, body: receiverMsg, company_id: token.company_id });
     } else if (receiver?.contact_email) {
       await sendEmail({ to: receiver.contact_email, subject: subj, text: receiverMsg, company_id: token.company_id });
@@ -301,12 +302,12 @@ async function handleSwapDecision(
     const isTrade = !!(token.target_shift_name && token.target_shift_date);
     const deniedMsg = `Your shift ${isTrade ? 'trade' : 'swap'} request for the ${token.shift_name} shift on ${new Date(token.shift_date + 'T12:00:00Z').toLocaleDateString('en-US', { month: 'long', day: 'numeric' })} has been denied by your manager. Please contact them if you have questions.`;
     const subj = isTrade ? 'Shift trade denied' : 'Swap denied';
-    if (requester?.contact_phone && token.aegis_sms_channel) {
+    if (!env.EMAIL_ONLY && requester?.contact_phone && token.aegis_sms_channel) {
       await sendSms({ to: requester.contact_phone, from: token.aegis_sms_channel, body: deniedMsg, company_id: token.company_id });
     } else if (requester?.contact_email) {
       await sendEmail({ to: requester.contact_email, subject: subj, text: deniedMsg, company_id: token.company_id });
     }
-    if (receiver?.contact_phone && token.aegis_sms_channel) {
+    if (!env.EMAIL_ONLY && receiver?.contact_phone && token.aegis_sms_channel) {
       await sendSms({ to: receiver.contact_phone, from: token.aegis_sms_channel, body: deniedMsg, company_id: token.company_id });
     } else if (receiver?.contact_email) {
       await sendEmail({ to: receiver.contact_email, subject: subj, text: deniedMsg, company_id: token.company_id });

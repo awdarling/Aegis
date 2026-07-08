@@ -2,6 +2,7 @@ import { supabase } from '../db/client';
 import { logActivity } from '../logger/activity-log';
 import { sendSms } from '../messaging/sms';
 import { sendEmail } from '../messaging/email';
+import { env } from '../config/env';
 import { greeting } from '../messaging/greeting';
 import { reply } from '../messaging/reply';
 import type { InboundMessage, VerifiedContact } from '../security/types';
@@ -41,7 +42,7 @@ export async function handleNotifyDayClosure(
     `${greeting(employeeName)} ${companyName} will be closed on ${formattedDate}. ` +
     `Your ${shiftPhrase} has been cancelled. We'll see you for your next scheduled shift. — Aegis`;
 
-  if (employeePhone) {
+  if (!env.EMAIL_ONLY && employeePhone) {
     const { data: channelData } = await supabase
       .from('company_channels')
       .select('channel_value')
@@ -81,7 +82,7 @@ export async function handleNotifyDayClosure(
       date,
       employee_name: employeeName,
       shift_name: shiftName,
-      channel: employeePhone ? 'sms' : 'email',
+      channel: (!env.EMAIL_ONLY && employeePhone) ? 'sms' : 'email',
     },
   });
 }

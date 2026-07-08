@@ -937,7 +937,7 @@ export async function sendDecisionNotification(
     });
     channel = 'email';
     sent_to = employee.contact_email;
-  } else if (employee.contact_phone) {
+  } else if (employee.contact_phone && !env.EMAIL_ONLY) {
     // SMS path needs the company's Aegis outbound number.
     const { data: channelRow } = await supabase
       .from('company_channels')
@@ -961,6 +961,15 @@ export async function sendDecisionNotification(
       throw new Error(`SMS send failed for employee ${employee.id}`);
     }
     channel = 'sms';
+    sent_to = employee.contact_phone;
+  } else if (env.EMAIL_ONLY && employee.contact_phone) {
+    // Email-only mode + no email on file: SMS is disabled, so this employee is
+    // currently unreachable. Log and skip the notice rather than throw — the
+    // time-off decision itself already succeeded; only the notification is skipped.
+    console.warn(
+      `[time-off] EMAIL_ONLY: employee ${employee.id} has a phone but no email; SMS disabled — decision notice skipped.`
+    );
+    channel = 'email';
     sent_to = employee.contact_phone;
   } else {
     throw new Error(`employee ${employee.id} has neither contact_email nor contact_phone`);
@@ -1196,8 +1205,9 @@ async function notifyManager(
     company_id: companyId,
   });
 
-  // SMS alert — notification only, no analysis
-  if (managerPhone && aegisSmsNumber) {
+  // SMS alert — notification only, no analysis (the manager email above always
+  // sends; this is additive and skipped entirely in email-only mode).
+  if (!env.EMAIL_ONLY && managerPhone && aegisSmsNumber) {
     const dateDisplay = formatDateRange(pending.start_date, pending.end_date);
     await sendSms({
       to: managerPhone,

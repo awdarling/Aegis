@@ -42,9 +42,11 @@ import {
   weekDatesFrom,
   swapBroadcastCommitGuard,
   bannedCohabPartnerName,
+  handleRespondSwap,
   type HardConflictRow,
   type TradeSide,
 } from '../shift-swap';
+import { reply } from '../../messaging/reply';
 import type { Employee } from '../../db/types';
 import type { ScheduleAssignment } from '../schedule-build';
 
@@ -356,5 +358,25 @@ describe('bannedCohabPartnerName', () => {
   it('matches a banned pair regardless of column order', () => {
     const flipped: HardConflictRow[] = [{ employee_id_1: 'casey', employee_id_2: 'riley' }];
     expect(bannedCohabPartnerName('riley', '2026-07-04', 'PM', assignments, flipped)).toBe('casey');
+  });
+});
+
+describe('handleRespondSwap fallback (BUG-6 residual)', () => {
+  const contact = { company_id: 'c', employee_id: 'e', role: 'employee', name: 'Sam' } as any;
+  const msg = (body: string) => ({ body, sender: 's', recipient: 'r', channel: 'email' } as any);
+
+  it('gives a graceful "nothing pending" reply for a bare affirmation — no phantom swap', async () => {
+    (reply as any).mockClear();
+    await handleRespondSwap(msg('Yes'), contact, {}, 'accept');
+    const text = (reply as any).mock.calls[0][2] as string;
+    expect(text).not.toMatch(/active swap request pending/i);
+    expect(text).toMatch(/may have expired|resend/i);
+  });
+
+  it('keeps the swap-specific reply for a content-bearing message', async () => {
+    (reply as any).mockClear();
+    await handleRespondSwap(msg("I'll take the Friday shift"), contact, {}, 'accept');
+    const text = (reply as any).mock.calls[0][2] as string;
+    expect(text).toMatch(/active swap request pending/i);
   });
 });

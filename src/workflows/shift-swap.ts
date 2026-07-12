@@ -2355,6 +2355,21 @@ export async function handleRespondSwap(
   _extracted: Record<string, unknown>,
   _decision: 'accept' | 'decline'
 ): Promise<void> {
+  // BUG-6 residual: a bare affirmation/negation ("yes"/"no") that reaches HERE means
+  // the classifier labeled it a swap response but the router found no pending swap (or
+  // TO/availability/onboarding) to intercept it first — i.e., whatever it was confirming
+  // has expired or was already handled. Don't imply a phantom swap ("no active swap
+  // request pending for you") — that's the confusing line employees saw. Guide them to
+  // resend instead. Content-bearing swap replies still get the swap-specific message.
+  const bare = message.body.trim().toLowerCase().replace(/[!.\s]+$/g, '');
+  const isBareConfirmation =
+    /^(y|ya|yes|yep|yeah|yup|sure|ok|okay|correct|confirm|confirmed|no|nope|nah)$/i.test(bare);
+  if (isBareConfirmation) {
+    await reply(contact, message,
+      "I don't have anything pending for you to confirm right now — if you were confirming a time-off request or a shift swap, it may have expired. Just resend the details and I'll take care of it."
+    );
+    return;
+  }
   await reply(contact, message,
     "I don't have an active swap request pending for you. If you received a swap request from Aegis, please check your recent messages."
   );

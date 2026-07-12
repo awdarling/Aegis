@@ -1359,7 +1359,11 @@ export async function handleSubmitTimeOff(
     return;
   }
 
-  // Store pending confirmation (TTL: 1 hour)
+  // Store pending confirmation (TTL: 24 hours). Email replies can lag hours behind
+  // the request (people confirm when they next check mail), and the router resolves a
+  // pending TO deterministically BEFORE the classifier — so a longer window keeps a
+  // bare "yes" on the confirmation path instead of expiring into the classifier, where
+  // a contentless affirmation can be mislabeled as a swap-accept (BUG-6 residual).
   const pendingData: PendingTimeOff = {
     employee_id: contact.employee_id!,
     start_date: parsed.start_date,
@@ -1370,7 +1374,7 @@ export async function handleSubmitTimeOff(
     recipient: message.recipient,
     raw_subject: message.raw_subject,
     thread_id: message.thread_id,
-    expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+    expires_at: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
     time_off_type: parsed.time_off_type,
     partial_days: parsed.partial_days,
   };

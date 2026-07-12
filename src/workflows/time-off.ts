@@ -1432,13 +1432,13 @@ export async function handlePendingTimeOffConfirmation(
   const classification = await classifyIntent(message.body, contact.role, '', companyTimezone);
 
   if (classification.intent === 'submit_time_off') {
-    const dateDisplay = formatDateRange(pending.start_date, pending.end_date);
-    await reply(
-      contact,
-      message,
-      `Looks like you've already got a time-off request waiting — ${dateDisplay}. ` +
-        `Reply "yes" to send that one over to your manager, or "start over" to cancel it and submit a new one.`
-    );
+    // The employee sent a NEW request instead of confirming the old one — treat it as
+    // a correction: replace the unconfirmed pending with the new dates rather than
+    // dropping them (BUG-5). handleSubmitTimeOff re-parses, stores the new pending, and
+    // asks the employee to confirm the new dates. (The old pending was never sent to a
+    // manager, so replacing it is safe.)
+    await clearPendingTimeOff(contact.company_id, contact.employee_id!);
+    await handleSubmitTimeOff(message, contact, classification.extracted);
     return;
   }
 
@@ -1450,6 +1450,27 @@ export async function handlePendingTimeOffConfirmation(
     /^(no|nope|n\b|wrong|incorrect|that'?s wrong|cancel|that'?s not right|nah)/.test(body);
 
   if (!isYes && !isNo) {
+    // The employee didn't confirm and didn't submit a new request — but did they send
+    // a different, clearly-actionable request? If so, don't hold it hostage to the
+    // unconfirmed pending (which now lives up to 24h) by nagging on every message
+    // (BUG-5). Abandon the unconfirmed pending and re-route so their actual request is
+    // handled this turn. Clearing the pending BEFORE re-routing guarantees the recursive
+    // route can't re-enter this handler (getPendingTimeOff will find nothing). We keep
+    // general_question / operational_query in the nag path below — those are commonly a
+    // fumbled confirmation rather than a genuine topic change.
+    const MOVED_ON = new Set([
+      'query_my_shifts',
+      'query_my_time_off',
+      'initiate_swap',
+      'update_availability',
+      'capabilities',
+    ]);
+    if (MOVED_ON.has(classification.intent)) {
+      await clearPendingTimeOff(contact.company_id, contact.employee_id!);
+      const { routeIntent } = await import('../router/intent-router');
+      await routeIntent(message, contact);
+      return;
+    }
     await reply(
       contact,
       message,

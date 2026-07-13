@@ -8,7 +8,13 @@ import {
 } from './types';
 
 // Recognized policy_keys. A key not in this set is dropped without log noise.
-const ATTRIBUTE_MIX_KEYS = new Set([
+//
+// These sets are EXPORTED and are the SINGLE vocabulary for the engine policy
+// family. Any writer that sets an engine policy (Aegis manager email-edit via
+// src/lib/policy-write.ts, Soteria, the Homebase UI) must validate against
+// THESE sets — never against a hand-copied list. A second copy of this
+// vocabulary is how a policy ends up written to a key the engine drops.
+export const ATTRIBUTE_MIX_KEYS = new Set([
   'attribute_mix',
   'minimum_attribute_mix',
   'gender_requirement',
@@ -16,43 +22,43 @@ const ATTRIBUTE_MIX_KEYS = new Set([
   'sex_requirement',
 ]);
 
-const HOURS_FAIRNESS_KEYS = new Set([
+export const HOURS_FAIRNESS_KEYS = new Set([
   'hours_fairness_weight',
   'fairness_weight',
 ]);
 
-const PARTIAL_SHIFTS_KEYS = new Set([
+export const PARTIAL_SHIFTS_KEYS = new Set([
   'partial_shifts_allowed',
   'allow_partial_shifts',
 ]);
 
-const VETERAN_DEFAULT_KEYS = new Set([
+export const VETERAN_DEFAULT_KEYS = new Set([
   'veteran_preference_default',
   'veteran_default',
 ]);
 
-const DOUBLES_POLICY_KEYS = new Set([
+export const DOUBLES_POLICY_KEYS = new Set([
   'doubles_policy',
   'double_shifts',
 ]);
 
-const CONFLICT_RES_KEYS = new Set([
+export const CONFLICT_RES_KEYS = new Set([
   'conflict_resolution_preference',
   'conflict_resolution',
 ]);
 
-const WEEK_START_KEYS = new Set([
+export const WEEK_START_KEYS = new Set([
   'week_start_day',
   'first_day_of_week',
 ]);
 
-const MAX_CONSECUTIVE_DAYS_KEYS = new Set([
+export const MAX_CONSECUTIVE_DAYS_KEYS = new Set([
   'max_consecutive_days_worked',
   'max_consecutive_days',
   'max_consecutive_work_days',
 ]);
 
-const ALL_RECOGNIZED = new Set<string>([
+export const ALL_RECOGNIZED = new Set<string>([
   ...ATTRIBUTE_MIX_KEYS,
   ...HOURS_FAIRNESS_KEYS,
   ...PARTIAL_SHIFTS_KEYS,

@@ -5,6 +5,7 @@ import { greeting } from '../messaging/greeting';
 import { generateReply } from '../ai/claude';
 import { coerceJsonObject } from '../utils/coerce-json';
 import { computeWageEstimate } from '../lib/schedule-simulator';
+import { coercePolicyWrite } from '../lib/policy-write';
 import { handleWageRateSync } from './payroll';
 import {
   computeManagerAvailabilityChange,
@@ -49,6 +50,11 @@ export interface PendingEdit {
   create_fields?: Record<string, unknown>;
   schedule_id?: string;
   availability_slots?: AvailabilitySlot[]; // for entity_type 'availability' (manager-set)
+  // D1: for entity_type 'policy'. The EXACT column patch that the reader for this
+  // policy_key actually consults — decided by coercePolicyWrite() at confirmation
+  // time, never by the LLM. Engine policies get policy_value_json; time-off
+  // policies get a bare-number policy_value + policy_type='time_off'.
+  policy_patch?: Record<string, unknown>;
   expires_at: string;
 }
 
@@ -87,6 +93,80 @@ function editLookupColumn(table: string): string {
   if (table === 'policies') return 'policy_key';
   if (table === 'wage_rates' || table === 'shift_requirements') return 'role';
   return 'name';
+}
+
+// ── D3: writable-column allow-list ────────────────────────────────────────────
+//
+// `pending.field` and `pending.create_fields` come from an LLM and used to be
+// interpolated straight into `.update({[field]: value})` / `.insert(fields)`.
+// That means the model could name ANY column on an allowed table — including
+// `company_id` (cross-tenant write) or `id`. Only `shift_requirements.days_active`
+// was ever blocked. This is the allow-list: nothing else is writable by message.
+//
+// Verified against information_schema on 2026-07-13. DELIBERATE omissions:
+//   employees.aegis_access      — a permission field; not editable by message.
+//   employees.company_id / id   — tenant + identity. Never.
+//   shift_requirements.shift_name/start_time/end_time — denormalized copies of
+//                                 shift_types (D4). Editing them here deepens
+//                                 the drift; edit the shift type instead.
+//   shift_requirements.days_active   — dormant (D9), already blocked below.
+//   shift_requirements.accepted_roles — not read by the engine (D10); inert.
+//   events.event_shifts / shift_overrides — structured staffing specs. Never
+//                                 built from a free-text LLM field. Use Homebase.
+//   policies.policy_value_json / policy_type — set by coercePolicyWrite(), NOT
+//                                 by the model. The model may only ask to change
+//                                 `policy_value`; we decide which column that
+//                                 actually means. See D1.
+//   schedules.*                 — schedule edits are refused upstream.
+const EDITABLE_COLUMNS: Record<string, Set<string>> = {
+  employees: new Set([
+    'name', 'primary_role', 'qualified_roles', 'max_weekly_hours',
+    'contact_phone', 'contact_email', 'active', 'is_veteran', 'individual_wage', 'sex',
+  ]),
+  policies: new Set(['policy_value', 'description']),
+  wage_rates: new Set(['role', 'hourly_rate']),
+  shift_types: new Set(['name', 'start_time', 'end_time', 'days_active', 'active']),
+  shift_requirements: new Set(['role', 'required_count']),
+  events: new Set(['title', 'date', 'end_date', 'description', 'event_type', 'staffing_notes']),
+};
+
+/** Columns Aegis may set when CREATING a row (a subset of the updatable ones,
+ *  plus the identity columns a new row needs). company_id is always forced by
+ *  executeEdit and is never taken from the model. */
+const CREATABLE_COLUMNS: Record<string, Set<string>> = {
+  employees: new Set([...EDITABLE_COLUMNS.employees]),
+  policies: new Set(['policy_key', 'policy_value', 'description']),
+  wage_rates: new Set([...EDITABLE_COLUMNS.wage_rates]),
+  shift_types: new Set([...EDITABLE_COLUMNS.shift_types]),
+  shift_requirements: new Set(['role', 'required_count', 'shift_type_id']),
+  events: new Set([...EDITABLE_COLUMNS.events]),
+};
+
+function assertEditableColumn(table: string, field: string): void {
+  const allowed = EDITABLE_COLUMNS[table];
+  if (!allowed) throw new Error(`I can't edit ${table} records by message.`);
+  if (!allowed.has(field)) {
+    throw new Error(
+      `I can't change "${field.replace(/_/g, ' ')}" by message. I can change: ` +
+        `${[...allowed].map(c => c.replace(/_/g, ' ')).join(', ')}.`,
+    );
+  }
+}
+
+/** Drop any column the model invented. Returns the kept fields + what was dropped. */
+function filterCreateFields(
+  table: string,
+  fields: Record<string, unknown>,
+): { kept: Record<string, unknown>; dropped: string[] } {
+  const allowed = CREATABLE_COLUMNS[table];
+  if (!allowed) throw new Error(`I can't create ${table} records by message.`);
+  const kept: Record<string, unknown> = {};
+  const dropped: string[] = [];
+  for (const [k, v] of Object.entries(fields)) {
+    if (allowed.has(k)) kept[k] = v;
+    else dropped.push(k);
+  }
+  return { kept, dropped };
 }
 
 // ── Personality prompt ────────────────────────────────────────────────────────
@@ -709,8 +789,37 @@ async function handleUpdateEdit(
   const currentValue = record[parsed.field];
   const entityId = record['id'] as string;
 
-  // Build confirmation message
-  const confirmMsg = buildUpdateConfirmation(parsed, currentValue, personality);
+  // D3 — validate the column BEFORE we ask the manager to confirm. Confirming a
+  // change we're going to refuse is worse than refusing it now.
+  try {
+    assertEditableColumn(table, parsed.field);
+  } catch (err) {
+    await reply(contact, message, err instanceof Error ? err.message : 'I can\'t change that field by message.');
+    return;
+  }
+
+  // D1 — POLICIES. Never write the column the model named; write the column the
+  // READER for this policy_key actually consults. coercePolicyWrite() resolves
+  // the family (engine → policy_value_json; time-off → text policy_value +
+  // policy_type='time_off') and validates the value against the same vocabulary
+  // the engine parses with. If it can't be expressed safely, we say so now.
+  let policyPatch: Record<string, unknown> | undefined;
+  let confirmMsg: string;
+
+  if (table === 'policies') {
+    const policyKey = String(record['policy_key'] ?? '');
+    const coerced = coercePolicyWrite(policyKey, parsed.new_value);
+    if (!coerced.ok) {
+      await reply(contact, message, coerced.reason);
+      return;
+    }
+    policyPatch = coerced.patch;
+    const currentStr = currentValue === null || currentValue === undefined ? 'not set' : String(currentValue);
+    confirmMsg =
+      `${policyKey.replace(/_/g, ' ')} is currently ${currentStr}. Change it to ${coerced.display}? (yes/no)`;
+  } else {
+    confirmMsg = buildUpdateConfirmation(parsed, currentValue, personality);
+  }
 
   const pending: PendingEdit = {
     company_id: contact.company_id,
@@ -723,6 +832,7 @@ async function handleUpdateEdit(
     field: parsed.field,
     current_value: currentValue,
     new_value: parsed.new_value,
+    ...(policyPatch ? { policy_patch: policyPatch } : {}),
     expires_at: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
   };
   await storePendingEdit(pending);
@@ -854,6 +964,9 @@ export async function handleEditConfirmation(
         table: pending.table, field: pending.field,
         old_value: pending.current_value, new_value: pending.new_value,
         create_fields: pending.create_fields,
+        // D1: record the columns we ACTUALLY wrote, so the audit trail shows
+        // policy_value_json (or the time-off text) — not the model's guess.
+        ...(pending.policy_patch ? { policy_patch: pending.policy_patch } : {}),
       },
     });
 
@@ -875,7 +988,18 @@ export async function handleEditConfirmation(
     await reply(contact, message, doneMsg + footerMsg);
   } catch (err) {
     console.error('[homebase-edit] execute failed:', err);
-    await reply(contact, message, `Something went wrong executing that change. Please make the edit directly in Homebase and try again.`);
+    // executeEdit throws MANAGER-FACING messages (allow-list refusals, policy
+    // coercion failures, and now real DB errors that used to be swallowed).
+    // Passing them through tells the manager what to do instead of a dead end.
+    const msg = err instanceof Error ? err.message : '';
+    const actionable = msg && !/^[A-Z][a-z]+ (into|to) /.test(msg) && msg.length < 400;
+    await reply(
+      contact,
+      message,
+      actionable
+        ? msg
+        : `That change didn't go through, so nothing was saved. Make the edit directly in Homebase, or send it again and I'll retry.`,
+    );
   }
 }
 
@@ -888,7 +1012,30 @@ async function executeEdit(pending: PendingEdit, companyId: string): Promise<voi
   }
 
   if (pending.action === 'create') {
-    const fields: Record<string, unknown> = { ...(pending.create_fields ?? {}), company_id: companyId };
+    // D3 — the model's create_fields are UNTRUSTED. Keep only allow-listed
+    // columns; company_id is forced from the verified contact, never the model.
+    const { kept, dropped } = filterCreateFields(pending.table, pending.create_fields ?? {});
+    if (dropped.length > 0) {
+      console.warn(`[homebase-edit] dropped non-allow-listed create fields on ${pending.table}:`, dropped);
+    }
+    const fields: Record<string, unknown> = { ...kept, company_id: companyId };
+
+    // D1 — a new POLICY row must be written into the column its reader consults.
+    // policy_value and policy_type are both NOT NULL, so a naive insert also
+    // just fails; coercePolicyWrite supplies both correctly.
+    if (pending.table === 'policies') {
+      const policyKey = String(kept['policy_key'] ?? '').trim();
+      const coerced = coercePolicyWrite(policyKey, kept['policy_value']);
+      if (!coerced.ok) throw new Error(coerced.reason);
+      Object.assign(fields, coerced.patch);
+      fields['policy_key'] = policyKey.toLowerCase();
+      // policy_type is load-bearing ONLY for the time-off family (its loader
+      // filters on it); coercePolicyWrite already set it there. The engine
+      // parser ignores policy_type entirely, so 'custom' is correct for it —
+      // and matches every existing engine-family row.
+      if (coerced.family === 'engine') fields['policy_type'] = 'custom';
+    }
+
     // Sensible defaults for employee creation
     if (pending.table === 'employees') {
       if (fields['active'] === undefined) fields['active'] = true;
@@ -901,13 +1048,19 @@ async function executeEdit(pending: PendingEdit, companyId: string): Promise<voi
     if (pending.table === 'events' || pending.table === 'shift_experience_rules') {
       fields['created_by'] = 'aegis';
     }
-    await supabase.from(pending.table).insert(fields);
+    const { error: insertErr } = await supabase.from(pending.table).insert(fields);
+    if (insertErr) throw new Error(`Insert into ${pending.table} failed: ${insertErr.message}`);
     return;
   }
 
   if (pending.action === 'delete') {
     if (!pending.entity_id) throw new Error('No entity_id for delete');
-    await supabase.from(pending.table).delete().eq('id', pending.entity_id).eq('company_id', companyId);
+    const { error: delErr } = await supabase
+      .from(pending.table)
+      .delete()
+      .eq('id', pending.entity_id)
+      .eq('company_id', companyId);
+    if (delErr) throw new Error(`Delete from ${pending.table} failed: ${delErr.message}`);
     return;
   }
 
@@ -919,6 +1072,26 @@ async function executeEdit(pending: PendingEdit, companyId: string): Promise<voi
   // diverging silently. days_active edits to shift_types still pass through.
   if (pending.table === 'shift_requirements' && pending.field === 'days_active') {
     throw new Error('Days are set on the shift type, not on the role requirement. Try editing the shift instead.');
+  }
+
+  // D3 — re-assert the allow-list at the write. handleUpdateEdit checks it too;
+  // this is the backstop, because THIS is the line that touches the database.
+  assertEditableColumn(pending.table, pending.field);
+
+  // D1 — POLICIES take the pre-coerced patch, never `{[field]: value}`. Writing
+  // policy_value on an engine-family rule leaves policy_value_json stale and the
+  // engine keeps enforcing the OLD rule while the manager is told it changed.
+  if (pending.table === 'policies') {
+    if (!pending.policy_patch) {
+      throw new Error('Missing the resolved policy patch — re-send the change and I\'ll redo it.');
+    }
+    const { error: polErr } = await supabase
+      .from('policies')
+      .update(pending.policy_patch)
+      .eq('id', pending.entity_id)
+      .eq('company_id', companyId);
+    if (polErr) throw new Error(`Policy update failed: ${polErr.message}`);
+    return;
   }
 
   let newValue = pending.new_value;
@@ -935,7 +1108,14 @@ async function executeEdit(pending: PendingEdit, companyId: string): Promise<voi
     newValue = (newValue as string).split(',').map(s => parseInt(s.trim()));
   }
 
-  await supabase.from(pending.table).update({ [pending.field]: newValue }).eq('id', pending.entity_id).eq('company_id', companyId);
+  const { error: updErr } = await supabase
+    .from(pending.table)
+    .update({ [pending.field]: newValue })
+    .eq('id', pending.entity_id)
+    .eq('company_id', companyId);
+  // Previously unchecked: a rejected write (type error, constraint) still fell
+  // through to the "Done — updated" reply. No orphan outputs.
+  if (updErr) throw new Error(`Update to ${pending.table}.${pending.field} failed: ${updErr.message}`);
 
   // Sync wage rate to payroll provider when individual_wage is updated on an employee
   if (pending.table === 'employees' && pending.field === 'individual_wage' && typeof newValue === 'number') {

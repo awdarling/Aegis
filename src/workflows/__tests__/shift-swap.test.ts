@@ -42,6 +42,7 @@ import {
   weekDatesFrom,
   swapBroadcastCommitGuard,
   bannedCohabPartnerName,
+  avoidCohabPartnerName,
   handleRespondSwap,
   type HardConflictRow,
   type TradeSide,
@@ -358,6 +359,42 @@ describe('bannedCohabPartnerName', () => {
   it('matches a banned pair regardless of column order', () => {
     const flipped: HardConflictRow[] = [{ employee_id_1: 'casey', employee_id_2: 'riley' }];
     expect(bannedCohabPartnerName('riley', '2026-07-04', 'PM', assignments, flipped)).toBe('casey');
+  });
+
+  // ── D13 ────────────────────────────────────────────────────────────────────
+  // loadHardConflicts now loads BOTH severities (it used to filter to 'never',
+  // which is why 'avoid' pairs were invisible to every swap path). These pin the
+  // two failure modes that change introduces if we get the filtering wrong:
+  //   1. an 'avoid' pair must NOT be reported as a hard ban, and
+  //   2. it must not vanish either — it has to surface as a soft flag.
+
+  it('D13: an "avoid" pair is NOT reported as a hard ban', () => {
+    const soft: HardConflictRow[] = [{ employee_id_1: 'riley', employee_id_2: 'casey', severity: 'avoid' }];
+    expect(bannedCohabPartnerName('riley', '2026-07-04', 'PM', assignments, soft)).toBeNull();
+  });
+
+  it('D13: an "avoid" pair IS surfaced as a soft flag (it used to vanish entirely)', () => {
+    const soft: HardConflictRow[] = [{ employee_id_1: 'riley', employee_id_2: 'casey', severity: 'avoid' }];
+    expect(avoidCohabPartnerName('riley', '2026-07-04', 'PM', assignments, soft)).toBe('casey');
+  });
+
+  it('D13: a "never" pair is NOT reported as a soft flag', () => {
+    const hard: HardConflictRow[] = [{ employee_id_1: 'riley', employee_id_2: 'casey', severity: 'never' }];
+    expect(avoidCohabPartnerName('riley', '2026-07-04', 'PM', assignments, hard)).toBeNull();
+    expect(bannedCohabPartnerName('riley', '2026-07-04', 'PM', assignments, hard)).toBe('casey');
+  });
+
+  it('D13: a row with NO severity is treated as a hard ban (safe default)', () => {
+    // Rather than silently ignoring an unrecognized/missing severity, we
+    // over-warn. Under-warning is what pairs two people who should be apart.
+    const legacy: HardConflictRow[] = [{ employee_id_1: 'riley', employee_id_2: 'casey' }];
+    expect(bannedCohabPartnerName('riley', '2026-07-04', 'PM', assignments, legacy)).toBe('casey');
+    expect(avoidCohabPartnerName('riley', '2026-07-04', 'PM', assignments, legacy)).toBeNull();
+  });
+
+  it('D13: the soft flag respects excludeEmpId like the hard one does', () => {
+    const soft: HardConflictRow[] = [{ employee_id_1: 'riley', employee_id_2: 'sam', severity: 'avoid' }];
+    expect(avoidCohabPartnerName('riley', '2026-07-04', 'PM', assignments, soft, 'sam')).toBeNull();
   });
 });
 

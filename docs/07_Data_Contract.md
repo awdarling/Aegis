@@ -133,7 +133,7 @@ anywhere silently makes an employee unqualified.
 | **D10** | `shift_requirements.accepted_roles` | Not read from the DB at all (Role Groups unbuilt). Eligibility matches `qualified_roles` vs `slot.role`. |
 | **D11** | `partial_shifts_allowed`, `conflict_resolution_preference` | Parsed by the constraint parser, then **never consulted** anywhere in the engine. |
 | **D12** | `doubles_policy: 'emergency_only'` | Treated identically to `'never'` — emergency mode is not wired. |
-| **D13** | `employee_conflicts.severity = 'avoid'` | Soft rank tiebreaker only, ranked *below* primary-role fit — so avoid-pairs are routinely co-scheduled. **Completely ignored in all swap paths.** |
+| **D13** | `employee_conflicts.severity = 'avoid'` | ✅ **Swap paths FIXED 2026-07-13.** `loadHardConflicts` filtered `.eq('severity','never')`, so 'avoid' pairs were **invisible to every swap path** — a manager could say "keep these two apart" and a swap would put them on the same shift without a word. Now both severities load; `bannedCohabPartnerName` (hard) and the new `avoidCohabPartnerName` (soft) split them, and the manager's approval email carries a softer flag for 'avoid'. **Flag-don't-force preserved — neither blocks.** A row with no severity is treated as HARD (over-warn beats under-warn). 5 regression tests. **Still open:** in the BUILD engine, 'avoid' remains a rank tiebreaker below primary-role fit, so avoid-pairs can still be co-scheduled by the builder. |
 | **D14** | `events.shift_overrides` | **Legacy.** Superseded by `events.event_shifts` (a strict superset). Two mechanisms for one concept — retire it. |
 
 ### P2 — integrity / consistency
@@ -145,8 +145,8 @@ anywhere silently makes an employee unqualified.
 | **D17** | `time_off_requests.decided_by` is never written by Aegis on either path (always NULL). |
 | **D18** | Emergency coverage rewrites `schedules.data` **without** recomputing `staffing_report.estimated_wages`; both swap paths do. |
 | **D19** | `coverage_session` is keyed `:<company_id>` — two concurrent call-outs at one company collide. |
-| **D20** | `writeEmployeeAvailability` deletes by `employee_id` **without a `company_id` predicate**. |
-| **D21** | Onboarding-created time-off omits `time_off_type` / `partial_days` — such requests can never be partial-day. |
+| **D20** | ✅ **FIXED 2026-07-13.** `writeEmployeeAvailability` deleted by `employee_id` with **no `company_id` predicate** — and, the part with real teeth, **neither the delete nor the insert checked for an error.** A failed DELETE + successful INSERT leaves an employee with BOTH their old and new availability (overlapping windows → looks available on days they just said they can't work); a failed INSERT after a successful DELETE leaves them with **none** — and both paths replied "saved". Now scoped by `company_id` and both writes throw. |
+| **D21** | ✅ **FIXED 2026-07-13.** Onboarding time-off extracted only `start_date`/`end_date`, and `time_off_requests.time_off_type` **DEFAULTS to `'full_day'`** — so a new hire saying *"I need the afternoon of the 20th off"* had their **whole day blocked**. Onboarding now extracts `time_off_type`/`period_label`/`start_time`/`end_time` and resolves the window through the **same exported `resolvePartialWindow`** the real time-off flow uses, so the two can't drift on what "afternoon" means. Unresolvable partials fall back to `full_day` rather than dropping the request. |
 | **D22** | `soteria_memory` is written straight from an LLM `<memory>` tag — the one Soteria write with no confirmation card and no executor. |
 
 ---

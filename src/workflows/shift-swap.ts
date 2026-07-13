@@ -1183,16 +1183,32 @@ export async function executeScheduleTrade(
 // requester↔receiver check, this catches the real case: someone joining a shift
 // where a HARD-banned coworker is already assigned.
 
-export interface HardConflictRow { employee_id_1: string; employee_id_2: string; }
+// `severity` is optional so existing callers/tests that build rows without it
+// still typecheck; a row with no severity is treated as a HARD ('never') pair,
+// which is the safe default — we'd rather over-warn than silently pair people.
+export interface HardConflictRow {
+  employee_id_1: string;
+  employee_id_2: string;
+  severity?: 'never' | 'avoid' | string | null;
+}
 
 /** Load the company's hard ('never') banned pairs. Never throws — returns []. */
+// D13 — this used to filter `.eq('severity','never')`, so pairs marked 'avoid'
+// were INVISIBLE to every swap path. A manager could say "try not to schedule
+// these two together", and a swap would cheerfully put them on the same shift
+// with no mention of it. (The build engine does honour 'avoid' — but only as a
+// soft rank tiebreaker, so swaps were the one place it vanished entirely.)
+//
+// Now we load BOTH severities and let the caller decide how loudly to speak.
+// Per flag-don't-force, neither one blocks the swap: 'never' gets a firm warning
+// in the manager's approval email, 'avoid' gets a softer one. The manager holds
+// final authority either way.
 export async function loadHardConflicts(companyId: string): Promise<HardConflictRow[]> {
   try {
     const { data } = await supabase
       .from('employee_conflicts')
-      .select('employee_id_1, employee_id_2')
-      .eq('company_id', companyId)
-      .eq('severity', 'never');
+      .select('employee_id_1, employee_id_2, severity')
+      .eq('company_id', companyId);
     return (data ?? []) as HardConflictRow[];
   } catch {
     return [];
@@ -1205,6 +1221,32 @@ export async function loadHardConflicts(companyId: string): Promise<HardConflict
  * null. `excludeEmpId` is the person vacating that shift (the requester on a
  * pickup), so they don't count as a co-inhabitant.
  */
+function cohabPartnerNameBySeverity(
+  empId: string,
+  date: string,
+  shiftName: string,
+  assignments: ScheduleAssignment[],
+  conflicts: HardConflictRow[],
+  want: 'never' | 'avoid',
+  excludeEmpId?: string,
+): string | null {
+  const flagged = new Set<string>();
+  for (const c of conflicts) {
+    // A row with no severity is treated as 'never' — the safe default.
+    const sev = c.severity === 'avoid' ? 'avoid' : 'never';
+    if (sev !== want) continue;
+    if (c.employee_id_1 === empId) flagged.add(c.employee_id_2);
+    else if (c.employee_id_2 === empId) flagged.add(c.employee_id_1);
+  }
+  if (flagged.size === 0) return null;
+  for (const a of assignments) {
+    if (a.date !== date || a.shift_name !== shiftName) continue;
+    if (a.employee_id === empId || a.employee_id === excludeEmpId) continue;
+    if (flagged.has(a.employee_id)) return a.employee_name;
+  }
+  return null;
+}
+
 export function bannedCohabPartnerName(
   empId: string,
   date: string,
@@ -1213,18 +1255,24 @@ export function bannedCohabPartnerName(
   conflicts: HardConflictRow[],
   excludeEmpId?: string,
 ): string | null {
-  const banned = new Set<string>();
-  for (const c of conflicts) {
-    if (c.employee_id_1 === empId) banned.add(c.employee_id_2);
-    else if (c.employee_id_2 === empId) banned.add(c.employee_id_1);
-  }
-  if (banned.size === 0) return null;
-  for (const a of assignments) {
-    if (a.date !== date || a.shift_name !== shiftName) continue;
-    if (a.employee_id === empId || a.employee_id === excludeEmpId) continue;
-    if (banned.has(a.employee_id)) return a.employee_name;
-  }
-  return null;
+  return cohabPartnerNameBySeverity(empId, date, shiftName, assignments, conflicts, 'never', excludeEmpId);
+}
+
+/**
+ * D13 — the soft twin. Returns the name of an 'avoid'-paired coworker already on
+ * that shift instance. Same flag-don't-force contract: this NEVER blocks a swap,
+ * it just means the manager gets told before they approve, instead of finding out
+ * when the two of them turn up on the same shift.
+ */
+export function avoidCohabPartnerName(
+  empId: string,
+  date: string,
+  shiftName: string,
+  assignments: ScheduleAssignment[],
+  conflicts: HardConflictRow[],
+  excludeEmpId?: string,
+): string | null {
+  return cohabPartnerNameBySeverity(empId, date, shiftName, assignments, conflicts, 'avoid', excludeEmpId);
 }
 
 // ── Swap validation ───────────────────────────────────────────────────────────
@@ -1505,6 +1553,19 @@ export async function sendManagerSwapApprovalRequest(params: {
       }
       if (bannedWith) {
         bannedPairFlag = `${who} and ${bannedWith} are a restricted pair — they normally aren't scheduled together. Approving this would place them on the same shift.`;
+      } else {
+        // D13 — no HARD conflict, so check the soft ones. 'avoid' pairs used to be
+        // filtered out of every swap path entirely, so a manager who asked us to
+        // keep two people apart would never hear about it on a swap.
+        let avoidWho = receiver.name;
+        let avoidWith = avoidCohabPartnerName(receiver.id, shift_date, shift_name, assignments, conflicts, requester.id);
+        if (!avoidWith && isTrade && params.target_shift_date && params.target_shift_name) {
+          avoidWith = avoidCohabPartnerName(requester.id, params.target_shift_date, params.target_shift_name, assignments, conflicts, receiver.id);
+          avoidWho = requester.name;
+        }
+        if (avoidWith) {
+          bannedPairFlag = `${avoidWho} and ${avoidWith} are a pair you'd rather not schedule together. This isn't a hard rule, so it's fine if you're happy with it — just flagging it before you approve.`;
+        }
       }
     }
   } catch { /* flag is best-effort — never let it block the approval email */ }

@@ -233,45 +233,83 @@ async function handleSwapDecision(
   // per flag-don't-force, the manager was warned in their approval email and
   // makes the call. See buildSwapManagerApprovalEmail's bannedPairFlag.
 
-  // Update swap_request status.
-  // NOTE: decided_by is a UUID column. The manager is identified by the
-  // magic-link email (shared across managers), so we don't have a single
-  // user UUID here — write null rather than a string (which would throw an
-  // invalid-uuid error and silently leave the row stuck at pending_manager).
-  // The decision is still captured by decided_at + the activity log below.
-  await supabase.from('swap_requests').update({
-    status: action === 'approve' ? 'approved' : 'denied',
-    decided_at: new Date().toISOString(),
-    decided_by: null,
-  }).eq('id', requestId);
-
-  // Consume both sibling tokens
-  await consumeSwapTokens(token.company_id, requestId);
+  // ── D2 — THE SCHEDULE WRITE IS AUTHORITATIVE ────────────────────────────────
+  //
+  // This used to run in exactly the wrong order: set status='approved' FIRST,
+  // then try to apply the swap, then email both employees "approved!" —
+  // OUTSIDE the `if (schedRow && receiver)` guard. So when the week's schedule
+  // was missing, still draft, or the assignment didn't match, the row read
+  // 'approved', both employees were told the swap was done, and the schedule
+  // never changed. The person who thought they were covered didn't show up.
+  //
+  // Now: apply the schedule change FIRST. Only if it actually lands do we mark
+  // the swap approved (recording the schedule_id it landed on, as the receipt)
+  // and tell anyone. If it fails, the row STAYS 'pending_manager' so the
+  // manager can retry after publishing, and nobody is told a lie.
+  const isTrade = !!(token.target_shift_name && token.target_shift_date);
 
   if (action === 'approve') {
-    // Find the schedule covering this shift date
+    if (!receiver) {
+      res.status(409).send(errorPage(
+        'The employee picking up this shift could not be found, so the swap was not applied. Nothing has changed — the request is still awaiting your approval.',
+      ));
+      return;
+    }
+
+    // Find the schedule covering this shift date.
     const { data: schedRow } = await supabase.from('schedules').select('id, data').is('deleted_at', null)
       .eq('company_id', token.company_id).eq('status', 'published')
       .lte('week_start', token.shift_date).gte('week_end', token.shift_date)
       .order('generated_at', { ascending: false }).limit(1).maybeSingle();
 
-    const isTrade = !!(token.target_shift_name && token.target_shift_date);
-    if (schedRow && receiver) {
-      const row = schedRow as { id: string; data: { assignments: unknown[] } };
-      if (isTrade) {
-        // True two-way trade: the requester and target switch shifts.
-        await executeScheduleTrade(
+    if (!schedRow) {
+      res.status(409).send(errorPage(
+        `There's no published schedule covering ${token.shift_date} yet, so this swap can't be applied to it. ` +
+        `Nothing has changed and nobody has been notified — publish the schedule for that week, then approve this again.`,
+      ));
+      return;
+    }
+
+    const row = schedRow as { id: string; data: { assignments: unknown[] } };
+    const applied = isTrade
+      ? await executeScheduleTrade(
           token.company_id, row.id,
           { date: token.shift_date, shift_name: token.shift_name, employee_id: token.requester_id, employee_name: token.requester_name },
           { date: token.target_shift_date!, shift_name: token.target_shift_name!, employee_id: token.receiver_id, employee_name: token.receiver_name },
-        );
-      } else {
-        await executeScheduleSwap(
+        )
+      : await executeScheduleSwap(
           token.company_id, row.id, token.shift_date, token.shift_name,
-          token.requester_id, token.receiver_id, token.receiver_name
+          token.requester_id, token.receiver_id, token.receiver_name,
         );
-      }
+
+    if (!applied.ok) {
+      // The schedule did NOT change. Do not approve, do not notify.
+      console.error(`[swap-decision] apply failed (${applied.code}) for swap ${requestId}: ${applied.reason}`);
+      res.status(409).send(errorPage(
+        `${applied.reason} Nothing has changed and nobody has been notified — the request is still awaiting your approval.`,
+      ));
+      return;
     }
+
+    // The schedule changed. NOW the approval is real — record it with the
+    // receipt (schedule_id) in the same write.
+    // NOTE: decided_by is a UUID column. The manager is identified by the
+    // magic-link email (shared across managers), so we don't have a single
+    // user UUID here — write null rather than a string.
+    const { error: statusErr } = await supabase.from('swap_requests').update({
+      status: 'approved',
+      schedule_id: applied.schedule_id,
+      decided_at: new Date().toISOString(),
+      decided_by: null,
+    }).eq('id', requestId);
+    if (statusErr) {
+      // The schedule IS updated but the row didn't close. Say so loudly rather
+      // than silently leaving a swap that's live on the schedule but reads as
+      // pending — that's a reconciliation problem, not a no-op.
+      console.error(`[swap-decision] schedule ${applied.schedule_id} updated but swap ${requestId} status write FAILED:`, statusErr);
+    }
+
+    await consumeSwapTokens(token.company_id, requestId);
 
     // Notify both employees — for a trade, each person hears the shift they now work.
     const dateLong = new Date(token.shift_date + 'T12:00:00Z').toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
@@ -298,8 +336,18 @@ async function handleSwapDecision(
       await sendEmail({ to: receiver.contact_email, subject: subj, text: receiverMsg, company_id: token.company_id });
     }
   } else {
-    // Denied — notify both
-    const isTrade = !!(token.target_shift_name && token.target_shift_date);
+    // Denied — no schedule change is involved, so the status write is safe to
+    // do first. (D2 only reorders the APPROVE path, where a status of
+    // 'approved' is a claim about the schedule that must be earned.)
+    await supabase.from('swap_requests').update({
+      status: 'denied',
+      decided_at: new Date().toISOString(),
+      decided_by: null,
+    }).eq('id', requestId);
+
+    await consumeSwapTokens(token.company_id, requestId);
+
+    // Notify both
     const deniedMsg = `Your shift ${isTrade ? 'trade' : 'swap'} request for the ${token.shift_name} shift on ${new Date(token.shift_date + 'T12:00:00Z').toLocaleDateString('en-US', { month: 'long', day: 'numeric' })} has been denied by your manager. Please contact them if you have questions.`;
     const subj = isTrade ? 'Shift trade denied' : 'Swap denied';
     if (!env.EMAIL_ONLY && requester?.contact_phone && token.aegis_sms_channel) {

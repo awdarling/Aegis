@@ -22,6 +22,9 @@ import type {
 } from '../lib/constraints/types';
 import { getWeekBounds } from '../lib/engine/week-bounds';
 import { buildCanvas } from '../lib/engine/canvas';
+// RULE 0b — ONE question, ONE function. Never reimplement "is this person
+// qualified" — see src/lib/qualification.ts.
+import { canFill, roleLabelOf, acceptedRolesOf } from '../lib/qualification';
 import {
   buildEligibility,
   consecutiveDaysRunIncluding,
@@ -75,7 +78,21 @@ export interface ScheduleAssignment {
   employee_id: string;
   employee_name: string;
   shift_name: string;
+  /** The role this person is filling. */
   role: string;
+  /**
+   * RULE 0b — every role the manager said may fill this slot ("Lifeguard or
+   * Headguard"), carried on the assignment so downstream workflows (swaps,
+   * coverage, gap resolution) don't have to re-derive it and can't disagree
+   * with the engine that built it.
+   *
+   * OPTIONAL, deliberately: schedules published before this existed have no such
+   * field. Every reader goes through `acceptedRolesOf()`, which falls back to
+   * `[role]` — i.e. exactly the old behaviour, never "nobody is qualified".
+   * Swap paths additionally fall back to a DB lookup (`resolveAcceptedRoles`) so
+   * even a legacy schedule gets the manager's real configuration.
+   */
+  accepted_roles?: string[];
   start_time: string;
   end_time: string;
   hours: number;
@@ -85,6 +102,15 @@ export interface ScheduleGap {
   date: string;
   shift_name: string;
   role: string;
+  /**
+   * RULE 0b — every role the manager said may fill this slot. Carried on the GAP
+   * so the Homebase gap-resolver offers the manager the same people the engine
+   * would have accepted. Without it, the resolver filtered candidates by the
+   * single `role` and hid qualified staff from the very manager trying to fix
+   * the gap. Optional for schedules built before this existed; readers fall back
+   * to `[role]`.
+   */
+  accepted_roles?: string[];
   required_count: number;
   filled_count: number;
   // Short bucket string for backwards compatibility — the binding constraint
@@ -350,11 +376,15 @@ function computeGapReason(input: GapReasonInput): string {
   const vetOnly = engineIsVeteranOnlyDate(slot.date, veteranOnlyDates);
   const pool = vetOnly ? employees.filter(e => e.is_veteran) : employees;
 
-  const qualified = pool.filter(e => e.qualified_roles.includes(slot.role));
+  // RULE 0b — same qualification function as the engine, the simulator, swaps and
+  // coverage. Previously this filtered on `slot.role` alone, so the cascade
+  // ignored every other role the manager said could fill the slot.
+  const qualified = pool.filter(e => canFill(e, slot));
   if (qualified.length === 0) {
+    const label = roleLabelOf(slot);
     return vetOnly
-      ? `No veteran employees are qualified for the ${slot.role} role on this veteran-only date`
-      : `No active employees are qualified for the ${slot.role} role`;
+      ? `No veteran employees are qualified for the ${label} role on this veteran-only date`
+      : `No active employees are qualified for the ${label} role`;
   }
 
   const available = qualified.filter(e => engineIsAvailable(e, slot, availByEmp));
@@ -415,9 +445,12 @@ function buildGapDiagnostic(input: GapReasonInput): {
 
   const vetOnly = engineIsVeteranOnlyDate(slot.date, veteranOnlyDates);
   const pool = (vetOnly ? employees.filter(e => e.is_veteran) : employees).filter(e => e.active);
-  const qualified = pool.filter(e => e.qualified_roles.includes(slot.role));
+  // RULE 0b — the gap REASON must reflect what the manager actually configured.
+  // Saying "no Lifeguard available" on a slot that also accepts Headguards hides
+  // the fact that the shift could have been covered.
+  const qualified = pool.filter(e => canFill(e, slot));
 
-  const head = `${slot.role} slot on ${slot.date} ${slot.shift_name} unfilled.`;
+  const head = `${roleLabelOf(slot)} slot on ${slot.date} ${slot.shift_name} unfilled.`;
 
   if (qualified.length === 0) {
     const desc = vetOnly
@@ -684,6 +717,9 @@ function buildScheduleForWeek(ctx: BuildContext): BuildResult {
         employee_name: chosen.name,
         shift_name: slot.shift_name,
         role: slot.role,
+        // RULE 0b — carry the manager's full accepted-role set onto the
+        // assignment so swaps/coverage read the same truth the engine used.
+        accepted_roles: acceptedRolesOf(slot),
         start_time: slot.start_time,
         end_time: slot.end_time,
         hours: slot.hours,
@@ -709,6 +745,9 @@ function buildScheduleForWeek(ctx: BuildContext): BuildResult {
           date: slot.date,
           shift_name: slot.shift_name,
           role: slot.role,
+          // RULE 0b — the manager fixing this gap must be offered everyone the
+          // engine itself would have accepted.
+          accepted_roles: acceptedRolesOf(slot),
           required_count: 1,
           filled_count: 0,
           reason: diagnostic.short_reason,

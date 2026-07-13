@@ -2,6 +2,10 @@ import { supabase } from '../db/client';
 import { getSpecialNotesForRange } from '../workflows/special-notes';
 import { resolveAvailabilityForWeek } from './custom-availability';
 import { buildTOMap, isBlockedByTO, type TOWindow } from './to-window';
+// RULE 0b — ONE question, ONE function. The coverage simulator must agree with
+// the build engine about who can fill a shift, or it warns about gaps that don't
+// exist (and clears ones that do). See src/lib/qualification.ts.
+import { canFill } from './qualification';
 import type {
   Employee,
   Availability,
@@ -262,8 +266,12 @@ function runBothScenarios(
       let withNewCovered = 0;
       const shiftId = req.shift_type_id ?? '';
 
+      // RULE 0b — the SAME qualification function the build engine uses. This
+      // decides whether approving time off opens a coverage gap; if it thinks
+      // fewer people can cover than the engine does, it will warn a manager about
+      // a gap that doesn't exist — or clear one that does.
       for (const emp of data.employees) {
-        if (!emp.qualified_roles.includes(req.role)) continue;
+        if (!canFill(emp, req)) continue;
         if (
           !isEmployeeAvailableForShift(
             emp.id,
@@ -312,7 +320,10 @@ function runBothScenarios(
         // Find employees who could cover this affected slot
         for (const emp of data.employees) {
           if (emp.id === newEmployeeId) continue;
-          if (!emp.qualified_roles.includes(req.role)) continue;
+          // RULE 0b — same function as everywhere else. The "who could cover
+          // instead?" list a manager sees must include every role they said can
+          // fill this shift, or we hide a viable alternate from them.
+          if (!canFill(emp, req)) continue;
           if (isBlockedByTO(emp.id, date, shiftStart, shiftEnd, shiftId, withNewMap)) continue;
           if (
             !isEmployeeAvailableForShift(

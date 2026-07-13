@@ -1125,6 +1125,24 @@ Focused Soteria session against the PURPOSE & DEFINITION-OF-DONE block. Diagnose
 - **Gap closed:** the one untested link was the **intake** — that an employee email actually *feeds* the custom system. Added 3 tests to `src/workflows/__tests__/custom-availability-magic.test.ts` (now 10): an "until \<date\>" email → date-limited pending (`custom_end_date` set, temporary framing in the confirm, permanent table untouched); a plain change → `custom_end_date` null; a non-date `end_date` value → ignored. Made the file's `withAnthropicRetry` mock controllable to drive `parseAvailabilityIntent`.
 - **State:** Aegis tsc clean; full suite **143/143 green**. Change is test-only (no production code touched) on a working copy — needs Alexander to push the branch + open a PR, then one live sandbox smoke (employee → manager approve) to flip #13 to fully DONE. Feature code itself is already deployed.
 
+### 2026-07-13 (session 9) — RULE 0b established. D10 finished properly. Client names ripped out of code.
+
+**Alexander stopped the session and was right to.** I had reported D10 as fixed; it was fixed in **2 of 8 places**. He asked the question that caught it: *"anytime a dual requirement is added to a shift, it should update everywhere automatically — right?"*
+
+**The real diagnosis.** *"Can this employee work this slot?"* was answered in **eight** places, each with its own copy of the logic. **Six compared against a single role string.** So a manager configuring *"Lifeguard **or** Headguard"* got: the engine **scheduling** a Headguard onto the shift, the swap workflow telling that same Headguard they were **"not qualified"** for it, the time-off simulator warning about coverage gaps that didn't exist, and the Homebase gap-resolver **hiding qualified staff from the manager trying to fix the gap.** The column existed, the UI wrote to it, and seven of eight readers ignored it.
+
+**This is Rule 0's twin, for LOGIC instead of DATA** — now written into the contract as **Rule 0b: one question, one function.** Duplicated logic rots exactly like duplicated data.
+
+**Fixed — every qualification decision in the product now routes through `src/lib/qualification.ts`:**
+- `engine/eligibility.ts` (build) · `workflows/schedule-build.ts` (cascade pool **and** gap reasons) · `lib/schedule-simulator.ts` (time-off coverage — **both** loops) · `workflows/shift-swap.ts` (`validateSwap` **and** `buildSwapCandidates`) · `workflows/emergency-coverage.ts` · Homebase `GapResolverPanel.tsx`.
+- **Verified: zero remaining single-role qualification checks in Aegis** (grep-clean; the one surviving `qualified_roles.includes` is onboarding adding a new hire's own role to their own list, which is correct).
+- `accepted_roles` is now carried on **`ScheduleAssignment`** and **`ScheduleGap`**, so downstream workflows read the same truth the engine used instead of re-deriving it. Both **optional** — schedules published before this parse fine and fall back to `[role]` (exactly the old behaviour, never "nobody qualifies"). Swap paths additionally fall back to a **DB lookup** (`resolveAcceptedRoles`) so even a legacy schedule gets the manager's real configuration.
+- **Nothing is client-specific.** No role vocabulary, no fixed count, no assumption about what a business calls its jobs. Tests cover a country club, a restaurant kitchen and a hotel front desk.
+
+**HARDCODED CLIENT NAME REMOVED — this was a hard blocker on selling.** `employee-onboarding.ts` had *"Welcome to Watermark — Let's get you set up"* and *"Aegis — Watermark Country Club"* as literal email subjects. **Every future client's employees would have been welcomed to Watermark Country Club.** A `loadCompanyName()` helper already existed 200 lines above it. Now driven from the client's own `companies` row. Contract corollary added: **if you are typing a client's name into a string, it is a config value.** Grep-verified: zero hardcoded client references left in Aegis source.
+
+- **State:** Aegis `tsc` clean, **246/246** (was 228), engine smoke + max-consecutive harnesses green. Homebase `tsc` clean. **18 new tests**, including a **cross-workflow agreement test** that asserts all six workflows return the SAME answer for the same employee and shift — if any of them ever disagrees, that test fails.
+
 ### 2026-07-13 (session 8) — D10: the engine was ignoring a role the manager configured. LIVE AT WATERMARK.
 
 **Rule 0, inverted.** The earlier violations were *hidden data the manager couldn't see*. This is the mirror image: **visible data the engine ignored.**

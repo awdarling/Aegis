@@ -47,6 +47,35 @@ there is nowhere else to put it.**
 (1) make every engine/workflow read the manager's row, (2) stop every writer copying it,
 (3) link/enforce the FK, (4) **drop the copy** — don't settle for keeping it in sync.
 
+### Rule 0b — ONE QUESTION, ONE FUNCTION (Alexander, 2026-07-13)
+
+Rule 0 governs **data**: one fact, one place. Rule 0b governs **logic**, and it exists because
+duplicated logic rots in exactly the same way — someone fixes one copy, the others silently
+disagree, and the product lies to a different user through a different channel.
+
+> **If two workflows need the same answer, they call the SAME function.**
+> A workflow that reimplements a check is a bug waiting to disagree with its siblings.
+
+**The case that proved it.** *"Can this employee work this slot?"* was answered in **eight**
+places, each with its own copy. Six compared against a **single** role string. So when a
+manager configured a shift to accept *"Lifeguard **or** Headguard"* — an ordinary thing to want
+in any business — the engine happily **scheduled** a Headguard onto it, and the swap workflow
+then told that same Headguard they were **"not qualified"** for the very same shift. The
+time-off simulator warned about gaps that didn't exist. The gap-resolver hid qualified staff
+from the manager trying to fix the gap. **The column existed, the UI wrote to it, and seven of
+eight readers ignored it.**
+
+**Now:** every workflow routes through **`src/lib/qualification.ts`** — `isQualified()`,
+`canFill()`, `acceptedRolesOf()`, `roleLabel()`. There is no role vocabulary, no fixed number
+of roles, no assumption about what a business calls its jobs. Any client, any roles, any
+combination — and every engine and workflow agrees, because there is only one answer.
+
+**Corollary — NO CLIENT NAMES IN CODE.** `employee-onboarding.ts` hardcoded *"Welcome to
+Watermark"* and *"Aegis — Watermark Country Club"* as email subjects; every future client's
+employees would have been welcomed to Watermark. A `loadCompanyName()` helper already existed.
+**If you are typing a client's name into a string, it is a config value.** Client identity comes
+from `companies` / `company_profiles`, always.
+
 ### The three rules
 
 1. **One concept → one canonical column.** Never mirror a concept into two columns. If two

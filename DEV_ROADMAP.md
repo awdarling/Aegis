@@ -1125,6 +1125,27 @@ Focused Soteria session against the PURPOSE & DEFINITION-OF-DONE block. Diagnose
 - **Gap closed:** the one untested link was the **intake** — that an employee email actually *feeds* the custom system. Added 3 tests to `src/workflows/__tests__/custom-availability-magic.test.ts` (now 10): an "until \<date\>" email → date-limited pending (`custom_end_date` set, temporary framing in the confirm, permanent table untouched); a plain change → `custom_end_date` null; a non-date `end_date` value → ignored. Made the file's `withAnthropicRetry` mock controllable to drive `parseAvailabilityIntent`.
 - **State:** Aegis tsc clean; full suite **143/143 green**. Change is test-only (no production code touched) on a working copy — needs Alexander to push the branch + open a PR, then one live sandbox smoke (employee → manager approve) to flip #13 to fully DONE. Feature code itself is already deployed.
 
+### 2026-07-13 (session 5) — RULE 0 established; Aegis engine can no longer read a hidden copy
+
+**Alexander set the governing rule** (now Rule 0 at the top of `docs/07_Data_Contract.md`, above the other three): *"Whatever the manager sees, updates, and saves needs to be what the entire system uses. There shouldn't be anything saved anywhere other than what the manager directly sees and interacts with."* Config-over-code multi-tenancy is meaningless otherwise — a hidden copy the manager never touched is, by definition, not the client's data.
+
+**Applied to shifts.** The manager defines a shift's name/hours/days once, in the shift box (`shift_types`). `shift_requirements` should say only *"this shift needs N of role X."* It was also storing copies of `shift_name`/`start_time`/`end_time`/`days_active`, stamped at creation (`ShiftRequirementsTab.tsx:229-232`) and never shown to the manager again. They drifted (D4).
+
+**What changed (Aegis) — the engine is now structurally incapable of reading the copy:**
+- New **`CanvasRequirement`** type (`lib/engine/canvas.ts`): `{ id, shift_type_id, role, required_count, days_active }` — and `days_active` there is an **engine-internal date-scope stamp**, not a DB read. It carries **no shift attributes at all**. `buildCanvas` now takes this instead of a raw `ShiftRequirement` row, so a copied column physically cannot cross into the engine. The smoke harness pins the signature — widening it back to `ShiftRequirement` is now a compile error.
+- **Removed the `req.shift_name === st.name` fallback** in both `canvas.ts` and `schedule-build.ts`. Requirements match their shift by **`shift_type_id` only**. Matching staffing to a shift by a copied name string meant a rename could silently detach a shift's own staffing.
+- **`schedule-simulator.ts` has no fallback left** — it reads name/hours from the `ShiftType` or skips the requirement loudly. It can no longer produce a coverage verdict from stale hours.
+- `tsc` clean, **214/214**, engine smoke harness fully green (including the stale-`days_active` case, which now proves the engine ignores the copy).
+
+**⚠️ MIGRATION REQUIRED BEFORE MERGE — `~/Desktop/Link_Shift_Requirements_To_Shift_Types.sql`.** The engine now matches by id only, so an **unlinked** requirement is skipped. **Quria Sandbox has 2 unlinked rows** (`AM`/`PM` Lifeguard); Watermark has 0. The script links them (verified lossless — both match a shift type by exact name and their hours already agree) and then sets `shift_type_id NOT NULL` so an unlinked requirement can never be created again. **Deploy the code without this and sandbox builds lose those slots.**
+
+**Still to do to finish Rule 0 for shifts** (the columns are still there, just unread by the engine):
+1. **Homebase — stop writing the copies:** `ShiftRequirementsTab.tsx` insert, and `soteria/execute` `add_role_requirement`. Also **remove the D4 `update_shift_type` cascade** — it keeps the copies in sync, which becomes pointless (and will error) once they're dropped.
+2. **Homebase — move the 3 remaining readers onto `shift_types`:** `GapResolverPanel.tsx:139` (this one builds the employee-facing *"you've been added to the AM shift (11:30–15:30)"* message — it is the reason an employee could be told the wrong hours), `ManualScheduleBuilder.tsx:169`, `TimeOffTab.tsx:305`.
+3. **Then DROP** `shift_name`, `start_time`, `end_time`, `days_active` from `shift_requirements` and regenerate `src/db/types.ts`.
+
+**Separately noted, not bundled:** `applyShiftOverrides` + `events.shift_overrides` (D14) is the *other* Rule 0 violation — a column the manager never sets. It is now **dead code** (the column is NULL on every row after the undo), so it's a cleanup, not a live bug. It's woven into the manager email and the staffing report, so it gets its own pass rather than riding along with this one.
+
 ### 2026-07-13 (session 4) — D4 + D5 FIXED: cascade bugs. D4 was ALREADY DRIFTED IN PRODUCTION.
 
 Both are the same disease: an edit that changes one table and forgets the others that depend on it. A role is a free-text string matched by exact equality across **five** tables; a shift's hours live canonically in `shift_types` but are **copied** onto `shift_requirements`.

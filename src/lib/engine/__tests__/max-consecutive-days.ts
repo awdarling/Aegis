@@ -56,12 +56,9 @@ function buildSingleEmployeeWeekFixture(): BuildData {
   const req: ShiftRequirement = {
     id: 'req-daily',
     company_id: COMPANY_ID,
-    shift_name: 'Daily',
     role: 'Lifeguard',
+    accepted_roles: ['Lifeguard'],
     required_count: 1,
-    start_time: '09:00',
-    end_time: '13:00',
-    days_active: [0, 1, 2, 3, 4, 5, 6],
     shift_type_id: ST_ID,
   };
 
@@ -324,6 +321,7 @@ function buildCascadeFixture(): {
     shift_name: SHIFT_NAME,
     shift_requirement_id: reqId,
     role: 'Lifeguard',
+    accepted_roles: ['Lifeguard'],
     start_time: '09:00',
     end_time: '13:00',
     hours: 4,
@@ -414,7 +412,7 @@ function runCascadeCapCoverageSmoke(): void {
   // Canvas — one slot per pre-existing assignment date plus the target.
   const baseSlot = (date: string, reqId: string): CanvasSlot => ({
     date, shift_type_id: 'st-cascade', shift_name: 'Day',
-    shift_requirement_id: reqId, role: 'Lifeguard',
+    shift_requirement_id: reqId, role: 'Lifeguard', accepted_roles: ['Lifeguard'],
     start_time: '09:00', end_time: '13:00', hours: 4,
     required_count: 1, slot_index: 0, is_priority: false,
   });
@@ -581,12 +579,9 @@ function buildAttributeMixFixture(): {
   const req: ShiftRequirement = {
     id: 'req-mixcap',
     company_id: COMPANY_ID,
-    shift_name: 'MixDay',
     role: 'Lifeguard',
+    accepted_roles: ['Lifeguard'],
     required_count: 2,
-    start_time: '09:00',
-    end_time: '13:00',
-    days_active: [0, 1, 2, 3, 4, 5, 6],
     shift_type_id: ST_ID,
   };
 
@@ -664,13 +659,13 @@ function runAttributeMixCapCoverageSmoke(): void {
   const canvasSlots: CanvasSlot[] = [
     {
       date: '2026-06-01', shift_type_id: f.shiftType.id, shift_name: 'MixDay',
-      shift_requirement_id: f.req.id, role: 'Lifeguard',
+      shift_requirement_id: f.req.id, role: 'Lifeguard', accepted_roles: ['Lifeguard'],
       start_time: '09:00', end_time: '13:00', hours: 4,
       required_count: 2, slot_index: 0, is_priority: false,
     },
     {
       date: '2026-06-01', shift_type_id: f.shiftType.id, shift_name: 'MixDay',
-      shift_requirement_id: f.req.id, role: 'Lifeguard',
+      shift_requirement_id: f.req.id, role: 'Lifeguard', accepted_roles: ['Lifeguard'],
       start_time: '09:00', end_time: '13:00', hours: 4,
       required_count: 2, slot_index: 1, is_priority: false,
     },

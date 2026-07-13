@@ -9,7 +9,23 @@ export interface CanvasSlot {
   shift_type_id: string;
   shift_name: string;
   shift_requirement_id: string;
+  /** The PREFERRED role for this slot. Drives ranking (primary-role fit) and all
+   *  manager-facing copy ("Lifeguard slot unfilled"). Always the first entry of
+   *  accepted_roles. */
   role: string;
+  /**
+   * D10 — EVERY role that may fill this slot. The manager sets this in the shift
+   * box ("Lifeguard or Headguard"); Watermark's Flex shift uses it today.
+   *
+   * The engine used to match on `role` ALONE, so a Headguard could never fill a
+   * "Lifeguard or Headguard" slot — the build reported a GAP while a qualified
+   * person sat available. The manager's stated intent was silently discarded.
+   *
+   * Eligibility now accepts an employee qualified for ANY of these. Ranking still
+   * PREFERS `role`, so behaviour is unchanged when there's only one accepted role
+   * (which is every other Watermark requirement).
+   */
+  accepted_roles: string[];
   start_time: string;
   end_time: string;
   hours: number;

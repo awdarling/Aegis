@@ -23,7 +23,10 @@ import { applyEventShifts } from './event-shifts';
 export interface CanvasRequirement {
   id: string;
   shift_type_id: string;
+  /** Preferred role — drives ranking and manager-facing copy. */
   role: string;
+  /** D10 — every role the manager said may fill this slot. Read from the DB. */
+  accepted_roles: string[];
   required_count: number;
   /** Engine-internal date scope stamp — not a DB column. */
   days_active: number[];
@@ -125,6 +128,10 @@ export function buildCanvas(
             shift_name: st.name,
             shift_requirement_id: req.id,
             role: req.role,
+            // D10 — carry the manager's full accepted-role list into the slot.
+            // Fall back to the preferred role so a malformed row can't make a
+            // slot unfillable by everyone.
+            accepted_roles: req.accepted_roles?.length ? req.accepted_roles : [req.role],
             start_time: st.start_time,
             end_time: st.end_time,
             hours,

@@ -15,7 +15,10 @@ import { env } from '../config/env';
 import { generateReply } from '../ai/claude';
 import { getSpecialNotes } from './special-notes';
 import type { InboundMessage, VerifiedContact } from '../security/types';
-import type { Employee, Availability, Event } from '../db/types';
+import type { Employee, Availability, Event, Policy } from '../db/types';
+// D12 — read the doubles policy through the canonical parser (policy_value_json),
+// never the display text. See D1 / docs/07_Data_Contract.md.
+import { parseConstraints } from '../lib/constraints/parser';
 import { coerceJsonObject } from '../utils/coerce-json';
 
 // Re-exported so existing tests importing it from this module keep working.
@@ -58,10 +61,26 @@ interface ScheduleData {
 
 export interface ShiftInfo {
   shift_name: string;
+  /** Preferred role — used in all manager- and employee-facing copy. */
   role: string;
+  /**
+   * D10 — every role that may fill this shift ("Lifeguard or Headguard").
+   * Emergency coverage used to match candidates on `role` ALONE, exactly like the
+   * build engine did — so a Headguard would never be offered as cover for a
+   * Lifeguard-or-Headguard slot, even in an emergency. The build now honours the
+   * manager's full list; coverage must agree, or the two channels disagree about
+   * who is qualified for the same shift.
+   * Optional so older stored sessions/outreach records still parse; falls back to [role].
+   */
+  accepted_roles?: string[];
   start_time: string;
   end_time: string;
   hours: number;
+}
+
+/** Every role that may fill this shift. Tolerates older records with no accepted_roles. */
+export function shiftAcceptedRoles(info: ShiftInfo): string[] {
+  return info.accepted_roles?.length ? info.accepted_roles : [info.role];
 }
 
 export interface OutreachResult {
@@ -144,6 +163,13 @@ interface CoverageCandidate {
   shift_hours: number;
   would_exceed_max: boolean;
   tier_label: 'Preferred' | 'Overtime Risk' | 'Already Working';
+  /**
+   * D12 — set only when the company's doubles_policy is 'never' AND this
+   * already-working employee is being surfaced anyway because NOBODY else can
+   * cover. The manager is choosing to break their own rule; say so out loud
+   * rather than let them do it unknowingly.
+   */
+  breaks_doubles_policy?: boolean;
 }
 
 // ── Store helpers ─────────────────────────────────────────────────────────────
@@ -469,18 +495,25 @@ async function findShiftInfo(
 
   const target = match ?? shiftTypes[0];
 
-  // Find required role for this shift type
+  // Find required role for this shift type.
+  // D10 — pull accepted_roles too. Matching cover candidates on the single `role`
+  // column is the same bug the build engine had: it silently discards the other
+  // roles the manager said could fill this shift.
   const { data: reqData } = await supabase
     .from('shift_requirements')
-    .select('role')
+    .select('role, accepted_roles')
     .eq('company_id', companyId)
     .eq('shift_type_id', target.id)
     .limit(1)
     .maybeSingle();
 
+  const req = reqData as { role: string; accepted_roles: string[] | null } | null;
+  const role = req?.role ?? 'General';
+
   return {
     shift_name: target.name,
-    role: (reqData as { role: string } | null)?.role ?? 'General',
+    role,
+    accepted_roles: req?.accepted_roles?.length ? req.accepted_roles : [role],
     start_time: target.start_time,
     end_time: target.end_time,
     hours: computeShiftHours(target.start_time, target.end_time),
@@ -626,7 +659,7 @@ async function buildCandidatePool(params: {
   const weeklyHoursMap = buildWeeklyHoursMap(schedule_data);
   const scheduledToday = buildScheduledTodaySet(schedule_data, shift_date);
 
-  const [empRes, availRes, toRes] = await Promise.all([
+  const [empRes, availRes, toRes, polRes] = await Promise.all([
     supabase.from('employees').select('*').eq('company_id', company_id).eq('active', true),
     supabase.from('availability').select('*').eq('company_id', company_id),
     supabase.from('time_off_requests').select('employee_id')
@@ -634,11 +667,34 @@ async function buildCandidatePool(params: {
       .eq('status', 'approved')
       .lte('start_date', shift_date)
       .gte('end_date', shift_date),
+    // D12 — the doubles policy. Read through parseConstraints so we consult the
+    // CANONICAL column (policy_value_json), not the display text. See D1.
+    supabase.from('policies').select('*').eq('company_id', company_id),
   ]);
 
   const employees = (empRes.data ?? []) as Employee[];
   const availability = (availRes.data ?? []) as Availability[];
   const onApprovedTO = new Set((toRes.data ?? []).map((r: { employee_id: string }) => r.employee_id));
+
+  // D12 — `doubles_policy` had three values but only two behaviours: the BUILD
+  // treats 'emergency_only' as 'never' (correct — a routine build shouldn't
+  // create doubles), and emergency coverage ignored the policy ENTIRELY, always
+  // offering already-working staff. So 'never' and 'emergency_only' were
+  // identical everywhere and the setting meant nothing.
+  //
+  // DECISION (Alexander, 2026-07-13): 'never' HARD-EXCLUDES already-working
+  // employees, even in an emergency. If the club says never doubles, Aegis does
+  // not offer one.
+  //
+  // SAFETY VALVE (flagged to Alexander): a strict reading can leave a shift with
+  // NO candidates at all when the only able person is already on. Handing the
+  // manager an empty list is worse than the rule it protects. So the exclusion is
+  // absolute UNLESS it would leave zero candidates across every tier — in which
+  // case the already-working staff are surfaced explicitly as a policy override,
+  // clearly labelled. 'never' still means never by default; it just never
+  // silently hands back nobody.
+  const doublesPolicy = parseConstraints((polRes.data ?? []) as Policy[]).settings.doublesPolicy;
+  const doublesBanned = doublesPolicy === 'never';
 
   // Group availability by employee
   const availByEmp = new Map<string, Availability[]>();
@@ -651,11 +707,18 @@ async function buildCandidatePool(params: {
   const tier2: CoverageCandidate[] = [];
   const tier3: CoverageCandidate[] = [];
 
+  // D10 — a candidate qualifies if they hold ANY role the manager said can fill
+  // this shift, not just the preferred one. Coverage previously checked only
+  // `shift_info.role`, so a Headguard was never offered to cover a
+  // "Lifeguard or Headguard" slot — the build engine and the call-out workflow
+  // disagreed about who was qualified for the very same shift.
+  const acceptedRoles = shiftAcceptedRoles(shift_info);
+
   for (const emp of employees) {
     if (emp.id === called_out_employee_id) continue;
     if (onApprovedTO.has(emp.id)) continue;
 
-    const hasRole = emp.qualified_roles.includes(shift_info.role);
+    const hasRole = acceptedRoles.some(r => emp.qualified_roles.includes(r));
     const isScheduledToday = scheduledToday.has(emp.id);
     const empAvail = availByEmp.get(emp.id) ?? [];
     const isAvailable = isAvailableForShift(dayOfWeek, shift_info.start_time, shift_info.end_time, empAvail);
@@ -695,6 +758,35 @@ async function buildCandidatePool(params: {
   tier2.sort(sortCandidates);
   tier3.sort(sortCandidates);
 
+  // D12 — enforce the doubles policy on the "Already Working" tier.
+  if (doublesBanned && tier3.length > 0) {
+    if (tier1.length > 0 || tier2.length > 0) {
+      // Someone can cover without a double. The company said never — so never.
+      // Drop them entirely; the manager is not even shown the option.
+      console.log(
+        `[coverage] doubles_policy=never — excluded ${tier3.length} already-working candidate(s) on ${shift_date} ${shift_info.shift_name}`,
+      );
+      return { tier1, tier2, tier3: [] };
+    }
+
+    // Nobody else can cover. Excluding these people would hand the manager an
+    // EMPTY list and leave the shift uncovered — worse than the rule protects
+    // against. Surface them, explicitly labelled as breaking the company's own
+    // no-doubles rule, so the manager chooses knowingly.
+    console.warn(
+      `[coverage] doubles_policy=never but NO other candidates exist on ${shift_date} ${shift_info.shift_name} — surfacing ${tier3.length} already-working employee(s) as an explicit policy override`,
+    );
+    return {
+      tier1,
+      tier2,
+      tier3: tier3.map(c => ({
+        ...c,
+        breaks_doubles_policy: true,
+        tier_label: 'Already Working' as const,
+      })),
+    };
+  }
+
   return { tier1, tier2, tier3 };
 }
 
@@ -712,8 +804,21 @@ function buildCandidateMessage(
   const showTier3 = tier1.length === 0 && tier2.length === 0;
   const display = [...tier1, ...tier2, ...(showTier3 ? tier3 : [])].slice(0, 5);
 
+  // D12 — when doubles_policy is 'never', already-working staff are excluded
+  // outright. They only reach this point when NOBODY else can cover, and in that
+  // case the manager must be told in plain words that picking one of these people
+  // breaks their own no-doubles rule. Never let that happen quietly.
+  const overridesDoubles = display.some(c => c.breaks_doubles_policy);
+  const doublesWarning = overridesDoubles
+    ? `\n\n⚠ Heads up: your company rule says never schedule doubles. Nobody else can cover this shift, so the people below are ALREADY WORKING today. Picking one means breaking that rule — your call.`
+    : '';
+
   const dateStr = formatDisplayDate(shiftDate);
-  const header = `Coverage needed: ${shiftInfo.shift_name} (${shiftInfo.role}) on ${dateStr}\nShift: ${shiftInfo.start_time}–${shiftInfo.end_time}\nAbsent: ${calledOutName}`;
+  const roleLabel = shiftAcceptedRoles(shiftInfo).join(' or ');
+  const header =
+    `Coverage needed: ${shiftInfo.shift_name} (${roleLabel}) on ${dateStr}\n` +
+    `Shift: ${shiftInfo.start_time}–${shiftInfo.end_time}\nAbsent: ${calledOutName}` +
+    doublesWarning;
 
   if (display.length === 0) {
     const reasons: string[] = [];

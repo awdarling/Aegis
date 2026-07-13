@@ -42,7 +42,7 @@ import {
   formatDispositionList,
   type EmployeeDisposition,
 } from '../lib/engine/dispositions';
-import type { ClosedDate } from '../lib/engine/canvas';
+import type { ClosedDate, CanvasRequirement } from '../lib/engine/canvas';
 import type { CanvasSlot, WeekState } from '../lib/engine/types';
 import type { InboundMessage, VerifiedContact } from '../security/types';
 import type {
@@ -509,23 +509,33 @@ function buildScheduleForWeek(ctx: BuildContext): BuildResult {
   const employeeById = new Map(data.employees.map(e => [e.id, e]));
 
   // 1) Build canvas (priority first, then chronological).
-  // Apply shift-overrides from special notes to requirements before canvas build.
-  // shift_requirements.days_active is dormant — only shift_types.days_active is
-  // consulted. The shift_type gate below is the single source of truth.
-  const overriddenReqs: ShiftRequirement[] = [];
+  //
+  // RULE 0 — the shift the MANAGER defined (`shift_types`) is the only source of
+  // a shift's name, hours and days. `shift_requirements` says only "N of role X".
+  // We build CanvasRequirements here: role + count, linked to the shift type by
+  // id, stamped with the single date they apply to. No copied shift attributes
+  // cross this boundary, so the engine cannot read a stale one.
+  const overriddenReqs: CanvasRequirement[] = [];
   const shiftOverrideMismatches: ShiftOverrideMismatch[] = [];
   for (const date of weekDates) {
     const dayOfWeek = new Date(date + 'T12:00:00Z').getUTCDay();
     const dateNotes = eventsByDate.get(date) ?? [];
     for (const st of data.shiftTypes) {
+      // The shift type's OWN days are the gate — always were.
       if (!st.days_active.includes(dayOfWeek)) continue;
-      const baseReqs = data.shiftRequirements.filter(req =>
-        (req.shift_type_id ? req.shift_type_id === st.id : req.shift_name === st.name)
-      );
+      // Linked by id only. The old `req.shift_name === st.name` fallback matched
+      // a requirement to a shift by a copied string; it's gone.
+      const baseReqs = data.shiftRequirements.filter(req => req.shift_type_id === st.id);
       const adjusted = applyShiftOverrides(baseReqs, dateNotes, st.name, date, shiftOverrideMismatches);
       for (const r of adjusted) {
-        // Tag this requirement with the date so canvas can scope properly.
-        overriddenReqs.push({ ...r, days_active: [dayOfWeek] });
+        overriddenReqs.push({
+          id: r.id,
+          shift_type_id: st.id,
+          role: r.role,
+          required_count: r.required_count,
+          // Date-scope stamp — engine-internal, never a DB value.
+          days_active: [dayOfWeek],
+        });
       }
     }
   }

@@ -15,6 +15,32 @@ That has already happened three times (stale `policy_value_json`; the Soteria bu
 never fired; a hallucinated Soteria verdict). **This file is the contract that makes those
 bugs impossible to reintroduce.**
 
+### Rule 0 — WHAT THE MANAGER SEES IS THE TRUTH (Alexander, 2026-07-13)
+
+> *"Whatever the manager sees, updates, and saves needs to be what the entire system uses
+> across all of its features. There shouldn't be anything saved anywhere other than what the
+> manager directly sees and interacts with, and that should be the only data any of the
+> workflows pull — otherwise it's not actually tailored to the client."*
+
+This outranks the three rules below; they are how you obey it. Concretely:
+
+- **The row behind the manager's own edit surface is the canonical row.** For shifts that is
+  `shift_types` (the shift box in the Data tab). For scheduling rules it is the Rules screen's
+  policy row. If an engine reads something else, the engine is wrong — not the manager.
+- **A field the manager cannot see must not influence behavior.** If code reads a column the
+  manager never sets, that column is either a cache (and must be provably derived) or a bug.
+- **Config-over-code multi-tenancy dies without this.** The whole product promise is that a
+  client's behavior comes from their own data. A hidden copy the manager never touched is, by
+  definition, not their data.
+
+**Known violation, being retired:** `shift_requirements` stores copies of the shift's
+`shift_name` / `start_time` / `end_time` / `days_active`, stamped from `shift_types` when the
+requirement is created and invisible to the manager. They drifted in production (D4). The
+engine never read them, and the simulator no longer does — but the columns still exist and
+some Homebase screens still read them. **End state: delete the four columns.** Blockers: all
+four are `NOT NULL`, and any `shift_requirements` row with `shift_type_id IS NULL` must be
+linked to its shift type first (the Quria Sandbox has 2 such rows; Watermark has 0).
+
 ### The three rules
 
 1. **One concept → one canonical column.** Never mirror a concept into two columns. If two
@@ -88,8 +114,8 @@ anywhere silently makes an employee unqualified.
 | **D2** | ✅ **FIXED 2026-07-13.** A swap could be `approved` while the schedule never changed. **Worse than first logged:** the *"your swap has been approved!"* emails to BOTH employees sat **outside** the `if (schedRow && receiver)` guard, so with no published schedule the row said approved, both people were told it was done, and the schedule was untouched. The person who believed they were covered wouldn't show up. Three silent exits (no schedule / no matching assignment / unchecked write), plus a **no-op write that reported success**. | — | **The schedule write is now authoritative.** `executeScheduleSwap`/`Trade` return `SwapApplyResult` (`{ok:true, schedule_id}` \| `{ok:false, code, reason}`) instead of `void`. `decision.ts` applies the schedule change **first**; only if it lands does it write `status='approved'` **together with the new `swap_requests.schedule_id` receipt**, and only then notify. On failure the row **stays `pending_manager`**, nobody is notified, and the manager gets a page telling them exactly why (e.g. "publish that week first"). The auto-approve path records `pending_manager` + honest "not final yet" messages instead of a false confirmation. **Requires migration `Add_Swap_Requests_Schedule_Id.sql`.** 7 new tests. |
 | **D3** | ✅ **FIXED 2026-07-13.** `pending.field` (LLM-supplied) was interpolated into `.update({[field]: value})` and `create_fields` was arbitrary LLM JSON — any column on an allowed table was writable, including `employees.company_id` (cross-tenant write). | — | `EDITABLE_COLUMNS` / `CREATABLE_COLUMNS` allow-lists in `operational-query.ts`, verified against `information_schema`. Enforced **twice**: at confirmation time (so the manager isn't asked to confirm a change we'll refuse) and again at the write. `company_id` is always forced from the verified contact, never the model. Deliberate omissions documented in-code (`aegis_access`, denormalized `shift_requirements` copies, structured `event_shifts`). |
 | **D3b** | ✅ **FIXED 2026-07-13 (found while fixing D3).** **Every write in `executeEdit` was unchecked** — `insert`/`update`/`delete` results were never inspected, so a rejected write (constraint violation, type error) fell straight through to the *"Done — updated"* reply. A pure orphan-output bug on the manager's most trusted surface. | Manager is told a change landed when the DB refused it. | All three now check `error` and throw; `handleEditConfirmation` passes the manager-facing reason through instead of a generic dead-end. |
-| **D4** | **`update_shift_type` never cascades to `shift_requirements`.** Soteria copies `shift_name/start_time/end_time/days_active` onto requirement rows at insert, then never updates them. | Engine is safe (it reads `shift_types`), but the **wage/coverage simulator reads `req.start_time/end_time`** → estimates diverge from reality. Legacy rows (`shift_type_id` null) match on a stale `shift_name` → their slots disappear. | Stop denormalizing (preferred), or cascade on update. |
-| **D5** | **`update_role` rename misses two tables.** It cascades to `employees.primary_role`, `employees.qualified_roles`, `shift_requirements.role/accepted_roles` — but **not `wage_rates.role`** and **not `shift_experience_rules.role`**. `delete_role` doesn't check them either. | Renaming "Lifeguard"→"Guard" silently orphans its wage rate and every veteran rule. A role can be deleted out from under its own wage rate. | Extend the cascade + the reference check. |
+| **D4** | ✅ **FIXED 2026-07-13.** `update_shift_type` never cascaded to the `shift_name/start_time/end_time/days_active` **copies** on `shift_requirements`. **Confirmed live, not theoretical: Watermark had 8 of 12 rows drifted** — `Day/Greeter` said 12:00–18:00 while the real shift type was 11:00–19:30 (**2.5h out**). The schedule engine was never affected (`canvas.ts` builds from `shift_types`). But the **Aegis time-off coverage simulator** read `req.start_time/end_time` to decide whether approving time off opens a gap → **wrong verdicts on a live workflow** — and **Homebase `GapResolverPanel`** built the employee-facing *"you've been added to the AM shift (11:30–15:30)"* message from it → **told the employee the wrong hours.** | — | Two-sided: (1) **Aegis** `schedule-simulator.ts` now resolves `start/end/name` from the parent `shift_type` (falls back to the local copy only for legacy `shift_type_id IS NULL` rows) — the canonical read. (2) **Homebase** `update_shift_type` now cascades to the mirrors, so every remaining mirror-reader stays honest. (3) `Repair_Shift_Requirement_Mirrors.sql` fixes the already-drifted rows. **End state: drop the mirror columns** (blocked today — they're NOT NULL and several UI components read them). |
+| **D5** | ✅ **FIXED 2026-07-13.** `update_role` rename cascaded to `employees.primary_role`, `employees.qualified_roles`, `shift_requirements.role`/`accepted_roles` — but **not `wage_rates.role`** and **not `shift_experience_rules.role`**. `delete_role` didn't check them either. Renaming "Lifeguard"→"Guard" silently orphaned the role's pay rate **and every veteran/experience rule scoped to it** — they stop applying, with no error and no gap flagged. | — | Cascade extended to both tables; `delete_role` now blocks on wage-rate and experience-rule references and names them. **Also corrected a dangerous comment:** `shift_requirements.role` was labelled "legacy" — it is in fact **the column the engine matches on**; `accepted_roles` is the inert one (D10). |
 
 ### P1 — the product promises something it cannot do
 

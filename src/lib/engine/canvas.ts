@@ -1,6 +1,33 @@
-import type { Event, ShiftRequirement, ShiftType } from '../../db/types';
+import type { Event, ShiftType } from '../../db/types';
 import type { CanvasSlot } from './types';
 import { applyEventShifts } from './event-shifts';
+
+// ── CanvasRequirement — what the engine actually needs ────────────────────────
+//
+// RULE 0 (docs/07_Data_Contract.md): what the manager sees is the truth.
+// The manager defines a shift's NAME, HOURS and DAYS once, in the shift box
+// (`shift_types`). A role requirement only says "this shift needs N of role X".
+//
+// `shift_requirements` historically ALSO carried copies of shift_name /
+// start_time / end_time / days_active, stamped at insert and invisible to the
+// manager. They drifted (D4). The engine must not depend on them, so the canvas
+// no longer accepts a raw DB row — it accepts this shape, which deliberately
+// contains NO shift attributes at all except the date-scoping stamp.
+//
+// `days_active` here is NOT the DB column. It is a per-date STAMP set by
+// schedule-build.ts, which scopes a requirement to a single day. It never comes
+// from `shift_requirements.days_active` — that column is being dropped.
+//
+// Everything else (name, hours) is read from the ShiftType. One source. The one
+// the manager edits.
+export interface CanvasRequirement {
+  id: string;
+  shift_type_id: string;
+  role: string;
+  required_count: number;
+  /** Engine-internal date scope stamp — not a DB column. */
+  days_active: number[];
+}
 
 const BUSY_DAY_EVENT_TYPES = new Set<Event['event_type']>([
   'holiday',
@@ -54,7 +81,7 @@ export interface CanvasResult {
 export function buildCanvas(
   weekDates: string[],
   shiftTypes: ShiftType[],
-  shiftRequirements: ShiftRequirement[],
+  shiftRequirements: CanvasRequirement[],
   events: Event[]
 ): CanvasResult {
   const slots: CanvasSlot[] = [];
@@ -76,15 +103,15 @@ export function buildCanvas(
     const activeShiftTypes = shiftTypes.filter(st => st.days_active.includes(dow));
 
     for (const st of activeShiftTypes) {
-      // days_active here is a per-date STAMP set by schedule-build.ts (line ~365)
-      // to scope per-date shift_overrides to a single day. It is NOT a read of
-      // the shift_requirements DB column — schedule-build.ts ignores that
-      // column. Callers passing un-stamped requirements must set
-      // days_active = the shift_type's days_active (or just call
-      // runScheduleBuild from workflows/schedule-build.ts instead).
+      // Matched by shift_type_id ONLY. The old code fell back to
+      // `req.shift_name === st.name` for rows with no shift_type_id — matching a
+      // requirement to a shift by a copied string. That fallback is gone: every
+      // requirement is now linked by id (enforced NOT NULL in the DB), so a
+      // renamed shift can never silently detach its own staffing.
+      //
+      // days_active is the per-date stamp from schedule-build.ts, not a DB read.
       const reqs = shiftRequirements.filter(req =>
-        (req.shift_type_id ? req.shift_type_id === st.id : req.shift_name === st.name) &&
-        req.days_active.includes(dow)
+        req.shift_type_id === st.id && req.days_active.includes(dow)
       );
 
       const hours = shiftHours(st.start_time, st.end_time);

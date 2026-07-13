@@ -1,5 +1,8 @@
 import { randomUUID } from 'crypto';
 import { supabase } from '../db/client';
+// RULE 0b — ONE question, ONE function. "Can this person work this slot?" is
+// answered in exactly one place for the whole product. See src/lib/qualification.ts.
+import { isQualified, acceptedRolesOf, roleLabel, resolveAcceptedRoles } from '../lib/qualification';
 import { coerceJsonObject } from '../utils/coerce-json';
 import { logActivity } from '../logger/activity-log';
 import { reply } from '../messaging/reply';
@@ -1283,14 +1286,32 @@ async function validateSwap(params: {
   receiver: Employee;
   shift_date: string;
   role: string;
+  /** RULE 0b — the shift being swapped, so we can resolve what it accepts. */
+  shift_name?: string;
+  /** Every role that may fill it. If omitted, resolved from Homebase. */
+  accepted_roles?: string[];
   shift_hours: number;
   policies: Policy[];
 }): Promise<ValidationResult> {
   const { company_id, requester_id, receiver, shift_date, role, shift_hours, policies } = params;
 
   // 1. Qualification check
-  if (!receiver.qualified_roles.includes(role)) {
-    return { valid: false, reason: `${receiver.name} is not qualified for the ${role} role.` };
+  //
+  // RULE 0b — the SAME function the build engine uses. This previously compared
+  // against the single `role` string, so a manager could configure a shift to
+  // accept "Lifeguard OR Headguard", the engine would happily SCHEDULE a
+  // Headguard onto it — and then this check would tell that same Headguard they
+  // were "not qualified" when they tried to pick the shift up. Two channels,
+  // two answers, same shift.
+  //
+  // `accepted_roles` may be supplied by the caller (from the assignment) or
+  // resolved from the manager's configuration in Homebase. Falls back to [role].
+  const acceptedRoles = params.accepted_roles?.length
+    ? params.accepted_roles
+    : await resolveAcceptedRoles(company_id, params.shift_name ?? '', role);
+
+  if (!isQualified(receiver.qualified_roles, acceptedRoles)) {
+    return { valid: false, reason: `${receiver.name} is not qualified for the ${roleLabel(acceptedRoles)} role.` };
   }
 
   // 2. Never-conflict check
@@ -1360,11 +1381,22 @@ async function buildSwapCandidates(params: {
   requester_id: string;
   shift_date: string;
   role: string;
+  /** RULE 0b — the shift's name, so we can resolve what it accepts if not given. */
+  shift_name?: string;
+  /** Every role the manager said may fill this shift. Resolved from Homebase if omitted. */
+  accepted_roles?: string[];
   shift_start: string;
   shift_end: string;
   shift_hours: number;
 }): Promise<Employee[]> {
   const { company_id, requester_id, shift_date, role, shift_start, shift_end, shift_hours } = params;
+
+  // RULE 0b — who can take this shift must match who the ENGINE would schedule
+  // onto it. Filtering on the single `role` here meant the broadcast/pickup list
+  // silently omitted everyone qualified via the manager's other accepted roles.
+  const acceptedRoles = params.accepted_roles?.length
+    ? params.accepted_roles
+    : await resolveAcceptedRoles(company_id, params.shift_name ?? '', role);
   const dayOfWeek = new Date(shift_date + 'T12:00:00Z').getUTCDay();
 
   const [empRes, availRes, toRes, schedRes] = await Promise.all([
@@ -1418,7 +1450,7 @@ async function buildSwapCandidates(params: {
     if (emp.id === requester_id) return false;
     if (onTO.has(emp.id)) return false;
     if (neverConflictIds.has(emp.id)) return false;
-    if (!emp.qualified_roles.includes(role)) return false;
+    if (!isQualified(emp.qualified_roles, acceptedRoles)) return false;
     const weeklyHours = weeklyHoursMap.get(emp.id) ?? 0;
     if (weeklyHours + shift_hours > emp.max_weekly_hours) return false;
     const empAvail = availByEmp.get(emp.id) ?? [];
@@ -1923,7 +1955,10 @@ export async function handleInitiateSwap(
     // requester's shift, AND the requester must be able to work the target's.
     const targetTakesYours = await validateSwap({
       company_id: contact.company_id, requester_id: contact.employee_id!,
-      receiver: targetEmployee, shift_date: shiftDate, role: shift.role, shift_hours: shiftHours, policies,
+      receiver: targetEmployee, shift_date: shiftDate, role: shift.role,
+      // RULE 0b — validate against every role the manager said can fill the shift.
+      shift_name: shift.shift_name, accepted_roles: acceptedRolesOf(shift),
+      shift_hours: shiftHours, policies,
     });
     if (!targetTakesYours.valid) {
       await reply(contact, message,
@@ -1935,7 +1970,9 @@ export async function handleInitiateSwap(
     }
     const youTakeTheirs = await validateSwap({
       company_id: contact.company_id, requester_id: targetEmployee.id,
-      receiver: requesterEmployee, shift_date: targetShift.date, role: targetShift.role, shift_hours: targetShiftHours, policies,
+      receiver: requesterEmployee, shift_date: targetShift.date, role: targetShift.role,
+      shift_name: targetShift.shift_name, accepted_roles: acceptedRolesOf(targetShift),
+      shift_hours: targetShiftHours, policies,
     });
     if (!youTakeTheirs.valid) {
       await reply(contact, message,
@@ -1984,6 +2021,9 @@ export async function handleInitiateSwap(
       requester_id: contact.employee_id!,
       shift_date: shiftDate,
       role: shift.role,
+      // RULE 0b — the assignment carries what the manager said can fill it.
+      shift_name: shift.shift_name,
+      accepted_roles: acceptedRolesOf(shift),
       shift_start: shift.start_time,
       shift_end: shift.end_time,
       shift_hours: shiftHours,
@@ -2169,6 +2209,9 @@ export async function handleSwapConfirmation(
       requester_id: contact.employee_id!,
       shift_date: pending.shift_date,
       role: pending.role,
+      // RULE 0b — pending records may predate accepted_roles; buildSwapCandidates
+      // resolves it from Homebase when we can only give it the shift name.
+      shift_name: pending.shift_name,
       shift_start: pending.shift_start,
       shift_end: pending.shift_end,
       shift_hours: shiftHours,

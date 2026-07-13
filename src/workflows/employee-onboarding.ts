@@ -502,12 +502,22 @@ function clampTime(time: string, min: string, max: string): string {
 
 // ── Messaging helpers ─────────────────────────────────────────────────────────
 
-function getStepSubject(step: string): string {
+// MULTI-TENANCY — the client's name comes from THEIR row in `companies`, never
+// from a string literal.
+//
+// This function used to hardcode "Welcome to Watermark" and
+// "Aegis — Watermark Country Club". Every employee of every future client would
+// have been welcomed to Watermark Country Club. `loadCompanyName()` already
+// existed two hundred lines up; the literals were never necessary.
+//
+// Nothing employee- or manager-facing may name a client in code. If you find
+// yourself typing a client's name into a string, that is a config value.
+function getStepSubject(step: string, companyName: string): string {
   switch (step) {
     case 'opt_in':
       return 'Confirm to receive scheduling messages from Aegis';
     case 'name_confirm':
-      return "Welcome to Watermark — Let's get you set up";
+      return `Welcome to ${companyName} — Let's get you set up`;
     case 'email':
       return 'One more thing — your email address';
     case 'role':
@@ -521,7 +531,7 @@ function getStepSubject(step: string): string {
     case 'complete':
       return "You're all set";
     default:
-      return 'Aegis — Watermark Country Club';
+      return `Aegis — ${companyName}`;
   }
 }
 
@@ -535,9 +545,11 @@ async function textEmployeeRaw(session: OnboardingSession, body: string): Promis
       console.warn(`[onboarding] cannot email ${session.employee_name}: no email on session`);
       return;
     }
+    // The client's own name, from their `companies` row. Never a literal.
+    const companyName = await loadCompanyName(session.company_id);
     await sendEmail({
       to: session.employee_email,
-      subject: getStepSubject(session.step),
+      subject: getStepSubject(session.step, companyName),
       text: body,
       company_id: session.company_id,
     });
@@ -590,7 +602,11 @@ function buildManagerMsg(session: OnboardingSession): InboundMessage {
     recipient: session.manager_recipient,
     body: '',
     channel: session.manager_channel,
-    raw_subject: 'Aegis — Watermark Country Club',
+    // MULTI-TENANCY — was hardcoded 'Aegis — Watermark Country Club'. This is the
+    // subject of the internal thread back to the MANAGER, so it doesn't need to
+    // name the client at all; describing the workflow is both client-agnostic and
+    // more useful. No client name may be hardcoded anywhere.
+    raw_subject: 'Aegis — Employee onboarding',
   };
 }
 

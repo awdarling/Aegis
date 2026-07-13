@@ -19,6 +19,8 @@ import type { Employee, Availability, Event, Policy } from '../db/types';
 // D12 — read the doubles policy through the canonical parser (policy_value_json),
 // never the display text. See D1 / docs/07_Data_Contract.md.
 import { parseConstraints } from '../lib/constraints/parser';
+// RULE 0b — ONE question, ONE function. See src/lib/qualification.ts.
+import { isQualified } from '../lib/qualification';
 import { coerceJsonObject } from '../utils/coerce-json';
 
 // Re-exported so existing tests importing it from this module keep working.
@@ -718,7 +720,9 @@ async function buildCandidatePool(params: {
     if (emp.id === called_out_employee_id) continue;
     if (onApprovedTO.has(emp.id)) continue;
 
-    const hasRole = acceptedRoles.some(r => emp.qualified_roles.includes(r));
+    // RULE 0b — the SAME function the build engine, the simulator and the swap
+    // paths use. Never reimplement this check.
+    const hasRole = isQualified(emp.qualified_roles, acceptedRoles);
     const isScheduledToday = scheduledToday.has(emp.id);
     const empAvail = availByEmp.get(emp.id) ?? [];
     const isAvailable = isAvailableForShift(dayOfWeek, shift_info.start_time, shift_info.end_time, empAvail);

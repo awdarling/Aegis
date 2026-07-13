@@ -339,6 +339,17 @@ User (manager): "Saturday night lifeguards should be all veterans this summer"
 User (manager): "at least two veterans on the morning shift"
 {"intent":"homebase_edit","confidence":"high","extracted":{"entity_type":"experience_rule"}}
 
+This ALSO includes rules about two people NOT working together (banned / avoided pairs).
+
+User (manager): "never schedule Marcus and Riley together"
+{"intent":"homebase_edit","confidence":"high","extracted":{"entity_type":"banned_pair"}}
+
+User (manager): "try not to put Jordan and Sam on the same shift"
+{"intent":"homebase_edit","confidence":"high","extracted":{"entity_type":"banned_pair"}}
+
+User (manager): "Marcus and Riley are fine to work together again"
+{"intent":"homebase_edit","confidence":"high","extracted":{"entity_type":"banned_pair"}}
+
 User (manager): "I want experienced staff covering the closing shift on weekends"
 {"intent":"homebase_edit","confidence":"high","extracted":{"entity_type":"experience_rule"}}
 

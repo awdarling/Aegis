@@ -55,6 +55,15 @@ export interface PendingEdit {
   // time, never by the LLM. Engine policies get policy_value_json; time-off
   // policies get a bare-number policy_value + policy_type='time_off'.
   policy_patch?: Record<string, unknown>;
+  // D8: for entity_type 'banned_pair'. Two employees, not one, so it can't ride
+  // the generic single-entity edit path.
+  conflict_pair?: {
+    employee_id_1: string;
+    employee_id_2: string;
+    name_1: string;
+    name_2: string;
+    severity: 'never' | 'avoid';
+  };
   expires_at: string;
 }
 
@@ -555,7 +564,8 @@ export async function handleHomebaseEdit(
   // Step 1: Parse the edit intent
   const parseSystem =
     `You are parsing a Homebase data edit request from a manager. ` +
-    `Return ONLY valid JSON: {"entity_type":"employee|event|policy|wage_rate|shift_type|shift_requirement|availability|schedule|experience_rule","entity_name":"...","action":"update|create|delete","field":"column_name_or_null","new_value":"...or null","create_fields":{} }. ` +
+    `Return ONLY valid JSON: {"entity_type":"employee|event|policy|wage_rate|shift_type|shift_requirement|availability|schedule|experience_rule|banned_pair","entity_name":"...","action":"update|create|delete","field":"column_name_or_null","new_value":"...or null","create_fields":{} }. ` +
+    `For a rule about TWO employees NOT working together ("never schedule Marcus and Riley together", "keep Jordan and Sam apart", "try not to put Alex with Casey", "Marcus and Riley can work together again"), entity_type="banned_pair" — the names, how strict it is, and whether they're setting or removing the rule stay in the message and are parsed downstream. ` +
     `For an availability change to an employee ("Maria can't work Wednesdays anymore", "set Maria to Mondays 9am-5pm", "give Jordan mornings off until Sept 1"), entity_type="availability", entity_name=the employee's name, action="update" — the day/time details stay in the message and are parsed downstream. ` +
     `For a VETERAN / EXPERIENCE staffing requirement on a shift ("Saturday nights should be all veterans", "at least two veterans on the morning shift", "veterans only on the closing shift this summer", "June 20 needs veteran lifeguards"), entity_type="experience_rule", action="create" — the shift, count, days, and season details stay in the message and are parsed downstream. ` +
     `For schedule edits (move/add/remove employee from shift), entity_type="schedule".`;
@@ -585,6 +595,19 @@ export async function handleHomebaseEdit(
     return;
   }
 
+  // D8 — banned / avoided PAIRS ("never schedule Marcus and Riley together").
+  // These need their own parse because they name TWO employees, not one, so the
+  // generic single-entity edit path cannot express them.
+  //
+  // CHANNEL PARITY (contract rule 3): a manager could set this in Homebase and
+  // through Soteria, but NOT by emailing Aegis — the assistant they're paying for
+  // couldn't do a thing their website could. Every rule a manager can set must be
+  // settable through every channel, or the AI employee is a second-class citizen.
+  if (parsed.entity_type === 'banned_pair') {
+    await handleBannedPairEdit(message, contact);
+    return;
+  }
+
   // Schedule edits by message aren't supported — point the manager to Homebase
   // rather than dead-end or misfire.
   if (parsed.entity_type === 'schedule') {
@@ -605,6 +628,126 @@ export async function handleHomebaseEdit(
   } else {
     await handleUpdateEdit(message, contact, parsed, table, personality);
   }
+}
+
+// ── D8 — banned / avoided pairs by message ────────────────────────────────────
+//
+// "Never schedule Marcus and Riley together."
+//
+// Writes `employee_conflicts`, which the engine reads: severity 'never' is a HARD
+// block at build time and in swap cohabitation checks; 'avoid' is a soft flag the
+// manager sees before approving a swap (D13). Same table, same semantics, same
+// engine as the Homebase UI and Soteria — this is a new CHANNEL, not a new
+// concept, and it deliberately writes nowhere else.
+async function handleBannedPairEdit(
+  message: InboundMessage,
+  contact: VerifiedContact
+): Promise<void> {
+  const parseSystem =
+    `You are parsing a manager's rule about two employees NOT being scheduled together. ` +
+    `Return ONLY JSON: {"employee_a":string|null,"employee_b":string|null,"severity":"never"|"avoid","action":"create"|"delete"}. ` +
+    `employee_a / employee_b = the two people's names as the manager wrote them. ` +
+    `severity: "never" = a hard rule (the schedule engine will never place them on the same shift) — use this for "never", "do not", "can't", "under no circumstances", or an unqualified "don't schedule them together". ` +
+    `"avoid" = a soft preference — use ONLY for clearly hedged wording ("try not to", "prefer not to", "if possible", "rather you didn't", "ideally"). When in doubt, choose "never": over-restricting is visible and easily undone, while under-restricting silently puts two people together the manager wanted apart. ` +
+    `action: "delete" when they are REMOVING the rule ("they can work together again", "drop that rule", "Marcus and Riley are fine now"), otherwise "create".`;
+
+  const parseText = await generateReply(parseSystem, message.body, []);
+  const r = coerceJsonObject<{
+    employee_a?: string | null;
+    employee_b?: string | null;
+    severity?: string | null;
+    action?: string | null;
+  }>(parseText);
+
+  if (!r?.employee_a || !r?.employee_b) {
+    await reply(contact, message,
+      `I couldn't tell which two people you meant. Try something like "never schedule Marcus and Riley together".`);
+    return;
+  }
+
+  // Resolve both names to real employees in THIS company.
+  const [empA, empB] = await Promise.all([
+    findEmployeeByNameForEdit(contact.company_id, r.employee_a),
+    findEmployeeByNameForEdit(contact.company_id, r.employee_b),
+  ]);
+
+  const missing = [
+    !empA ? r.employee_a : null,
+    !empB ? r.employee_b : null,
+  ].filter(Boolean) as string[];
+
+  if (missing.length > 0) {
+    await reply(contact, message,
+      `I couldn't find ${missing.map(n => `"${n}"`).join(' or ')} on your team. Check the spelling and try again.`);
+    return;
+  }
+  if (empA!.id === empB!.id) {
+    await reply(contact, message, `Those are the same person — I need two different people for that rule.`);
+    return;
+  }
+
+  const severity: 'never' | 'avoid' = r.severity === 'avoid' ? 'avoid' : 'never';
+  const action: 'create' | 'delete' = r.action === 'delete' ? 'delete' : 'create';
+
+  const confirmMsg = action === 'delete'
+    ? `Remove the rule keeping ${empA!.name} and ${empB!.name} apart? They'd be schedulable together again. (yes/no)`
+    : severity === 'never'
+      ? `Got it — ${empA!.name} and ${empB!.name} should never be scheduled on the same shift. I'll make that a hard rule the scheduler enforces. Confirm? (yes/no)`
+      : `Got it — I'll try to keep ${empA!.name} and ${empB!.name} off the same shift, but it won't block a schedule if it's the only way to cover. Confirm? (yes/no)`;
+
+  const pending: PendingEdit = {
+    company_id: contact.company_id,
+    manager_id: contact.matched_identifier,
+    table: 'employee_conflicts',
+    action,
+    entity_type: 'banned_pair',
+    entity_name: `${empA!.name} & ${empB!.name}`,
+    entity_id: null,
+    conflict_pair: {
+      employee_id_1: empA!.id,
+      employee_id_2: empB!.id,
+      name_1: empA!.name,
+      name_2: empB!.name,
+      severity,
+    },
+    expires_at: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+  };
+  await storePendingEdit(pending);
+  await reply(contact, message, confirmMsg);
+}
+
+/** Resolve an employee by name within a company. Exact match first, then a single
+ *  unambiguous partial. Returns null on no match OR on ambiguity — we will not
+ *  guess which of two people a manager meant when setting a rule about them. */
+async function findEmployeeByNameForEdit(
+  companyId: string,
+  name: string
+): Promise<{ id: string; name: string } | null> {
+  const trimmed = name.trim();
+  if (!trimmed) return null;
+
+  const { data: exact } = await supabase
+    .from('employees')
+    .select('id, name')
+    .eq('company_id', companyId)
+    .eq('active', true)
+    .ilike('name', trimmed)
+    .limit(2);
+
+  const exactRows = (exact ?? []) as { id: string; name: string }[];
+  if (exactRows.length === 1) return exactRows[0];
+  if (exactRows.length > 1) return null; // ambiguous — don't guess
+
+  const { data: partial } = await supabase
+    .from('employees')
+    .select('id, name')
+    .eq('company_id', companyId)
+    .eq('active', true)
+    .ilike('name', `%${trimmed}%`)
+    .limit(2);
+
+  const partialRows = (partial ?? []) as { id: string; name: string }[];
+  return partialRows.length === 1 ? partialRows[0] : null;
 }
 
 // Manager sets a veteran/experience staffing rule on a shift by message
@@ -970,11 +1113,19 @@ export async function handleEditConfirmation(
       },
     });
 
-    const isStructural = ['policies', 'wage_rates', 'shift_types', 'shift_requirements', 'shift_experience_rules'].includes(pending.table);
+    const isStructural = ['policies', 'wage_rates', 'shift_types', 'shift_requirements', 'shift_experience_rules', 'employee_conflicts'].includes(pending.table);
     const doneMsg = pending.table === 'availability'
       ? `Done — ${pending.entity_name}'s availability updated.`
       : pending.table === 'shift_experience_rules'
         ? `Done — the staffing rule for the ${pending.entity_name} shift is set. I'll enforce it on every build going forward.`
+      // D8 — say plainly what the rule will DO, so the manager knows whether it's a
+      // hard block or a soft preference without having to look it up.
+      : pending.table === 'employee_conflicts'
+        ? (pending.action === 'delete'
+            ? `Done — ${pending.conflict_pair?.name_1} and ${pending.conflict_pair?.name_2} can be scheduled together again.`
+            : pending.conflict_pair?.severity === 'never'
+              ? `Done — ${pending.conflict_pair?.name_1} and ${pending.conflict_pair?.name_2} will never be put on the same shift. I'll enforce that on every build, and flag it if a swap would break it.`
+              : `Done — I'll keep ${pending.conflict_pair?.name_1} and ${pending.conflict_pair?.name_2} apart where I can, and tell you before approving a swap that puts them together.`)
       : pending.action === 'create'
         ? `Done — ${pending.entity_type} "${pending.entity_name}" created.`
         : pending.action === 'delete'
@@ -1004,6 +1155,63 @@ export async function handleEditConfirmation(
 }
 
 async function executeEdit(pending: PendingEdit, companyId: string): Promise<void> {
+  // D8 — banned/avoided pair. Writes `employee_conflicts`, the SAME table the
+  // Homebase UI and Soteria write and the SAME one the engine reads (hard 'never'
+  // block at build + swap cohabitation; soft 'avoid' flag on swap approval).
+  // A new channel, not a new concept.
+  if (pending.table === 'employee_conflicts') {
+    const pair = pending.conflict_pair;
+    if (!pair) throw new Error('Missing the pair for that rule — send it again and I\'ll redo it.');
+
+    // The pair is unordered: (A,B) and (B,A) are the same rule. Match on both
+    // orderings so we never create a duplicate or fail to delete one.
+    const bothOrders =
+      `and(employee_id_1.eq.${pair.employee_id_1},employee_id_2.eq.${pair.employee_id_2}),` +
+      `and(employee_id_1.eq.${pair.employee_id_2},employee_id_2.eq.${pair.employee_id_1})`;
+
+    if (pending.action === 'delete') {
+      const { error: delErr } = await supabase
+        .from('employee_conflicts')
+        .delete()
+        .eq('company_id', companyId)
+        .or(bothOrders);
+      if (delErr) throw new Error(`Couldn't remove that rule: ${delErr.message}`);
+      return;
+    }
+
+    // Upsert-by-hand: an existing rule for this pair gets its severity updated
+    // rather than duplicated (two rows for one pair would make 'avoid' and
+    // 'never' both true for the same people).
+    const { data: existing, error: findErr } = await supabase
+      .from('employee_conflicts')
+      .select('id')
+      .eq('company_id', companyId)
+      .or(bothOrders)
+      .limit(1)
+      .maybeSingle();
+    if (findErr) throw new Error(`Couldn't check that rule: ${findErr.message}`);
+
+    if (existing) {
+      const { error: updErr } = await supabase
+        .from('employee_conflicts')
+        .update({ severity: pair.severity })
+        .eq('id', (existing as { id: string }).id)
+        .eq('company_id', companyId);
+      if (updErr) throw new Error(`Couldn't update that rule: ${updErr.message}`);
+      return;
+    }
+
+    const { error: insErr } = await supabase.from('employee_conflicts').insert({
+      company_id: companyId,
+      employee_id_1: pair.employee_id_1,
+      employee_id_2: pair.employee_id_2,
+      severity: pair.severity,
+      reason: 'Set by manager via Aegis',
+    });
+    if (insErr) throw new Error(`Couldn't save that rule: ${insErr.message}`);
+    return;
+  }
+
   // Availability is a multi-row replace (delete + insert), handled by the engine.
   if (pending.table === 'availability') {
     if (!pending.entity_id || !pending.availability_slots) throw new Error('Missing availability data for edit');
@@ -1055,6 +1263,36 @@ async function executeEdit(pending: PendingEdit, companyId: string): Promise<voi
 
   if (pending.action === 'delete') {
     if (!pending.entity_id) throw new Error('No entity_id for delete');
+
+    // D15 — deleting an EMPLOYEE must take everything that points at them with
+    // it. Otherwise their approved time-off keeps blocking coverage maths, and a
+    // banned-pair rule keeps being enforced about a person who no longer exists.
+    // Dependants first, employee last, so a mid-way failure never leaves the
+    // person gone but their rules alive. Mirrors the Soteria delete_employee
+    // cascade exactly — both channels, same behaviour.
+    if (pending.table === 'employees') {
+      const empId = pending.entity_id;
+      for (const [table, filter] of [
+        ['availability', 'employee_id'],
+        ['custom_availability', 'employee_id'],
+        ['time_off_requests', 'employee_id'],
+      ] as const) {
+        const { error } = await supabase
+          .from(table)
+          .delete()
+          .eq('company_id', companyId)
+          .eq(filter, empId);
+        if (error) throw new Error(`Couldn't remove ${pending.entity_name}'s ${table.replace(/_/g, ' ')}: ${error.message}`);
+      }
+      // employee_conflicts references the employee in EITHER id column.
+      const { error: confErr } = await supabase
+        .from('employee_conflicts')
+        .delete()
+        .eq('company_id', companyId)
+        .or(`employee_id_1.eq.${empId},employee_id_2.eq.${empId}`);
+      if (confErr) throw new Error(`Couldn't remove ${pending.entity_name}'s scheduling rules: ${confErr.message}`);
+    }
+
     const { error: delErr } = await supabase
       .from(pending.table)
       .delete()
@@ -1108,9 +1346,34 @@ async function executeEdit(pending: PendingEdit, companyId: string): Promise<voi
     newValue = (newValue as string).split(',').map(s => parseInt(s.trim()));
   }
 
+  const patch: Record<string, unknown> = { [pending.field]: newValue };
+
+  // D16 — a primary_role that isn't in qualified_roles makes the employee
+  // UNSCHEDULABLE FOR THEIR OWN JOB. The engine matches on qualified_roles
+  // (Rule 0b); primary_role only breaks ranking ties. So "make Jordan a
+  // Headguard" would set the title and leave the engine refusing to schedule
+  // Jordan as a Headguard — and the gap reason would say "not qualified" about
+  // the exact role on their record.
+  //
+  // Same heal as the Soteria path (soteria/execute update_employee): a manager
+  // promoting someone plainly means they can work the role. Both channels must
+  // behave identically — that is the whole point of the contract.
+  if (pending.table === 'employees' && pending.field === 'primary_role' && typeof newValue === 'string') {
+    const { data: current } = await supabase
+      .from('employees')
+      .select('qualified_roles')
+      .eq('id', pending.entity_id)
+      .eq('company_id', companyId)
+      .maybeSingle();
+    const qualified = (current as { qualified_roles: string[] } | null)?.qualified_roles ?? [];
+    if (!qualified.includes(newValue)) {
+      patch['qualified_roles'] = [newValue, ...qualified];
+    }
+  }
+
   const { error: updErr } = await supabase
     .from(pending.table)
-    .update({ [pending.field]: newValue })
+    .update(patch)
     .eq('id', pending.entity_id)
     .eq('company_id', companyId);
   // Previously unchecked: a rejected write (type error, constraint) still fell

@@ -5,7 +5,7 @@
 // directly (e.g. `npx ts-node src/lib/engine/__tests__/smoke.ts`).
 
 import { getWeekBounds } from '../week-bounds';
-import { buildCanvas, type CanvasResult } from '../canvas';
+import { buildCanvas, type CanvasResult, type CanvasRequirement } from '../canvas';
 import {
   buildEligibility,
   isAvailableForShift,

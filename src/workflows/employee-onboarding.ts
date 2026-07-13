@@ -23,6 +23,9 @@ import {
 } from '../messaging/brand';
 import { env } from '../config/env';
 import { withAnthropicRetry } from '../ai/claude';
+// D21 — reuse the real time-off flow's partial-window resolver so onboarding and
+// the normal flow cannot disagree about what "the afternoon" means.
+import { resolvePartialWindow } from './time-off';
 import { generateActionToken } from '../lib/aegis-actions/tokens';
 import { formatDateRange } from './time-off';
 import type { InboundMessage, VerifiedContact } from '../security/types';
@@ -874,14 +877,41 @@ export async function computeManagerAvailabilityChange(
 }
 
 // Replace an employee's availability with the given slots (delete + insert).
+// Replaces an employee's standing availability wholesale: delete every row, then
+// insert the new set. Read by the engine (lib/engine/eligibility.ts) and the
+// time-off coverage simulator — if this leaves the table in a bad state, the
+// employee is scheduled on days they can't work, or not scheduled at all.
+//
+// D20 — two defects, both of which could corrupt availability silently:
+//
+//  1. The DELETE had NO company_id predicate. `employee_id` is a globally-unique
+//     UUID so this could not actually cross tenants today — but it means the
+//     query's blast radius is bounded only by the caller passing a correct id,
+//     with no tenant guard behind it. Every other write in the codebase scopes
+//     by company_id; this one didn't. Now it does.
+//
+//  2. NEITHER the delete NOR the insert checked for an error. That is the bug
+//     with teeth: if the DELETE failed and the INSERT succeeded, the employee
+//     ends up with BOTH their old and new availability — overlapping windows
+//     that make them look available on days they just told us they can't work.
+//     Onboarding and the manager availability edit both call this, and both
+//     would have replied "got it, saved" over the top of it.
 export async function writeEmployeeAvailability(
   companyId: string,
   employeeId: string,
   slots: AvailabilitySlot[]
 ): Promise<void> {
-  await supabase.from('availability').delete().eq('employee_id', employeeId);
+  const { error: delErr } = await supabase
+    .from('availability')
+    .delete()
+    .eq('company_id', companyId)
+    .eq('employee_id', employeeId);
+  if (delErr) {
+    throw new Error(`Could not clear existing availability for ${employeeId}: ${delErr.message}`);
+  }
+
   if (slots.length > 0) {
-    await supabase.from('availability').insert(
+    const { error: insErr } = await supabase.from('availability').insert(
       slots.map(s => ({
         company_id: companyId,
         employee_id: employeeId,
@@ -890,6 +920,12 @@ export async function writeEmployeeAvailability(
         end_time: s.end_time,
       }))
     );
+    // The old rows are already gone. Failing loudly here means the caller can
+    // tell the employee it didn't save, instead of leaving them with NO
+    // availability on file and a cheerful confirmation message.
+    if (insErr) {
+      throw new Error(`Could not save availability for ${employeeId}: ${insErr.message}`);
+    }
   }
 }
 
@@ -913,26 +949,63 @@ async function claudeClassifyYesNo(message: string, question: string): Promise<'
   return text.trim().toLowerCase().startsWith('y') ? 'yes' : 'no';
 }
 
-async function claudeExtractDates(
-  message: string
-): Promise<{ start_date: string; end_date: string }[]> {
+// D21 — onboarding time-off used to extract ONLY start_date/end_date, and
+// time_off_requests.time_off_type DEFAULTS to 'full_day'. So a new hire who said
+// "I need the afternoon of July 20 off" had their WHOLE DAY blocked: the engine
+// then refuses to schedule them at all that day, and the coverage simulator
+// counts them as fully unavailable. Over-blocking a new employee's very first
+// availability is a bad first impression and quietly costs coverage.
+//
+// This now extracts the same shape the real time-off flow does
+// (ExtractedDateEntry in workflows/time-off.ts) and resolves partial windows
+// through the SAME exported helper — resolvePartialWindow — so onboarding and
+// the normal flow can't drift into disagreeing about what "afternoon" means.
+interface OnboardingDateEntry {
+  start_date: string;
+  end_date?: string | null;
+  time_off_type?: 'full_day' | 'partial' | null;
+  period_label?: 'morning' | 'afternoon' | 'evening' | null;
+  start_time?: string | null;
+  end_time?: string | null;
+}
+
+async function claudeExtractDates(message: string): Promise<OnboardingDateEntry[]> {
   const today = new Date().toISOString().split('T')[0];
   const response = await withAnthropicRetry(() =>
     client.messages.create({
       model: MODEL,
-      max_tokens: 256,
+      max_tokens: 512,
       system:
         `Extract time-off dates from a message. Today is ${today}. ` +
         `If only one date, set start_date = end_date. ` +
+        `time_off_type is "partial" when the person only needs PART of a day off ` +
+        `("the afternoon of the 20th", "I have to leave at 3 on Friday", "mornings that week"); ` +
+        `otherwise "full_day". ` +
+        `For a partial day, set period_label to morning/afternoon/evening when they use those words, ` +
+        `and/or start_time/end_time as "HH:MM" 24-hour when they give explicit times. ` +
         `Respond ONLY with valid JSON (no markdown): ` +
-        `{ "dates": [{ "start_date": "YYYY-MM-DD", "end_date": "YYYY-MM-DD" }] } ` +
+        `{ "dates": [{ "start_date": "YYYY-MM-DD", "end_date": "YYYY-MM-DD", ` +
+        `"time_off_type": "full_day"|"partial", "period_label": "morning"|"afternoon"|"evening"|null, ` +
+        `"start_time": "HH:MM"|null, "end_time": "HH:MM"|null }] } ` +
         `If none, return { "dates": [] }.`,
       messages: [{ role: 'user', content: message }],
     })
   );
 
   const text = response.content[0].type === 'text' ? response.content[0].text : '';
-  return coerceJsonObject<{ dates: { start_date: string; end_date: string }[] }>(text)?.dates ?? [];
+  return coerceJsonObject<{ dates: OnboardingDateEntry[] }>(text)?.dates ?? [];
+}
+
+/** Every date from start..end inclusive. */
+function eachDateInRangeLocal(start: string, end: string): string[] {
+  const out: string[] = [];
+  const d = new Date(`${start}T12:00:00Z`);
+  const last = new Date(`${end}T12:00:00Z`);
+  while (d <= last) {
+    out.push(d.toISOString().slice(0, 10));
+    d.setUTCDate(d.getUTCDate() + 1);
+  }
+  return out;
 }
 
 // ── Step senders ──────────────────────────────────────────────────────────────
@@ -1337,7 +1410,40 @@ async function handleTimeOffStep(
     return;
   }
 
-  for (const { start_date, end_date } of dates) {
+  for (const entry of dates) {
+    const start_date = entry.start_date;
+    const end_date = entry.end_date ?? entry.start_date;
+
+    // D21 — resolve a partial window through the SAME helper the real time-off
+    // flow uses, so "the afternoon of the 20th" means the same thing in both.
+    // If the entry claims to be partial but we can't pin a window, fall back to
+    // full_day rather than dropping the request — losing it entirely is worse
+    // than over-blocking, and the manager still sees it to approve.
+    let timeOffType: 'full_day' | 'partial' = 'full_day';
+    let partialDays: Array<{
+      date: string;
+      type: 'custom_hours';
+      shift_id: null;
+      shift_name: null;
+      start_time: string;
+      end_time: string;
+    }> | null = null;
+
+    if (entry.time_off_type === 'partial') {
+      const window = resolvePartialWindow(entry);
+      if (window) {
+        timeOffType = 'partial';
+        partialDays = eachDateInRangeLocal(start_date, end_date).map(date => ({
+          date,
+          type: 'custom_hours' as const,
+          shift_id: null,
+          shift_name: null,
+          start_time: window.start_time,
+          end_time: window.end_time,
+        }));
+      }
+    }
+
     const { data: torData } = await supabase
       .from('time_off_requests')
       .insert({
@@ -1348,6 +1454,10 @@ async function handleTimeOffStep(
         reason: 'submitted during onboarding',
         status: 'pending',
         requested_at: new Date().toISOString(),
+        // Previously omitted entirely — the column DEFAULTS to 'full_day', so an
+        // onboarding request could never be partial no matter what the new hire said.
+        time_off_type: timeOffType,
+        partial_days: partialDays,
       })
       .select('id')
       .single();

@@ -227,3 +227,43 @@ Any time a future Claude Code session or live debugging surfaces a difference be
 - **Implication for onboarding:** `getIncompleteEmployees` (`src/workflows/employee-onboarding.ts`) treats `!e.primary_role` as one of the "incomplete" signals, but since the column can never be null, **that branch is effectively dead** — incompleteness is driven in practice by missing `contact_phone`, missing `contact_email`, or no `availability` rows. To make an employee an onboarding candidate, clear the phone and/or delete their availability; do not attempt to null the role.
 - **Secondary quirk (logic, not schema):** `getIncompleteEmployees` flags `!contact_phone` as incomplete, so an **email-only** employee (no phone by design) will always read as "incomplete" even after completing onboarding. Harmless for the demo (the Homebase Onboarding tab drives status off the `onboarding_complete` activity log, not this helper), but worth tightening later — "reachable but unconfigured" should probably be phone-OR-email plus role/availability, not phone-AND-everything.
 - Row shape observed (Riley, sandbox): columns include `id, company_id, name, primary_role, qualified_roles(text[]), max_weekly_hours, contact_phone(nullable), contact_email, active, created_at, …, sex`. Consistent with `src/db/types.ts` being incomplete.
+
+---
+
+## 2026-07-13 — `events` has TWO columns for one concept; `event_shifts` is canonical, `shift_overrides` is legacy (a bad backfill was run and undone)
+
+### `public.events` — `event_shifts` (jsonb) vs `shift_overrides` (jsonb)
+- **Both columns exist and BOTH are read by the engine, at different stages:**
+  - `shift_overrides` — shape `{ "<shift_name>": { "<role>": <count> } }`. Read **PRE-canvas** by `applyShiftOverrides` (`src/workflows/schedule-build.ts`), which mutates `shift_requirements.required_count`.
+  - `event_shifts` — shape `[{ mode, shift_name, start_time?, end_time?, roles: [{role, count}] }]`. Read **POST-canvas** by `applyEventShifts` (`src/lib/engine/event-shifts.ts`, called from `src/lib/engine/canvas.ts:116`).
+- **`event_shifts` is a strict SUPERSET and is CANONICAL.** It expresses per-role counts (`mode:'stretch'` + `roles[].count`), shift **time** changes, and **brand-new one-off shifts** (`mode:'add'`) — none of which `shift_overrides` can represent. On collision `applyEventShifts` wins, because it *rebuilds* the role group (removes the existing slots for that role, then creates exactly `roles[].count`).
+- **Known defect in the legacy reader:** `applyShiftOverrides` **early-returns on the FIRST event whose `shift_overrides` matches the shift type name** — so with two events on one date, the second is silently discarded. Another reason to retire it.
+- **Incident (2026-07-13):** working from a wrong diagnosis (that Soteria's `event_shifts` writes were invisible to the engine), a backfill (`~/Desktop/Backfill_Event_Shift_Overrides.sql`) was written and **executed against live data**, deriving `shift_overrides` from `event_shifts` on 3 events. The premise was false — `applyEventShifts` was there all along, so Soteria's events were **always** honoured.
+- **Why it still had to be undone (not cosmetic):** Soteria does **not** sync `shift_overrides`, so a populated value is a stale, unsynced mirror. If an event is later edited to a **time-only** stretch (no `roles`), `applyEventShifts` does not rebuild the role group — and the **stale backfilled head-count would silently persist**, overriding what the manager asked for.
+- **Undo:** `~/Desktop/Undo_Event_Shift_Overrides_Backfill.sql` sets `shift_overrides = NULL where shift_overrides is not null and event_shifts is not null`. Safe because a pre-undo count proved **`legacy_overrides_only = 0`** — no event anywhere depends on `shift_overrides` alone (all 3 populated rows also had `event_shifts`). The original backfill file has been overwritten with a RETRACTED banner.
+- **Contract:** `events.event_shifts` is the single source of truth. **`events.shift_overrides` must stay NULL. Never dual-write them.** Homebase writes only `event_shifts` (a contract NOTE now sits in `soteria/execute/route.ts` above `add_event`). Tracked as **D14** in `docs/07_Data_Contract.md`; the follow-up is deleting `applyShiftOverrides` from the engine entirely.
+- Lesson (the real one): **before claiming a column is unread, grep the whole engine for the column name — not just the one file you're already in.** The reader lived in `src/lib/engine/event-shifts.ts`, a file not open at the time.
+
+---
+
+## 2026-07-13 (session 2) — `policies` has TWO reader families with OPPOSITE canonical columns
+
+### `public.policies` — verified against `information_schema`
+`id (uuid), company_id (uuid NOT NULL), policy_key (text NOT NULL), policy_value (text **NOT NULL**), policy_type (text **NOT NULL**), description (text), version (int NOT NULL default 1), created_at (timestamptz NOT NULL), policy_value_json (jsonb, NULLABLE)`.
+**There is no `updated_at` column** — do not try to set one.
+
+### The trap: one table, two conventions
+| | Engine family | Time-off family |
+|---|---|---|
+| Reader | `src/lib/constraints/parser.ts` (`parseConstraints`) | `src/lib/time-off-policies.ts` (`loadTimeOffPolicies`) |
+| **Canonical column** | **`policy_value_json`** | **`policy_value` (TEXT)**, read via `parseInt10` |
+| `policy_value` (text) | display only — never read | **THE SOURCE OF TRUTH** |
+| `policy_type` | **ignored entirely** | **LOAD-BEARING** — loader does `.eq('policy_type','time_off')`; lose it and the row is never SELECTed |
+| `policy_value_json` | canonical | ignored |
+| Keys | the exported `*_KEYS` sets in `parser.ts` | `max_consecutive_days_off`, `min_notice_period_days` |
+
+- **Why this is dangerous:** the two failure modes are mirror images. Write the ENGINE family as text → `policy_value_json` goes stale → **the engine keeps enforcing the old rule.** Write the TIME-OFF family as a human display string → `parseInt10('Two weeks')` → `NaN` → `null` → **the rule silently switches OFF.** Both report success to the manager.
+- **Live-data confirmation (Watermark `a1b2c3d4…`):** engine rows carry human text in `policy_value` (`doubles_policy` → `"Only in emergencies"`, `partial_shifts_allowed` → `"Disabled"`) with the real value in `policy_value_json` — proving `policy_value` is display-only *for that family*. Meanwhile `min_notice_period_days` has `policy_value='7'` and `policy_value_json=NULL` — proving the text column is canonical *for the other one*.
+- **Also found — two INERT keys.** `max_consecutive_days_off` and `min_notice_period_days` are **not** in the constraint parser's `ALL_RECOGNIZED` set, so `parseConstraints` drops them as `unknown_key`. That's correct (they're time-off concepts, not scheduling constraints, and `time-off-policies.ts` reads them) — but note `max_consecutive_days_off` is one character from the parser's `max_consecutive_days` alias. **A typo there would make a time-off rule get parsed as a scheduling constraint.** Watermark also has `policy_value_json=7` set on `max_consecutive_days_off`, which is harmless (nobody reads it) but is exactly the kind of orphan value that invites a wrong conclusion later.
+- **Rule going forward: never write `policies` directly.** Go through `src/lib/policy-write.ts` → `coercePolicyWrite(policy_key, raw)`, which resolves the family and returns the exact column patch. It imports the key sets **from the parser**, so the writer and the reader cannot drift apart. A key in neither family is refused rather than written as an inert row.
+- Fixes D1 (and the D3 allow-list) — see `docs/07_Data_Contract.md` and the 2026-07-13 session-2 roadmap entry.

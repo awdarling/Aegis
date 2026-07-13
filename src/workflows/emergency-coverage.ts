@@ -20,7 +20,9 @@ import type { Employee, Availability, Event, Policy } from '../db/types';
 // never the display text. See D1 / docs/07_Data_Contract.md.
 import { parseConstraints } from '../lib/constraints/parser';
 // RULE 0b — ONE question, ONE function. See src/lib/qualification.ts.
-import { isQualified } from '../lib/qualification';
+import { isQualified, acceptedRolesOf } from '../lib/qualification';
+// D18 — coverage must recompute the wage estimate like the swap paths do.
+import { computeWageEstimate } from '../lib/schedule-simulator';
 import { coerceJsonObject } from '../utils/coerce-json';
 
 // Re-exported so existing tests importing it from this module keep working.
@@ -402,11 +404,14 @@ export function swapScheduleAssignment(
 async function loadScheduleRow(
   companyId: string,
   date: string
-): Promise<{ id: string; data: ScheduleData } | null> {
+): Promise<{ id: string; data: ScheduleData; staffing_report: Record<string, unknown> | null } | null> {
   for (const status of ['published', 'draft'] as const) {
     const { data } = await supabase
       .from('schedules')
-      .select('id, data')
+      // D18 — staffing_report comes along so we can recompute estimated_wages
+      // after a coverage swap. Both shift-swap paths already did this; coverage
+      // rewrote `data` and left the wage estimate stale.
+      .select('id, data, staffing_report')
       .is('deleted_at', null)
       .eq('company_id', companyId)
       .lte('week_start', date)
@@ -415,7 +420,7 @@ async function loadScheduleRow(
       .order('generated_at', { ascending: false })
       .limit(1)
       .maybeSingle();
-    if (data) return data as { id: string; data: ScheduleData };
+    if (data) return data as { id: string; data: ScheduleData; staffing_report: Record<string, unknown> | null };
   }
   return null;
 }
@@ -446,9 +451,19 @@ async function applyCoverageToSchedule(params: {
   });
   if (!swapped) return { updated: false, reason: 'assignment_not_found' };
 
+  // D18 — recompute the wage estimate. Coverage rewrote `data` but left
+  // `staffing_report.estimated_wages` untouched, so after a call-out the
+  // manager's cost figure silently described a schedule that no longer existed —
+  // and the coverer may be paid at a different rate than the person they replaced.
+  // Both shift-swap paths already did this; coverage was the odd one out.
+  const wages = await computeWageEstimate(params.company_id, assignments);
+
   const { error } = await supabase
     .from('schedules')
-    .update({ data: { ...data, assignments } })
+    .update({
+      data: { ...data, assignments },
+      staffing_report: { ...(row.staffing_report ?? {}), estimated_wages: wages },
+    })
     .eq('id', row.id);
   if (error) return { updated: false, reason: error.message };
   return { updated: true };
@@ -470,6 +485,10 @@ async function findShiftInfo(
       return {
         shift_name: entry.shift_name,
         role: entry.role,
+        // RULE 0b — carry the manager's full accepted-role set off the assignment.
+        // Without this, coverage would silently narrow back to a single role and
+        // disagree with the engine that built the shift.
+        accepted_roles: acceptedRolesOf(entry),
         start_time: entry.start_time,
         end_time: entry.end_time,
         hours: entry.hours,

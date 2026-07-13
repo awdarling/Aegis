@@ -1035,6 +1035,21 @@ export function applyTradeToAssignments(
 
 // Executes an approved swap: updates the schedule data and recalculates wages.
 // Exported so the decision webhook can call it after manager approval.
+// ── D2: the schedule write is AUTHORITATIVE ───────────────────────────────────
+//
+// These two functions used to return void and `console.warn` + `return` on every
+// failure path. Their callers then marked the swap `approved` and emailed BOTH
+// employees "your swap has been approved!" — whether or not the schedule had
+// actually changed. An employee who believed they were covered simply didn't
+// show up.
+//
+// They now RETURN a result. A caller may not announce an approval it did not
+// get. `status='approved'` is written only together with the `schedule_id` the
+// swap actually landed on — schedule first, status second.
+export type SwapApplyResult =
+  | { ok: true; schedule_id: string }
+  | { ok: false; code: 'schedule_not_found' | 'no_matching_assignment' | 'write_failed'; reason: string };
+
 export async function executeScheduleSwap(
   companyId: string,
   scheduleId: string,
@@ -1043,31 +1058,46 @@ export async function executeScheduleSwap(
   requesterId: string,
   receiverId: string,
   receiverName: string
-): Promise<void> {
+): Promise<SwapApplyResult> {
   const { data: schedRow } = await supabase.from('schedules').select('id, data, staffing_report')
     .eq('id', scheduleId).is('deleted_at', null).single();
   if (!schedRow) {
-    // Loud on purpose: a silent return here means an approved pickup never lands
-    // on the schedule (the bug we chased). If the schedule can't be resolved, say so.
     console.warn(`[executeScheduleSwap] schedule ${scheduleId} not found/deleted — pickup for requester ${requesterId} on ${shiftDate} ${shiftName} was NOT applied`);
-    return;
+    return {
+      ok: false,
+      code: 'schedule_not_found',
+      reason: `The published schedule covering ${shiftDate} could not be found, so the swap was not applied.`,
+    };
   }
 
   const row = schedRow as { id: string; data: ScheduleData; staffing_report: Record<string, unknown> | null };
   const updatedAssignments = applySwapToAssignments(
     row.data.assignments, shiftDate, shiftName, requesterId, receiverId, receiverName
   );
+  // Previously this only warned and then wrote anyway — a no-op write that
+  // reported success. If nothing changed, the swap did NOT happen.
   if (!updatedAssignments.some((a, i) => a.employee_id !== row.data.assignments[i]?.employee_id)) {
     console.warn(`[executeScheduleSwap] no matching assignment for requester ${requesterId} on ${shiftDate} ${shiftName} in schedule ${scheduleId} — nothing updated`);
+    return {
+      ok: false,
+      code: 'no_matching_assignment',
+      reason: `No ${shiftName} assignment for that employee on ${shiftDate} exists in the published schedule, so there was nothing to swap.`,
+    };
   }
 
   const updatedData: ScheduleData = { ...row.data, assignments: updatedAssignments };
   const wages = await computeWageEstimate(companyId, updatedAssignments);
 
-  await supabase.from('schedules').update({
+  const { error: writeErr } = await supabase.from('schedules').update({
     data: updatedData as unknown as Record<string, unknown>,
     staffing_report: { ...(row.staffing_report ?? {}), estimated_wages: wages },
   }).eq('id', scheduleId);
+  if (writeErr) {
+    console.error(`[executeScheduleSwap] schedule write failed for ${scheduleId}:`, writeErr);
+    return { ok: false, code: 'write_failed', reason: 'The schedule could not be saved, so the swap was not applied.' };
+  }
+
+  return { ok: true, schedule_id: scheduleId };
 }
 
 // Which of the target's shifts the requester is trading FOR. Resolves your
@@ -1109,27 +1139,42 @@ export async function executeScheduleTrade(
   scheduleId: string,
   sideA: TradeSide,
   sideB: TradeSide
-): Promise<void> {
+): Promise<SwapApplyResult> {
   const { data: schedRow } = await supabase.from('schedules').select('id, data, staffing_report')
     .eq('id', scheduleId).is('deleted_at', null).single();
   if (!schedRow) {
     console.warn(`[executeScheduleTrade] schedule ${scheduleId} not found/deleted — trade between ${sideA.employee_id} and ${sideB.employee_id} was NOT applied`);
-    return;
+    return {
+      ok: false,
+      code: 'schedule_not_found',
+      reason: `The published schedule covering ${sideA.date} could not be found, so the trade was not applied.`,
+    };
   }
 
   const row = schedRow as { id: string; data: ScheduleData; staffing_report: Record<string, unknown> | null };
   const updatedAssignments = applyTradeToAssignments(row.data.assignments, sideA, sideB);
   if (!updatedAssignments.some((a, i) => a.employee_id !== row.data.assignments[i]?.employee_id)) {
     console.warn(`[executeScheduleTrade] no matching assignments for trade (${sideA.employee_id} ${sideA.date} ${sideA.shift_name} ↔ ${sideB.employee_id} ${sideB.date} ${sideB.shift_name}) in schedule ${scheduleId} — nothing updated`);
+    return {
+      ok: false,
+      code: 'no_matching_assignment',
+      reason: `One or both of those shifts aren't in the published schedule, so there was nothing to trade.`,
+    };
   }
 
   const updatedData: ScheduleData = { ...row.data, assignments: updatedAssignments };
   const wages = await computeWageEstimate(companyId, updatedAssignments);
 
-  await supabase.from('schedules').update({
+  const { error: writeErr } = await supabase.from('schedules').update({
     data: updatedData as unknown as Record<string, unknown>,
     staffing_report: { ...(row.staffing_report ?? {}), estimated_wages: wages },
   }).eq('id', scheduleId);
+  if (writeErr) {
+    console.error(`[executeScheduleTrade] schedule write failed for ${scheduleId}:`, writeErr);
+    return { ok: false, code: 'write_failed', reason: 'The schedule could not be saved, so the trade was not applied.' };
+  }
+
+  return { ok: true, schedule_id: scheduleId };
 }
 
 // ── Banned-pair (hard 'never' conflict) guard for pickups & trades ────────────
@@ -1622,7 +1667,70 @@ async function executeSwapNow(params: {
 }): Promise<void> {
   const { company_id, requester, receiver, shift_date, shift_name, role, shift_start, shift_end, schedule_id } = params;
 
-  // Create approved swap_request record
+  const dateStr = formatDisplayDate(shift_date);
+  const shiftDesc = `${shift_name} (${shift_start}–${shift_end}, ${role}) on ${dateStr}`;
+
+  // ── D2 — apply the schedule change BEFORE claiming the swap is approved ────
+  // This path used to insert status='approved' first, then apply the swap only
+  // `if (schedule_id)`, then tell BOTH employees "your swap has been confirmed!"
+  // unconditionally. With no published schedule — or an assignment that didn't
+  // match — the row said approved, both people were told it was done, and the
+  // schedule never changed.
+  const applied: SwapApplyResult = schedule_id
+    ? await executeScheduleSwap(company_id, schedule_id, shift_date, shift_name, requester.id, receiver.id, receiver.name)
+    : { ok: false, code: 'schedule_not_found', reason: `There's no published schedule covering ${dateStr} yet, so I couldn't put this on it.` };
+
+  const requesterMsgIn: InboundMessage = {
+    sender: params.requester_sender, recipient: params.requester_recipient, body: '',
+    channel: params.requester_channel, raw_subject: params.requester_raw_subject, thread_id: params.requester_thread_id,
+  };
+  const requesterContactIn: VerifiedContact = {
+    role: 'employee', company_id, employee_id: requester.id, user_id: null,
+    name: requester.name, matched_identifier: params.requester_sender, channel: params.requester_channel,
+  };
+
+  if (!applied.ok) {
+    // Do NOT auto-approve something that isn't on the schedule. Record it as
+    // awaiting the manager, and tell both people the truth: the cover is agreed,
+    // but it isn't live yet.
+    console.error(`[autoApproveSwap] apply failed (${applied.code}) — recording as pending_manager instead of approved: ${applied.reason}`);
+    const { data: pendingRow } = await supabase.from('swap_requests').insert({
+      company_id,
+      requesting_employee_id: requester.id,
+      receiving_employee_id: receiver.id,
+      shift_date,
+      shift_name,
+      role,
+      status: 'pending_manager',
+      initiated_by: 'aegis',
+      notes: `Auto-approval could not be applied to the schedule (${applied.code}): ${applied.reason} Needs a manager to publish the week and approve.`,
+    }).select('id').single();
+
+    await reply(
+      requesterContactIn, requesterMsgIn,
+      `${greeting(requester.name)} ${receiver.name} has agreed to cover your ${shiftDesc} — but I couldn't put it on the schedule yet because that week isn't published. Your manager will confirm it. Plan on working the shift until you hear it's locked in.`,
+    );
+    await sendOutreachMessage({
+      receiverEmail: receiver.contact_email ?? null,
+      receiverPhone: receiver.contact_phone ?? null,
+      aegisSmsNumber: params.aegis_sms_channel,
+      subject: `Covering ${requester.name}'s ${shift_name} shift — not final yet`,
+      text: `${greeting(receiver.name)} thanks for agreeing to cover ${requester.name}'s ${shiftDesc}. It isn't on the schedule yet because that week hasn't been published — your manager will confirm it. I'll let you know when it's locked in.`,
+      company_id,
+    });
+
+    await logActivity({
+      company_id,
+      action: 'swap_apply_failed',
+      entity_type: 'swap_request',
+      entity_id: (pendingRow as { id: string } | null)?.id ?? 'unknown',
+      summary: `Auto-approval NOT applied (${applied.code}): ${requester.name} ↔ ${receiver.name}, ${shift_name} on ${shift_date}. Left pending_manager.`,
+      metadata: { requester_id: requester.id, receiver_id: receiver.id, shift_date, shift_name, role, code: applied.code, reason: applied.reason },
+    });
+    return;
+  }
+
+  // The schedule changed. Now the approval is real — record it with its receipt.
   const { data: swapRow } = await supabase.from('swap_requests').insert({
     company_id,
     requesting_employee_id: requester.id,
@@ -1631,6 +1739,7 @@ async function executeSwapNow(params: {
     shift_name,
     role,
     status: 'approved',
+    schedule_id: applied.schedule_id,
     initiated_by: 'aegis',
     decided_at: new Date().toISOString(),
     decided_by: null, // UUID column — system auto-approval has no manager user; null (decided_at + notes record it). Writing a string here threw invalid-uuid and failed the insert.
@@ -1639,24 +1748,8 @@ async function executeSwapNow(params: {
 
   const swapId = (swapRow as { id: string } | null)?.id ?? 'unknown';
 
-  // Update schedule
-  if (schedule_id) {
-    await executeScheduleSwap(company_id, schedule_id, shift_date, shift_name, requester.id, receiver.id, receiver.name);
-  }
-
-  const dateStr = formatDisplayDate(shift_date);
-  const shiftDesc = `${shift_name} (${shift_start}–${shift_end}, ${role}) on ${dateStr}`;
-
   // Notify requester
-  const requesterMsg: InboundMessage = {
-    sender: params.requester_sender, recipient: params.requester_recipient, body: '',
-    channel: params.requester_channel, raw_subject: params.requester_raw_subject, thread_id: params.requester_thread_id,
-  };
-  const requesterContact: VerifiedContact = {
-    role: 'employee', company_id, employee_id: requester.id, user_id: null,
-    name: requester.name, matched_identifier: params.requester_sender, channel: params.requester_channel,
-  };
-  await reply(requesterContact, requesterMsg, `${greeting(requester.name)} your swap has been confirmed! ${receiver.name} will cover your ${shiftDesc}.`);
+  await reply(requesterContactIn, requesterMsgIn, `${greeting(requester.name)} your swap has been confirmed! ${receiver.name} will cover your ${shiftDesc}.`);
 
   // Notify receiver — EMAIL-FIRST (SMS only once A2P clears).
   await sendOutreachMessage({
@@ -1674,7 +1767,9 @@ async function executeSwapNow(params: {
     entity_type: 'swap_request',
     entity_id: swapId,
     summary: `Swap approved: ${requester.name} ↔ ${receiver.name} for ${shift_name} on ${shift_date}`,
-    metadata: { requester_id: requester.id, receiver_id: receiver.id, shift_date, shift_name, role, schedule_updated: !!schedule_id },
+    // schedule_updated is now a FACT, not an assumption: we only get here if the
+    // schedule write returned ok.
+    metadata: { requester_id: requester.id, receiver_id: receiver.id, shift_date, shift_name, role, schedule_updated: true, schedule_id: applied.schedule_id },
   });
 }
 

@@ -124,7 +124,13 @@ export function applyEventShifts(
       for (let i = 0; i < ro.count; i++) {
         working.push({
           date, shift_type_id: shiftTypeId, shift_name: name, shift_requirement_id: reqId,
-          role: ro.role, start_time, end_time, hours: shiftHours(start_time, end_time),
+          role: ro.role,
+          // D10 — an event's staffing spec names ONE role per entry ("4 Lifeguards
+          // on the Afternoon shift"), so the accepted set is exactly that role.
+          // Inheriting the template slot's wider accepted_roles would quietly let
+          // someone else fill a slot the manager explicitly asked a Lifeguard for.
+          accepted_roles: [ro.role],
+          start_time, end_time, hours: shiftHours(start_time, end_time),
           required_count: ro.count, slot_index: i, is_priority: true,
         });
       }
@@ -145,6 +151,8 @@ export function applyEventShifts(
           shift_name: shift.shift_name,
           shift_requirement_id: `event:${eventId}:${shift.shift_name}:${ro.role}`,
           role: ro.role,
+          // D10 — see above: a one-off event shift names its role explicitly.
+          accepted_roles: [ro.role],
           start_time, end_time, hours,
           required_count: ro.count,
           slot_index: i,

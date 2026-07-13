@@ -12,6 +12,28 @@ export function isQualifiedForRole(emp: Employee, role: string): boolean {
   return emp.qualified_roles.includes(role);
 }
 
+/**
+ * D10 — can this employee fill this slot at all?
+ *
+ * A slot may accept several roles ("Lifeguard or Headguard"). The engine used to
+ * check only `slot.role`, so the manager's other accepted roles were silently
+ * ignored and the shift went unfilled. Accept an employee qualified for ANY of
+ * them.
+ *
+ * Falls back to `slot.role` if accepted_roles is somehow empty, so a malformed
+ * row can never make a slot unfillable by everyone.
+ */
+export function isQualifiedForSlot(emp: Employee, slot: CanvasSlot): boolean {
+  const accepted = slot.accepted_roles?.length ? slot.accepted_roles : [slot.role];
+  return accepted.some(r => emp.qualified_roles.includes(r));
+}
+
+/** Manager-facing description of what a slot needs. "Lifeguard" or "Lifeguard or Headguard". */
+export function slotRoleLabel(slot: CanvasSlot): string {
+  const accepted = slot.accepted_roles?.length ? slot.accepted_roles : [slot.role];
+  return accepted.length === 1 ? accepted[0] : accepted.join(' or ');
+}
+
 // Slot's time window must be fully contained inside one of the employee's
 // availability rows for the matching day-of-week.
 export function isAvailableForShift(
@@ -154,8 +176,9 @@ export function buildEligibility(
       removed.set(e.id, 'veteran-only date');
       continue;
     }
-    if (!isQualifiedForRole(e, slot.role)) {
-      removed.set(e.id, `not qualified for ${slot.role}`);
+    // D10 — accept ANY of the slot's accepted roles, not just the preferred one.
+    if (!isQualifiedForSlot(e, slot)) {
+      removed.set(e.id, `not qualified for ${slotRoleLabel(slot)}`);
       continue;
     }
     if (!isAvailableForShift(e, slot, availByEmp)) {

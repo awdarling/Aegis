@@ -532,6 +532,11 @@ function buildScheduleForWeek(ctx: BuildContext): BuildResult {
           id: r.id,
           shift_type_id: st.id,
           role: r.role,
+          // D10 — the manager's full accepted-role list ("Lifeguard or Headguard").
+          // The engine used to ignore this entirely and match on `role` alone, so
+          // a Headguard could never fill Watermark's Flex slot and the build
+          // reported a gap with a qualified person standing right there.
+          accepted_roles: r.accepted_roles?.length ? r.accepted_roles : [r.role],
           required_count: r.required_count,
           // Date-scope stamp — engine-internal, never a DB value.
           days_active: [dayOfWeek],

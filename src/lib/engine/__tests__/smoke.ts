@@ -183,6 +183,7 @@ function makeSlot(opts: Partial<CanvasSlot> & { date: string; start_time: string
     shift_name: opts.shift_name ?? 'Shift',
     shift_requirement_id: opts.shift_requirement_id ?? 'req',
     role: opts.role ?? 'Lifeguard',
+    accepted_roles: [opts.role ?? 'Lifeguard'],
     start_time: opts.start_time,
     end_time: opts.end_time,
     hours: opts.hours ?? 4,
@@ -335,12 +336,9 @@ function runDaysActiveConsolidationSmoke(): void {
   const stale: ShiftRequirement = {
     id: 'req-greeter',
     company_id: COMPANY_ID,
-    shift_name: 'Weekday Greeter',
     role: 'Greeter',
+    accepted_roles: ['Greeter'],
     required_count: 1,
-    start_time: '09:00',
-    end_time: '13:00',
-    days_active: [], // ← the bug condition
     shift_type_id: ST_ID,
   };
 
@@ -449,12 +447,9 @@ function runAttributeMixUnsatisfiabilitySmoke(): void {
     const req: ShiftRequirement = {
       id: 'req-test-greeter',
       company_id: COMPANY_ID,
-      shift_name: 'Test Greeter',
       role: 'Greeter',
+      accepted_roles: ['Greeter'],
       required_count: 1,
-      start_time: '09:00',
-      end_time: '13:00',
-      days_active: [1],
       shift_type_id: ST_ID,
     };
     const male: Employee = {
@@ -526,12 +521,9 @@ function runAttributeMixUnsatisfiabilitySmoke(): void {
     const req: ShiftRequirement = {
       id: 'req-test-big',
       company_id: COMPANY_ID,
-      shift_name: 'Test Big Shift',
       role: 'Lifeguard',
+      accepted_roles: ['Lifeguard'],
       required_count: 4,
-      start_time: '09:00',
-      end_time: '13:00',
-      days_active: [1],
       shift_type_id: ST_ID,
     };
 
@@ -651,17 +643,17 @@ function runAttributeMixSwapPassSmoke(): void {
     created_at: '2026-01-01T00:00:00Z',
   };
 
-  const buildReqs = (stId: string, shiftName: string, layout: Array<{ role: string; count: number }>): ShiftRequirement[] =>
+  // A requirement no longer carries the shift's name/hours/days — those live on
+  // shift_types, the row the manager edits (Rule 0; columns dropped 2026-07-13).
+  // `shiftName` is kept in the signature for call-site readability only.
+  const buildReqs = (stId: string, _shiftName: string, layout: Array<{ role: string; count: number }>): ShiftRequirement[] =>
     layout.map((spec, i) => ({
       id: `req-${stId}-${i}`,
       company_id: COMPANY_ID,
-      shift_name: shiftName,
-      role: spec.role,
-      required_count: spec.count,
-      start_time: '09:00',
-      end_time: '13:00',
-      days_active: [1],
       shift_type_id: stId,
+      role: spec.role,
+      accepted_roles: [spec.role],
+      required_count: spec.count,
     }));
 
   // ── Fixture A: 4 positions (1 HG, 2 LG, 1 Mgr), 4 females + 1 male LG-only ─
@@ -919,12 +911,9 @@ function runAttributeMixDiagnosticSmoke(): void {
   const req: ShiftRequirement = {
     id: 'req-test-2pos',
     company_id: COMPANY_ID,
-    shift_name: 'Test 2-Position',
     role: 'Lifeguard',
+    accepted_roles: ['Lifeguard'],
     required_count: 2,
-    start_time: '09:00',
-    end_time: '13:00',
-    days_active: [1],
     shift_type_id: ST_ID,
   };
 
@@ -1067,12 +1056,9 @@ function runCoverageGapDispositionSmoke(): void {
   const req: ShiftRequirement = {
     id: 'req-test-gap',
     company_id: COMPANY_ID,
-    shift_name: 'Test Gap Shift',
     role: 'Greeter',
+    accepted_roles: ['Greeter'],
     required_count: 1,
-    start_time: '09:00',
-    end_time: '13:00',
-    days_active: [1],
     shift_type_id: ST_ID,
   };
 
@@ -1215,12 +1201,9 @@ function runClosureEventSmoke(): void {
   const req: ShiftRequirement = {
     id: 'req-closure',
     company_id: COMPANY_ID,
-    shift_name: 'Daily Shift',
     role: 'Greeter',
+    accepted_roles: ['Greeter'],
     required_count: 1,
-    start_time: '09:00',
-    end_time: '13:00',
-    days_active: [1, 2, 3, 4, 5],
     shift_type_id: ST_ID,
   };
 
@@ -1386,12 +1369,9 @@ function runVeteranEnrichmentSmoke(): void {
   const req: ShiftRequirement = {
     id: 'req-vet',
     company_id: COMPANY_ID,
-    shift_name: 'Vet Shift',
     role: 'Lifeguard',
+    accepted_roles: ['Lifeguard'],
     required_count: 1,
-    start_time: '09:00',
-    end_time: '13:00',
-    days_active: [1],
     shift_type_id: ST_ID,
   };
 
@@ -1517,12 +1497,9 @@ function runShiftOverrideMismatchSmoke(): void {
   const req: ShiftRequirement = {
     id: 'req-override-mm',
     company_id: COMPANY_ID,
-    shift_name: 'Override Shift',
     role: 'Lifeguard',
+    accepted_roles: ['Lifeguard'],
     required_count: 1,
-    start_time: '09:00',
-    end_time: '13:00',
-    days_active: [1],
     shift_type_id: ST_ID,
   };
 

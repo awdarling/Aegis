@@ -138,17 +138,32 @@ export interface Database {
           created_at: string;
         };
       };
+      // A role requirement says ONE thing: "this shift needs N of role X".
+      //
+      // It used to ALSO carry copies of the parent shift's name/start/end/days.
+      // Those copies were invisible to the manager, drifted in production, and
+      // are DROPPED as of 2026-07-13 (Drop_Shift_Requirement_Mirrors.sql).
+      // A shift's name, hours and days live in exactly one place: `shift_types`
+      // — the shift box the manager edits. See docs/07_Data_Contract.md Rule 0.
+      //
+      // `shift_type_id` is NOT NULL: every requirement resolves its shift by id,
+      // never by a copied name string.
       shift_requirements: {
         Row: {
           id: string;
           company_id: string;
-          shift_name: string;
+          shift_type_id: string;
+          /** Preferred role. Drives ranking and manager-facing copy. Always accepted_roles[0]. */
           role: string;
+          /**
+           * D10 — EVERY role that may fill this slot ("Lifeguard or Headguard").
+           * The manager sets this; the engine ignored it until 2026-07-13 and
+           * matched on `role` alone, so a Headguard could never fill a
+           * Lifeguard-or-Headguard slot and the build reported a phantom gap.
+           * NOT NULL in the DB.
+           */
+          accepted_roles: string[];
           required_count: number;
-          start_time: string;
-          end_time: string;
-          days_active: number[];
-          shift_type_id: string | null;
         };
       };
       shift_experience_rules: {

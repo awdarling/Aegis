@@ -33,13 +33,19 @@ This outranks the three rules below; they are how you obey it. Concretely:
   client's behavior comes from their own data. A hidden copy the manager never touched is, by
   definition, not their data.
 
-**Known violation, being retired:** `shift_requirements` stores copies of the shift's
-`shift_name` / `start_time` / `end_time` / `days_active`, stamped from `shift_types` when the
-requirement is created and invisible to the manager. They drifted in production (D4). The
-engine never read them, and the simulator no longer does — but the columns still exist and
-some Homebase screens still read them. **End state: delete the four columns.** Blockers: all
-four are `NOT NULL`, and any `shift_requirements` row with `shift_type_id IS NULL` must be
-linked to its shift type first (the Quria Sandbox has 2 such rows; Watermark has 0).
+**First violation found — and now ELIMINATED (2026-07-13).** `shift_requirements` stored
+copies of `shift_name` / `start_time` / `end_time` / `days_active`, stamped from `shift_types`
+at creation and invisible to the manager. They drifted in production (D4 — 8 of 12 Watermark
+rows, one by 2.5h) and were read by the Aegis coverage simulator, Homebase's `GapResolverPanel`
+(which emails an employee their shift hours) and `ManualScheduleBuilder` (which writes the
+schedule). **All readers now join `shift_types`; all writers stopped; `shift_type_id` is
+`NOT NULL`; the four columns are DROPPED** (`Drop_Shift_Requirement_Mirrors.sql`). A shift is
+now defined in exactly one place: the shift box. **The schema itself now enforces Rule 0 here —
+there is nowhere else to put it.**
+
+**Use this as the template.** When you find the next Rule 0 violation, the sequence is:
+(1) make every engine/workflow read the manager's row, (2) stop every writer copying it,
+(3) link/enforce the FK, (4) **drop the copy** — don't settle for keeping it in sync.
 
 ### The three rules
 
@@ -121,8 +127,8 @@ anywhere silently makes an employee unqualified.
 
 | ID | Drift | Impact | Fix |
 |---|---|---|---|
-| **D6** | **Soteria's capability list over-promises.** `lib/soteria/capabilities.ts` tells the model she can *"approve or deny time-off"*, *"arrange emergency coverage"*, and *"swap a shift"*. **No executor action exists for any of the three.** | A manager asks Soteria to approve time off → dead end or improvisation. Same failure shape as the build bug. | Either implement the actions or stop advertising them. |
-| **D7** | **No `distribute_schedule` action.** She can `trigger_schedule_build` but cannot send it out. | Manager must leave the chat and click a button — breaks the "never learn the system" promise. | Add the action (executor + planner vocabulary). |
+| **D6** | ✅ **FIXED 2026-07-13.** `capabilities.ts` is a **shared** Soteria+Aegis product list — and it was injected into Soteria's system prompt under the heading *"WHAT YOU CAN DO FOR THIS USER"*. So the model read *"approve or deny time-off"*, *"arrange emergency coverage"* and *"swap a shift"* as **her** abilities. **No executor exists for any of the three.** | — | **We did NOT build those actions — we stopped claiming them** (Alexander's call: Soteria configures, Aegis converses; if she absorbs his job the manager stops using him and the product loses its point). New `soteriaScopeSection()` states a **hard boundary**: what she does herself, what she may **ASK AEGIS** to do, and what is **Aegis's alone** — with the exact hand-off wording ("That one's Aegis's job — email him and say…"). The product list is retained but re-labelled as the product, not her. |
+| **D7** | ✅ **FIXED 2026-07-13.** No `distribute_schedule` action — she could build but not send. | — | Added, as a thin pass-through to the **same** `/internal/distribute-schedule` endpoint the Homebase Distribute button uses (no second implementation). **Emails every employee**, so: company-scoped schedule lookup (never trusts the LLM's `schedule_id`), explicit confirmation required, and Aegis's `already_distributed` guard means an accidental second confirm cannot spam 30 people. All copy says **"I've asked Aegis to…"**, never "I've done it." Also fixed stale UI copy promising *"you'll receive a text"* — SMS is off under EMAIL_ONLY. |
 | **D8** | **Banned pairs are Soteria/UI-only.** `employee_conflicts` has no entry in the Aegis manager-edit `ENTITY_TABLE`, and no Aegis workflow writes it. | A manager cannot set "never schedule these two together" over email. | Add to the Aegis edit surface. |
 
 ### P2 — configured-but-inert (writers set it; nothing reads it)

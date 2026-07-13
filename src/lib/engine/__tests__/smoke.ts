@@ -58,10 +58,15 @@ type _WeekBounds = (offset?: number) => { weekStart: string; weekEnd: string };
 const _wb: _WeekBounds = getWeekBounds;
 void _wb;
 
+// buildCanvas takes CanvasRequirement — role + count + shift_type_id + a date
+// stamp — NOT a raw shift_requirements row. Rule 0: no copied shift attributes
+// cross into the engine; name/hours/days come from the ShiftType the manager
+// defined. If this assertion ever fails because someone widened it back to
+// ShiftRequirement, that is the regression.
 type _Canvas = (
   weekDates: string[],
   shiftTypes: ShiftType[],
-  shiftRequirements: ShiftRequirement[],
+  shiftRequirements: CanvasRequirement[],
   events: Event[]
 ) => CanvasResult;
 const _c: _Canvas = buildCanvas;

@@ -267,3 +267,28 @@ Any time a future Claude Code session or live debugging surfaces a difference be
 - **Also found — two INERT keys.** `max_consecutive_days_off` and `min_notice_period_days` are **not** in the constraint parser's `ALL_RECOGNIZED` set, so `parseConstraints` drops them as `unknown_key`. That's correct (they're time-off concepts, not scheduling constraints, and `time-off-policies.ts` reads them) — but note `max_consecutive_days_off` is one character from the parser's `max_consecutive_days` alias. **A typo there would make a time-off rule get parsed as a scheduling constraint.** Watermark also has `policy_value_json=7` set on `max_consecutive_days_off`, which is harmless (nobody reads it) but is exactly the kind of orphan value that invites a wrong conclusion later.
 - **Rule going forward: never write `policies` directly.** Go through `src/lib/policy-write.ts` → `coercePolicyWrite(policy_key, raw)`, which resolves the family and returns the exact column patch. It imports the key sets **from the parser**, so the writer and the reader cannot drift apart. A key in neither family is refused rather than written as an inert row.
 - Fixes D1 (and the D3 allow-list) — see `docs/07_Data_Contract.md` and the 2026-07-13 session-2 roadmap entry.
+
+---
+
+## 2026-07-13 (session 4) — `shift_requirements` MIRRORS `shift_types`, and the mirror is STALE in production
+
+### `public.shift_requirements` — four columns are copies, not facts
+`shift_name`, `start_time`, `end_time`, `days_active` are **denormalized copies** of the parent `shift_types` row (`name`, `start_time`, `end_time`, `days_active`), joined via `shift_requirements.shift_type_id`. They are written once at INSERT and were **never updated** when the shift type changed.
+
+- **CANONICAL is `shift_types`.** The schedule engine builds slots from it (`src/lib/engine/canvas.ts:86-102`) — it matches a requirement to a type by `shift_type_id` (falling back to `req.shift_name === st.name` only when `shift_type_id` is null) and then takes name/start/end **from the shift_type**. So schedules have always been correct.
+- **MEASURED LIVE (Watermark `a1b2c3d4…`, 2026-07-13): 8 of 12 requirement rows were drifted.** Examples:
+  - `Day / Greeter` — requirement `12:00–18:00`, shift type `11:00–19:30` (**2.5 hours out**)
+  - `AM / Headguard` + `AM / Lifeguard` — requirement start `11:30`, shift type `11:00`
+  - `AM Weekend / Headguard` + `/ Lifeguard` — requirement start `09:30`, shift type `09:00`
+  - `PM / Headguard` + `/ Lifeguard` — requirement end `21:00`, shift type `21:15`
+  - Several rows also had a drifted `shift_name`.
+- **Who was reading the stale copy (this is the damage):**
+  - **Aegis `src/lib/schedule-simulator.ts`** — used `req.start_time`/`req.end_time` to decide whether approving a time-off request opens a coverage gap. Wrong hours → **wrong coverage verdict on a live employee-facing workflow.** (Interestingly it already gated `days_active` through `shift_types` with a comment saying the copy "may be stale" — the times were simply missed.)
+  - **Homebase `src/components/schedule/GapResolverPanel.tsx`** — builds the employee-facing message *"you've been added to the AM shift (11:30–15:30)"* from these columns → **told the employee the wrong hours.**
+  - `computeWageEstimate` is NOT affected: it computes from `schedules.data.assignments`, which come from the engine (canonical).
+- **Fixed 2026-07-13 (three parts):** Aegis simulator now resolves start/end/name from the parent `shift_type` (local copy is a fallback for legacy `shift_type_id IS NULL` rows only); Homebase `update_shift_type` now cascades to the mirrors; `~/Desktop/Repair_Shift_Requirement_Mirrors.sql` repairs the existing drift.
+- **The mirror columns CANNOT be dropped yet** — all four are **NOT NULL** and several Homebase UI components read them. End state is to drop them and join `shift_types` everywhere. Until then: **`shift_types` is the source of truth; never read the mirror in engine or workflow code.**
+
+### Roles are strings across FIVE tables — rename must hit all five
+A role has no FK. It is a free-text string compared by exact equality in: `employees.primary_role`, `employees.qualified_roles[]`, `shift_requirements.role`, `shift_requirements.accepted_roles[]`, **`wage_rates.role`**, and **`shift_experience_rules.role`**. Soteria's `update_role` cascade covered only the first four — a rename silently orphaned the wage rate and every veteran/experience rule (they stop matching and stop being enforced; nothing errors). Fixed 2026-07-13; `delete_role` now checks all references too.
+- **Correction to a misleading in-code comment:** `shift_requirements.role` was labelled the *"legacy column"*. **It is not legacy — it is what the engine matches on.** `accepted_roles` is the column nothing reads (D10). Do not act on that old comment.

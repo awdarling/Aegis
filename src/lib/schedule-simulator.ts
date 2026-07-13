@@ -226,16 +226,37 @@ function runBothScenarios(
     const dayOfWeek = new Date(date + 'T12:00:00Z').getUTCDay(); // 0 = Sunday
 
     for (const req of data.shiftRequirements) {
-      // Gate by the parent shift_type's days_active — shift_requirements.days_active
-      // is dormant and may be stale. Mirrors the canvas builder in
-      // src/lib/engine/canvas.ts.
-      if (req.shift_type_id) {
-        const st = data.shiftTypesById.get(req.shift_type_id);
-        if (!st || !st.days_active.includes(dayOfWeek)) continue;
-      } else {
-        // Legacy rows with no shift_type_id: fall back to the requirement's own field.
-        if (!req.days_active.includes(dayOfWeek)) continue;
+      // D4 — shift_requirements carries a COPY of the shift's name/start/end/days
+      // that is written once at insert and (until 2026-07-13) never updated when
+      // the shift type changed. Those copies ARE stale in production: Watermark
+      // had 8 of 12 rows disagreeing with their shift type, one by 2.5 hours.
+      //
+      // shift_types is CANONICAL (it's what the schedule engine builds from —
+      // src/lib/engine/canvas.ts). This simulator decides whether approving a
+      // time-off request opens a coverage gap; reading the stale copy meant it
+      // could clear a request that actually leaves a shift short, or flag one
+      // that doesn't. Resolve every shift attribute from the parent shift_type,
+      // falling back to the row's own fields only for legacy rows that have no
+      // shift_type_id. Same rule the days_active gate below already used.
+      // RULE 0 — every shift attribute comes from the shift the MANAGER defined.
+      // There is no fallback to shift_requirements' copied columns: they are
+      // being dropped, and reading them is what made this simulator give wrong
+      // coverage verdicts (D4 — 8 of 12 Watermark rows were stale, one by 2.5h).
+      // A requirement with no shift type is not schedulable, so skip it loudly
+      // rather than guess its hours.
+      // shift_type_id is nullable in the generated DB types until the NOT NULL
+      // migration lands. An unlinked requirement has no defined hours, so it is
+      // not schedulable — skip it loudly rather than invent times for it.
+      const st = req.shift_type_id ? data.shiftTypesById.get(req.shift_type_id) : undefined;
+      if (!st) {
+        console.warn(`[simulator] requirement ${req.id} (${req.role}) is not linked to an active shift type — skipped`);
+        continue;
       }
+      if (!st.days_active.includes(dayOfWeek)) continue;
+
+      const shiftStart = st.start_time;
+      const shiftEnd = st.end_time;
+      const shiftName = st.name;
 
       let baselineCovered = 0;
       let withNewCovered = 0;
@@ -247,14 +268,14 @@ function runBothScenarios(
           !isEmployeeAvailableForShift(
             emp.id,
             dayOfWeek,
-            req.start_time,
-            req.end_time,
+            shiftStart,
+            shiftEnd,
             data.availabilityByEmployee
           )
         )
           continue;
-        if (!isBlockedByTO(emp.id, date, req.start_time, req.end_time, shiftId, baselineMap)) baselineCovered++;
-        if (!isBlockedByTO(emp.id, date, req.start_time, req.end_time, shiftId, withNewMap)) withNewCovered++;
+        if (!isBlockedByTO(emp.id, date, shiftStart, shiftEnd, shiftId, baselineMap)) baselineCovered++;
+        if (!isBlockedByTO(emp.id, date, shiftStart, shiftEnd, shiftId, withNewMap)) withNewCovered++;
       }
 
       baselineTotalReq += req.required_count;
@@ -266,7 +287,7 @@ function runBothScenarios(
       if (withNewCovered < req.required_count) {
         coverageGaps.push({
           date,
-          shift_name: req.shift_name,
+          shift_name: shiftName,
           role: req.role,
           shortfall: req.required_count - withNewCovered,
         });
@@ -276,26 +297,29 @@ function runBothScenarios(
       if (withNewCovered < baselineCovered) {
         affectedShifts.push({
           date,
-          shift_name: req.shift_name,
+          shift_name: shiftName,
           role: req.role,
           required_count: req.required_count,
           covered_without: Math.min(baselineCovered, req.required_count),
           covered_with: Math.min(withNewCovered, req.required_count),
-          shift_start: req.start_time,
-          shift_end: req.end_time,
+          // These two are surfaced to the MANAGER in the time-off decision email.
+          // Reading the stale copy quoted them the wrong hours for the shift they
+          // were being asked to approve against.
+          shift_start: shiftStart,
+          shift_end: shiftEnd,
         });
 
         // Find employees who could cover this affected slot
         for (const emp of data.employees) {
           if (emp.id === newEmployeeId) continue;
           if (!emp.qualified_roles.includes(req.role)) continue;
-          if (isBlockedByTO(emp.id, date, req.start_time, req.end_time, shiftId, withNewMap)) continue;
+          if (isBlockedByTO(emp.id, date, shiftStart, shiftEnd, shiftId, withNewMap)) continue;
           if (
             !isEmployeeAvailableForShift(
               emp.id,
               dayOfWeek,
-              req.start_time,
-              req.end_time,
+              shiftStart,
+              shiftEnd,
               data.availabilityByEmployee
             )
           )

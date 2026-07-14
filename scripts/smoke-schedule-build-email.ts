@@ -19,7 +19,6 @@ import type {
   ScheduleAssignment,
   ScheduleGap,
   FlaggedIssue,
-  ShiftOverrideMismatch,
 } from '../src/workflows/schedule-build';
 import type { ClosedDate } from '../src/lib/engine/canvas';
 import type { EmployeeDisposition } from '../src/lib/engine/dispositions';
@@ -126,14 +125,11 @@ function buildFixture(): {
     { date: '2026-06-07', event_title: 'Annual Inventory Close' },
   ];
 
-  const shift_override_mismatches: ShiftOverrideMismatch[] = [];
-
   const result: RunScheduleBuildResult = {
     assignments,
     gaps,
     flagged_issues,
     closed_dates,
-    shift_override_mismatches,
     totalRequired: 12,
     totalFilled: 10,
   };

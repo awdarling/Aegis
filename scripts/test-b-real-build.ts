@@ -198,9 +198,8 @@ async function main(): Promise<void> {
     gap_summary: result.gaps.length === 0
       ? 'All shifts fully covered.'
       : result.gaps.map(g => `${g.date} ${g.shift_name} ${g.role} (${g.filled_count}/${g.required_count}): ${g.reason}`).join('\n'),
-    special_notes_applied: specialNotes.filter(n => n.staffing_notes || n.shift_overrides).map(n => n.title),
+    special_notes_applied: specialNotes.filter(n => n.staffing_notes).map(n => n.title),
     closed_dates: result.closed_dates,
-    shift_override_mismatches: result.shift_override_mismatches,
     aegis_notes: overtimeRisk.length > 0 ? `${overtimeRisk.length} employee(s) are near or at maximum weekly hours.` : '',
     estimated_wages: wages,
     engine_version: ENGINE_VERSION,
@@ -213,7 +212,6 @@ async function main(): Promise<void> {
     gaps: result.gaps,
     flagged_issues: result.flagged_issues,
     closed_dates: result.closed_dates,
-    shift_override_mismatches: result.shift_override_mismatches,
   } as unknown as Record<string, unknown>;
   const { data: inserted, error: insertErr } = await supabase
     .from('schedules')
@@ -339,13 +337,6 @@ async function main(): Promise<void> {
   lines.push(`## Closed dates`);
   if (result.closed_dates.length === 0) lines.push('_none_');
   else for (const c of result.closed_dates) lines.push(`- ${c.date}: ${c.event_title}`);
-
-  lines.push('');
-  lines.push(`## Shift override mismatches`);
-  if (result.shift_override_mismatches.length === 0) lines.push('_none_');
-  else for (const m of result.shift_override_mismatches) {
-    lines.push(`- ${m.date} ${m.shift_name}: override key '${m.override_key}' not in available roles [${m.available_roles.join(', ')}]`);
-  }
 
   lines.push('');
   lines.push(`## Unrecognized policies`);

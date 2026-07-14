@@ -1478,78 +1478,6 @@ function runVeteranEnrichmentSmoke(): void {
   );
 }
 
-// Task 7 — shift_overrides referencing a role that doesn't exist on any
-// requirement surface as a structured mismatch entry.
-function runShiftOverrideMismatchSmoke(): void {
-  const COMPANY_ID = 'company-override-mm';
-  const ST_ID = 'st-override-mm';
-
-  const shiftType: ShiftType = {
-    id: ST_ID,
-    company_id: COMPANY_ID,
-    name: 'Override Shift',
-    start_time: '09:00',
-    end_time: '13:00',
-    days_active: [1],
-    active: true,
-    created_at: '2026-01-01T00:00:00Z',
-  };
-  const req: ShiftRequirement = {
-    id: 'req-override-mm',
-    company_id: COMPANY_ID,
-    role: 'Lifeguard',
-    accepted_roles: ['Lifeguard'],
-    required_count: 1,
-    shift_type_id: ST_ID,
-  };
-
-  // Override targets a 'Cleaner' role that doesn't exist on this shift.
-  const noteWithBadOverride: Event = {
-    id: 'evt-bad-override',
-    company_id: COMPANY_ID,
-    title: 'Try to add a Cleaner',
-    date: '2026-06-01',
-    end_date: '2026-06-01',
-    description: null,
-    event_type: 'staffing',
-    staffing_notes: null,
-    shift_overrides: { 'Override Shift': { 'Cleaner': 1 } },
-    event_shifts: null,
-    created_by: 'manager',
-    created_at: '2026-01-01T00:00:00Z',
-    updated_at: '2026-01-01T00:00:00Z',
-  };
-
-  const data: BuildData = {
-    employees: [],
-    availByEmp: new Map(),
-    toMap: new Map(),
-    shiftTypes: [shiftType],
-    shiftRequirements: [req],
-    conflicts: [],
-    policies: [],
-    events: [noteWithBadOverride],
-    companyName: 'Test Co',
-    companyTimezone: 'America/New_York',
-  };
-
-  const result = runScheduleBuild(data, DEFAULT_ENGINE_SETTINGS, null, [], '2026-06-01', '2026-06-01');
-
-  expect(
-    result.shift_override_mismatches.length === 1,
-    `Override mismatch: exactly 1 mismatch (got ${result.shift_override_mismatches.length})`,
-  );
-  const mm = result.shift_override_mismatches[0];
-  expect(
-    mm?.override_key === 'Cleaner' && mm?.shift_name === 'Override Shift' && mm?.date === '2026-06-01',
-    `Override mismatch: identifies key='Cleaner', shift='Override Shift', date='2026-06-01' (got ${JSON.stringify(mm)})`,
-  );
-  expect(
-    mm?.available_roles.includes('Lifeguard') && mm?.available_roles.length === 1,
-    `Override mismatch: available_roles lists only 'Lifeguard' (got ${JSON.stringify(mm?.available_roles)})`,
-  );
-}
-
 if (require.main === module) {
   runDoublesAndOverlapsSmoke();
   console.log('');
@@ -1572,7 +1500,5 @@ if (require.main === module) {
   runWageFallbackSmoke();
   console.log('');
   runVeteranEnrichmentSmoke();
-  console.log('');
-  runShiftOverrideMismatchSmoke();
   if (!process.exitCode) console.log('\nAll smoke checks passed.');
 }

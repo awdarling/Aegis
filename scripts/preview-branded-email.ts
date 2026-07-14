@@ -78,7 +78,6 @@ const distBody = renderScheduleResultBodyHtml({
     gaps: [],
     flagged_issues: [],
     closed_dates: [],
-    shift_override_mismatches: [],
   } as never,
   hoursRows: [
     { employee_id: '1', name: 'Lucas Vermeer', role: 'Headguard', hours: 15.3, max_hours: 40, pct_of_max: 38 },

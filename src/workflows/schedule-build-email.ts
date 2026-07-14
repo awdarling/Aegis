@@ -12,7 +12,6 @@ import type {
   ScheduleAssignment,
   ScheduleGap,
   FlaggedIssue,
-  ShiftOverrideMismatch,
 } from './schedule-build';
 import type { ClosedDate } from '../lib/engine/canvas';
 import type { EmployeeDisposition } from '../lib/engine/dispositions';
@@ -379,22 +378,6 @@ function wagesSectionHtml(wages: WageEstimate): string {
 </div>`;
 }
 
-function overrideMismatchesSectionHtml(mismatches: ShiftOverrideMismatch[]): string {
-  if (mismatches.length === 0) return '';
-  const items = mismatches.map(m => `
-    <li style="margin:0 0 4px;font-size:13px;color:${BRAND.textPrimary};">
-      <strong>${escapeHtml(formatShortDate(m.date))} ${escapeHtml(m.shift_name)}</strong>: override key
-      <code style="background:${BRAND.surface3};color:${BRAND.textPrimary};padding:1px 4px;border-radius:3px;">${escapeHtml(m.override_key)}</code>
-      didn't match any requirement role
-      (available: ${escapeHtml(m.available_roles.join(', '))})
-    </li>`).join('');
-  return `
-<div style="margin:0 0 20px;">
-  <div style="font-size:13px;font-weight:600;color:${BRAND.silver};text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px;">Shift override mismatches</div>
-  <ul style="margin:0;padding-left:18px;">${items}</ul>
-</div>`;
-}
-
 // The Distribute button + the Homebase link live INSIDE the action card (they
 // ARE the action). The conversational framing sits above the card — see
 // renderScheduleResultBodyHtml.
@@ -445,7 +428,6 @@ ${closedDatesSectionHtml(args.result.closed_dates)}
 ${flaggedIssuesSectionHtml(args.result.flagged_issues, args.resolveShiftRuleLabel)}
 ${topHoursSectionHtml(args.hoursRows)}
 ${wagesSectionHtml(args.wages)}
-${overrideMismatchesSectionHtml(args.result.shift_override_mismatches)}
 ${ctaSectionHtml(args.distributeUrl, args.homebaseUrl)}`;
 
   const card = brandActionCard('Action needed · Distribute', cardInner);
@@ -466,7 +448,6 @@ export function buildPlainText(params: {
   issues: FlaggedIssue[];
   hoursRows: HoursRow[];
   wages: WageEstimate;
-  mismatches: ShiftOverrideMismatch[];
   distributeUrl: string;
   homebaseUrl: string;
   resolveShiftRuleLabel?: (shiftName: string, date: string) => string | null;
@@ -548,14 +529,6 @@ export function buildPlainText(params: {
   }
   lines.push('');
 
-  if (params.mismatches.length > 0) {
-    lines.push('SHIFT OVERRIDE MISMATCHES');
-    for (const m of params.mismatches) {
-      lines.push(`- ${formatShortDate(m.date)} ${m.shift_name}: override key "${m.override_key}" didn't match (available: ${m.available_roles.join(', ')})`);
-    }
-    lines.push('');
-  }
-
   lines.push('Distribute the schedule to all assigned employees:');
   lines.push(params.distributeUrl);
   lines.push('');
@@ -622,7 +595,6 @@ export async function buildScheduleResultEmail(
     issues: params.result.flagged_issues,
     hoursRows,
     wages: params.wages,
-    mismatches: params.result.shift_override_mismatches,
     distributeUrl: tokenResult.url,
     homebaseUrl,
     resolveShiftRuleLabel: params.resolveShiftRuleLabel,

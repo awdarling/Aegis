@@ -310,49 +310,6 @@ async function loadBuildData(
   };
 }
 
-// ── Shift override from special notes ─────────────────────────────────────────
-
-export interface ShiftOverrideMismatch {
-  date: string;
-  shift_name: string;
-  override_key: string;
-  available_roles: string[];
-}
-
-function applyShiftOverrides(
-  requirements: ShiftRequirement[],
-  dateNotes: Event[],
-  shiftTypeName: string,
-  date: string,
-  mismatches: ShiftOverrideMismatch[]
-): ShiftRequirement[] {
-  for (const note of dateNotes) {
-    if (!note.shift_overrides) continue;
-    const overrides = note.shift_overrides as Record<string, Record<string, number>>;
-    const forShift = overrides[shiftTypeName];
-    if (!forShift) continue;
-    const availableRoles = requirements.map(r => r.role);
-    for (const key of Object.keys(forShift)) {
-      if (!availableRoles.includes(key)) {
-        console.log(
-          `[schedule-build] shift override key '${key}' on ${date} ${shiftTypeName} doesn't match any requirement role (available: ${availableRoles.join(',')})`
-        );
-        mismatches.push({
-          date,
-          shift_name: shiftTypeName,
-          override_key: key,
-          available_roles: [...availableRoles],
-        });
-      }
-    }
-    return requirements.map(req => {
-      const count = forShift[req.role];
-      return count !== undefined ? { ...req, required_count: count } : req;
-    });
-  }
-  return requirements;
-}
-
 // ── Gap reason ────────────────────────────────────────────────────────────────
 
 interface GapReasonInput {
@@ -511,7 +468,6 @@ interface BuildResult {
   gaps: ScheduleGap[];
   flagged_issues: FlaggedIssue[];
   closed_dates: ClosedDate[];
-  shift_override_mismatches: ShiftOverrideMismatch[];
   totalRequired: number;
   totalFilled: number;
 }
@@ -549,18 +505,15 @@ function buildScheduleForWeek(ctx: BuildContext): BuildResult {
   // id, stamped with the single date they apply to. No copied shift attributes
   // cross this boundary, so the engine cannot read a stale one.
   const overriddenReqs: CanvasRequirement[] = [];
-  const shiftOverrideMismatches: ShiftOverrideMismatch[] = [];
   for (const date of weekDates) {
     const dayOfWeek = new Date(date + 'T12:00:00Z').getUTCDay();
-    const dateNotes = eventsByDate.get(date) ?? [];
     for (const st of data.shiftTypes) {
       // The shift type's OWN days are the gate — always were.
       if (!st.days_active.includes(dayOfWeek)) continue;
       // Linked by id only. The old `req.shift_name === st.name` fallback matched
       // a requirement to a shift by a copied string; it's gone.
       const baseReqs = data.shiftRequirements.filter(req => req.shift_type_id === st.id);
-      const adjusted = applyShiftOverrides(baseReqs, dateNotes, st.name, date, shiftOverrideMismatches);
-      for (const r of adjusted) {
+      for (const r of baseReqs) {
         overriddenReqs.push({
           id: r.id,
           shift_type_id: st.id,
@@ -1072,7 +1025,6 @@ function buildScheduleForWeek(ctx: BuildContext): BuildResult {
     gaps: weekState.gaps,
     flagged_issues: weekState.flagged_issues,
     closed_dates,
-    shift_override_mismatches: shiftOverrideMismatches,
     totalRequired,
     totalFilled,
   };
@@ -1085,7 +1037,6 @@ export interface RunScheduleBuildResult {
   gaps: ScheduleGap[];
   flagged_issues: FlaggedIssue[];
   closed_dates: ClosedDate[];
-  shift_override_mismatches: ShiftOverrideMismatch[];
   totalRequired: number;
   totalFilled: number;
 }
@@ -1133,7 +1084,6 @@ export function runScheduleBuild(
     gaps: result.gaps,
     flagged_issues: result.flagged_issues,
     closed_dates: result.closed_dates,
-    shift_override_mismatches: result.shift_override_mismatches,
     totalRequired: result.totalRequired,
     totalFilled: result.totalFilled,
   };
@@ -1148,8 +1098,7 @@ function buildStaffingReport(
   totalFilled: number,
   employees: Employee[],
   specialNotes: Event[],
-  closedDates: ClosedDate[],
-  shiftOverrideMismatches: ShiftOverrideMismatch[]
+  closedDates: ClosedDate[]
 ): Record<string, unknown> {
   const coverage_rate = totalRequired > 0 ? Math.round((totalFilled / totalRequired) * 1000) / 10 : 100;
 
@@ -1182,7 +1131,7 @@ function buildStaffingReport(
     : gaps.map(g => `${formatShortDate(g.date)} ${g.shift_name} — ${g.role} (${g.filled_count}/${g.required_count} filled): ${g.reason}`).join('\n');
 
   const special_notes_applied = specialNotes
-    .filter(n => n.staffing_notes || n.shift_overrides)
+    .filter(n => n.staffing_notes)
     .map(n => n.title);
 
   return {
@@ -1192,7 +1141,6 @@ function buildStaffingReport(
     gap_summary,
     special_notes_applied,
     closed_dates: closedDates,
-    shift_override_mismatches: shiftOverrideMismatches,
     aegis_notes: overtime_risk.length > 0
       ? `${overtime_risk.length} employee(s) are near or at maximum weekly hours.`
       : '',
@@ -1253,7 +1201,7 @@ async function buildManagerSummary(
   }
 
   if (specialNotes.length > 0) {
-    const applied = specialNotes.filter(n => n.staffing_notes || n.shift_overrides);
+    const applied = specialNotes.filter(n => n.staffing_notes);
     if (applied.length > 0) {
       lines.push(`Notes applied: ${applied.map(n => n.title).join(', ')}`);
     }
@@ -1399,12 +1347,12 @@ export async function buildScheduleAndSave(
     weekStart,
     weekEnd,
   );
-  const { assignments, gaps, flagged_issues, closed_dates, shift_override_mismatches, totalRequired, totalFilled } = runResult;
+  const { assignments, gaps, flagged_issues, closed_dates, totalRequired, totalFilled } = runResult;
 
   const wages = await computeWageEstimate(companyId, assignments);
 
   const staffingReport = {
-    ...buildStaffingReport(assignments, gaps, totalRequired, totalFilled, data.employees, specialNotes, closed_dates, shift_override_mismatches),
+    ...buildStaffingReport(assignments, gaps, totalRequired, totalFilled, data.employees, specialNotes, closed_dates),
     estimated_wages: wages,
     engine_version: ENGINE_VERSION,
   };
@@ -1550,7 +1498,7 @@ export async function handleBuildSchedule(
 
   const {
     scheduleId, weekStart, weekEnd, assignments, gaps, flagged_issues,
-    closed_dates, shift_override_mismatches, totalRequired, totalFilled,
+    closed_dates, totalRequired, totalFilled,
     wages, employees, companyName, specialNotes, resolveShiftRuleLabel,
   } = outcome;
 
@@ -1565,7 +1513,6 @@ export async function handleBuildSchedule(
         gaps,
         flagged_issues,
         closed_dates,
-        shift_override_mismatches,
         totalRequired,
         totalFilled,
       },

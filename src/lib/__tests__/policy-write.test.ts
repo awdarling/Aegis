@@ -49,14 +49,23 @@ describe('coercePolicyWrite — engine family (canonical column = policy_value_j
     }
   });
 
+  it('REFUSES partial_shifts and conflict_resolution — removed from the user surface (D11)', () => {
+    // These were settable but read by nothing. Aegis must decline rather than
+    // confirm a rule it can't honour. The parser still RECOGNISES the keys
+    // (scaffolding), so this is purely about the write surface.
+    for (const key of ['partial_shifts_allowed', 'allow_partial_shifts', 'conflict_resolution_preference', 'conflict_resolution']) {
+      const r = coercePolicyWrite(key, 'yes');
+      expect(r.ok, `${key} should be refused`).toBe(false);
+      if (!r.ok) expect(r.reason).toMatch(/roadmap|doesn't act on it|shouldn't work together/i);
+    }
+  });
+
   it('week_start_day / veteran_preference / fairness / max-consecutive all round-trip through the parser', () => {
     const cases: Array<[string, unknown, (p: ReturnType<typeof parseConstraints>) => unknown, unknown]> = [
       ['week_start_day', 'Sunday', p => p.settings.weekStartDay, 'sunday'],
       ['veteran_preference_default', 'prioritize', p => p.settings.veteranPreferenceDefault, 'prioritize'],
       ['hours_fairness_weight', '0.8', p => p.settings.hoursFairnessWeight, 0.8],
       ['max_consecutive_days_worked', '5', p => p.settings.maxConsecutiveDaysWorked, 5],
-      ['partial_shifts_allowed', 'yes', p => p.settings.partialShiftsAllowed, true],
-      ['conflict_resolution_preference', 'fairness first', p => p.settings.conflictResolution, 'fairness_first'],
     ];
     for (const [key, said, pick, want] of cases) {
       const r = coercePolicyWrite(key, said);

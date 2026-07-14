@@ -1125,6 +1125,18 @@ Focused Soteria session against the PURPOSE & DEFINITION-OF-DONE block. Diagnose
 - **Gap closed:** the one untested link was the **intake** — that an employee email actually *feeds* the custom system. Added 3 tests to `src/workflows/__tests__/custom-availability-magic.test.ts` (now 10): an "until \<date\>" email → date-limited pending (`custom_end_date` set, temporary framing in the confirm, permanent table untouched); a plain change → `custom_end_date` null; a non-date `end_date` value → ignored. Made the file's `withAnthropicRetry` mock controllable to drive `parseAvailabilityIntent`.
 - **State:** Aegis tsc clean; full suite **143/143 green**. Change is test-only (no production code touched) on a working copy — needs Alexander to push the branch + open a PR, then one live sandbox smoke (employee → manager approve) to flip #13 to fully DONE. Feature code itself is already deployed.
 
+### 2026-07-13 (session 11) — D11 RESOLVED by removal: partial_shifts + conflict_resolution pulled from every user surface.
+
+Alexander's call: neither will come up often, and shipping a rule the engine ignores is the exact "manager sets something that silently does nothing" failure. **Removed from every surface a user touches; scaffolding kept for a future add-on.**
+- **Homebase Rules UI** — both entries removed from `CATEGORY_LIST` (`lib/rules/categories.ts`), so the cards no longer render. `categorizeByKey`, the `formatPolicySummary` cases, and the modal components (`ConflictResolutionModal`, `PartialShiftsModal`) are LEFT as dormant scaffolding.
+- **Soteria** — removed from the policy vocabulary in `soteria/route.ts`; prompt now tells her they're not supported and to decline if asked.
+- **Aegis email** — `coercePolicyWrite` now REFUSES both keys with a plain-English "not available yet" rather than writing an inert row.
+- **Parser scaffolding kept** — `PARTIAL_SHIFTS_KEYS` / `CONFLICT_RES_KEYS` still recognised by `constraints/parser.ts` (so legacy rows parse without noise), and `EngineSettings.partialShiftsAllowed` / `.conflictResolution` still exist but are read by nothing. Re-enabling = wire the reader, not rebuild the plumbing.
+- **To re-enable later:** restore the two `CATEGORY_LIST` entries, restore the Soteria vocabulary lines + the `coercePolicyWrite` branches, and add the engine reader. Comments at each site say so.
+- Test flipped: `policy-write.test.ts` now asserts both keys are REFUSED. Aegis `tsc` clean, **247 pass**. Homebase `tsc` clean.
+
+**D11 is now CLOSED** (resolved by removal). Partial shifts remains a possible future feature — real engine work (slot splitting, partial assignments, wage/coverage), tracked as a side project, not a hole.
+
 ### 2026-07-13 (session 10) — D8, D15, D16, D18 fixed in BOTH channels. D17 closed as not-a-bug.
 
 **D8 — the last channel-parity gap. A manager could set a rule in Homebase that they could NOT set through the AI employee they're paying for.** `employee_conflicts` ("never schedule these two together") was settable in the UI and via Soteria, but **not by emailing Aegis**.

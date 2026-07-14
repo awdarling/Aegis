@@ -1125,6 +1125,21 @@ Focused Soteria session against the PURPOSE & DEFINITION-OF-DONE block. Diagnose
 - **Gap closed:** the one untested link was the **intake** — that an employee email actually *feeds* the custom system. Added 3 tests to `src/workflows/__tests__/custom-availability-magic.test.ts` (now 10): an "until \<date\>" email → date-limited pending (`custom_end_date` set, temporary framing in the confirm, permanent table untouched); a plain change → `custom_end_date` null; a non-date `end_date` value → ignored. Made the file's `withAnthropicRetry` mock controllable to drive `parseAvailabilityIntent`.
 - **State:** Aegis tsc clean; full suite **143/143 green**. Change is test-only (no production code touched) on a working copy — needs Alexander to push the branch + open a PR, then one live sandbox smoke (employee → manager approve) to flip #13 to fully DONE. Feature code itself is already deployed.
 
+### 2026-07-13 (session 12) — D19 FIXED: coverage sessions are now per-call-out (the last functional bug).
+
+**The bug:** coverage sessions were keyed by COMPANY (`coverage_session:<company_id>`), so a second employee calling out **deleted** the first manager's session. The manager's "show me more names" thread on the first call-out went dead the instant a second came in. (The schedule was always correct — each `ActiveOutreach` is self-contained and carries its own call-out info — so no employee was ever misled; the damage was confined to the manager's control of the first call-out.)
+
+**The fix — call-outs are now first-class objects:**
+- Every `CoverageSession` gets a unique `session_id` and its own stored row (`coverage_session:<session_id>`). Two (or more) coexist without collision.
+- `ActiveOutreach` and the `coverage_batch` decision token both carry `session_id`, so an employee's acceptance / a manager's button resolves the EXACT call-out — `getCoverageSessionById` replaces the old "the manager's session" lookup on both employee-accept paths and the email-button path.
+- New `routeManagerCoverageReply` (the single router entry): lists a manager's open, reply-able sessions; 0 → fall through; 1 → route it (unchanged UX); >1 → match the reply against each call-out's absent-person/shift, and if still ambiguous, **ask which one** rather than guess. A reply that's itself a fresh call-out starts a new flow.
+- Storage helpers reworked: `listActiveCoverageSessions`, `getCoverageSessionById`, `clearSessionById`, and `clearSession(session)` (was `clearSession(companyId)`, which is what made it delete the wrong thing). All ~9 clear sites updated to pass the session object. The timeout scheduler's local copies key by `session_id` too (with legacy per-company fallback). Legacy pre-D19 rows still resolve via fallbacks, so nothing in flight breaks on deploy.
+- **This is the groundwork Alexander flagged for the employee-initiated call-out feature** — that feature *generates* concurrent call-outs, so it depended on this. Recommended sequence: D19 (done) → ship contest → build the employee route (framed as a same-day time-off request that also triggers coverage, so it doesn't fork the workflow).
+
+- **State:** `tsc` clean, **253 tests** (was 247; +6 D19 regression tests with a driveable in-memory `aegis_memory` store proving two sessions coexist and each resolves by id), engine smoke green. Files: `src/workflows/emergency-coverage.ts`, `src/router/intent-router.ts`, `src/webhooks/decision.ts`, `src/scheduler/coverage-timeout.ts`. **No migration.**
+
+**ROADMAP AFTER THIS: no known functional bugs remain.** Left: D22 (Soteria memory written from an LLM tag with no confirmation — low blast radius, no engine reads it), D14 (dead override code — `events.shift_overrides` NULL everywhere), the undo button (UI), and the from-scratch-tenant test (the real repeatability proof; do before Telnyx). Then SMS re-verification once A2P clears.
+
 ### 2026-07-13 (session 11) — D11 RESOLVED by removal: partial_shifts + conflict_resolution pulled from every user surface.
 
 Alexander's call: neither will come up often, and shipping a rule the engine ignores is the exact "manager sets something that silently does nothing" failure. **Removed from every surface a user touches; scaffolding kept for a future add-on.**

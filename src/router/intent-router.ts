@@ -34,9 +34,8 @@ import {
 } from '../workflows/shift-swap';
 import {
   handleEmergencyCoverage,
-  handleManagerCoverageReply,
+  routeManagerCoverageReply,
   handleEmployeeCoverageResponse,
-  getActiveCoverageSession,
   getActiveOutreach,
 } from '../workflows/emergency-coverage';
 import { handlePayrollCheck } from '../workflows/payroll';
@@ -219,9 +218,10 @@ async function routeIntentInner(
       return;
     }
 
-    const session = await getActiveCoverageSession(contact.company_id, contact.matched_identifier);
-    if (session && (session.state === 'awaiting_names' || session.state === 'awaiting_next_batch_decision')) {
-      await handleManagerCoverageReply(message, contact, session);
+    // D19 — a manager may have several call-outs open at once; the router asks
+    // coverage which one this reply belongs to (and to disambiguate if needed).
+    const handledCoverage = await routeManagerCoverageReply(message, contact);
+    if (handledCoverage) {
       console.log('[router] EARLY RETURN', { reason: 'manager_coverage_reply' });
       return;
     }

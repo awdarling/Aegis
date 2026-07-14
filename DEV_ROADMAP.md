@@ -1125,6 +1125,18 @@ Focused Soteria session against the PURPOSE & DEFINITION-OF-DONE block. Diagnose
 - **Gap closed:** the one untested link was the **intake** — that an employee email actually *feeds* the custom system. Added 3 tests to `src/workflows/__tests__/custom-availability-magic.test.ts` (now 10): an "until \<date\>" email → date-limited pending (`custom_end_date` set, temporary framing in the confirm, permanent table untouched); a plain change → `custom_end_date` null; a non-date `end_date` value → ignored. Made the file's `withAnthropicRetry` mock controllable to drive `parseAvailabilityIntent`.
 - **State:** Aegis tsc clean; full suite **143/143 green**. Change is test-only (no production code touched) on a working copy — needs Alexander to push the branch + open a PR, then one live sandbox smoke (employee → manager approve) to flip #13 to fully DONE. Feature code itself is already deployed.
 
+### 2026-07-14 (session 2) — D22 GATED: Soteria memory is now a confirmed action, not a silent write.
+
+**What it was.** Soteria's system prompt told her to save memory "silently" via a `<memory>` tag with "no confirmation needed," and the chat route (`Homebase src/app/api/soteria/route.ts`) parsed that tag and inserted straight into `soteria_memory` — the one Soteria write with no confirmation card and no executor. Low blast radius (only her own prompt context reads it; no engine does), but the lone ungated LLM-driven write.
+
+**Fix (Homebase-only; full confirmation card — Alexander's call).** Memory is now a first-class `save_memory` **action**, gated by the same confirmation card as every other write:
+- **Prompt rewritten:** propose `save_memory` (shown as a card, stored only on confirm); `<memory>` tag retired; added to the action-types list with an example and a "durable facts the manager actually stated, never a guess" instruction.
+- **`api/soteria/route.ts`:** deleted the silent insert; kept a defensive strip so a stray `<memory>` tag never persists or renders.
+- **`api/soteria/execute/route.ts`:** new `case 'save_memory'` mirroring `add_conflict` — validates `memory_type` ∈ {preference,decision,context,feedback}, requires non-empty content capped at 500 chars, de-dupes identical notes, error-checked insert, activity-log entry. Manager/owner-gated by the executor's existing auth (employees can't write).
+- **UI unchanged** — the confirmation card renders generically from `action.description`. The one-action-per-response rule means a memory-save now takes its own turn (can't ride along with another change) — intended serialization.
+
+**State:** branch `chore/d22-gate-soteria-memory` (Homebase, off `origin/main`). Homebase `tsc` clean. No migration. Aegis untouched. **Owed:** one live sandbox eyeball (Soteria proposes `save_memory` → card → confirm → row appears; reject → nothing written), since Homebase has no test runner. Data contract: D22 flipped → FIXED (docs/07 §2). *(This roadmap/contract log rides on the Aegis `chore/d14-remove-shift-overrides` branch since the docs live in the Aegis repo; the D22 CODE is the separate Homebase branch above — merge them together.)*
+
 ### 2026-07-14 — D14 REMOVED: dead `shift_overrides` / `applyShiftOverrides` deleted from the engine (code-only; column drop gated).
 
 **What it was.** `applyShiftOverrides` (`schedule-build.ts`) read `events.shift_overrides` PRE-canvas and mutated `required_count`; the column is NULL on every row, so it always no-op'd and `shift_override_mismatches` was always `[]`. The canonical path — `events.event_shifts` → `applyEventShifts` (post-canvas) — was untouched. Pure dead code (D14 in the data contract).

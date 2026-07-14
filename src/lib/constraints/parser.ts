@@ -27,6 +27,13 @@ export const HOURS_FAIRNESS_KEYS = new Set([
   'fairness_weight',
 ]);
 
+// SCAFFOLDING (drift D11, 2026-07-13). partial_shifts and conflict_resolution
+// were removed from every USER surface (Homebase Rules UI, Soteria vocabulary,
+// Aegis email) because the engine never acted on them. The keys are KEPT here so
+// the parser still recognises any legacy DB rows without noise, and so
+// re-enabling the feature is "wire the reader", not "rebuild the plumbing".
+// NOTHING in the engine currently consults settings.partialShiftsAllowed or
+// settings.conflictResolution — see EngineSettings in ./types.
 export const PARTIAL_SHIFTS_KEYS = new Set([
   'partial_shifts_allowed',
   'allow_partial_shifts',

@@ -163,15 +163,17 @@ export function coercePolicyWrite(policyKey: string, raw: unknown): PolicyWriteR
     return { ok: true, family: 'engine', patch: { policy_value_json: n, policy_value: n.toFixed(2) }, display: n.toFixed(2) };
   }
 
+  // REMOVED FROM THE USER SURFACE 2026-07-13 (drift D11). partial_shifts and
+  // conflict_resolution were settable but read by NOTHING in the engine — a
+  // manager could set them and the schedule came out identical. Rather than
+  // accept a rule Aegis can't honour, we decline. The parser still RECOGNISES
+  // these keys (scaffolding) so re-enabling is wiring the reader, not rebuilding
+  // the plumbing. parseBoolish is kept for that day.
   if (PARTIAL_SHIFTS_KEYS.has(key)) {
-    const b = parseBoolish(raw);
-    if (b === null) return fail(`I need a yes or no for partial shifts. I got "${asText(raw)}".`);
-    return {
-      ok: true,
-      family: 'engine',
-      patch: { policy_value_json: b, policy_value: b ? 'Enabled' : 'Disabled' },
-      display: b ? 'enabled' : 'disabled',
-    };
+    return fail(
+      `Partial shifts aren't a setting I can change right now — the scheduler doesn't act on it yet, ` +
+        `so I'd rather not pretend it's on. It's on the roadmap; for now every shift is filled as a whole.`,
+    );
   }
 
   if (VETERAN_DEFAULT_KEYS.has(key)) {
@@ -201,16 +203,14 @@ export function coercePolicyWrite(policyKey: string, raw: unknown): PolicyWriteR
     return { ok: true, family: 'engine', patch: { policy_value_json: v, policy_value: label[v] }, display: label[v] };
   }
 
+  // REMOVED FROM THE USER SURFACE 2026-07-13 (drift D11) — see partial_shifts above.
+  // The banned-pair CASCADE still runs; what's gone is the unread "fallback mode"
+  // knob. Setting banned pairs themselves (D8) is unaffected.
   if (CONFLICT_RES_KEYS.has(key)) {
-    const t = asText(raw).toLowerCase().replace(/[\s-]+/g, '_');
-    const map: Record<string, string> = {
-      fairness_first: 'fairness_first', fairness: 'fairness_first', fair: 'fairness_first',
-      minimize_disruption: 'minimize_disruption', disruption: 'minimize_disruption', stability: 'minimize_disruption',
-    };
-    const v = map[t];
-    if (!v) return fail(`Conflict resolution has to be "fairness first" or "minimize disruption". I got "${asText(raw)}".`);
-    const label: Record<string, string> = { fairness_first: 'Fairness first', minimize_disruption: 'Minimize disruption' };
-    return { ok: true, family: 'engine', patch: { policy_value_json: v, policy_value: label[v] }, display: label[v] };
+    return fail(
+      `That fallback setting isn't something I can change right now — the scheduler doesn't act on it yet. ` +
+        `You can still tell me which people shouldn't work together, and I'll enforce that.`,
+    );
   }
 
   if (WEEK_START_KEYS.has(key)) {

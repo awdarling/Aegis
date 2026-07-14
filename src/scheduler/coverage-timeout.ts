@@ -106,8 +106,8 @@ async function processRecord(record: {
     return 'skipped';
   }
 
-  // Load the parent coverage session
-  const session = await loadSession(outreach.company_id);
+  // Load the parent coverage session — by the id the outreach carries (D19).
+  const session = await loadSession(outreach.company_id, outreach.session_id);
 
   if (!session) {
     // Orphaned outreach — no parent session exists, clean up
@@ -173,14 +173,23 @@ async function handleTimeout(
 // These are local to the scheduler — emergency-coverage.ts has its own copies.
 // Duplication is intentional: the scheduler is a separate process context.
 
+// D19 — sessions are keyed per call-out (`coverage_session:<session_id>`), so the
+// scheduler loads the specific session an outreach belongs to. Falls back to the
+// legacy per-company key for any outreach/session that predates the change.
+function sessionSource(sessionId: string): string {
+  return `coverage_session:${sessionId}`;
+}
+
 async function loadSession(
-  companyId: string
+  companyId: string,
+  sessionId: string | undefined
 ): Promise<(CoverageSession & { _memory_id: string }) | null> {
+  const source = sessionId ? sessionSource(sessionId) : `coverage_session:${companyId}`;
   const { data } = await supabase
     .from('aegis_memory')
     .select('id, content')
     .eq('company_id', companyId)
-    .eq('source', `coverage_session:${companyId}`)
+    .eq('source', source)
     .maybeSingle();
 
   if (!data) return null;
@@ -198,24 +207,23 @@ async function updateSession(session: CoverageSession & { _memory_id?: string })
   const { _memory_id, ...data } = session;
   if (_memory_id) {
     await supabase.from('aegis_memory').update({ content: JSON.stringify(data) }).eq('id', _memory_id);
-  } else {
-    await supabase.from('aegis_memory').delete()
-      .eq('company_id', session.company_id)
-      .eq('source', `coverage_session:${session.company_id}`);
-    await supabase.from('aegis_memory').insert({
-      company_id: session.company_id,
-      memory_type: 'observation',
-      source: `coverage_session:${session.company_id}`,
-      content: JSON.stringify(data),
-    });
+    return;
   }
+  const source = session.session_id ? sessionSource(session.session_id) : `coverage_session:${session.company_id}`;
+  await supabase.from('aegis_memory').delete()
+    .eq('company_id', session.company_id)
+    .eq('source', source);
+  await supabase.from('aegis_memory').insert({
+    company_id: session.company_id,
+    memory_type: 'observation',
+    source,
+    content: JSON.stringify(data),
+  });
 }
 
-async function clearSession(companyId: string): Promise<void> {
-  await supabase.from('aegis_memory').delete()
-    .eq('company_id', companyId)
-    .eq('source', `coverage_session:${companyId}`);
-}
+// (No clearSession here — the scheduler never resolves a session to "done";
+// it only advances the queue or hands off to promptForNextBatchOrExhaust, which
+// owns clearing. emergency-coverage.ts has the clearing logic.)
 
 // ── Formatting ────────────────────────────────────────────────────────────────
 

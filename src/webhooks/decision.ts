@@ -120,6 +120,7 @@ interface CoverageDecisionToken {
 // The live session is looked up fresh by company_id + manager_contact.
 interface CoverageBatchDecisionToken {
   decision_type: 'coverage_batch';
+  session_id?: string;
   action: 'approve' | 'deny';
   request_id: string;
   company_id: string;
@@ -436,6 +437,7 @@ async function handleCoverageBatchDecision(
     companyId: token.company_id,
     managerContact: token.manager_contact,
     action: action === 'approve' ? 'send' : 'stop',
+    sessionId: token.session_id,
   });
   // Single-use: drop both of this request's tokens so the link can't be replayed.
   await consumeSwapTokens(token.company_id, requestId);

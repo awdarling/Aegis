@@ -96,6 +96,14 @@ export interface OutreachResult {
 
 export interface CoverageSession {
   _memory_id?: string;
+  /**
+   * D19 — a unique id PER CALL-OUT. Sessions were keyed by company
+   * (`coverage_session:<company_id>`), so a second call-out at the same company
+   * DELETED the first manager's session. Now each call-out gets its own id and
+   * its own stored row, so two (or more) can be open at once without colliding.
+   * Optional only so a legacy row mid-flight still parses; every new session sets it.
+   */
+  session_id?: string;
   company_id: string;
   manager_contact: string;
   manager_channel: 'sms' | 'email';
@@ -135,6 +143,13 @@ export interface PoolCandidate {
 
 export interface ActiveOutreach {
   _memory_id?: string;
+  /**
+   * D19 — the id of the CoverageSession this outreach belongs to. When an
+   * employee accepts, we update THAT session directly instead of "the manager's
+   * session" (which was ambiguous once more than one could be open). Optional so
+   * an in-flight legacy outreach still parses; falls back to the newest session.
+   */
+  session_id?: string;
   company_id: string;
   employee_id: string;
   shift_date: string;
@@ -178,31 +193,101 @@ interface CoverageCandidate {
 
 // ── Store helpers ─────────────────────────────────────────────────────────────
 
+// D19 — the storage key. Sessions used to share ONE key per company
+// (`coverage_session:<company_id>`). Each call-out now gets its own key, so
+// concurrent call-outs no longer overwrite each other.
+function sessionSource(sessionId: string): string {
+  return `coverage_session:${sessionId}`;
+}
+// Legacy key, matched with a prefix so old single-key rows are still found and
+// cleaned up during the transition.
+function legacySessionSource(companyId: string): string {
+  return `coverage_session:${companyId}`;
+}
+
+function parseSessionRow(row: { id: string; content: string }): CoverageSession | null {
+  try {
+    return { ...(JSON.parse(row.content) as CoverageSession), _memory_id: row.id };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * ALL of a manager's currently-open, non-expired coverage sessions, newest
+ * first. Expired rows are cleaned up as we go. This replaces the old
+ * "one session per company" assumption — a manager can now have several call-outs
+ * in flight at once, and the router decides which one a reply belongs to.
+ */
+export async function listActiveCoverageSessions(
+  companyId: string,
+  managerContact: string
+): Promise<CoverageSession[]> {
+  const { data } = await supabase
+    .from('aegis_memory')
+    .select('id, content, source, created_at')
+    .eq('company_id', companyId)
+    .like('source', 'coverage_session:%')
+    .order('created_at', { ascending: false });
+
+  const rows = (data ?? []) as { id: string; content: string }[];
+  const now = new Date();
+  const out: CoverageSession[] = [];
+  for (const row of rows) {
+    const session = parseSessionRow(row);
+    if (!session) continue;
+    if (session.manager_contact !== managerContact) continue;
+    if (new Date(session.expires_at) < now) {
+      await supabase.from('aegis_memory').delete().eq('id', row.id);
+      continue;
+    }
+    out.push(session);
+  }
+  return out;
+}
+
+/**
+ * Direct lookup by a call-out's session_id — used by the employee-accept path,
+ * where the ActiveOutreach carries the exact session it belongs to. No ambiguity.
+ * Falls back to the manager's newest session for legacy outreach with no id.
+ */
+export async function getCoverageSessionById(
+  companyId: string,
+  sessionId: string | undefined,
+  managerContactForFallback?: string
+): Promise<CoverageSession | null> {
+  if (sessionId) {
+    const { data } = await supabase
+      .from('aegis_memory')
+      .select('id, content')
+      .eq('company_id', companyId)
+      .eq('source', sessionSource(sessionId))
+      .maybeSingle();
+    if (data) {
+      const session = parseSessionRow(data as { id: string; content: string });
+      if (session && new Date(session.expires_at) >= new Date()) return session;
+    }
+  }
+  // Legacy fallback: an outreach created before session_id existed. Use the
+  // manager's newest open session so mid-flight call-outs still resolve.
+  if (managerContactForFallback) {
+    const all = await listActiveCoverageSessions(companyId, managerContactForFallback);
+    return all[0] ?? null;
+  }
+  return null;
+}
+
+/**
+ * BACKWARD-COMPAT shim. Old callers asked for "the manager's session"; that only
+ * ever made sense when there was one. Returns the newest open session. New code
+ * should use listActiveCoverageSessions (to disambiguate) or getCoverageSessionById.
+ */
 export async function getActiveCoverageSession(
   companyId: string,
   managerContact: string
 ): Promise<CoverageSession | null> {
-  const { data } = await supabase
-    .from('aegis_memory')
-    .select('id, content')
-    .eq('company_id', companyId)
-    .eq('source', `coverage_session:${companyId}`)
-    .maybeSingle();
-
-  if (!data) return null;
-
-  try {
-    const row = data as { id: string; content: string };
-    const session = JSON.parse(row.content) as CoverageSession;
-    if (session.manager_contact !== managerContact) return null;
-    if (new Date(session.expires_at) < new Date()) {
-      await supabase.from('aegis_memory').delete().eq('id', row.id);
-      return null;
-    }
-    return { ...session, _memory_id: row.id };
-  } catch {
-    return null;
-  }
+  const all = await listActiveCoverageSessions(companyId, managerContact);
+  return all[0] ?? null;
 }
 
 export async function getActiveOutreach(
@@ -228,14 +313,17 @@ export async function getActiveOutreach(
 }
 
 async function storeSession(session: CoverageSession): Promise<void> {
-  const { _memory_id, ...data } = session;
+  // D19 — every session must carry an id; generate one if a caller forgot.
+  const sessionId = session.session_id ?? randomUUID();
+  const { _memory_id, ...data } = { ...session, session_id: sessionId };
+  // Delete only THIS call-out's row (by id), never the company's other sessions.
   await supabase.from('aegis_memory').delete()
     .eq('company_id', session.company_id)
-    .eq('source', `coverage_session:${session.company_id}`);
+    .eq('source', sessionSource(sessionId));
   await supabase.from('aegis_memory').insert({
     company_id: session.company_id,
     memory_type: 'observation',
-    source: `coverage_session:${session.company_id}`,
+    source: sessionSource(sessionId),
     content: JSON.stringify(data),
   });
 }
@@ -246,10 +334,25 @@ async function updateSession(session: CoverageSession): Promise<void> {
   await supabase.from('aegis_memory').update({ content: JSON.stringify(data) }).eq('id', _memory_id);
 }
 
-async function clearSession(companyId: string): Promise<void> {
+// D19 — clear ONE call-out's session by its id, not every session at the company.
+async function clearSessionById(companyId: string, sessionId: string | undefined): Promise<void> {
+  if (!sessionId) return;
   await supabase.from('aegis_memory').delete()
     .eq('company_id', companyId)
-    .eq('source', `coverage_session:${companyId}`);
+    .eq('source', sessionSource(sessionId));
+}
+
+// Clear a specific session object (preferred — carries its own id). Falls back to
+// the legacy company-wide key ONLY for a session with no id (pre-D19 row), so we
+// don't leak stale rows during the transition.
+async function clearSession(session: CoverageSession): Promise<void> {
+  if (session.session_id) {
+    await clearSessionById(session.company_id, session.session_id);
+    return;
+  }
+  await supabase.from('aegis_memory').delete()
+    .eq('company_id', session.company_id)
+    .eq('source', legacySessionSource(session.company_id));
 }
 
 async function storeOutreach(outreach: ActiveOutreach): Promise<void> {
@@ -1088,6 +1191,9 @@ export async function dispatchOutreach(params: {
   }
 
   const outreach: ActiveOutreach = {
+    // D19 — remember which call-out this outreach belongs to, so an acceptance
+    // updates the RIGHT session even when several are open.
+    session_id: session.session_id,
     company_id: session.company_id,
     employee_id: employee.id,
     shift_date: session.shift_date,
@@ -1286,7 +1392,9 @@ export async function handleEmergencyCoverage(
   const shownCount = t12 > 0 ? Math.min(5, t12) : Math.min(5, tier3.length);
 
   // Store session (awaiting manager's name reply)
+  // D19 — a unique id for THIS call-out, so a second call-out can't overwrite it.
   const session: CoverageSession = {
+    session_id: randomUUID(),
     company_id: contact.company_id,
     manager_contact: contact.matched_identifier,
     manager_channel: message.channel,
@@ -1455,7 +1563,7 @@ async function blastNextBatch(
     .filter(c => c.employee_id !== session.callout_employee_id);
 
   if (next.length === 0) {
-    await clearSession(contact.company_id);
+    await clearSession(session);
     await reply(
       contact,
       message,
@@ -1501,14 +1609,17 @@ export async function processCoverageBatchButton(params: {
   companyId: string;
   managerContact: string;
   action: 'send' | 'stop';
+  // D19 — the call-out this button belongs to. Resolves the right session when
+  // several are open. Optional for older tokens issued before D19.
+  sessionId?: string;
 }): Promise<{ outcome: CoverageBatchOutcome; shiftName: string }> {
-  const session = await getActiveCoverageSession(params.companyId, params.managerContact);
+  const session = await getCoverageSessionById(params.companyId, params.sessionId, params.managerContact);
   const outcome = classifyCoverageBatchButton(session, params.action);
   if (!session) return { outcome: 'not_found', shiftName: '' };
   const shiftName = session.shift_info.shift_name;
 
   if (outcome === 'stopped') {
-    await clearSession(session.company_id);
+    await clearSession(session);
     await logActivity({
       company_id: session.company_id,
       action: 'emergency_coverage_declined_outreach',
@@ -1519,7 +1630,7 @@ export async function processCoverageBatchButton(params: {
   }
 
   if (outcome === 'exhausted') {
-    await clearSession(session.company_id);
+    await clearSession(session);
     return { outcome, shiftName };
   }
 
@@ -1586,6 +1697,9 @@ export async function promptForNextBatchOrExhaust(params: {
         request_id: requestId,
         company_id: session.company_id,
         manager_contact: session.manager_contact,
+        // D19 — which call-out this button belongs to, so the click resolves the
+        // right session when several are open.
+        session_id: session.session_id,
         expires_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
       };
       await Promise.all([
@@ -1620,7 +1734,7 @@ export async function promptForNextBatchOrExhaust(params: {
       metadata: { shift_date: session.shift_date, shift_name: session.shift_info.shift_name, already_contacted: shown },
     });
   } else {
-    await clearSession(session.company_id);
+    await clearSession(session);
     await reply(
       managerContact,
       managerMessage,
@@ -1639,6 +1753,61 @@ export async function promptForNextBatchOrExhaust(params: {
 // Step 2: Manager decides who to contact (everyone on the list or specific
 // names), or answers a "send another batch?" prompt. Outreach goes out in
 // parallel — first YES wins.
+// D19 — a manager can now have several call-outs open at once. This decides
+// which one a reply belongs to, and is the single entry the router calls.
+// Returns true if it handled the message (routed a reply, or asked which
+// call-out the manager meant); false if there's nothing to route (fall through).
+const REPLYABLE_STATES = new Set<CoverageSession['state']>(['awaiting_names', 'awaiting_next_batch_decision']);
+
+/** Does the manager's message clearly name this call-out (by the absent person or the shift)? */
+function replyMatchesSession(body: string, session: CoverageSession): boolean {
+  const b = body.toLowerCase();
+  const firstName = session.callout_employee_name.trim().split(/\s+/)[0]?.toLowerCase();
+  const shiftName = session.shift_info.shift_name?.toLowerCase();
+  return (!!firstName && firstName.length > 1 && b.includes(firstName)) ||
+         (!!shiftName && shiftName.length > 1 && b.includes(shiftName));
+}
+
+export async function routeManagerCoverageReply(
+  message: InboundMessage,
+  contact: VerifiedContact
+): Promise<boolean> {
+  const open = (await listActiveCoverageSessions(contact.company_id, contact.matched_identifier))
+    .filter(s => REPLYABLE_STATES.has(s.state));
+
+  if (open.length === 0) return false;
+  if (open.length === 1) {
+    await handleManagerCoverageReply(message, contact, open[0]);
+    return true;
+  }
+
+  // Several call-outs are awaiting this manager. If the reply is itself a brand
+  // new call-out, let it start a fresh flow rather than trying to disambiguate.
+  if (isNewCoverageRequest(message.body)) {
+    await handleEmergencyCoverage(message, contact, {});
+    return true;
+  }
+
+  // Try to pin the reply to ONE call-out by the person or shift it names.
+  const matched = open.filter(s => replyMatchesSession(message.body, s));
+  if (matched.length === 1) {
+    await handleManagerCoverageReply(message, contact, matched[0]);
+    return true;
+  }
+
+  // Still ambiguous — ask, rather than guess which shift the manager meant.
+  const list = open
+    .map(s => `• ${s.callout_employee_name}'s ${s.shift_info.shift_name} shift on ${formatShortDate(s.shift_date)}`)
+    .join('\n');
+  await reply(
+    contact,
+    message,
+    `You've got ${open.length} coverage requests going right now, so I want to make sure I apply this to the right one:\n\n${list}\n\n` +
+      `Just name the person or the shift (for example "${open[0].callout_employee_name.split(/\s+/)[0]}") and I'll take it from there.`
+  );
+  return true;
+}
+
 export async function handleManagerCoverageReply(
   message: InboundMessage,
   contact: VerifiedContact,
@@ -1651,7 +1820,7 @@ export async function handleManagerCoverageReply(
   // I need coverage" gets parsed as "contact Maisey" — contacting the person
   // who's actually out.
   if (isNewCoverageRequest(message.body)) {
-    await clearSession(contact.company_id);
+    await clearSession(session);
     await handleEmergencyCoverage(message, contact, {});
     return;
   }
@@ -1661,7 +1830,7 @@ export async function handleManagerCoverageReply(
     if (parseEmployeeResponse(message.body) === 'yes') {
       await blastNextBatch(message, contact, session);
     } else {
-      await clearSession(contact.company_id);
+      await clearSession(session);
       await reply(
         contact,
         message,
@@ -1708,7 +1877,7 @@ export async function handleManagerCoverageReply(
 
   if (names.length === 0) {
     // Manager is declining Aegis outreach or just following up.
-    await clearSession(contact.company_id);
+    await clearSession(session);
     await reply(
       contact,
       message,
@@ -1799,8 +1968,10 @@ export async function handleEmployeeCoverageResponse(
     return;
   }
 
-  // Load current session
-  const session = await getActiveCoverageSession(outreach.company_id, outreach.manager_contact);
+  // Load THIS call-out's session by the id the outreach carries (D19), so an
+  // acceptance updates the right one when several call-outs are open. Legacy
+  // outreach with no id falls back to the manager's newest session.
+  const session = await getCoverageSessionById(outreach.company_id, outreach.session_id, outreach.manager_contact);
 
   if (responseType === 'yes') {
     // Mark coverage filled
@@ -1837,7 +2008,7 @@ export async function handleEmployeeCoverageResponse(
           await storeOutreach({ ...rest, coverage_filled: true });
         }
       }
-      await clearSession(outreach.company_id);
+      await clearSession(session);
     }
 
     await clearOutreach(outreach.company_id, contact.employee_id!);
@@ -1986,7 +2157,8 @@ export async function processCoverageButtonDecision(params: {
   }
 
   const { contact: managerContact, message: managerMessage } = managerReplyTarget(outreach);
-  const session = await getActiveCoverageSession(companyId, outreach.manager_contact);
+  // D19 — route by the outreach's own session id, not "the manager's session".
+  const session = await getCoverageSessionById(companyId, outreach.session_id, outreach.manager_contact);
 
   if (decision === 'accept') {
     if (session) {
@@ -2009,7 +2181,7 @@ export async function processCoverageButtonDecision(params: {
           await storeOutreach({ ...rest, coverage_filled: true });
         }
       }
-      await clearSession(companyId);
+      await clearSession(session);
     }
     await clearOutreach(companyId, employeeId);
 

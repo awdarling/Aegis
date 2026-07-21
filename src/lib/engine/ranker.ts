@@ -34,6 +34,15 @@ export function rankCandidates(
     }
   }
 
+  // FAIRNESS-1 — the hours that drive fairness are this week's hours PLUS the
+  // employee's decayed hours from recent prior weeks (weekState.priorHoursMap).
+  // Folding in recent history is what stops the same people topping the
+  // schedule every week. priorHoursMap is empty for seedless/legacy callers, so
+  // this reduces to the old within-week behavior when there's no memory.
+  function combinedHours(id: string): number {
+    return (weekState.weeklyHoursMap.get(id) ?? 0) + (weekState.priorHoursMap?.get(id) ?? 0);
+  }
+
   // Peer group min/max for fairness normalization. Peers are employees in
   // the candidate pool sharing the primary_role of each ranked employee.
   // We compute per-candidate during sort.
@@ -45,7 +54,7 @@ export function rankCandidates(
     let min = Infinity;
     let max = -Infinity;
     for (const p of peers) {
-      const h = weekState.weeklyHoursMap.get(p.id) ?? 0;
+      const h = combinedHours(p.id);
       if (h < min) min = h;
       if (h > max) max = h;
     }
@@ -58,7 +67,7 @@ export function rankCandidates(
     const { min, max } = peerStats(e.primary_role);
     const range = max - min;
     if (range <= 0) return 0;
-    const h = weekState.weeklyHoursMap.get(e.id) ?? 0;
+    const h = combinedHours(e.id);
     return (h - min) / range;
   }
 
@@ -83,8 +92,36 @@ export function rankCandidates(
       if (aVet !== bVet) return aVet - bVet;
     }
 
+    // FAIRNESS-1 — final tiebreaker. Everything above (qualification, avoid
+    // conflicts, fairness, veteran preference) is UNCHANGED and still decides
+    // first; this only orders candidates the engine considers equally good.
+    // With a per-build seed, rotate them pseudo-randomly so rebuilding the same
+    // week produces a different valid schedule and coworkers vary week to week.
+    // Deterministic per (id, seed); falls back to alphabetical when no seed is
+    // supplied so seedless callers and tests stay stable.
+    const seed = weekState.tieBreakSeed;
+    if (seed) {
+      const ha = tieHash(a.id, seed);
+      const hb = tieHash(b.id, seed);
+      if (ha !== hb) return ha - hb;
+    }
+
     return a.name.localeCompare(b.name);
   });
 
   return ranked;
+}
+
+// Deterministic 32-bit hash of `${id}:${seed}` (FNV-1a). Used ONLY to rotate
+// otherwise-equal candidates in the ranker's final tiebreaker — never for
+// anything security-sensitive. Same id+seed always yields the same value, so a
+// build is reproducible given its seed; different seeds reshuffle ties.
+function tieHash(id: string, seed: string): number {
+  const s = `${id}:${seed}`;
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
 }

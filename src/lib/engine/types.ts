@@ -46,6 +46,21 @@ export interface CandidatePool {
 // sameDayDoubleReason in eligibility.ts. Don't reintroduce a parallel index.
 export interface WeekState {
   weeklyHoursMap: Map<string, number>;
+  // FAIRNESS-1 — read-only during a build. Decayed hours each employee worked
+  // in recent prior published weeks. Folded into the ranker's fairness score so
+  // under-worked people rank ahead, but NEVER counted against this week's
+  // max_weekly_hours cap (that check reads weeklyHoursMap alone). Empty map =
+  // no cross-week memory (old behavior). Optional so the many WeekState
+  // sub-views (cascade validation, test fixtures) need not construct it;
+  // readers treat absent as "no prior hours".
+  priorHoursMap?: Map<string, number>;
+  // FAIRNESS-1 — per-build seed for the ranker's FINAL tiebreaker only. A
+  // non-empty seed rotates who wins otherwise-equal ties, so rebuilding the
+  // same week gives a different (still valid) schedule and coworkers vary week
+  // to week. Empty string falls back to alphabetical — stable, for tests and
+  // seedless callers. It never overrides fairness, qualification, or any rule.
+  // Optional (see priorHoursMap) — absent/empty means alphabetical tiebreak.
+  tieBreakSeed?: string;
   assignments: ScheduleAssignment[];
   gaps: ScheduleGap[];
   flagged_issues: FlaggedIssue[];

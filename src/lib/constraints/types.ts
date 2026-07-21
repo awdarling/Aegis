@@ -53,6 +53,18 @@ export interface EngineSettings {
   // TODO: counting consecutive days from the PRIOR week is out of scope —
   // the run is computed strictly from assignments made in this build.
   maxConsecutiveDaysWorked: number | null;
+  // FAIRNESS-1 — cross-week hours memory. The builder biases toward
+  // under-worked people by folding each employee's ACTUAL hours from recent
+  // prior published weeks into the fairness ranking (decayed by age). This is
+  // what stops the same names landing on top every single week.
+  //   fairnessLookbackWeeks — how many prior published weeks to consider
+  //     (0 disables the memory — pure within-week fairness, the old behavior).
+  //   fairnessDecay — weight multiplier per week of age: the most recent week
+  //     counts ×decay^0 (full), the one before ×decay^1, etc. (0..1].
+  // Prior hours bias RANKING only; they never count against this week's
+  // max_weekly_hours cap.
+  fairnessLookbackWeeks: number;
+  fairnessDecay: number;
 }
 
 export interface ParsedConstraints {
@@ -72,4 +84,6 @@ export const DEFAULT_ENGINE_SETTINGS: EngineSettings = {
   conflictResolution: 'fairness_first',
   weekStartDay: 'sunday',
   maxConsecutiveDaysWorked: null,
+  fairnessLookbackWeeks: 3,
+  fairnessDecay: 0.5,
 };

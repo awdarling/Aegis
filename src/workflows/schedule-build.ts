@@ -310,6 +310,53 @@ async function loadBuildData(
   };
 }
 
+// FAIRNESS-1 — cross-week hours memory. Sums each employee's ACTUAL hours from
+// the most recent `lookbackWeeks` DISTINCT published, non-superseded, non-
+// deleted weeks strictly before `weekStart`, decayed by age (most recent week
+// full weight, each older week ×decay). Returns employee_id → decayed hours.
+// Empty when disabled (lookbackWeeks<=0) or there's no history. This is a
+// RANKING bias only — it never counts against this week's max_weekly_hours cap.
+async function loadRecentHours(
+  companyId: string,
+  weekStart: string,
+  lookbackWeeks: number,
+  decay: number,
+): Promise<Map<string, number>> {
+  const priorHours = new Map<string, number>();
+  if (lookbackWeeks <= 0) return priorHours;
+
+  const { data: rows } = await supabase
+    .from('schedules')
+    .select('week_start, data')
+    .eq('company_id', companyId)
+    .lt('week_start', weekStart)
+    .is('deleted_at', null)
+    .is('superseded_by', null)
+    .not('published_at', 'is', null)
+    .order('week_start', { ascending: false })
+    .order('published_at', { ascending: false })
+    .limit(lookbackWeeks * 4);
+
+  type PriorRow = {
+    week_start: string;
+    data: { assignments?: Array<{ employee_id?: string; hours?: number }> } | null;
+  };
+  const seenWeeks = new Set<string>();
+  let rank = 0;
+  for (const row of (rows ?? []) as PriorRow[]) {
+    if (seenWeeks.has(row.week_start)) continue; // one effective schedule per week
+    seenWeeks.add(row.week_start);
+    const weight = Math.pow(decay, rank);
+    rank++;
+    for (const a of row.data?.assignments ?? []) {
+      if (!a.employee_id || typeof a.hours !== 'number' || !Number.isFinite(a.hours)) continue;
+      priorHours.set(a.employee_id, (priorHours.get(a.employee_id) ?? 0) + a.hours * weight);
+    }
+    if (rank >= lookbackWeeks) break;
+  }
+  return priorHours;
+}
+
 // ── Gap reason ────────────────────────────────────────────────────────────────
 
 interface GapReasonInput {
@@ -461,6 +508,10 @@ interface BuildContext {
   settings: EngineSettings;
   attributeMix: AttributeMixConstraint[];
   concurrentCoverage: ConcurrentCoverageConstraint[];
+  // FAIRNESS-1 — optional cross-week inputs. Absent/empty = legacy behavior
+  // (no cross-week memory, alphabetical tiebreak).
+  priorHoursMap?: Map<string, number>;
+  tieBreakSeed?: string;
 }
 
 interface BuildResult {
@@ -540,10 +591,19 @@ function buildScheduleForWeek(ctx: BuildContext): BuildResult {
 
   const weekState: WeekState = {
     weeklyHoursMap: new Map(),
+    // FAIRNESS-1 — cross-week memory + tiebreak seed threaded from the caller.
+    priorHoursMap: ctx.priorHoursMap ?? new Map(),
+    tieBreakSeed: ctx.tieBreakSeed ?? '',
     assignments: [],
     gaps: [],
     flagged_issues: [],
   };
+
+  // FAIRNESS-1 — hours that fairness "feels": this week so far + decayed prior
+  // weeks. The post-fill veteran swaps use this to pick the LEAST-worked
+  // eligible veteran (not the first in roster order), matching the ranker.
+  const combinedHoursOf = (id: string): number =>
+    (weekState.weeklyHoursMap.get(id) ?? 0) + (weekState.priorHoursMap?.get(id) ?? 0);
 
   // Track required vs filled. required = sum of slot counts across canvas.
   // We compute totalRequired from canvas length.
@@ -804,7 +864,10 @@ function buildScheduleForWeek(ctx: BuildContext): BuildResult {
           ...weekState,
           assignments: weekState.assignments.filter((_, i) => i !== idx),
         };
-        const candidate = elig.employees.find(e => {
+        // FAIRNESS-1 — pick the LEAST-worked eligible veteran, not the first in
+        // roster order, so satisfying the veteran requirement doesn't pile hours
+        // onto the same few people.
+        const candidate = elig.employees.filter(e => {
           if (!e.is_veteran) return false;
           if (placedVets.has(e.id)) return false;
           if (cohabIds.includes(e.id)) return false;
@@ -818,7 +881,7 @@ function buildScheduleForWeek(ctx: BuildContext): BuildResult {
           }
           if (sameDayDoubleReason(e.id, slot, viewState, settings) !== null) return false;
           return true;
-        });
+        }).sort((x, y) => combinedHoursOf(x.id) - combinedHoursOf(y.id))[0];
         if (!candidate) continue;
 
         const prevId = cur.employee_id;
@@ -905,7 +968,9 @@ function buildScheduleForWeek(ctx: BuildContext): BuildResult {
             ...weekState,
             assignments: weekState.assignments.filter((_, i) => i !== idx),
           };
-          const candidate = elig.employees.find(e => {
+          // FAIRNESS-1 — least-worked eligible veteran first (see the veteranMode
+          // swap above for rationale).
+          const candidate = elig.employees.filter(e => {
             if (!e.is_veteran) return false;
             if (placedVets.has(e.id)) return false;
             if (cohabIds.includes(e.id)) return false;
@@ -917,7 +982,7 @@ function buildScheduleForWeek(ctx: BuildContext): BuildResult {
             ) return false;
             if (sameDayDoubleReason(e.id, slot, viewState, settings) !== null) return false;
             return true;
-          });
+          }).sort((x, y) => combinedHoursOf(x.id) - combinedHoursOf(y.id))[0];
           if (!candidate) continue;
 
           const prevId = cur.employee_id;
@@ -1056,6 +1121,10 @@ export function runScheduleBuild(
   veteranOnlyDates: VeteranOnlyRange[],
   weekStart: string,
   weekEnd: string,
+  // FAIRNESS-1 — optional. priorHoursMap biases fairness toward under-worked
+  // people using recent weeks; tieBreakSeed rotates otherwise-equal ties per
+  // build. Omitted (e.g. legacy callers, tests) = old deterministic behavior.
+  opts?: { priorHoursMap?: Map<string, number>; tieBreakSeed?: string },
 ): RunScheduleBuildResult {
   const weekDates = getDatesInRange(weekStart, weekEnd);
 
@@ -1077,6 +1146,8 @@ export function runScheduleBuild(
     settings,
     attributeMix: parsedHard.attributeMix,
     concurrentCoverage: parsedHard.concurrentCoverage,
+    priorHoursMap: opts?.priorHoursMap,
+    tieBreakSeed: opts?.tieBreakSeed,
   });
 
   return {
@@ -1339,6 +1410,23 @@ export async function buildScheduleAndSave(
     console.log('[schedule-build] veteran-only date ranges:', veteranOnlyDates);
   }
 
+  // FAIRNESS-1 — cross-week memory + a fresh per-build rotation seed. The seed
+  // varies every build (so rebuilding the same week yields a different valid
+  // schedule); priorHoursMap pulls recent actual hours so under-worked people
+  // rank ahead.
+  const priorHoursMap = await loadRecentHours(
+    companyId,
+    weekStart,
+    parsed.settings.fairnessLookbackWeeks,
+    parsed.settings.fairnessDecay,
+  );
+  const tieBreakSeed = `${weekStart}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+  console.log(
+    '[schedule-build] fairness memory:', priorHoursMap.size,
+    'employees carry prior-week hours (lookback', parsed.settings.fairnessLookbackWeeks,
+    ', decay', parsed.settings.fairnessDecay, ')'
+  );
+
   const runResult = runScheduleBuild(
     data,
     parsed.settings,
@@ -1346,6 +1434,7 @@ export async function buildScheduleAndSave(
     veteranOnlyDates,
     weekStart,
     weekEnd,
+    { priorHoursMap, tieBreakSeed },
   );
   const { assignments, gaps, flagged_issues, closed_dates, totalRequired, totalFilled } = runResult;
 

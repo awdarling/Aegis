@@ -76,6 +76,27 @@ function daysBetween(fromDate: string, toDate: string): number {
   return Math.floor((to - from) / (24 * 60 * 60 * 1000));
 }
 
+function dayOfWeekUTC(date: string): number {
+  return new Date(date + 'T12:00:00Z').getUTCDay();
+}
+
+// CUSTOM-AVAIL-ALIGN: shift `date` back to the most recent day whose weekday
+// matches `weekAligned`'s weekday (the schedule's week-start). A rotating
+// cycle_start_date can be ANY weekday (a manager might pick a Wednesday), but
+// the schedule runs in fixed week-start-aligned weeks. Anchoring the rotation to
+// the same weekday makes daysBetween(anchor, weekStart) a clean multiple of 7,
+// so the whole build week reads ONE rotation-week pattern instead of flipping
+// mid-week. Without this, ~5 of every 7 days got the wrong week's availability.
+function alignToWeekday(date: string, weekAligned: string): string {
+  const target = dayOfWeekUTC(weekAligned);
+  const dow = dayOfWeekUTC(date);
+  const back = (((dow - target) % 7) + 7) % 7;
+  if (back === 0) return date;
+  const d = new Date(date + 'T12:00:00Z');
+  d.setUTCDate(d.getUTCDate() - back);
+  return d.toISOString().slice(0, 10);
+}
+
 // Resolves the effective availability for an employee for the given schedule
 // week, taking any active custom_availability override into account. Returns
 // `normalAvailability` unchanged when no override applies, when the override
@@ -108,7 +129,10 @@ export function resolveAvailabilityForWeek(
     const weeks = patternsAsWeeks(customAvailability.patterns);
     if (!weeks) return normalAvailability;
 
-    const daysDiff = daysBetween(customAvailability.cycle_start_date, weekStart);
+    // Anchor the cycle to the schedule's week-start (see alignToWeekday) so the
+    // rotation lines up with build weeks instead of flipping mid-week.
+    const alignedCycleStart = alignToWeekday(customAvailability.cycle_start_date, weekStart);
+    const daysDiff = daysBetween(alignedCycleStart, weekStart);
     if (daysDiff < 0) return normalAvailability;
 
     const weekNumber = (Math.floor(daysDiff / 7) % customAvailability.cycle_weeks) + 1;

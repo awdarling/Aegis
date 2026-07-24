@@ -37,6 +37,10 @@ Per-action status of the 8 `ActionType`s in `src/lib/aegis-actions/types.ts`. Dr
 
 **State:** branch `fix/engine-fairness-timeoff-memory`; `schedule-build.ts`, `types.ts`, new `fairness-timeoff-memory.test.ts` (5) + `scripts/dryrun-timeoff-memory-compare.ts`. tsc clean, 270/270. NOT merged; owed = live dry-run (Lucas's memory rises) → PR → merge. Together with FAIRNESS-2 this closes the Michael-at-zero / Lucas-front-loaded pair.
 
+## 2026-07-24 (cont.) — FAIRNESS-2 floor tuned to ratio 1.0
+
+First post-deploy build showed the fixes working (Michael 0→9h, Lucas 28.8→10.75h) but fully-available lifeguards still bottomed at ~6h (the 0.5 floor guarantees only ~half the role mean). Bumped `DEFAULT_ENGINE_SETTINGS.fairnessFloorRatio` 0.5 → 1.0 so available same-role guards cluster near the weekly average; time-off people stay correctly lower. One-line change, tsc clean. Verify via `scripts/dryrun-floor-compare.ts`.
+
 ## 2026-07-24 — FAIRNESS-2 engine floor: eligible employees no longer starved to zero (BUILT, IN REVIEW)
 
 **Bug (Watermark managers):** an available employee with no time-off request (Michael McCorkle, Headguard) was left entirely off next week while same-role peers ran 20+ h. Root cause = FAIRNESS-1 cross-week memory with no floor (Michael's genuine 3-week load ≈ 44 decayed → ranked last → 0; fully staffed, so pure ranker starvation, not a gap).

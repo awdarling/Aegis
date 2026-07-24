@@ -1033,6 +1033,119 @@ function buildScheduleForWeek(ctx: BuildContext): BuildResult {
     }
   }
 
+  // ── FAIRNESS-2: within-week distribution floor (anti-starvation) ────────────
+  // Managers' universal rule: if availability + time off don't EXCLUDE an
+  // employee, they must not be starved to zero for a week while an equally-
+  // eligible peer runs 20+ hours. FAIRNESS-1's cross-week memory decides who
+  // LEADS each week; this floor guarantees nobody eligible is left far below
+  // their role's peers in ANY single week. It moves whole slots from the most-
+  // loaded eligible holder to a starved eligible peer, reusing the SAME
+  // eligibility primitives as the fill loop, so it never breaks availability,
+  // time off, the hours cap, a banned pair, a consecutive-day cap, a veteran
+  // requirement, and never creates a double-booking. Deterministic + bounded.
+  if (settings.fairnessFloorEnabled) {
+    const thisWeek = (id: string): number => weekState.weeklyHoursMap.get(id) ?? 0;
+
+    // Floor is relative to each role's realized MEAN hours this week, so it is
+    // generic across clients (no hard-coded hours constant). ratio 0 => no lift;
+    // higher ratio => a higher minimum and more balancing.
+    const roleSum = new Map<string, { h: number; n: number }>();
+    for (const e of data.employees) {
+      const cur = roleSum.get(e.primary_role) ?? { h: 0, n: 0 };
+      cur.h += thisWeek(e.id);
+      cur.n += 1;
+      roleSum.set(e.primary_role, cur);
+    }
+    const floorOf = (e: Employee): number => {
+      const s = roleSum.get(e.primary_role);
+      const mean = s && s.n > 0 ? s.h / s.n : 0;
+      return settings.fairnessFloorRatio * mean;
+    };
+
+    // Removing a veteran from a shift must not drop it below a veteran
+    // requirement (veteranMode or a stored experience rule). Only matters when
+    // the incoming employee is a non-veteran.
+    const veteranRemovalSafe = (date: string, shiftName: string, removalIndex: number): boolean => {
+      const groupIndices: number[] = [];
+      for (let i = 0; i < weekState.assignments.length; i++) {
+        const a = weekState.assignments[i];
+        if (a.date === date && a.shift_name === shiftName) groupIndices.push(i);
+      }
+      if (veteranMode === 'only') return false;
+      if (veteranMode === 'at_least_one') {
+        const vets = groupIndices.filter(i => employeeById.get(weekState.assignments[i].employee_id)?.is_veteran).length;
+        if (vets - 1 < 1) return false;
+      }
+      if (experienceRules.length > 0) {
+        const shiftTypeId = canvas.find(s => s.date === date && s.shift_name === shiftName)?.shift_type_id ?? '';
+        const groupAssignments = groupIndices.map(i => ({ index: i, role: weekState.assignments[i].role }));
+        const targets = veteranTargetsForGroup(experienceRules, date, shiftTypeId, groupAssignments);
+        for (const target of targets) {
+          if (!target.indices.includes(removalIndex)) continue;
+          const targetVets = target.indices.filter(i => employeeById.get(weekState.assignments[i].employee_id)?.is_veteran).length;
+          if (targetVets - 1 < target.need) return false;
+        }
+      }
+      return true;
+    };
+
+    // Bounded, deterministic loop. Each pass rescues the single MOST-starved
+    // employee that has a legal, inequality-reducing transfer, then re-evaluates.
+    const maxTransfers = weekState.assignments.length;
+    for (let t = 0; t < maxTransfers; t++) {
+      const starved = data.employees
+        .filter(e => thisWeek(e.id) < floorOf(e))
+        .sort((a, b) => (thisWeek(a.id) - thisWeek(b.id)) || a.name.localeCompare(b.name));
+
+      let applied = false;
+      for (const E of starved) {
+        let bestDonorIdx = -1;
+        let bestGap = 0;
+        for (let j = 0; j < weekState.assignments.length; j++) {
+          const a = weekState.assignments[j];
+          if (a.employee_id === E.id) continue;
+          const R = employeeById.get(a.employee_id);
+          if (!R) continue;
+          const slot = canvas.find(s => s.date === a.date && s.shift_name === a.shift_name && s.role === a.role);
+          if (!slot) continue;
+          const gap = thisWeek(R.id) - thisWeek(E.id);
+          if (gap <= slot.hours) continue;   // must reduce inequality without inverting it
+          if (gap <= bestGap) continue;       // keep the most-unequal legal transfer
+          const viewState: WeekState = {
+            ...weekState,
+            assignments: weekState.assignments.filter((_, i) => i !== j),
+          };
+          const cohabIds = weekState.assignments
+            .filter((x, i) => i !== j && x.date === a.date && x.shift_name === a.shift_name)
+            .map(x => x.employee_id);
+          const elig = buildEligibility(slot, data.employees, data.availByEmp, data.toMap, veteranOnlyDates);
+          if (!elig.employees.some(x => x.id === E.id)) continue;
+          if (cohabIds.includes(E.id)) continue;
+          if (hasHardBannedPair(E.id, cohabIds, data.conflicts)) continue;
+          if (thisWeek(E.id) + slot.hours > E.max_weekly_hours) continue;
+          if (
+            settings.maxConsecutiveDaysWorked != null &&
+            consecutiveDaysRunIncluding(E.id, slot.date, viewState) > settings.maxConsecutiveDaysWorked
+          ) continue;
+          if (sameDayDoubleReason(E.id, slot, viewState, settings) !== null) continue;
+          if (R.is_veteran && !E.is_veteran && !veteranRemovalSafe(a.date, a.shift_name, j)) continue;
+          bestDonorIdx = j;
+          bestGap = gap;
+        }
+        if (bestDonorIdx >= 0) {
+          const a = weekState.assignments[bestDonorIdx];
+          const slot = canvas.find(s => s.date === a.date && s.shift_name === a.shift_name && s.role === a.role)!;
+          weekState.weeklyHoursMap.set(a.employee_id, thisWeek(a.employee_id) - slot.hours);
+          weekState.weeklyHoursMap.set(E.id, thisWeek(E.id) + slot.hours);
+          weekState.assignments[bestDonorIdx] = { ...a, employee_id: E.id, employee_name: E.name };
+          applied = true;
+          break;
+        }
+      }
+      if (!applied) break;
+    }
+  }
+
   // Concurrent (facility-wide temporal) coverage evaluation. Validate-and-flag
   // only — runs on the final assignment state, never swaps. Replaces the
   // per-shift sex enforcement for the sex_coverage rule.

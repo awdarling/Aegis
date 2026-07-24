@@ -65,6 +65,14 @@ export interface EngineSettings {
   // max_weekly_hours cap.
   fairnessLookbackWeeks: number;
   fairnessDecay: number;
+  // FAIRNESS-2 — within-week distribution floor (anti-starvation).
+  //   fairnessFloorEnabled — guarantee no eligible employee is starved far
+  //     below their role peers in a single week (false = old behavior).
+  //   fairnessFloorRatio — the per-role minimum, as a fraction of that
+  //     role's MEAN hours this week (0..1]. Higher = higher floor + more
+  //     balancing. Prior-week memory still governs distribution above it.
+  fairnessFloorEnabled: boolean;
+  fairnessFloorRatio: number;
 }
 
 export interface ParsedConstraints {
@@ -86,4 +94,6 @@ export const DEFAULT_ENGINE_SETTINGS: EngineSettings = {
   maxConsecutiveDaysWorked: null,
   fairnessLookbackWeeks: 3,
   fairnessDecay: 0.5,
+  fairnessFloorEnabled: true,
+  fairnessFloorRatio: 0.5,
 };

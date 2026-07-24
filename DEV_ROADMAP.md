@@ -1125,6 +1125,36 @@ Focused Soteria session against the PURPOSE & DEFINITION-OF-DONE block. Diagnose
 - **Gap closed:** the one untested link was the **intake** — that an employee email actually *feeds* the custom system. Added 3 tests to `src/workflows/__tests__/custom-availability-magic.test.ts` (now 10): an "until \<date\>" email → date-limited pending (`custom_end_date` set, temporary framing in the confirm, permanent table untouched); a plain change → `custom_end_date` null; a non-date `end_date` value → ignored. Made the file's `withAnthropicRetry` mock controllable to drive `parseAvailabilityIntent`.
 - **State:** Aegis tsc clean; full suite **143/143 green**. Change is test-only (no production code touched) on a working copy — needs Alexander to push the branch + open a PR, then one live sandbox smoke (employee → manager approve) to flip #13 to fully DONE. Feature code itself is already deployed.
 
+### 2026-07-24 — FAIRNESS-3: exclude approved time off from the cross-week memory — BUILT on branch (stacked on FAIRNESS-2), tests green, pending merge + live dry-run
+
+**Reported (Alexander).** The cross-week fairness memory (FAIRNESS-1) is good, but it counts a week of approved time off as an under-worked week — so an employee returning from leave gets front-loaded the next week. Taking time off should NOT be rewarded with a pile of back-to-back hours.
+
+**Diagnosis (live Watermark).** `loadRecentHours` summed raw prior-week actual hours with no time-off awareness. Lucas Witham (Headguard) had approved full-day TO 07-09→11, 07-12, and 07-17→07-25 — covering all three prior weeks that feed the 07-27 build (07-20, 07-13, 07-06) — so his decayed prior ≈ 10.75 (near the bottom) → ranked #1 Headguard → 28.8h next week. Same memory as FAIRNESS-2's Michael case, opposite end.
+
+**Fix (branch `fix/engine-fairness-timeoff-memory`, stacked on `fix/engine-fairness-floor`).** `loadRecentHours` now marks, per prior week, who had approved FULL-DAY time off overlapping that week, and the core fold is a pure, tested `foldPriorHours(weeks, decay, excludeTimeOff)`: a time-off week is imputed to the employee's OWN average over their non-TO weeks (roster normal-week average as fallback when every in-window week was TO — Lucas's case) instead of their near-zero actual. Leave reads as a normal week, not under-work. Genuine under-work (low hours, no TO) is untouched and still ranks up. With `excludeTimeOff` off, behavior is byte-identical to FAIRNESS-1.
+- **Setting:** `EngineSettings.fairnessExcludeTimeOff` (default `true`, per-client toggleable). Parser unchanged (spreads defaults).
+- **Files:** `src/workflows/schedule-build.ts` (`loadRecentHours` rewritten + exported pure `foldPriorHours`; call site passes the flag), `src/lib/constraints/types.ts` (+1 setting), `src/lib/engine/__tests__/fairness-timeoff-memory.test.ts` (NEW, 5), `scripts/dryrun-timeoff-memory-compare.ts` (NEW, read-only OFF-vs-ON).
+- **Tests:** 5 new (vacationer imputed, genuine under-work untouched, partial vacationer → own typical, toggle, empty). Full suite **270/270** (265 + 5), tsc clean.
+
+**Status: BUILT, IN REVIEW — NOT merged.** Stacked on FAIRNESS-2 (both edit `schedule-build.ts`/`types.ts` in different spots; FAIRNESS-3's `types.ts` edit anchors on FAIRNESS-2's fields → apply FAIRNESS-2 first). DONE needs the live dry-run (`scripts/dryrun-timeoff-memory-compare.ts` — Lucas's memory should rise) then merge. **Refinement (logged, not built):** a partial-TO week (a couple days off) is imputed at full-week granularity; day-level proration is a future nicety.
+
+### 2026-07-24 — FAIRNESS-2: within-week distribution floor (anti-starvation) — BUILT on branch, tests green, pending merge + live dry-run
+
+**Reported (Alexander).** Watermark managers: an employee with NO time-off request and no availability block was left ENTIRELY off next week's schedule (Michael McCorkle, Headguard) while same-role peers ran 20+ h. Rule (universal, all clients): if availability + time off don't EXCLUDE someone, they must not be starved to zero while an equally-eligible peer runs 20+; managers want ~10/10, not 0/20.
+
+**Diagnosis (read-only, live Watermark, next-week 2026-07-27 draft `bd4ed959`).** Michael: active, veteran, `qualified_roles [AManager, Headguard, Lifeguard, Greeter]`, full 7-day availability, NO approved TO — yet 0 shifts, while Lucas 28.8h / Addison 25.2h (Headguards). Cause is FAIRNESS-1's cross-week memory with NO floor: Michael worked 28.5 / 18.75 / 25.0 the prior 3 weeks → decayed prior ≈ 44 (near roster top) → ranked last every slot → 0. `gap_count=0` (fully staffed) so it is pure ranker starvation, not a coverage gap. Same memory mechanism as the Lucas case (FAIRNESS-3), opposite end: no floor at the bottom vs a polluted signal at the top.
+
+**Fix (branch `fix/engine-fairness-floor` off `origin/main` b0e3fd7).** New post-fill pass in `buildScheduleForWeek` (after the veteran/experience swaps, before `evaluateSexCoverage`): a bounded, deterministic loop that rescues the most-starved eligible employee by moving a whole slot from the most-loaded eligible holder, reusing the fill loop's OWN primitives (`buildEligibility` + slot-level filters via a donor-excluded `viewState` + `hasHardBannedPair` + hours cap + `consecutiveDaysRunIncluding` + `sameDayDoubleReason`), plus a `veteranRemovalSafe` guard so removing a veteran never drops a shift below its `veteranMode`/experience-rule requirement. NEVER breaks availability, time off, the hours cap, a banned pair, a consecutive-day cap, a veteran requirement, and never double-books; reassign-only, so it cannot create a gap or reduce coverage. FAIRNESS-1 memory still governs distribution ABOVE the floor.
+- **Settings (config-over-code):** `EngineSettings.fairnessFloorEnabled` (default `true`, per-client toggleable) + `fairnessFloorRatio` (default `0.5` — floor = ratio × the role's MEAN hours that week; no hard-coded hours constant). Added to `DEFAULT_ENGINE_SETTINGS`; parser needs no change (it spreads defaults), config-ready like FAIRNESS-1's lookback/decay.
+- **Files:** `src/lib/constraints/types.ts` (+2 settings), `src/workflows/schedule-build.ts` (+113, the pass), `src/lib/engine/__tests__/fairness-floor.test.ts` (NEW, 5 tests), `scripts/dryrun-floor-compare.ts` (NEW, read-only OFF-vs-ON live compare).
+- **Tests:** 5 new — rescue-off-zero, hours-cap safety, availability safety, veteran-rule safety, toggle-off. Full suite **265/265** (260 prior + 5), `tsc --noEmit` clean.
+
+**Status: BUILT, IN REVIEW — NOT merged, no prod writes, no policy/migration change.** DONE needs (a) the live dry-run (`npx ts-node --transpile-only scripts/dryrun-floor-compare.ts` from a networked shell — device_bash has none) confirming Michael lifts off zero on the real 07-27 inputs, then (b) branch → PR → merge → Railway. Patch saved to repo root `FAIRNESS-2-floor.patch`.
+
+**Data oddity (flag, not blocking):** Michael McCorkle's `qualified_roles` contains `"AManager"` — likely a typo for an Assistant-Manager role. Harmless to the floor; worth correcting in the roster.
+
+**Next — FAIRNESS-3 (diagnosed, NOT built):** `loadRecentHours` sums raw prior-week hours with no time-off awareness, so an approved-leave week reads as "under-worked" and front-loads the returner (Lucas: approved off 07-17→07-25; prior-3wk ≈ 10.75 → ranked #1 Headguard at 28.8h next week). Fix: impute/neutralize approved-time-off weeks in the memory so leave is not rewarded with a front-loaded week.
+
 ### 2026-07-21 — CUSTOM-AVAIL-ALIGN (rotating availability) + schedule-editor UX — BUILT, tests green, pending merge
 
 **Two small asks from Watermark.**
@@ -1154,7 +1184,6 @@ Focused Soteria session against the PURPOSE & DEFINITION-OF-DONE block. Diagnose
 **Follow-up (optional):** route the single-cell check through `validateScheduleEdit` too (it still uses a coarse day-level availability check without custom availability). Minor — the schedule-level check is authoritative.
 
 **HANDOFF (Alexander, two-lane):** changes are in the HOMEBASE working tree (4 files: validator, its test, the two routes). Branch off `main`, commit, PR, merge → Vercel deploy. No migration. This roadmap entry lives in the Aegis repo (docs home) — commit it there separately (docs-only), per the D22 pattern. Homebase has no vitest runner; the validator is proven via the ts-node harness (command in the test file header).
-
 ### 2026-07-21 — FAIRNESS-1 diagnosed: chronic hours inequity + identical rebuilds (Watermark) — BUILT on branch, tests green, pending merge
 
 **Reported (Alexander):** at Watermark a few lifeguards (e.g. Katie Schillaci) run ~25–33 h/wk for weeks while equally-situated peers get ~6 h; and rebuilding the same week yields near-identical schedules (same people, always together).

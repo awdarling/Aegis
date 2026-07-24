@@ -310,20 +310,87 @@ async function loadBuildData(
   };
 }
 
-// FAIRNESS-1 — cross-week hours memory. Sums each employee's ACTUAL hours from
-// the most recent `lookbackWeeks` DISTINCT published, non-superseded, non-
+// FAIRNESS-1/3 — cross-week hours memory. Folds each employee's ACTUAL hours
+// from the most recent `lookbackWeeks` DISTINCT published, non-superseded, non-
 // deleted weeks strictly before `weekStart`, decayed by age (most recent week
 // full weight, each older week ×decay). Returns employee_id → decayed hours.
-// Empty when disabled (lookbackWeeks<=0) or there's no history. This is a
-// RANKING bias only — it never counts against this week's max_weekly_hours cap.
+// RANKING bias only — never counts against this week's max_weekly_hours cap.
+//
+// FAIRNESS-3 — when `excludeTimeOff` is on (default), a prior week in which an
+// employee had APPROVED full-day time off is NOT read as an under-worked week:
+// that week is imputed to the employee's own average over their non-TO weeks
+// (roster normal-week average as fallback). Otherwise a vacation reads as
+// "worked little" and the returner gets front-loaded the next week.
+
+function addDaysISO(d: string, days: number): string {
+  const dt = new Date(d + 'T12:00:00Z');
+  dt.setUTCDate(dt.getUTCDate() + days);
+  return dt.toISOString().slice(0, 10);
+}
+
+export interface PriorWeekHours {
+  hoursByEmp: Map<string, number>;   // employee_id → actual hours that week
+  toEmps: Set<string>;               // employees with approved full-day TO that week
+}
+
+// Pure + deterministic. `weeks` is most-recent-first (index 0 = rank 0).
+export function foldPriorHours(
+  weeks: PriorWeekHours[],
+  decay: number,
+  excludeTimeOff: boolean,
+): Map<string, number> {
+  const result = new Map<string, number>();
+  if (weeks.length === 0) return result;
+
+  const allIds = new Set<string>();
+  for (const w of weeks) {
+    for (const id of w.hoursByEmp.keys()) allIds.add(id);
+    for (const id of w.toEmps) allIds.add(id);
+  }
+
+  // Per-employee typical = mean ACTUAL over their NON-time-off weeks (an absent
+  // non-TO week counts as 0 — genuinely under-worked). Roster fallback = the
+  // mean of every non-TO week that had hours, i.e. a normal working week.
+  const typical = new Map<string, number>();
+  const hasNonTOWeek = new Map<string, boolean>();
+  let globalSum = 0, globalN = 0;
+  for (const id of allIds) {
+    let sum = 0, n = 0;
+    for (const w of weeks) {
+      if (w.toEmps.has(id)) continue;
+      const h = w.hoursByEmp.get(id) ?? 0;
+      sum += h; n++;
+      if (h > 0) { globalSum += h; globalN++; }
+    }
+    hasNonTOWeek.set(id, n > 0);
+    typical.set(id, n > 0 ? sum / n : 0);
+  }
+  const globalTypical = globalN > 0 ? globalSum / globalN : 0;
+
+  for (let rank = 0; rank < weeks.length; rank++) {
+    const w = weeks[rank];
+    const weight = Math.pow(decay, rank);
+    for (const id of allIds) {
+      let value: number;
+      if (excludeTimeOff && w.toEmps.has(id)) {
+        value = hasNonTOWeek.get(id) ? (typical.get(id) ?? 0) : globalTypical;
+      } else {
+        value = w.hoursByEmp.get(id) ?? 0;
+      }
+      if (value !== 0) result.set(id, (result.get(id) ?? 0) + value * weight);
+    }
+  }
+  return result;
+}
+
 async function loadRecentHours(
   companyId: string,
   weekStart: string,
   lookbackWeeks: number,
   decay: number,
+  excludeTimeOff: boolean,
 ): Promise<Map<string, number>> {
-  const priorHours = new Map<string, number>();
-  if (lookbackWeeks <= 0) return priorHours;
+  if (lookbackWeeks <= 0) return new Map<string, number>();
 
   const { data: rows } = await supabase
     .from('schedules')
@@ -341,20 +408,48 @@ async function loadRecentHours(
     week_start: string;
     data: { assignments?: Array<{ employee_id?: string; hours?: number }> } | null;
   };
+
+  // Collapse to one effective schedule per week (most-recent-first), summing
+  // each employee's actual hours for that week.
   const seenWeeks = new Set<string>();
-  let rank = 0;
+  const weekStarts: string[] = [];
+  const weeks: PriorWeekHours[] = [];
   for (const row of (rows ?? []) as PriorRow[]) {
-    if (seenWeeks.has(row.week_start)) continue; // one effective schedule per week
+    if (seenWeeks.has(row.week_start)) continue;
     seenWeeks.add(row.week_start);
-    const weight = Math.pow(decay, rank);
-    rank++;
+    const hoursByEmp = new Map<string, number>();
     for (const a of row.data?.assignments ?? []) {
       if (!a.employee_id || typeof a.hours !== 'number' || !Number.isFinite(a.hours)) continue;
-      priorHours.set(a.employee_id, (priorHours.get(a.employee_id) ?? 0) + a.hours * weight);
+      hoursByEmp.set(a.employee_id, (hoursByEmp.get(a.employee_id) ?? 0) + a.hours);
     }
-    if (rank >= lookbackWeeks) break;
+    weeks.push({ hoursByEmp, toEmps: new Set<string>() });
+    weekStarts.push(row.week_start);
+    if (weeks.length >= lookbackWeeks) break;
   }
-  return priorHours;
+
+  // FAIRNESS-3 — mark, per week, who had APPROVED full-day time off overlapping
+  // that week (so those weeks aren't read as under-worked).
+  if (excludeTimeOff && weeks.length > 0) {
+    const oldest = weekStarts[weekStarts.length - 1];
+    const { data: toRows } = await supabase
+      .from('time_off_requests')
+      .select('employee_id, start_date, end_date, time_off_type')
+      .eq('company_id', companyId)
+      .eq('status', 'approved')
+      .eq('time_off_type', 'full_day')
+      .lte('start_date', weekStart)
+      .gte('end_date', oldest);
+    const to = (toRows ?? []) as Array<{ employee_id: string; start_date: string; end_date: string }>;
+    for (let i = 0; i < weeks.length; i++) {
+      const ws = weekStarts[i];
+      const we = addDaysISO(ws, 6);
+      for (const t of to) {
+        if (t.start_date <= we && t.end_date >= ws) weeks[i].toEmps.add(t.employee_id);
+      }
+    }
+  }
+
+  return foldPriorHours(weeks, decay, excludeTimeOff);
 }
 
 // ── Gap reason ────────────────────────────────────────────────────────────────
@@ -1033,6 +1128,119 @@ function buildScheduleForWeek(ctx: BuildContext): BuildResult {
     }
   }
 
+  // ── FAIRNESS-2: within-week distribution floor (anti-starvation) ────────────
+  // Managers' universal rule: if availability + time off don't EXCLUDE an
+  // employee, they must not be starved to zero for a week while an equally-
+  // eligible peer runs 20+ hours. FAIRNESS-1's cross-week memory decides who
+  // LEADS each week; this floor guarantees nobody eligible is left far below
+  // their role's peers in ANY single week. It moves whole slots from the most-
+  // loaded eligible holder to a starved eligible peer, reusing the SAME
+  // eligibility primitives as the fill loop, so it never breaks availability,
+  // time off, the hours cap, a banned pair, a consecutive-day cap, a veteran
+  // requirement, and never creates a double-booking. Deterministic + bounded.
+  if (settings.fairnessFloorEnabled) {
+    const thisWeek = (id: string): number => weekState.weeklyHoursMap.get(id) ?? 0;
+
+    // Floor is relative to each role's realized MEAN hours this week, so it is
+    // generic across clients (no hard-coded hours constant). ratio 0 => no lift;
+    // higher ratio => a higher minimum and more balancing.
+    const roleSum = new Map<string, { h: number; n: number }>();
+    for (const e of data.employees) {
+      const cur = roleSum.get(e.primary_role) ?? { h: 0, n: 0 };
+      cur.h += thisWeek(e.id);
+      cur.n += 1;
+      roleSum.set(e.primary_role, cur);
+    }
+    const floorOf = (e: Employee): number => {
+      const s = roleSum.get(e.primary_role);
+      const mean = s && s.n > 0 ? s.h / s.n : 0;
+      return settings.fairnessFloorRatio * mean;
+    };
+
+    // Removing a veteran from a shift must not drop it below a veteran
+    // requirement (veteranMode or a stored experience rule). Only matters when
+    // the incoming employee is a non-veteran.
+    const veteranRemovalSafe = (date: string, shiftName: string, removalIndex: number): boolean => {
+      const groupIndices: number[] = [];
+      for (let i = 0; i < weekState.assignments.length; i++) {
+        const a = weekState.assignments[i];
+        if (a.date === date && a.shift_name === shiftName) groupIndices.push(i);
+      }
+      if (veteranMode === 'only') return false;
+      if (veteranMode === 'at_least_one') {
+        const vets = groupIndices.filter(i => employeeById.get(weekState.assignments[i].employee_id)?.is_veteran).length;
+        if (vets - 1 < 1) return false;
+      }
+      if (experienceRules.length > 0) {
+        const shiftTypeId = canvas.find(s => s.date === date && s.shift_name === shiftName)?.shift_type_id ?? '';
+        const groupAssignments = groupIndices.map(i => ({ index: i, role: weekState.assignments[i].role }));
+        const targets = veteranTargetsForGroup(experienceRules, date, shiftTypeId, groupAssignments);
+        for (const target of targets) {
+          if (!target.indices.includes(removalIndex)) continue;
+          const targetVets = target.indices.filter(i => employeeById.get(weekState.assignments[i].employee_id)?.is_veteran).length;
+          if (targetVets - 1 < target.need) return false;
+        }
+      }
+      return true;
+    };
+
+    // Bounded, deterministic loop. Each pass rescues the single MOST-starved
+    // employee that has a legal, inequality-reducing transfer, then re-evaluates.
+    const maxTransfers = weekState.assignments.length;
+    for (let t = 0; t < maxTransfers; t++) {
+      const starved = data.employees
+        .filter(e => thisWeek(e.id) < floorOf(e))
+        .sort((a, b) => (thisWeek(a.id) - thisWeek(b.id)) || a.name.localeCompare(b.name));
+
+      let applied = false;
+      for (const E of starved) {
+        let bestDonorIdx = -1;
+        let bestGap = 0;
+        for (let j = 0; j < weekState.assignments.length; j++) {
+          const a = weekState.assignments[j];
+          if (a.employee_id === E.id) continue;
+          const R = employeeById.get(a.employee_id);
+          if (!R) continue;
+          const slot = canvas.find(s => s.date === a.date && s.shift_name === a.shift_name && s.role === a.role);
+          if (!slot) continue;
+          const gap = thisWeek(R.id) - thisWeek(E.id);
+          if (gap <= slot.hours) continue;   // must reduce inequality without inverting it
+          if (gap <= bestGap) continue;       // keep the most-unequal legal transfer
+          const viewState: WeekState = {
+            ...weekState,
+            assignments: weekState.assignments.filter((_, i) => i !== j),
+          };
+          const cohabIds = weekState.assignments
+            .filter((x, i) => i !== j && x.date === a.date && x.shift_name === a.shift_name)
+            .map(x => x.employee_id);
+          const elig = buildEligibility(slot, data.employees, data.availByEmp, data.toMap, veteranOnlyDates);
+          if (!elig.employees.some(x => x.id === E.id)) continue;
+          if (cohabIds.includes(E.id)) continue;
+          if (hasHardBannedPair(E.id, cohabIds, data.conflicts)) continue;
+          if (thisWeek(E.id) + slot.hours > E.max_weekly_hours) continue;
+          if (
+            settings.maxConsecutiveDaysWorked != null &&
+            consecutiveDaysRunIncluding(E.id, slot.date, viewState) > settings.maxConsecutiveDaysWorked
+          ) continue;
+          if (sameDayDoubleReason(E.id, slot, viewState, settings) !== null) continue;
+          if (R.is_veteran && !E.is_veteran && !veteranRemovalSafe(a.date, a.shift_name, j)) continue;
+          bestDonorIdx = j;
+          bestGap = gap;
+        }
+        if (bestDonorIdx >= 0) {
+          const a = weekState.assignments[bestDonorIdx];
+          const slot = canvas.find(s => s.date === a.date && s.shift_name === a.shift_name && s.role === a.role)!;
+          weekState.weeklyHoursMap.set(a.employee_id, thisWeek(a.employee_id) - slot.hours);
+          weekState.weeklyHoursMap.set(E.id, thisWeek(E.id) + slot.hours);
+          weekState.assignments[bestDonorIdx] = { ...a, employee_id: E.id, employee_name: E.name };
+          applied = true;
+          break;
+        }
+      }
+      if (!applied) break;
+    }
+  }
+
   // Concurrent (facility-wide temporal) coverage evaluation. Validate-and-flag
   // only — runs on the final assignment state, never swaps. Replaces the
   // per-shift sex enforcement for the sex_coverage rule.
@@ -1419,6 +1627,7 @@ export async function buildScheduleAndSave(
     weekStart,
     parsed.settings.fairnessLookbackWeeks,
     parsed.settings.fairnessDecay,
+    parsed.settings.fairnessExcludeTimeOff,
   );
   const tieBreakSeed = `${weekStart}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
   console.log(

@@ -20,6 +20,8 @@ import {
   brandedButtonRow,
   brandActionCard,
   brandSectionLabel,
+  brandReflect,
+  brandDetailRow,
 } from '../messaging/brand';
 import { env } from '../config/env';
 import { withAnthropicRetry } from '../ai/claude';
@@ -484,6 +486,29 @@ export function formatAvailabilityList(slots: AvailabilitySlot[]): string {
     lines.push(`${DAY_NAMES[d]}: ${times}`);
   }
   return lines.join('\n');
+}
+
+// HTML sibling of formatAvailabilityList: one accent detail row per day, so an
+// availability list reads as scannable cards in the email (the plain-text list
+// above is still what SMS / the text part receives). Day names + formatted times
+// are safe constants, so no escaping is needed.
+function availabilityDetailRowsHtml(slots: AvailabilitySlot[]): string {
+  const byDay = new Map<number, AvailabilitySlot[]>();
+  for (const slot of slots) {
+    const existing = byDay.get(slot.day_of_week) ?? [];
+    existing.push(slot);
+    byDay.set(slot.day_of_week, existing);
+  }
+  const rows: string[] = [];
+  for (let d = 0; d <= 6; d++) {
+    const daySlots = byDay.get(d);
+    if (!daySlots) continue;
+    const times = daySlots
+      .map(s => `${formatTime12h(s.start_time)} to ${formatTime12h(s.end_time)}`)
+      .join(', ');
+    rows.push(brandDetailRow(DAY_NAMES[d], times));
+  }
+  return rows.join('');
 }
 
 function totalWeeklyHours(slots: AvailabilitySlot[]): number {
@@ -2197,7 +2222,27 @@ export async function handleUpdateAvailability(
   } else {
     confirmBody = `Got it — here's what I'd set your availability to:\n${proposedDisplay}\nLook right? Reply YES and I'll pass it to your manager to approve — or NO and we'll tweak it.`;
   }
-  await reply(contact, message, confirmBody);
+
+  // Rich HTML sibling of the plain confirmBody: reflect the employee's own words
+  // back, then the proposed availability as accent detail rows, then the reply-YES
+  // ask. The plain text (confirmBody) still rides SMS and the text part. Purely
+  // visual — the decision path (YES/NO) is unchanged.
+  const introHtml = assumedFullWeek
+    ? `You don't have any availability on file yet, so I'm reading this as: you can work your usual hours every day <strong>except</strong> what you mentioned.${customEndDate ? ` This would run through <strong>${formatDateRange(customEndDate, customEndDate)}</strong>, then back to normal.` : ''} Here's what I'd set:`
+    : customEndDate
+      ? `Got it — through <strong>${formatDateRange(customEndDate, customEndDate)}</strong>, here's the availability I have for you. After that you're back to your normal hours.`
+      : `Got it — here's the new availability I have for you:`;
+  const pStyle = `margin:0 0 16px;font-size:16px;line-height:1.65;color:${BRAND.textPrimary};`;
+  const confirmHtml = brandedEmailShell({
+    bodyHtml:
+      brandReflect(message.body) +
+      `<p style="${pStyle}">${greeting(contact.name)}</p>` +
+      `<p style="${pStyle}">${introHtml}</p>` +
+      availabilityDetailRowsHtml(proposed) +
+      `<p style="margin:4px 0 0;font-size:16px;line-height:1.65;color:${BRAND.textPrimary};">If that's right, just reply <strong>YES</strong> and I'll send it to your manager to approve. If I got anything wrong, tell me what to fix and we'll sort it out.</p>` +
+      `<p style="margin:22px 0 0;color:${BRAND.textSecondary};">— Aegis</p>`,
+  });
+  await reply(contact, message, confirmBody, confirmHtml);
 }
 
 export async function handleAvailabilityConfirmResponse(

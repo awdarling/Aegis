@@ -3,7 +3,7 @@ import { logActivity } from '../logger/activity-log';
 import { reply, sendInThreadAck } from '../messaging/reply';
 import { sendEmail } from '../messaging/email';
 import { greeting } from '../messaging/greeting';
-import { BRAND, brandedEmailShell } from '../messaging/brand';
+import { BRAND, brandedEmailShell, brandDetailRow } from '../messaging/brand';
 import { isAlreadyDistributed } from '../lib/distribute-guard';
 import { computeChangedEmployeeIds } from '../lib/schedule-diff';
 import { buildTemplatedScheduleGridHtml, type EmailScheduleTemplate } from './templated-grid';
@@ -2122,29 +2122,18 @@ export async function distributeScheduleCore(
           ? `You're on for ${shiftCount} shift${shiftCount === 1 ? '' : 's'} this week — ${totalHours}h in total. Here's how your week looks:`
           : `You're not on the schedule this week, so enjoy the time off. If you were expecting shifts, just reply to this email or check with your manager and we'll get it sorted.`;
 
-        const shiftRows = hasShifts
-          ? myShifts.map(s =>
-              `<tr style="background:${BRAND.surface2};">` +
-              `<td style="padding:10px 12px;border:1px solid ${BRAND.borderDefault};color:${BRAND.textPrimary};">${formatDisplayDate(s.date)}</td>` +
-              `<td style="padding:10px 12px;border:1px solid ${BRAND.borderDefault};color:${BRAND.textPrimary};">${s.role}` +
-                `<br><span style="color:${BRAND.textSecondary};font-size:12px;">${s.shift_name}</span></td>` +
-              `<td style="padding:10px 12px;border:1px solid ${BRAND.borderDefault};color:${BRAND.textPrimary};white-space:nowrap;">${formatTime(s.start_time)} – ${formatTime(s.end_time)}</td>` +
-              `<td style="padding:10px 12px;border:1px solid ${BRAND.borderDefault};color:${BRAND.textPrimary};text-align:right;">${s.hours}h</td>` +
-              `</tr>`
-            ).join('')
-          : '';
-
+        // The employee's OWN shifts as accent detail rows (person-first list),
+        // e.g. "Monday, Jun 16 — PM Lifeguard · 1:00 – 9:00 PM". Employee summary
+        // only — the full team grid below is the template-driven renderer, left
+        // exactly as configured in Homebase.
         const shiftTable = hasShifts
-          ? `<table style="width:100%;border-collapse:collapse;margin:4px 0 18px;font-size:14px;">
-<thead><tr style="background:${BRAND.surface3};">
-<th style="padding:8px 12px;border:1px solid ${BRAND.borderDefault};color:${BRAND.silver};text-align:left;">Day</th>
-<th style="padding:8px 12px;border:1px solid ${BRAND.borderDefault};color:${BRAND.silver};text-align:left;">Position</th>
-<th style="padding:8px 12px;border:1px solid ${BRAND.borderDefault};color:${BRAND.silver};text-align:left;">Time</th>
-<th style="padding:8px 12px;border:1px solid ${BRAND.borderDefault};color:${BRAND.silver};text-align:right;">Hours</th>
-</tr></thead>
-<tbody>${shiftRows}</tbody>
-</table>
-<p style="margin:0 0 20px;color:${BRAND.textSecondary};">That's <strong style="color:${BRAND.textPrimary};">${totalHours}h</strong> across the week.</p>`
+          ? myShifts.map(s =>
+              brandDetailRow(
+                formatDisplayDate(s.date),
+                `${s.shift_name} · ${formatTime(s.start_time)} – ${formatTime(s.end_time)} · ${s.hours}h`,
+              )
+            ).join('') +
+            `<p style="margin:6px 0 20px;color:${BRAND.textSecondary};">That's <strong style="color:${BRAND.textPrimary};">${totalHours}h</strong> across the week.</p>`
           : '';
 
         const bodyHtml = `<h2 style="margin:0 0 12px;font-size:20px;color:${BRAND.textPrimary};">Your shifts for ${weekLabel}</h2>
@@ -2461,29 +2450,16 @@ export async function notifyScheduleChangesCore(
           ? `Your schedule for ${weekLabel} was just updated. Here are your current shifts — ${shiftCount} shift${shiftCount === 1 ? '' : 's'}, ${totalHours}h in total:`
           : `Your schedule for ${weekLabel} was just updated, and you're no longer on the schedule this week. If that doesn't look right, just reply to this email or check with your manager.`;
 
-        const shiftRows = hasShifts
-          ? myNew.map(s =>
-              `<tr style="background:${BRAND.surface2};">` +
-              `<td style="padding:10px 12px;border:1px solid ${BRAND.borderDefault};color:${BRAND.textPrimary};">${formatDisplayDate(s.date)}</td>` +
-              `<td style="padding:10px 12px;border:1px solid ${BRAND.borderDefault};color:${BRAND.textPrimary};">${s.role}` +
-                `<br><span style="color:${BRAND.textSecondary};font-size:12px;">${s.shift_name}</span></td>` +
-              `<td style="padding:10px 12px;border:1px solid ${BRAND.borderDefault};color:${BRAND.textPrimary};white-space:nowrap;">${formatTime(s.start_time)} – ${formatTime(s.end_time)}</td>` +
-              `<td style="padding:10px 12px;border:1px solid ${BRAND.borderDefault};color:${BRAND.textPrimary};text-align:right;">${s.hours}h</td>` +
-              `</tr>`
-            ).join('')
-          : '';
-
+        // Updated-schedule (republish) email — same accent detail-row treatment
+        // as the normal distribution, driven by the employee's new shifts.
         const shiftTable = hasShifts
-          ? `<table style="width:100%;border-collapse:collapse;margin:4px 0 18px;font-size:14px;">
-<thead><tr style="background:${BRAND.surface3};">
-<th style="padding:8px 12px;border:1px solid ${BRAND.borderDefault};color:${BRAND.silver};text-align:left;">Day</th>
-<th style="padding:8px 12px;border:1px solid ${BRAND.borderDefault};color:${BRAND.silver};text-align:left;">Position</th>
-<th style="padding:8px 12px;border:1px solid ${BRAND.borderDefault};color:${BRAND.silver};text-align:left;">Time</th>
-<th style="padding:8px 12px;border:1px solid ${BRAND.borderDefault};color:${BRAND.silver};text-align:right;">Hours</th>
-</tr></thead>
-<tbody>${shiftRows}</tbody>
-</table>
-<p style="margin:0 0 20px;color:${BRAND.textSecondary};">That's <strong style="color:${BRAND.textPrimary};">${totalHours}h</strong> across the week.</p>`
+          ? myNew.map(s =>
+              brandDetailRow(
+                formatDisplayDate(s.date),
+                `${s.shift_name} · ${formatTime(s.start_time)} – ${formatTime(s.end_time)} · ${s.hours}h`,
+              )
+            ).join('') +
+            `<p style="margin:6px 0 20px;color:${BRAND.textSecondary};">That's <strong style="color:${BRAND.textPrimary};">${totalHours}h</strong> across the week.</p>`
           : '';
 
         const bodyHtml = `<h2 style="margin:0 0 12px;font-size:20px;color:${BRAND.textPrimary};">Your updated shifts for ${weekLabel}</h2>

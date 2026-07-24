@@ -16,6 +16,8 @@ import {
   brandedEmailShell,
   brandedButtonRow,
   brandActionCard,
+  brandReflect,
+  brandDetailRow,
 } from '../messaging/brand';
 import { buildTimeOffManagerEmail, buildTimeOffResolutionEmail, type TimeOffRecommendation } from './time-off-manager-email';
 import type { InboundMessage, VerifiedContact } from '../security/types';
@@ -1389,12 +1391,28 @@ export async function handleSubmitTimeOff(
   });
 
   const summary = formatRequestSummary(parsed);
-  await reply(
-    contact,
-    message,
+  const confirmText =
     `${greeting(contact.name)}\n\nGot it — you're requesting ${summary} off for ${reason}. Is that correct? (Reply "yes" to confirm or "no" to restate.)` +
-      availabilityFollowupNote(extracted)
-  );
+    availabilityFollowupNote(extracted);
+
+  // Rich HTML sibling: reflect the employee's own words, present the requested
+  // time off as a single accent detail row, then ask to confirm. SMS + the text
+  // part still get confirmText. Purely visual — the yes/no path is unchanged.
+  const pStyle = `margin:0 0 16px;font-size:16px;line-height:1.65;color:${BRAND.textPrimary};`;
+  const psNote = extracted?.['also_mentions_availability'] === true
+    ? `<p style="margin:16px 0 0;font-size:14px;line-height:1.6;color:${BRAND.silver};">P.S. — I also saw you included your availability. Send that in its own message (like &ldquo;I can work Monday and Wednesday mornings&rdquo;) and I&rsquo;ll set it up — I kept this one focused on your time off so nothing gets crossed.</p>`
+    : '';
+  const confirmHtml = brandedEmailShell({
+    bodyHtml:
+      brandReflect(message.body) +
+      `<p style="${pStyle}">${greeting(contact.name)}</p>` +
+      `<p style="${pStyle}">Sure thing — here's the request I'll send over:</p>` +
+      brandDetailRow(escapeHtmlTo(summary), `for ${escapeHtmlTo(reason)}`) +
+      `<p style="margin:4px 0 0;font-size:16px;line-height:1.65;color:${BRAND.textPrimary};">Want me to pass it to your manager? Just reply <strong>YES</strong> to confirm, or <strong>NO</strong> to restate it.</p>` +
+      psNote +
+      `<p style="margin:22px 0 0;color:${BRAND.textSecondary};">— Aegis</p>`,
+  });
+  await reply(contact, message, confirmText, confirmHtml);
 }
 
 // Step 2: Employee replies yes/no to confirmation — runs simulation and submits.

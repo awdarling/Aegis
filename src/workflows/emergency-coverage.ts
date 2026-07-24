@@ -9,6 +9,7 @@ import {
   brandedEmailShell,
   brandActionCard,
   brandedButtonRow,
+  brandCardDetailLine,
 } from '../messaging/brand';
 import { randomUUID } from 'node:crypto';
 import { env } from '../config/env';
@@ -1166,8 +1167,15 @@ export async function dispatchOutreach(params: {
     ]);
     const acceptUrl = `${env.BASE_URL}/webhooks/decision?action=approve&requestId=${requestId}&token=${acceptToken}`;
     const declineUrl = `${env.BASE_URL}/webhooks/decision?action=deny&requestId=${requestId}&token=${declineToken}`;
-    const introHtml = `<p style="margin:0 0 14px;color:${BRAND.textPrimary};font-size:15px;line-height:1.5;">${escapeHtml(greeting(employee.name))} this is Aegis. <strong>${escapeHtml(session.callout_employee_name)}</strong> is out and we need coverage for the <strong>${escapeHtml(si.shift_name)}</strong> shift (${escapeHtml(si.start_time)}–${escapeHtml(si.end_time)}, ${escapeHtml(si.role)}) on ${escapeHtml(dateStr)}.</p>`;
-    const cardInner = `${brandedButtonRow([
+    // Person-first: the ask reads like a manager wrote it and lives in the body;
+    // the card holds only the shift on offer + the Accept/Decline buttons.
+    const introHtml =
+      `<p style="margin:0 0 16px;color:${BRAND.textPrimary};font-size:16px;line-height:1.65;">${escapeHtml(greeting(employee.name))}</p>` +
+      `<p style="margin:0 0 4px;color:${BRAND.textPrimary};font-size:16px;line-height:1.65;">This is Aegis, and I could use your help. <strong>${escapeHtml(session.callout_employee_name)}</strong> is out and we're short on coverage for the shift below. You're qualified and open — any chance you can jump in?</p>`;
+    const cardInner = `${brandCardDetailLine(
+      `${escapeHtml(dateStr)} · ${escapeHtml(si.shift_name)}`,
+      `${escapeHtml(si.start_time)}–${escapeHtml(si.end_time)} · ${escapeHtml(si.role)}`,
+    )}${brandedButtonRow([
       { url: acceptUrl, label: 'Yes, I can cover', variant: 'primary' },
       { url: declineUrl, label: "Can't make it", variant: 'secondary' },
     ])}

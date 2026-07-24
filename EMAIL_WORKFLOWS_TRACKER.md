@@ -29,6 +29,24 @@ Per-action status of the 8 `ActionType`s in `src/lib/aegis-actions/types.ts`. Dr
 
 ---
 
+## 2026-07-24 — Email visual redesign: person-first framing (IN REVIEW, branch-only, NOT deployed)
+
+Visual/branding pass on the employee-facing emails so they read like a person wrote them (Alexander's mockups). **Scope rule honored: only HTML/copy construction changed — no send logic, DB writes, token minting, intent routing, schedule engine, or grid renderers touched. Rebased onto HEAD 73c41d8 (FAIRNESS-2/3) so nothing there is clobbered. tsc clean + full vitest green on current HEAD.**
+
+**Framing rule (carry forward):** the warm conversational message is the email *body*; an **action card** appears only when the recipient can act, and holds *only* the item + its buttons (never prose). Aegis never shows one employee's message to another (no cross-employee quotes). A "You said:" reflect-back is allowed only on the recipient's *own* prior message.
+
+**`brand.ts` — 3 additive primitives** (no existing exports changed): `brandReflect`, `brandDetailRow`, `brandCardDetailLine`.
+
+**Changed emails:** availability confirmation (`employee-onboarding.ts`) — reflect + prose + per-day accent rows + reply-YES; time-off submit confirmation (`time-off.ts`) — reflect + prose + request detail row; shift-swap broadcast (`shift-swap.ts`) — ask moved to BODY, card = shift + buttons, labels "Pick up this shift"/"Offer a swap" (test updated); emergency-coverage outreach (`emergency-coverage.ts`) — same reframe; distribution + republish per-employee summaries (`schedule-build.ts`) — own shifts as accent rows (BOTH the normal and the "updated shifts" emails). **Team grid untouched.**
+
+**NOT redesigned this pass:** `query_my_time_off` (the "upcoming time off" reply) — it's a read-only list with nothing to act on, so no action card by design. Candidate for the detail-row treatment if desired.
+
+**Files:** `src/messaging/brand.ts`, `src/workflows/{shift-swap,employee-onboarding,time-off,emergency-coverage,schedule-build}.ts`, `src/workflows/__tests__/swap-broadcast-email.test.ts`. **Not committed/pushed/deployed** — production Aegis still runs old code until Alexander commits → pushes → Railway deploys.
+
+**GRID PARITY (Piece 3, still open — NOT fixed here).** Aegis email grid (`templated-grid.ts`) vs Homebase `resolveCellAppearance.ts`: both template-driven and agree on layout/colors/columns/fields/UNFILLED/CLOSED, email hides veteran info. Remaining drift: Homebase tints each *filled cell* with the per-day color at `CELL_TINT_ALPHA=0.06`; the email tints only the header (flat `BRAND.surface2` cells). Also closure-merge + role-accent differ. Close as a separate confirmed pass (changes the sensitive grid renderer; untouched here → no regression).
+
+---
+
 ## 2026-07-24 — FAIRNESS-3: time off no longer inflates the fairness memory (BUILT, IN REVIEW)
 
 **Bug:** the cross-week memory read a week of approved time off as "under-worked," so a returner from leave got front-loaded (Lucas Witham: approved off 07-17→07-25 covering the memory window → prior ≈ 10.75 → #1 Headguard at 28.8h next week).

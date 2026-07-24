@@ -178,6 +178,47 @@ export function brandActionCard(label: string, innerHtml: string): string {
 </div>`;
 }
 
+/**
+ * A soft "You said:" reflect-back of the recipient's OWN prior message, so a
+ * confirmation reads like a person restating what you told them (and gives Aegis
+ * a context anchor). Muted, italic, left-ruled — distinct from Aegis's own voice.
+ *
+ * INVARIANT: only ever pass the message the *recipient themselves* sent. Never
+ * quote one employee's words into another employee's email.
+ */
+export function brandReflect(text: string): string {
+  const clean = text.replace(/\s+/g, ' ').trim();
+  const shown = clean.length > 220 ? `${clean.slice(0, 217)}…` : clean;
+  return `<div style="margin:0 0 20px;padding:13px 16px;background:${BRAND.surface2};border-left:3px solid ${BRAND.borderStrong};border-radius:6px;">` +
+    `<span style="color:${BRAND.silver};font-weight:600;font-size:13px;">You said:</span>` +
+    `<span style="color:${BRAND.textSecondary};font-style:italic;font-size:14px;"> &ldquo;${escapeAttr(shown)}&rdquo;</span>` +
+    `</div>`;
+}
+
+/**
+ * An accent-bordered detail row: a bold lead (a day, date, or shift) with an
+ * optional trailing detail. This is for INFORMATION being presented (a shift, a
+ * time window) — not an action. Use several in a row for a shift/availability
+ * list. `lead`/`detail` are rendered verbatim (callers pre-escape any raw text).
+ */
+export function brandDetailRow(lead: string, detail?: string): string {
+  const tail = detail
+    ? `<span style="color:${BRAND.textSecondary};font-size:15px;"> — ${detail}</span>`
+    : '';
+  return `<div style="margin:0 0 12px;padding:14px 16px;background:${BRAND.surface2};border:1px solid ${BRAND.borderDefault};border-left:4px solid ${BRAND.accent};border-radius:8px;">` +
+    `<span style="color:${BRAND.textPrimary};font-weight:700;font-size:15px;">${lead}</span>${tail}</div>`;
+}
+
+/**
+ * A clean detail line to sit INSIDE a brandActionCard (bold title + muted sub),
+ * with no nested border/background so it doesn't read as a card-in-a-card. Use
+ * it to state the one item the card's buttons act on, above the button row.
+ */
+export function brandCardDetailLine(title: string, sub?: string): string {
+  return `<p style="margin:0 0 4px;font-size:16px;font-weight:700;color:${BRAND.textPrimary};">${title}</p>` +
+    (sub ? `<p style="margin:0 0 16px;font-size:14px;color:${BRAND.textSecondary};">${sub}</p>` : '<div style="height:14px;line-height:14px;font-size:0;">&nbsp;</div>');
+}
+
 // ── The shell ─────────────────────────────────────────────────────────────────
 
 export interface BrandedShellParams {

@@ -82,8 +82,8 @@ describe('buildSwapBroadcastEmail — swap-eligible candidate', () => {
     expect(swapTok.payload.shift_date).toBe('2026-07-11');
     expect(swapTok.payload.requester_name).toBe('John Jones');
 
-    expect(html).toContain(">I'll pick it up</a>");
-    expect(html).toContain(">I'd like to swap</a>");
+    expect(html).toContain(">Pick up this shift</a>");
+    expect(html).toContain(">Offer a swap</a>");
     expect(subject).toContain('Saturday AM');
     expect(text).toMatch(/John Jones/);
     // Employee-facing: never a Homebase CTA.
@@ -96,8 +96,8 @@ describe('buildSwapBroadcastEmail — pickup-only candidate', () => {
     const { html } = await buildSwapBroadcastEmail({ ...base, swapEligible: false });
 
     expect(h.tokenInserts.map(t => t.action_type)).toEqual(['swap_pickup']);
-    expect(html).toContain(">I'll pick it up</a>");
-    expect(html).not.toContain(">I'd like to swap</a>");
+    expect(html).toContain(">Pick up this shift</a>");
+    expect(html).not.toContain(">Offer a swap</a>");
   });
 
   it('mentions the days the requester can work in return', async () => {

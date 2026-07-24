@@ -17,6 +17,7 @@ import {
   brandedEmailShell,
   brandedButtonRow,
   brandActionCard,
+  brandCardDetailLine,
 } from '../messaging/brand';
 import { generateActionToken } from '../lib/aegis-actions/tokens';
 import type { InboundMessage, VerifiedContact } from '../security/types';
@@ -831,28 +832,34 @@ export async function buildSwapBroadcastEmail(params: {
     `Just tap the button in this email to let me know.`;
 
   const buttons = [
-    { url: pickupTok.url, label: "I'll pick it up", variant: 'primary' as const },
-    ...(swapUrl ? [{ url: swapUrl, label: 'I\'d like to swap', variant: 'secondary' as const }] : []),
+    { url: pickupTok.url, label: 'Pick up this shift', variant: 'primary' as const },
+    ...(swapUrl ? [{ url: swapUrl, label: 'Offer a swap', variant: 'secondary' as const }] : []),
   ];
 
-  const detail =
-    `<p style="margin:0 0 12px;font-size:15px;color:${BRAND.textPrimary};line-height:1.6;">` +
-    `${escapeHtml(params.requester_name)} can't work their <strong>${escapeHtml(params.shift_name)}</strong> ` +
-    `(${escapeHtml(params.shift_start)}–${escapeHtml(params.shift_end)}, ${escapeHtml(params.shift_role)}) on <strong>${escapeHtml(dateLong)}</strong>.</p>` +
-    (willingList
-      ? `<p style="margin:0 0 14px;font-size:14px;color:${BRAND.silver};line-height:1.6;">In return, ${escapeHtml(firstName(params.requester_name))} can work: ${escapeHtml(willingList)}.</p>`
-      : '') +
-    `<p style="margin:0 0 16px;font-size:14px;color:${BRAND.silver};line-height:1.6;">` +
-    (swapUrl
-      ? `Pick it up and add it to your schedule, or swap one of your own shifts for it.`
-      : `Pick it up and add it to your schedule.`) +
-    `</p>` +
+  // Person-first framing: the ask reads like a manager wrote it and lives in the
+  // BODY. The action card holds ONLY the shift on offer + the buttons — the thing
+  // the coworker can actually act on. (We never quote the requester's own message
+  // into a coworker's email; we describe the shift, which is operational fact.)
+  const askLine =
+    `${escapeHtml(params.requester_name)} can't make the <strong>${escapeHtml(params.shift_name)}</strong> shift ` +
+    `(${escapeHtml(params.shift_start)}–${escapeHtml(params.shift_end)}, ${escapeHtml(params.shift_role)}) on <strong>${escapeHtml(dateLong)}</strong> ` +
+    `and is looking for coverage. You're qualified and open that day — could you help out?`;
+  const tradeLine = swapUrl
+    ? ` If you'd rather trade than pick it up outright${willingList ? `, ${escapeHtml(firstName(params.requester_name))} can cover one of your shifts on ${escapeHtml(willingList)} in return` : ''}.`
+    : '';
+
+  const cardInner =
+    brandCardDetailLine(
+      `${escapeHtml(dateLong)} · ${escapeHtml(params.shift_name)}`,
+      `${escapeHtml(params.shift_start)}–${escapeHtml(params.shift_end)} · ${escapeHtml(params.shift_role)}`,
+    ) +
     brandedButtonRow(buttons);
 
   const bodyHtml =
-    `<p style="margin:0 0 18px;font-size:16px;color:${BRAND.textPrimary};line-height:1.65;">` +
-    `${escapeHtml(greeting(params.candidate.name))} ${escapeHtml(params.requester_name)} needs a hand with a shift — can you help?</p>` +
-    brandActionCard('Shift available', detail);
+    `<p style="margin:0 0 16px;font-size:16px;color:${BRAND.textPrimary};line-height:1.65;">${escapeHtml(greeting(params.candidate.name))}</p>` +
+    `<p style="margin:0 0 4px;font-size:16px;color:${BRAND.textPrimary};line-height:1.65;">${askLine}${tradeLine}</p>` +
+    brandActionCard('Shift available', cardInner) +
+    `<p style="margin:0 0 0;font-size:14px;color:${BRAND.silver};line-height:1.6;">First person to lock it in gets it, and your manager gives the final okay before anything changes. Thanks for being flexible.</p>`;
 
   const html = brandedEmailShell({ bodyHtml, preheader: subject });
   return { subject, text, html };

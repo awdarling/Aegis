@@ -98,6 +98,6 @@ export const DEFAULT_ENGINE_SETTINGS: EngineSettings = {
   fairnessLookbackWeeks: 3,
   fairnessDecay: 0.5,
   fairnessFloorEnabled: true,
-  fairnessFloorRatio: 0.5,
+  fairnessFloorRatio: 1.0,
   fairnessExcludeTimeOff: true,
 };

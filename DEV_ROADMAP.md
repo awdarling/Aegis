@@ -1138,6 +1138,16 @@ Focused Soteria session against the PURPOSE & DEFINITION-OF-DONE block. Diagnose
 
 **Status: BUILT, IN REVIEW — NOT merged.** Stacked on FAIRNESS-2 (both edit `schedule-build.ts`/`types.ts` in different spots; FAIRNESS-3's `types.ts` edit anchors on FAIRNESS-2's fields → apply FAIRNESS-2 first). DONE needs the live dry-run (`scripts/dryrun-timeoff-memory-compare.ts` — Lucas's memory should rise) then merge. **Refinement (logged, not built):** a partial-TO week (a couple days off) is imputed at full-week granularity; day-level proration is a future nicety.
 
+### 2026-07-24 (cont.) — FAIRNESS-2 floor TUNED: fairnessFloorRatio 0.5 → 1.0 (flatten available same-role hours)
+
+**Why.** First post-deploy Watermark build (week 07-27, generated 7:15pm) confirmed FAIRNESS-2/3 working (Michael McCorkle 0→9h; Lucas Witham 28.8→10.75h). But fully-available, no-time-off lifeguards still sat at ~6h (Cameron Osterhaven 6.25, Jenna Stibitz 6.25) because the 0.5 floor only guarantees ~half the role mean (~6h). Verified against live availability + time off: the true bottom (Maisey/Miles/Quin/Will) IS time off (correct); the ~6h available guards were pure floor-conservatism. Alexander wants available guards evened out.
+
+**Change.** `DEFAULT_ENGINE_SETTINGS.fairnessFloorRatio` 0.5 → **1.0** (floor = the role's mean hours). Available same-role guards now cluster within ~one shift of the weekly average instead of a 6–25h spread; the top is trimmed to pay for lifting the bottom. Indivisible shift blocks (4.5–8.5h) mean it's near-even, not identical; approved-time-off people stay correctly lower. One-line default change; `tsc --noEmit` clean.
+
+**Verification caveat.** Could NOT run vitest in the cloud sandbox this session — the Mac `npm install` during the PR-98 merge replaced `node_modules` with darwin-arm64 rolldown bindings, which the Linux runner can't load (tsc is unaffected). The suite runs on the Mac (279/279 in Block C); existing floor tests were traced to still pass at ratio 1.0. Real check = `npx ts-node --transpile-only scripts/dryrun-floor-compare.ts` after deploy.
+
+**Follow-up (logged, not built):** wire `fairnessFloorRatio` (+ `fairnessFloorEnabled`, `fairnessExcludeTimeOff`, `fairnessLookbackWeeks`, `fairnessDecay`) into the Homebase Rules UI so each client tunes them as data instead of an engine default.
+
 ### 2026-07-24 — FAIRNESS-2: within-week distribution floor (anti-starvation) — BUILT on branch, tests green, pending merge + live dry-run
 
 **Reported (Alexander).** Watermark managers: an employee with NO time-off request and no availability block was left ENTIRELY off next week's schedule (Michael McCorkle, Headguard) while same-role peers ran 20+ h. Rule (universal, all clients): if availability + time off don't EXCLUDE someone, they must not be starved to zero while an equally-eligible peer runs 20+; managers want ~10/10, not 0/20.

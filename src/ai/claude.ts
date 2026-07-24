@@ -292,8 +292,15 @@ Teen/informal register is common (lowercase, no punctuation, slang). Map:
 - "gotta leave early X", "cant come in till Y on X" → partial day-off
 - "im sick", "cant make it today" → submit_time_off for today (${today})
 - "can someone cover", "trade shifts", "swap" → initiate_swap
-- "yeah" / "yep" / "ok" / "sure" by itself → respond_swap_accept
-- "nah" / "no" / "no wait" / "never mind" by itself → respond_swap_decline
+- "<coworker> is taking/covering my <shift>", "me and <coworker> are swapping <shift>",
+  "<coworker> is taking my <day> shift, and I'm taking theirs" → initiate_swap. A message
+  that NAMES a coworker and/or a shift is arranging a swap — classify it initiate_swap even
+  when it sounds like the employee is reporting an already-agreed arrangement.
+- "yeah" / "yep" / "ok" / "sure" BY ITSELF → respond_swap_accept
+- "nah" / "no" / "no wait" / "never mind" BY ITSELF → respond_swap_decline
+- respond_swap_accept / respond_swap_decline are ONLY a bare yes/no with no other content.
+  If the message names a person, a shift, a day, or any details, it is NOT a swap response —
+  classify the underlying request (usually initiate_swap) instead.
 - Indirect partials: ONLY when the message gives an OFF/BUSY context for part of a
   day and then what they CAN do for the rest. "busy the morning of June 21st. I can
   work at night though" → partial, period_label="morning" (NOT "evening"). A message

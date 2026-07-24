@@ -1480,7 +1480,87 @@ async function buildSwapCandidates(params: {
 
 // ── AI extraction ─────────────────────────────────────────────────────────────
 
+// The DIRECTION of a swap, from the SENDER's point of view:
+//   'giveaway' — someone takes the sender's shift; the sender gets nothing back
+//                ("Emily is taking my Saturday shift", "Colin is covering my Thursday").
+//   'pickup'   — the sender takes someone else's shift ("I'll take Joe's Friday shift").
+//   'trade'    — a two-way exchange ("swap my Sat AM for Joe's Fri PM").
+// Direction governs which shift is which and whether a return shift is required.
+export type SwapDirection = 'giveaway' | 'pickup' | 'trade';
+
+export interface SwapExtractionRaw {
+  direction?: string | null;
+  shift_date?: string | null;
+  shift_name?: string | null;
+  target_employee_name?: string | null;
+  target_shift_date?: string | null;
+  target_shift_name?: string | null;
+  willing_days?: unknown;
+}
+
+export interface SwapExtraction {
+  direction: SwapDirection;
+  shift_date: string | null;
+  shift_name: string | null;
+  target_employee_name: string | null;
+  target_shift_date: string | null;
+  target_shift_name: string | null;
+  willing_days: number[];
+}
+
+// Pure normalization of the extractor's JSON. Kept separate + exported so the
+// direction decision (which routes giveaway vs trade in handleInitiateSwap) is
+// unit-testable without the LLM. A missing/unknown direction falls back safely:
+// a named return shift ⇒ trade, otherwise ⇒ giveaway (so "X is taking my shift",
+// with no return shift, never lands in the two-way trade path by default).
+export function normalizeSwapExtraction(parsed: SwapExtractionRaw | null): SwapExtraction {
+  const willing_days = Array.isArray(parsed?.willing_days)
+    ? (parsed!.willing_days as unknown[]).filter((n): n is number => Number.isInteger(n) && (n as number) >= 0 && (n as number) <= 6)
+    : [];
+  const direction: SwapDirection =
+    parsed?.direction === 'giveaway' || parsed?.direction === 'pickup' || parsed?.direction === 'trade'
+      ? parsed.direction
+      : (parsed?.target_shift_name ?? parsed?.target_shift_date) ? 'trade' : 'giveaway';
+  return {
+    direction,
+    shift_date: parsed?.shift_date ?? null,
+    shift_name: parsed?.shift_name ?? null,
+    target_employee_name: parsed?.target_employee_name ?? null,
+    target_shift_date: parsed?.target_shift_date ?? null,
+    target_shift_name: parsed?.target_shift_name ?? null,
+    willing_days,
+  };
+}
+
+// Pure builder for the coworker-ping message. A one-way giveaway (no target shift)
+// must NOT be called a "trade" or say the coworker gives up a shift — they only
+// pick up the sender's shift. Exported for unit testing the two wordings.
+export function buildSwapAskText(params: {
+  receiverName: string;
+  requesterName: string;
+  shiftName: string;
+  shiftStart: string;
+  shiftEnd: string;
+  role: string;
+  shiftDateDisplay: string;
+  targetShiftName?: string | null;
+  targetShiftDateDisplay?: string | null;
+}): { subject: string; text: string; isGiveaway: boolean } {
+  const theirShift = `${params.requesterName}'s ${params.shiftName} shift (${params.shiftStart}–${params.shiftEnd}, ${params.role}) on ${params.shiftDateDisplay}`;
+  const isGiveaway = !params.targetShiftName;
+  const text = isGiveaway
+    ? `${greeting(params.receiverName)} this is Aegis. ${params.requesterName} says you agreed to take ${theirShift}. ` +
+      `Can you confirm you'll cover it? Reply YES or NO.`
+    : `${greeting(params.receiverName)} this is Aegis. ${params.requesterName} would like to trade shifts with you — ` +
+      `you'd give up your ${params.targetShiftName} shift on ${params.targetShiftDateDisplay ?? params.shiftDateDisplay} and pick up ${theirShift}. Want to do it? Reply YES or NO.`;
+  const subject = isGiveaway
+    ? `Shift coverage request from ${params.requesterName}`
+    : `Shift trade request from ${params.requesterName}`;
+  return { subject, text, isGiveaway };
+}
+
 async function extractSwapDetails(body: string, today: string): Promise<{
+  direction: SwapDirection;
   shift_date: string | null;
   shift_name: string | null;
   target_employee_name: string | null;
@@ -1490,29 +1570,24 @@ async function extractSwapDetails(body: string, today: string): Promise<{
 }> {
   const system =
     `You are a data extractor for a workforce scheduling system. Today is ${today}. ` +
-    'A shift swap is a TRADE: the sender gives up one of their shifts and takes one of a coworker\'s shifts. ' +
-    'Extract: shift_date/shift_name = the SENDER\'s shift they want to give up; ' +
-    'target_employee_name = the coworker they want to trade with (null if they didn\'t name anyone); ' +
-    'target_shift_date/target_shift_name = the COWORKER\'s shift the sender wants to take in return (null if not stated). ' +
+    'A shift swap moves a shift between two people. Determine the DIRECTION from the SENDER\'s point of view: ' +
+    '"giveaway" = someone takes the SENDER\'s shift and the sender gets nothing back ("Emily is taking my Saturday shift", "Colin is covering my Thursday AM", "can someone take my Friday?"); ' +
+    '"pickup" = the SENDER takes a coworker\'s shift ("I\'ll take Joe\'s Friday PM", "put me on Sam\'s Sunday shift"); ' +
+    '"trade" = a two-way exchange where BOTH give up a shift ("swap my Sat AM for Joe\'s Fri PM", "me and Joe are trading — my Sat for his Fri"). ' +
+    'When the sender only says a coworker is taking their shift with no shift named for the sender in return, it is a "giveaway", NOT a trade — do not invent a return shift. ' +
+    'Extract: shift_date/shift_name = the SENDER\'s own shift involved (the one they give up in a giveaway or trade; for a pure "pickup" of a coworker\'s shift this may be null); ' +
+    'target_employee_name = the OTHER person named (null if they didn\'t name anyone); ' +
+    'target_shift_date/target_shift_name = the COWORKER\'s shift (the one the sender takes in a pickup/trade; null if not stated or if it is a giveaway); ' +
     'willing_days = the weekdays the SENDER says they CAN work in return, as integers 0=Sunday..6=Saturday (e.g. "I can work Mon/Tue/Wed" → [1,2,3]); empty array if they did not say. ' +
-    'Example: "swap my Saturday AM for Joe\'s Friday PM" → shift_name "Saturday AM", target_employee_name "Joe", target_shift_name "Friday PM". ' +
-    'Respond with ONLY valid JSON: {"shift_date":"YYYY-MM-DD"|null,"shift_name":string|null,"target_employee_name":string|null,"target_shift_date":"YYYY-MM-DD"|null,"target_shift_name":string|null,"willing_days":number[]}';
+    'Examples: ' +
+    '"Emily is taking my 3-9pm shift on Saturday" → direction "giveaway", shift_name "Saturday 3-9pm", target_employee_name "Emily", target_shift_name null. ' +
+    '"Colin is taking my Thursday AM" → direction "giveaway", shift_name "Thursday AM", target_employee_name "Colin", target_shift_name null. ' +
+    '"swap my Saturday AM for Joe\'s Friday PM" → direction "trade", shift_name "Saturday AM", target_employee_name "Joe", target_shift_name "Friday PM". ' +
+    '"can anyone cover my Saturday shift?" → direction "giveaway", shift_name "Saturday", target_employee_name null. ' +
+    'Respond with ONLY valid JSON: {"direction":"giveaway"|"pickup"|"trade","shift_date":"YYYY-MM-DD"|null,"shift_name":string|null,"target_employee_name":string|null,"target_shift_date":"YYYY-MM-DD"|null,"target_shift_name":string|null,"willing_days":number[]}';
   const text = await generateReply(system, body, []);
-  const parsed = coerceJsonObject<{
-    shift_date: string | null; shift_name: string | null; target_employee_name: string | null;
-    target_shift_date: string | null; target_shift_name: string | null; willing_days?: unknown;
-  }>(text);
-  const willing_days = Array.isArray(parsed?.willing_days)
-    ? (parsed!.willing_days as unknown[]).filter((n): n is number => Number.isInteger(n) && (n as number) >= 0 && (n as number) <= 6)
-    : [];
-  return {
-    shift_date: parsed?.shift_date ?? null,
-    shift_name: parsed?.shift_name ?? null,
-    target_employee_name: parsed?.target_employee_name ?? null,
-    target_shift_date: parsed?.target_shift_date ?? null,
-    target_shift_name: parsed?.target_shift_name ?? null,
-    willing_days,
-  };
+  const parsed = coerceJsonObject<SwapExtractionRaw>(text);
+  return normalizeSwapExtraction(parsed);
 }
 
 // Resolve the requester's willing WEEKDAYS (0=Sun..6=Sat) to concrete dates that
@@ -1925,6 +2000,59 @@ export async function handleInitiateSwap(
       return;
     }
 
+    // Direction "giveaway" — the named coworker is TAKING the sender's shift and the
+    // sender gets nothing back (e.g. "Emily is taking my Saturday shift", "Colin is
+    // taking my Thursday AM"). This is a one-way pickup by a specific person, NOT a
+    // two-way trade — so there is no coworker shift to choose. Validate only that the
+    // coworker can work the sender's shift, then confirm the give-up in one-way wording.
+    // (The downstream confirm/outreach/execute path already supports a null target
+    // shift — see the PendingSwap.target_shift_* comment and executeScheduleSwap.)
+    if (raw.direction === 'giveaway') {
+      const targetTakesYours = await validateSwap({
+        company_id: contact.company_id, requester_id: contact.employee_id!,
+        receiver: targetEmployee, shift_date: shiftDate, role: shift.role,
+        // RULE 0b — validate against every role the manager said can fill the shift.
+        shift_name: shift.shift_name, accepted_roles: acceptedRolesOf(shift),
+        shift_hours: shiftHours, policies,
+      });
+      if (!targetTakesYours.valid) {
+        await reply(contact, message,
+          `This swap can't proceed: ${targetTakesYours.reason} Want to try a different coworker, or ask "can anyone take my ${shift.shift_name} shift?" instead?`);
+        await logActivity({ company_id: contact.company_id, action: 'swap_validation_failed',
+          summary: `${contact.name}'s giveaway to ${targetEmployee.name} failed (${targetEmployee.name} taking requester's shift): ${targetTakesYours.reason}`,
+          metadata: { requester_id: contact.employee_id, receiver_id: targetEmployee.id, shift_date: shiftDate, mode: 'directed', direction: 'giveaway', reason: targetTakesYours.reason } });
+        return;
+      }
+
+      const pending: PendingSwap = {
+        mode: 'directed',
+        company_id: contact.company_id,
+        requester_id: contact.employee_id!,
+        requester_name: contact.name,
+        channel: message.channel,
+        sender: message.sender,
+        recipient: message.recipient,
+        raw_subject: message.raw_subject,
+        thread_id: message.thread_id,
+        shift_date: shiftDate,
+        shift_name: shift.shift_name,
+        role: shift.role,
+        shift_start: shift.start_time,
+        shift_end: shift.end_time,
+        schedule_id: schedule?.id ?? null,
+        target_employee_id: targetEmployee.id,
+        target_employee_name: targetEmployee.name,
+        // No target_shift_* — one-way giveaway (the coworker gives up nothing).
+        expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+      };
+      await storePendingSwap(pending);
+
+      await reply(contact, message,
+        `Got it — ${firstName(targetEmployee.name)} would take your ${shift.shift_name} shift on ${formatDisplayDate(shiftDate)} (${shift.start_time}–${shift.end_time}) and you'd be off, no shift back. Reply "yes" and I'll check with ${firstName(targetEmployee.name)} to confirm, then pass it to your manager to approve. Reply "no" to cancel.`
+      );
+      return;
+    }
+
     // A swap is a TRADE — find which of the target's shifts the requester takes
     // in return. They name it; we only ask if more than one still matches.
     const choice = schedule
@@ -2180,23 +2308,30 @@ export async function handleSwapConfirmation(
     };
     await storeSwapOutreach(outreach);
 
-    // From the target's side: they give up THEIR shift and pick up the requester's.
-    const yourShift = pending.target_shift_name
-      ? `your ${pending.target_shift_name} shift on ${formatDisplayDate(pending.target_shift_date ?? pending.shift_date)}`
-      : 'your shift';
-    const theirShift = `their ${pending.shift_name} shift (${pending.shift_start}–${pending.shift_end}, ${pending.role}) on ${formatDisplayDate(pending.shift_date)}`;
-    const askText =
-      `${greeting(receiver.name)} this is Aegis. ${contact.name} would like to trade shifts with you — ` +
-      `you'd give up ${yourShift} and pick up ${theirShift}. Want to do it? Reply YES or NO.`;
+    // From the target's side. A one-way giveaway (no target_shift_name) means they
+    // simply pick up the requester's shift and give up nothing — do NOT call it a
+    // "trade" or say they give up a shift. A two-way trade names both shifts.
+    const ask = buildSwapAskText({
+      receiverName: receiver.name,
+      requesterName: contact.name,
+      shiftName: pending.shift_name,
+      shiftStart: pending.shift_start,
+      shiftEnd: pending.shift_end,
+      role: pending.role,
+      shiftDateDisplay: formatDisplayDate(pending.shift_date),
+      targetShiftName: pending.target_shift_name,
+      targetShiftDateDisplay: pending.target_shift_date ? formatDisplayDate(pending.target_shift_date) : null,
+    });
+    const isGiveaway = ask.isGiveaway;
 
     await sendOutreachMessage({
       receiverEmail, receiverPhone, aegisSmsNumber,
-      subject: `Shift trade request from ${contact.name}`,
-      text: askText, company_id: contact.company_id,
+      subject: ask.subject,
+      text: ask.text, company_id: contact.company_id,
     });
 
     await reply(contact, message,
-      `I've reached out to ${receiver.name} about the trade. I'll let you know as soon as I hear back.`
+      `I've reached out to ${receiver.name} about ${isGiveaway ? 'covering your shift' : 'the trade'}. I'll let you know as soon as I hear back.`
     );
 
     await logActivity({

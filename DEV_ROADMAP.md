@@ -1739,3 +1739,54 @@ Scope (to be refined when picked up — diagnose-first, page-by-page):
 - **Accessibility baseline.** Contrast, focus states, and labels on interactive controls.
 
 **Done when:** the app reads as one cohesive Quria-branded product across all pages, with consistent components, states, and responsive behavior — ready to show prospective clients. Break into per-area sub-tasks when started.
+
+---
+
+### 2026-07-24 — SWAP-DIRECTION-1: one-way "X is taking my shift" misread as a two-way trade — BUILT on branch, tests green, pending merge + live verify
+
+**Reported (Alexander, live Watermark swap testing).** Two employee messages parsed wrong:
+1. **"Emily is taking my 3–9 pm shift on Saturday"** (a one-way GIVEAWAY — Emily covers the
+   sender's shift, sender gets nothing back) → Aegis replied *"Emily has more than one shift
+   that week — which of theirs do you want to take?"* (direction INVERTED — asked the sender
+   to pick up one of Emily's shifts).
+2. **"Me and Colin will be swapping my Thursday…"** then **"Colin is taking my Thursday AM
+   7/30, and…"** → Aegis: *"Colin doesn't have a shift that week to trade for"*, then the
+   follow-up hit *"I don't have an active swap request pending for you."*
+
+**Root cause (`src/workflows/shift-swap.ts`).** `extractSwapDetails` hardcoded *"a shift swap
+is a TRADE: the sender gives up one shift and takes one of the coworker's."* No concept of
+DIRECTION and no one-way path. `handleInitiateSwap` (directed branch) unconditionally called
+`chooseTradeShift` to find a shift of the target's for the sender to take → Emily (2 shifts) →
+`kind:'ambiguous'` → *"which of theirs?"*; Colin (0 shifts) → `kind:'none'` → *"nothing to
+trade for."* The downstream confirm/outreach/execute path already supported a null target
+shift (one-way) — it was only blocked at intake. Case-2's second message was ALSO
+misclassified by the classifier as a swap RESPONSE (accept/decline) instead of `initiate_swap`
+→ the "no active swap request" dead-end.
+
+**Fix (branch `fix/swap-direction-parsing`).**
+- `extractSwapDetails` now extracts a `direction` (`giveaway` | `pickup` | `trade`) with
+  examples for "X is taking my shift." Pure exported `normalizeSwapExtraction` decides it and
+  falls back safely (named return shift ⇒ trade, else ⇒ giveaway) so a giveaway never defaults
+  into the two-way path.
+- `handleInitiateSwap` directed branch: when `direction === 'giveaway'`, skip `chooseTradeShift`,
+  validate only that the named coworker can work the sender's shift, store a one-way
+  `PendingSwap` (null target shift), and confirm the give-up in one-way wording. Reuses the
+  existing confirm → coworker-ping → manager-approve → `executeScheduleSwap` (one-way) path.
+- **Coworker ping (Alexander's call): the named coworker IS pinged to confirm** ("you agreed to
+  take X's shift — confirm?") before manager approval. New pure `buildSwapAskText` pins the
+  giveaway vs trade wording (a giveaway is never called a "trade").
+- `src/ai/claude.ts`: classifier now routes "X is taking/covering my <shift>" and
+  content-bearing swap statements to `initiate_swap`, and restricts `respond_swap_accept/decline`
+  to a BARE yes/no with no other content.
+- **Tests:** new `swap-direction.test.ts` (11) — Emily + Colin transcripts → giveaway, genuine
+  two-way trade still → trade (regression), the safe fallback, and the giveaway-vs-trade
+  wording. tsc clean; **266 pass** (3 pre-existing suites fail to LOAD in this sandbox only
+  because there is no `.env` — `monitoring`/`coverage-button`/`accepted-roles` don't mock
+  `config/env`; identical failure with the branch stashed, so not from this change).
+
+**Status: BUILT, IN REVIEW — NOT merged.** DONE needs a live sandbox round-trip (a giveaway
+"X is taking my <shift>" → coworker confirm → manager approve → schedule reassigns) since the
+LLM direction/classification isn't unit-testable offline. **Follow-up (logged, not built):**
+the `pickup` direction (sender takes a coworker's shift, one-way) still routes through the
+existing trade path — fine for now (no reported case), worth its own pass. Aegis `main` is
+branch-protected: push `fix/swap-direction-parsing` → PR → merge → Railway.

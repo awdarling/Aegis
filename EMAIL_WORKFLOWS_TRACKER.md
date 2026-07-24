@@ -29,6 +29,14 @@ Per-action status of the 8 `ActionType`s in `src/lib/aegis-actions/types.ts`. Dr
 
 ---
 
+## 2026-07-24 — FAIRNESS-3: time off no longer inflates the fairness memory (BUILT, IN REVIEW)
+
+**Bug:** the cross-week memory read a week of approved time off as "under-worked," so a returner from leave got front-loaded (Lucas Witham: approved off 07-17→07-25 covering the memory window → prior ≈ 10.75 → #1 Headguard at 28.8h next week).
+
+**Fix:** `loadRecentHours` now flags approved full-day-TO weeks and imputes them to the employee's own non-TO typical (roster normal-week fallback) via a pure, tested `foldPriorHours`. Leave reads as a normal week; genuine under-work still ranks up. Gated by `EngineSettings.fairnessExcludeTimeOff` (default on). Stacked on the FAIRNESS-2 floor branch.
+
+**State:** branch `fix/engine-fairness-timeoff-memory`; `schedule-build.ts`, `types.ts`, new `fairness-timeoff-memory.test.ts` (5) + `scripts/dryrun-timeoff-memory-compare.ts`. tsc clean, 270/270. NOT merged; owed = live dry-run (Lucas's memory rises) → PR → merge. Together with FAIRNESS-2 this closes the Michael-at-zero / Lucas-front-loaded pair.
+
 ## 2026-07-24 — FAIRNESS-2 engine floor: eligible employees no longer starved to zero (BUILT, IN REVIEW)
 
 **Bug (Watermark managers):** an available employee with no time-off request (Michael McCorkle, Headguard) was left entirely off next week while same-role peers ran 20+ h. Root cause = FAIRNESS-1 cross-week memory with no floor (Michael's genuine 3-week load ≈ 44 decayed → ranked last → 0; fully staffed, so pure ranker starvation, not a gap).

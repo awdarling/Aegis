@@ -73,6 +73,9 @@ export interface EngineSettings {
   //     balancing. Prior-week memory still governs distribution above it.
   fairnessFloorEnabled: boolean;
   fairnessFloorRatio: number;
+  // FAIRNESS-3 — exclude approved-time-off weeks from the cross-week memory
+  //   so a vacation is not read as "under-worked" and rewarded next week.
+  fairnessExcludeTimeOff: boolean;
 }
 
 export interface ParsedConstraints {
@@ -96,4 +99,5 @@ export const DEFAULT_ENGINE_SETTINGS: EngineSettings = {
   fairnessDecay: 0.5,
   fairnessFloorEnabled: true,
   fairnessFloorRatio: 0.5,
+  fairnessExcludeTimeOff: true,
 };

@@ -310,20 +310,87 @@ async function loadBuildData(
   };
 }
 
-// FAIRNESS-1 — cross-week hours memory. Sums each employee's ACTUAL hours from
-// the most recent `lookbackWeeks` DISTINCT published, non-superseded, non-
+// FAIRNESS-1/3 — cross-week hours memory. Folds each employee's ACTUAL hours
+// from the most recent `lookbackWeeks` DISTINCT published, non-superseded, non-
 // deleted weeks strictly before `weekStart`, decayed by age (most recent week
 // full weight, each older week ×decay). Returns employee_id → decayed hours.
-// Empty when disabled (lookbackWeeks<=0) or there's no history. This is a
-// RANKING bias only — it never counts against this week's max_weekly_hours cap.
+// RANKING bias only — never counts against this week's max_weekly_hours cap.
+//
+// FAIRNESS-3 — when `excludeTimeOff` is on (default), a prior week in which an
+// employee had APPROVED full-day time off is NOT read as an under-worked week:
+// that week is imputed to the employee's own average over their non-TO weeks
+// (roster normal-week average as fallback). Otherwise a vacation reads as
+// "worked little" and the returner gets front-loaded the next week.
+
+function addDaysISO(d: string, days: number): string {
+  const dt = new Date(d + 'T12:00:00Z');
+  dt.setUTCDate(dt.getUTCDate() + days);
+  return dt.toISOString().slice(0, 10);
+}
+
+export interface PriorWeekHours {
+  hoursByEmp: Map<string, number>;   // employee_id → actual hours that week
+  toEmps: Set<string>;               // employees with approved full-day TO that week
+}
+
+// Pure + deterministic. `weeks` is most-recent-first (index 0 = rank 0).
+export function foldPriorHours(
+  weeks: PriorWeekHours[],
+  decay: number,
+  excludeTimeOff: boolean,
+): Map<string, number> {
+  const result = new Map<string, number>();
+  if (weeks.length === 0) return result;
+
+  const allIds = new Set<string>();
+  for (const w of weeks) {
+    for (const id of w.hoursByEmp.keys()) allIds.add(id);
+    for (const id of w.toEmps) allIds.add(id);
+  }
+
+  // Per-employee typical = mean ACTUAL over their NON-time-off weeks (an absent
+  // non-TO week counts as 0 — genuinely under-worked). Roster fallback = the
+  // mean of every non-TO week that had hours, i.e. a normal working week.
+  const typical = new Map<string, number>();
+  const hasNonTOWeek = new Map<string, boolean>();
+  let globalSum = 0, globalN = 0;
+  for (const id of allIds) {
+    let sum = 0, n = 0;
+    for (const w of weeks) {
+      if (w.toEmps.has(id)) continue;
+      const h = w.hoursByEmp.get(id) ?? 0;
+      sum += h; n++;
+      if (h > 0) { globalSum += h; globalN++; }
+    }
+    hasNonTOWeek.set(id, n > 0);
+    typical.set(id, n > 0 ? sum / n : 0);
+  }
+  const globalTypical = globalN > 0 ? globalSum / globalN : 0;
+
+  for (let rank = 0; rank < weeks.length; rank++) {
+    const w = weeks[rank];
+    const weight = Math.pow(decay, rank);
+    for (const id of allIds) {
+      let value: number;
+      if (excludeTimeOff && w.toEmps.has(id)) {
+        value = hasNonTOWeek.get(id) ? (typical.get(id) ?? 0) : globalTypical;
+      } else {
+        value = w.hoursByEmp.get(id) ?? 0;
+      }
+      if (value !== 0) result.set(id, (result.get(id) ?? 0) + value * weight);
+    }
+  }
+  return result;
+}
+
 async function loadRecentHours(
   companyId: string,
   weekStart: string,
   lookbackWeeks: number,
   decay: number,
+  excludeTimeOff: boolean,
 ): Promise<Map<string, number>> {
-  const priorHours = new Map<string, number>();
-  if (lookbackWeeks <= 0) return priorHours;
+  if (lookbackWeeks <= 0) return new Map<string, number>();
 
   const { data: rows } = await supabase
     .from('schedules')
@@ -341,20 +408,48 @@ async function loadRecentHours(
     week_start: string;
     data: { assignments?: Array<{ employee_id?: string; hours?: number }> } | null;
   };
+
+  // Collapse to one effective schedule per week (most-recent-first), summing
+  // each employee's actual hours for that week.
   const seenWeeks = new Set<string>();
-  let rank = 0;
+  const weekStarts: string[] = [];
+  const weeks: PriorWeekHours[] = [];
   for (const row of (rows ?? []) as PriorRow[]) {
-    if (seenWeeks.has(row.week_start)) continue; // one effective schedule per week
+    if (seenWeeks.has(row.week_start)) continue;
     seenWeeks.add(row.week_start);
-    const weight = Math.pow(decay, rank);
-    rank++;
+    const hoursByEmp = new Map<string, number>();
     for (const a of row.data?.assignments ?? []) {
       if (!a.employee_id || typeof a.hours !== 'number' || !Number.isFinite(a.hours)) continue;
-      priorHours.set(a.employee_id, (priorHours.get(a.employee_id) ?? 0) + a.hours * weight);
+      hoursByEmp.set(a.employee_id, (hoursByEmp.get(a.employee_id) ?? 0) + a.hours);
     }
-    if (rank >= lookbackWeeks) break;
+    weeks.push({ hoursByEmp, toEmps: new Set<string>() });
+    weekStarts.push(row.week_start);
+    if (weeks.length >= lookbackWeeks) break;
   }
-  return priorHours;
+
+  // FAIRNESS-3 — mark, per week, who had APPROVED full-day time off overlapping
+  // that week (so those weeks aren't read as under-worked).
+  if (excludeTimeOff && weeks.length > 0) {
+    const oldest = weekStarts[weekStarts.length - 1];
+    const { data: toRows } = await supabase
+      .from('time_off_requests')
+      .select('employee_id, start_date, end_date, time_off_type')
+      .eq('company_id', companyId)
+      .eq('status', 'approved')
+      .eq('time_off_type', 'full_day')
+      .lte('start_date', weekStart)
+      .gte('end_date', oldest);
+    const to = (toRows ?? []) as Array<{ employee_id: string; start_date: string; end_date: string }>;
+    for (let i = 0; i < weeks.length; i++) {
+      const ws = weekStarts[i];
+      const we = addDaysISO(ws, 6);
+      for (const t of to) {
+        if (t.start_date <= we && t.end_date >= ws) weeks[i].toEmps.add(t.employee_id);
+      }
+    }
+  }
+
+  return foldPriorHours(weeks, decay, excludeTimeOff);
 }
 
 // ── Gap reason ────────────────────────────────────────────────────────────────
@@ -1532,6 +1627,7 @@ export async function buildScheduleAndSave(
     weekStart,
     parsed.settings.fairnessLookbackWeeks,
     parsed.settings.fairnessDecay,
+    parsed.settings.fairnessExcludeTimeOff,
   );
   const tieBreakSeed = `${weekStart}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
   console.log(

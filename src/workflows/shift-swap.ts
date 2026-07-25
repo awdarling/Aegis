@@ -20,8 +20,9 @@ import {
   brandCardDetailLine,
 } from '../messaging/brand';
 import { generateActionToken } from '../lib/aegis-actions/tokens';
+import { resolveAvailabilityForWeek } from '../lib/custom-availability';
 import type { InboundMessage, VerifiedContact } from '../security/types';
-import type { Employee, Policy } from '../db/types';
+import type { Employee, Policy, Availability, CustomAvailability } from '../db/types';
 import type { ScheduleAssignment } from './schedule-build';
 
 // ── Schedule types (shared shape with emergency-coverage and schedule-build) ──
@@ -1389,7 +1390,7 @@ async function validateSwap(params: {
 
 // ── Candidate pool (Mode 2) ───────────────────────────────────────────────────
 
-async function buildSwapCandidates(params: {
+export async function buildSwapCandidates(params: {
   company_id: string;
   requester_id: string;
   shift_date: string;
@@ -1412,23 +1413,27 @@ async function buildSwapCandidates(params: {
     : await resolveAcceptedRoles(company_id, params.shift_name ?? '', role);
   const dayOfWeek = new Date(shift_date + 'T12:00:00Z').getUTCDay();
 
-  const [empRes, availRes, toRes, schedRes] = await Promise.all([
+  const [empRes, availRes, customAvailRes, toRes, schedRes] = await Promise.all([
     supabase.from('employees').select('*').eq('company_id', company_id).eq('active', true),
     supabase.from('availability').select('*').eq('company_id', company_id),
+    supabase.from('custom_availability').select('*')
+      .eq('company_id', company_id).eq('active', true)
+      .order('created_at', { ascending: false }),
     supabase.from('time_off_requests').select('employee_id')
       .eq('company_id', company_id).eq('status', 'approved')
       .lte('start_date', shift_date).gte('end_date', shift_date),
-    supabase.from('schedules').select('data').is('deleted_at', null)
+    supabase.from('schedules').select('data, week_start, week_end').is('deleted_at', null)
       .eq('company_id', company_id).eq('status', 'published')
       .lte('week_start', shift_date).gte('week_end', shift_date)
       .order('generated_at', { ascending: false }).limit(1).maybeSingle(),
   ]);
 
   const employees = (empRes.data ?? []) as Employee[];
-  const availability = (availRes.data ?? []) as { employee_id: string; day_of_week: number; start_time: string; end_time: string }[];
+  const availability = (availRes.data ?? []) as Availability[];
   const onTO = new Set((toRes.data ?? []).map((r: { employee_id: string }) => r.employee_id));
 
-  const schedData = schedRes.data ? (schedRes.data as { data: ScheduleData }).data : null;
+  const schedRow = schedRes.data as { data: ScheduleData; week_start: string; week_end: string } | null;
+  const schedData = schedRow ? schedRow.data : null;
   const weeklyHoursMap = new Map<string, number>();
   if (schedData) {
     for (const a of schedData.assignments) {
@@ -1437,10 +1442,30 @@ async function buildSwapCandidates(params: {
     }
   }
 
-  const availByEmp = new Map<string, typeof availability>();
+  const availByEmp = new Map<string, Availability[]>();
   for (const a of availability) {
     if (!availByEmp.has(a.employee_id)) availByEmp.set(a.employee_id, []);
     availByEmp.get(a.employee_id)!.push(a);
+  }
+
+  // CUSTOM-AVAIL-ALIGN — a candidate on a date-limited or rotating availability
+  // block must be judged by the availability the ENGINE would use for this week,
+  // not their base recurring rows. Mirror the schedule-build load+apply pattern:
+  // first custom row per employee, then resolve their effective week availability.
+  // Only when a published schedule row (with week bounds) exists — the rotating
+  // cycle is anchored to the week-start, so we need it.
+  if (schedRow) {
+    const customByEmp = new Map<string, CustomAvailability>();
+    for (const row of (customAvailRes.data ?? []) as CustomAvailability[]) {
+      if (!customByEmp.has(row.employee_id)) customByEmp.set(row.employee_id, row);
+    }
+    for (const emp of employees) {
+      const custom = customByEmp.get(emp.id) ?? null;
+      if (!custom) continue;
+      const normal = availByEmp.get(emp.id) ?? [];
+      const resolved = resolveAvailabilityForWeek(emp, schedRow.week_start, schedRow.week_end, normal, custom);
+      if (resolved !== normal) availByEmp.set(emp.id, resolved);
+    }
   }
 
   // Load never-conflicts for the requester to exclude them as candidates

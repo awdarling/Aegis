@@ -32,6 +32,12 @@ interface ScheduleData {
 
 // ── Public state types ────────────────────────────────────────────────────────
 
+// How long a requester's unconfirmed swap ("reply yes to send it") stays valid.
+// Bumped 1h → 24h to match the pending-time-off TTL (BUG-6): email round-trips
+// routinely lag more than an hour, and a "yes" that arrives after expiry falls
+// through to handleRespondSwap's "nothing pending" dead-end.
+const PENDING_SWAP_TTL_MS = 24 * 60 * 60 * 1000;
+
 export interface PendingSwap {
   mode: 'directed' | 'facilitated';
   company_id: string;
@@ -1532,6 +1538,22 @@ export function normalizeSwapExtraction(parsed: SwapExtractionRaw | null): SwapE
   };
 }
 
+// Manager sign-off gate for a confirmed swap. A DIRECTED swap — a deliberate
+// arrangement between two named people, whether a one-way giveaway or a two-way
+// trade — ALWAYS requires the manager. A facilitated one-at-a-time pickup only
+// requires the manager when a company swap policy explicitly says so. Exported so
+// the gate is unit-testable without the DB/LLM. (The undirected broadcast path is
+// separately always manager-gated in its own pickup/trade flow.)
+export function swapRequiresManagerApproval(params: {
+  mode: 'directed' | 'facilitated';
+  targetShiftName?: string | null;
+  policyRequiresApproval: boolean;
+}): boolean {
+  if (params.mode === 'directed') return true;
+  if (params.targetShiftName) return true; // a two-way trade always needs sign-off
+  return params.policyRequiresApproval;
+}
+
 // Pure builder for the coworker-ping message. A one-way giveaway (no target shift)
 // must NOT be called a "trade" or say the coworker gives up a shift — they only
 // pick up the sender's shift. Exported for unit testing the two wordings.
@@ -2000,6 +2022,15 @@ export async function handleInitiateSwap(
       return;
     }
 
+    // Guard against a self-referential swap (name resolves back to the requester,
+    // e.g. "Alex is taking my shift" sent by Alex) — a swap needs two distinct people.
+    if (targetEmployee.id === contact.employee_id) {
+      await reply(contact, message,
+        `That's your own shift — a swap needs a coworker to take it. Who would you like to swap with, or want me to ask the team if anyone can cover it?`
+      );
+      return;
+    }
+
     // Direction "giveaway" — the named coworker is TAKING the sender's shift and the
     // sender gets nothing back (e.g. "Emily is taking my Saturday shift", "Colin is
     // taking my Thursday AM"). This is a one-way pickup by a specific person, NOT a
@@ -2043,7 +2074,7 @@ export async function handleInitiateSwap(
         target_employee_id: targetEmployee.id,
         target_employee_name: targetEmployee.name,
         // No target_shift_* — one-way giveaway (the coworker gives up nothing).
-        expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+        expires_at: new Date(Date.now() + PENDING_SWAP_TTL_MS).toISOString(),
       };
       await storePendingSwap(pending);
 
@@ -2142,7 +2173,7 @@ export async function handleInitiateSwap(
       target_role: targetShift.role,
       target_shift_start: targetShift.start_time,
       target_shift_end: targetShift.end_time,
-      expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+      expires_at: new Date(Date.now() + PENDING_SWAP_TTL_MS).toISOString(),
     };
     await storePendingSwap(pending);
 
@@ -2181,7 +2212,7 @@ export async function handleInitiateSwap(
       shift_end: shift.end_time,
       schedule_id: schedule?.id ?? null,
       willing_days: raw.willing_days,
-      expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+      expires_at: new Date(Date.now() + PENDING_SWAP_TTL_MS).toISOString(),
     };
     await storePendingSwap(pending);
 
@@ -2590,18 +2621,21 @@ export async function handleSwapOutreachResponse(
     .eq('company_id', outreach.company_id).eq('policy_type', 'swaps');
   const policies = (policyData ?? []) as Policy[];
 
-  // Ask Claude if manager approval is required
-  let requiresApproval = false;
+  // Ask Claude whether a company swap policy explicitly requires manager approval.
+  let policyRequiresApproval = false;
   if (policies.length > 0) {
     const policyText = policies.map(p => `${p.policy_key}: ${p.policy_value}${p.description ? ' — ' + p.description : ''}`).join('\n');
     const system = 'Based on these swap policies, does manager approval EXPLICITLY appear to be required before a swap is executed? Respond ONLY with valid JSON: {"requires_approval":true|false}';
     const text = await generateReply(system, policyText, []);
     const parsed = coerceJsonObject<{ requires_approval: boolean }>(text);
-    requiresApproval = parsed?.requires_approval ?? false;
+    policyRequiresApproval = parsed?.requires_approval ?? false;
   }
 
-  // A two-way trade ALWAYS needs the manager's sign-off (item 18 design).
-  if (outreach.target_shift_name) requiresApproval = true;
+  const requiresApproval = swapRequiresManagerApproval({
+    mode: outreach.mode,
+    targetShiftName: outreach.target_shift_name,
+    policyRequiresApproval,
+  });
 
   await logActivity({
     company_id: outreach.company_id,
@@ -2611,9 +2645,11 @@ export async function handleSwapOutreachResponse(
   });
 
   if (!requiresApproval) {
-    await reply(contact, message,
-      `You're confirmed for the ${outreach.shift_name} shift (${outreach.shift_start}–${outreach.shift_end}) on ${formatDisplayDate(outreach.shift_date)}. Swap complete!`
-    );
+    // Do NOT pre-announce "Swap complete!" here — that claimed success before the
+    // schedule write, the same announce-before-apply class D2 fixed elsewhere.
+    // executeSwapNow applies the change FIRST, then sends the authoritative message
+    // to BOTH the requester and the receiver: a real confirmation only if the write
+    // landed, or an honest "pending your manager" note if the week isn't published.
     await executeSwapNow({
       company_id: outreach.company_id,
       requester,

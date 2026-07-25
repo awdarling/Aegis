@@ -197,17 +197,40 @@ export async function generateReply(
 // which made bare-weekday phrases ("my Saturday shift") resolve to today. We
 // compute the upcoming occurrence of every weekday in code and hand the model a
 // lookup table so it never has to do the math itself.
-function upcomingWeekdayLines(today: string): string {
+export interface WeekdayAnchor { name: string; iso: string; isToday: boolean; }
+
+// Deterministic weekday→date anchors for THIS week (the nearest upcoming
+// occurrence, 0–6 days out) AND NEXT week (that same occurrence + 7). The model
+// is bad at weekday arithmetic, so we compute both and hand it a lookup table.
+// The NEXT-week set is what lets a swap target a shift on next week's schedule:
+// "next Saturday" / "my shift next Friday" resolve to the right week instead of
+// collapsing onto this week's occurrence. Monday-first listing.
+export function weekdayAnchors(today: string): {
+  todayName: string;
+  thisWeek: WeekdayAnchor[];
+  nextWeek: WeekdayAnchor[];
+} {
   const base = new Date(today + 'T12:00:00Z');
   const names = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
   const todayDow = base.getUTCDay();
-  const order = [1, 2, 3, 4, 5, 6, 0]; // Monday-first listing
-  const lines = order.map(d => {
-    const daysAhead = (d - todayDow + 7) % 7;
-    const iso = new Date(base.getTime() + daysAhead * 86400000).toISOString().slice(0, 10);
-    return `${names[d]} → ${iso}${daysAhead === 0 ? ' (today)' : ''}`;
+  const order = [1, 2, 3, 4, 5, 6, 0];
+  const at = (daysAhead: number, name: string): WeekdayAnchor => ({
+    name,
+    iso: new Date(base.getTime() + daysAhead * 86400000).toISOString().slice(0, 10),
+    isToday: daysAhead === 0,
   });
-  return `Today is ${names[todayDow]}. Upcoming day-of-week dates — use these EXACTLY for any bare weekday (e.g. "Saturday", "my Friday shift"); never compute weekday arithmetic yourself: ${lines.join(', ')}.`;
+  const thisWeek = order.map(d => at((d - todayDow + 7) % 7, names[d]));
+  const nextWeek = order.map(d => at(((d - todayDow + 7) % 7) + 7, names[d]));
+  return { todayName: names[todayDow], thisWeek, nextWeek };
+}
+
+function upcomingWeekdayLines(today: string): string {
+  const { todayName, thisWeek, nextWeek } = weekdayAnchors(today);
+  const fmt = (rows: WeekdayAnchor[]) =>
+    rows.map(r => `${r.name} → ${r.iso}${r.isToday ? ' (today)' : ''}`).join(', ');
+  return `Today is ${todayName}. Resolve every weekday from these two tables EXACTLY; never compute weekday arithmetic yourself.
+THIS week — use for a bare weekday or "this <weekday>" (e.g. "Saturday", "my Friday shift", "this Friday"): ${fmt(thisWeek)}.
+NEXT week — use for "next <weekday>" or "<weekday> next week" (e.g. "next Saturday", "my shift next Friday"): ${fmt(nextWeek)}.`;
 }
 
 function buildClassifySystemPrompt(
@@ -481,10 +504,12 @@ Respond with ONLY valid JSON in this exact shape — no markdown, no explanation
     //   Include employee_name and/or date when mentioned; omit either if not stated.
     // For initiate_swap: { "shift_date": "YYYY-MM-DD", "shift_name": "AM|PM|null", "target_employee_name": "..." }
     //   shift_date = the date of the shift the employee wants to GIVE UP / can't
-    //   work / wants to trade away. Resolve a bare day-of-week using the
-    //   "Upcoming day-of-week dates" table above — "my Saturday shift" / "trade my
-    //   Saturday PM shift" → the Saturday date from that table. NEVER resolve a
-    //   named weekday to today's date unless today IS that weekday.
+    //   work / wants to trade away. Resolve a bare weekday or "this <weekday>"
+    //   from the THIS-week table above ("my Saturday shift" → the Saturday date
+    //   from THIS week). Resolve "next <weekday>" or "<weekday> next week" from
+    //   the NEXT-week table ("next Saturday" / "my shift next Friday" → next
+    //   week's date) — swaps CAN target a shift on next week's schedule. NEVER
+    //   resolve a named weekday to today's date unless today IS that weekday.
     //   If the employee ALSO lists days they CAN work in return (e.g. "I can work a
     //   Friday AM, a Wednesday PM, or a Thursday PM"), those are OFFERED trade days,
     //   NOT the shift_date — they must never override the give-up shift's date.

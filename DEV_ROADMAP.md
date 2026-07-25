@@ -1790,3 +1790,22 @@ LLM direction/classification isn't unit-testable offline. **Follow-up (logged, n
 the `pickup` direction (sender takes a coworker's shift, one-way) still routes through the
 existing trade path — fine for now (no reported case), worth its own pass. Aegis `main` is
 branch-protected: push `fix/swap-direction-parsing` → PR → merge → Railway.
+
+---
+
+### 2026-07-25 — SWAP-SUBSYSTEM AUDIT: manager-gate directed giveaways + adjacent holes — BUILT on branch, tests green, pending merge + live verify
+
+**Context.** Read-only audit of the whole swap subsystem after SWAP-DIRECTION-1 shipped. Prior logged swap bugs (D2 announce-before-apply, `decided_by` UUID, banned-pair flag, swap persistence, weekday resolution) all confirmed fixed in code. Findings ranked; the top one is a live gap in the just-shipped giveaway path.
+
+**FIXED (branch `fix/swap-approval-gaps`, stacked on `fix/swap-direction-parsing`).**
+- **#1 (HIGH) — directed giveaway skipped manager approval.** `handleSwapOutreachResponse` forced approval only for a two-way trade (`outreach.target_shift_name`) or when a swap policy required it. **Verified live: Watermark has NO `policies` row with `policy_type='swaps'`** → a one-way directed giveaway auto-executed on the coworker's YES with no manager in the loop, contradicting the confirmation we send the requester ("...then pass it to your manager to approve"). Fix: new pure exported `swapRequiresManagerApproval({mode, targetShiftName, policyRequiresApproval})` — every DIRECTED swap (giveaway OR trade) is manager-gated; only the legacy facilitated one-at-a-time pickup may auto-execute (and only if a policy waives approval). Also **removed the premature "Swap complete!" reply** in the no-approval branch — `executeSwapNow` already applies the schedule change FIRST and then messages BOTH parties authoritatively (announce-before-apply, same class as D2). `swap-approval-gate.test.ts` (7) pins the gate.
+- **#4 (LOW/MED) — pending-swap TTL 1h → 24h** (`PENDING_SWAP_TTL_MS`, all 3 PendingSwap creations). Matches the pending-time-off TTL (BUG-6); an email "yes" after an hour no longer dead-ends into `handleRespondSwap`'s "nothing pending."
+- **#6 (LOW) — self-target guard.** "Alex is taking my shift" sent by Alex (name resolves to the requester) now asks for a real coworker instead of running `validateSwap` with requester == receiver.
+- **State:** tsc clean; **273 pass** (266 + 7). Same 3 suites fail to LOAD in the cloud sandbox only (no `.env`; `monitoring`/`coverage-button`/`accepted-roles` don't mock `config/env`) — pre-existing, not from this change.
+
+**HELD (design calls / heavier — logged, not built):**
+- **#2 (MED) — `validateSwap` never checks the receiver's availability** (regular or custom); it validates qualification, banned pairs, approved TO, max hours, policy. A directed swap can put someone on a shift outside their availability windows. Arguable: the coworker's YES is consent and the manager approves — but it bypasses the availability the engine enforces everywhere else. **Needs Alexander's call** (enforce as a hard block, or keep consent+manager-gate). Not silently changed — a hard block could reject swaps people actively want.
+- **#3 (MED) — `buildSwapCandidates` (facilitated broadcast) ignores `custom_availability`** — reads only the `availability` table, so it can broadcast a pickup to someone on a date-limited/rotating block. Same inconsistency class the CUSTOM-AVAIL-ALIGN fix closed for the builder + Soteria; the swap candidate pool was never brought in line. Moderate build (reuse `resolveAvailabilityForWeek`); do in a dedicated pass.
+- **#5 (LOW) — `findSchedule` falls back to a DRAFT schedule** while `buildSwapCandidates`/`getReceiverWeeklyHours` read published-only. A swap started against an unpublished draft mixes sources. Narrow edge case.
+
+**DONE needs** a live sandbox round-trip on the giveaway path: "X is taking my \<shift\>" → coworker confirms → **manager approve/deny email arrives** → approve → schedule reassigns. Aegis `main` is branch-protected: push `fix/swap-approval-gaps` → PR → merge → Railway. (Stacked on `fix/swap-direction-parsing`; if that's already merged, cut this from current `main`.)

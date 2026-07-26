@@ -77,12 +77,108 @@ export interface OnboardingSession {
   opt_in_sent_at: string | null;
   started_at: string;
   expires_at: string;
+  // BUG-7: the inbound email pipeline is at-least-once (SendGrid retries after
+  // the webhook's immediate 200, and processing runs in the background), while
+  // saveOnboardingSession is last-writer-wins on aegis_memory.content. A retried
+  // inbound reprocessed against a since-advanced session could clobber the
+  // availability -> availability_confirm transition, dead-ending a new hire's
+  // "Yes" in an "I didn't quite catch that" loop. We stamp the last inbound's
+  // Message-ID here and skip an exact-id repeat. Optional/back-compat: absent on
+  // sessions created before this field existed.
+  last_processed_message_id?: string | null;
 }
 
 interface ShiftBounds {
   earliest_start: string;
   latest_end: string;
   min_shift_hours: number;
+}
+
+// ── BUG-7 helpers (pure, exported for unit tests) ────────────────────────────
+//
+// Three additive guards that close the onboarding availability-confirm loop
+// (an intermittent duplicate-inbound / classifier race). None change the
+// happy-path behaviour; each only makes a fragile transition deterministic.
+
+// Deterministic yes/no for UNAMBIGUOUS one-liners, so a plain "Yes" confirming
+// availability is never handed to the LLM (which is told to default to "no" on
+// any ambiguity and can flake a bare affirmation to "no", resetting the step).
+// Returns null for anything nuanced ("yes but change Tuesday") so the LLM still
+// decides — this is strictly a fast-path for the clear cases, never a downgrade.
+const AFFIRM_WORDS = new Set([
+  'yes', 'yep', 'yeah', 'yup', 'ya', 'yes!', 'yes.', 'sure', 'correct', 'right',
+  'confirmed', 'confirm', 'perfect', 'great', 'ok', 'okay', 'k', 'good',
+  'affirmative', '👍', '✅', '👍🏻', '👍🏼', '👍🏽', '👍🏾', '👍🏿',
+]);
+const AFFIRM_PHRASES = [
+  'yes please', 'yes thats right', "yes that's right", 'yes correct',
+  "yes that's correct", 'thats right', "that's right", 'thats correct',
+  "that's correct", 'looks good', 'looks right', 'looks correct', 'sounds good',
+  'sounds right', 'all good', 'that works', 'all correct', 'thats it', "that's it",
+];
+const NEGATE_WORDS = new Set([
+  'no', 'nope', 'nah', 'na', 'no.', 'wrong', 'incorrect', 'change', 'fix', 'redo',
+]);
+const NEGATE_PHRASES = [
+  'thats wrong', "that's wrong", 'not right', 'not correct', 'not quite',
+  'change it', 'change that', 'fix it', 'start over', 'do over', 'thats not right',
+  "that's not right",
+];
+// Words that make an otherwise-affirmative message actually a change request.
+const CHANGE_MARKERS = ['but', 'except', 'instead', 'actually', 'change', 'wrong', 'not '];
+
+export function classifyAffirmation(message: string): 'yes' | 'no' | null {
+  const norm = (message || '')
+    .toLowerCase()
+    .replace(/[.!,;:]+$/g, '')
+    .trim();
+  if (!norm) return null;
+
+  // A short message with a change marker is neither a clean yes nor a clean no.
+  if (CHANGE_MARKERS.some(m => norm.includes(m))) {
+    // "no"/"nope" alone already handled below; a change marker with other words
+    // is a change request the confirm handler treats as "no" only via the LLM.
+    if (NEGATE_WORDS.has(norm) || NEGATE_PHRASES.includes(norm)) return 'no';
+    return null;
+  }
+
+  if (AFFIRM_WORDS.has(norm) || AFFIRM_PHRASES.includes(norm)) return 'yes';
+  if (NEGATE_WORDS.has(norm) || NEGATE_PHRASES.includes(norm)) return 'no';
+
+  // Very short leading-affirmation with no change marker: "yes thanks", "ok cool".
+  const words = norm.split(/\s+/);
+  if (words.length <= 3 && AFFIRM_WORDS.has(words[0])) return 'yes';
+  if (words.length <= 3 && NEGATE_WORDS.has(words[0])) return 'no';
+
+  return null;
+}
+
+// True when an inbound is an exact repeat of the last one we already processed
+// for this session (a SendGrid retry). Requires a stable Message-ID on both.
+export function isDuplicateOnboardingInbound(
+  session: Pick<OnboardingSession, 'last_processed_message_id'>,
+  messageId: string | undefined | null
+): boolean {
+  return (
+    !!messageId &&
+    !!session.last_processed_message_id &&
+    session.last_processed_message_id === messageId
+  );
+}
+
+// True when a clear affirmation lands on the 'availability' step while a parsed
+// availability is already on file — i.e. the confirm prompt was already sent but
+// a race reverted the step. Treat it as the confirmation instead of trying to
+// parse "yes" as hours.
+export function shouldRecoverAvailabilityConfirm(
+  session: Pick<OnboardingSession, 'step' | 'collected'>,
+  body: string
+): boolean {
+  return (
+    session.step === 'availability' &&
+    session.collected.availability_parsed.length > 0 &&
+    classifyAffirmation(body) === 'yes'
+  );
 }
 
 // A rotating (e.g. "every other week") custom-availability change: a cycle of N
@@ -975,6 +1071,13 @@ export async function writeEmployeeAvailability(
 // reliably. Falls back to 'no' on parse failure (the safe default everywhere
 // it's used: re-prompt rather than silently accept).
 async function claudeClassifyYesNo(message: string, question: string): Promise<'yes' | 'no'> {
+  // BUG-7: resolve unambiguous one-liners deterministically. A bare "Yes"
+  // confirming availability must never depend on an LLM call that is told to
+  // default to "no" on ambiguity — a flaked "no" resets the step and starts the
+  // confirm loop. Nuanced messages (null) still go to the model.
+  const deterministic = classifyAffirmation(message);
+  if (deterministic) return deterministic;
+
   const response = await withAnthropicRetry(() =>
     client.messages.create({
       model: MODEL,
@@ -1623,6 +1726,26 @@ export async function handleOnboardingResponse(
 ): Promise<void> {
   const managerContact = buildManagerContact(session);
   const managerMsg = buildManagerMsg(session);
+
+  // BUG-7: drop an exact repeat of the last inbound (a SendGrid retry). Without
+  // this, a retried message can be reprocessed against a since-advanced session
+  // and clobber the availability -> availability_confirm transition. Stamp the
+  // id and persist it BEFORE dispatching so a retry that arrives mid-processing
+  // is caught. Messages without a stable Message-ID (e.g. SMS) skip the guard.
+  if (isDuplicateOnboardingInbound(session, message.thread_id)) {
+    return;
+  }
+  if (message.thread_id) {
+    session.last_processed_message_id = message.thread_id;
+    await saveOnboardingSession(session);
+  }
+
+  // BUG-7: if a clear "Yes" lands on the availability step while a parsed
+  // availability is already on file, the confirm prompt was already sent and a
+  // race reverted the step — treat it as the confirmation, not as new hours.
+  if (shouldRecoverAvailabilityConfirm(session, message.body)) {
+    session.step = 'availability_confirm';
+  }
 
   const { data: empData } = await supabase
     .from('employees')

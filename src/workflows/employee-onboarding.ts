@@ -1165,20 +1165,6 @@ async function sendOptInStep(session: OnboardingSession, companyName: string): P
   );
 }
 
-// Email onboarding kickoff. Email has no TCPA SMS opt-in requirement, so instead
-// of the SMS-consent prompt we open with a warm welcome and go straight to name
-// confirmation. The session is already at step 'name_confirm', so the employee's
-// reply routes to handleNameConfirmStep.
-async function sendEmailWelcomeStep(session: OnboardingSession, companyName: string): Promise<void> {
-  const firstName = session.employee_name.split(' ')[0];
-  await textEmployee(
-    session,
-    `Hi ${firstName}! I'm Aegis, the scheduling assistant for ${companyName}. ` +
-      `Your manager asked me to help get you set up — it only takes a minute, right here over email. ` +
-      `To start, can you reply with your full name so I can confirm I've got the right person?`
-  );
-}
-
 async function sendEmailStep(session: OnboardingSession): Promise<void> {
   const firstName = session.employee_name.split(' ')[0];
   await textEmployee(
@@ -1960,9 +1946,15 @@ async function executeOnboardingForCandidates(
       manager_channel: message.channel,
       manager_sender: message.sender,
       manager_recipient: message.recipient,
-      // Email onboarding has no TCPA SMS opt-in gate — start at name_confirm with
-      // opt-in pre-satisfied. SMS still gates on an explicit YES via the opt_in step.
-      step: isEmail ? 'name_confirm' : 'opt_in',
+      // A2P/10DLC (Telnyx) requires the opt-in consent message to be the FIRST
+      // item in onboarding, on EVERY channel — the employee must affirmatively
+      // reply YES before Aegis sends any other onboarding content. So every
+      // session starts at `opt_in` with `opt_in_confirmed:false`, regardless of
+      // channel (previously the email path started at `name_confirm` with opt-in
+      // pre-satisfied, which skipped the consent step). The `textEmployee` guard
+      // enforces this: it blocks and re-sends the opt-in prompt on any downstream
+      // send until YES is recorded.
+      step: 'opt_in',
       collected: {
         name_confirmed: false,
         email: null,
@@ -1977,18 +1969,15 @@ async function executeOnboardingForCandidates(
       invalid_email_attempts: 0,
       invalid_availability_attempts: 0,
       warned_24h: false,
-      opt_in_confirmed: isEmail ? true : false,
+      opt_in_confirmed: false,
       opt_in_sent_at: now.toISOString(),
       started_at: now.toISOString(),
       expires_at: new Date(now.getTime() + 48 * 60 * 60 * 1000).toISOString(),
     };
 
     await saveOnboardingSession(session);
-    if (isEmail) {
-      await sendEmailWelcomeStep(session, companyName);
-    } else {
-      await sendOptInStep(session, companyName);
-    }
+    // Opt-in consent prompt is the first message on every channel (A2P/10DLC).
+    await sendOptInStep(session, companyName);
     started.push(employee.name);
 
     await logActivity({

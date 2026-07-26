@@ -76,6 +76,32 @@ Reference for who/what is configured in each tenant. Append-only — when identi
 
 ---
 
+## Sandbox Tenant Two (B1 multi-tenant proof) — provisioned via SQL 2026-07-26
+
+**company_id**: `00000000-0000-0000-0000-000000000002`
+**name**: Quria Sandbox Two
+**Aegis email channel**: `sandbox2@aegis.quriasolutions.com` (LOWERCASE — the inbound webhook lowercases the recipient before the exact match)
+**Timezone**: America/Detroit
+**Purpose**: the second tenant for the B1 "tenant-aware outbound Reply-To + threading + strict routing, zero cross-talk" proof. SANDBOX ONLY.
+
+> **Status (2026-07-26):** the setup SQL (`Sandbox_Tenant2_B1_Setup.sql`, repo root) is written + verified against `information_schema` but **Alexander must run it** (Supabase MCP is read-only). Rows below are the INTENDED provisioning; mark CONFIRMED once the SQL has run.
+
+> **SendGrid:** `sandbox2@aegis.quriasolutions.com` is a new local-part on the EXISTING `aegis.quriasolutions.com` subdomain, so it rides the existing Inbound Parse route — no new SendGrid/DNS setup needed.
+
+### Tenant Two identities
+| Kind | Name | Email | Notes |
+|---|---|---|---|
+| Employee | Robin Vale | lightningmakigga@gmail.com | Reuses Riley's real inbox as a DIFFERENT person in tenant B — makes the zero-cross-talk proof strongest (one inbox, two tenants: a reply to A's address must resolve to Riley(A), a reply to B's address to Robin(B)). Swap for a distinct inbox if preferred. `Lifeguard`, sex=female, aegis_access=employee. |
+| Manager (optional) | Sandbox Two Manager | sandbox2-mgr@quriasolutions.com | Only needed for manager-side workflow tests (the employee round-trip alone proves routing/threading). Requires creating the auth user FIRST (Supabase Dashboard) — `public.users.id` is a FK to `auth.users.id` — then the `users` row (role=manager, company_id=…0002). A FREE M365 shared mailbox works. |
+
+### Tenant Two seed (optional, for build/distribute tests)
+| Table | Row |
+|---|---|
+| shift_types | PM Lifeguard 15:00–21:00, all days, active |
+| shift_requirements | Lifeguard ×1 on PM Lifeguard (`shift_type_id` NOT NULL; `accepted_roles=ARRAY['Lifeguard']`) |
+
+---
+
 ## Process for adding a new test identity
 
 ### To add a new manager (with Homebase access)

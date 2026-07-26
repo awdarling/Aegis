@@ -292,3 +292,22 @@ Any time a future Claude Code session or live debugging surfaces a difference be
 ### Roles are strings across FIVE tables — rename must hit all five
 A role has no FK. It is a free-text string compared by exact equality in: `employees.primary_role`, `employees.qualified_roles[]`, `shift_requirements.role`, `shift_requirements.accepted_roles[]`, **`wage_rates.role`**, and **`shift_experience_rules.role`**. Soteria's `update_role` cascade covered only the first four — a rename silently orphaned the wage rate and every veteran/experience rule (they stop matching and stop being enforced; nothing errors). Fixed 2026-07-13; `delete_role` now checks all references too.
 - **Correction to a misleading in-code comment:** `shift_requirements.role` was labelled the *"legacy column"*. **It is not legacy — it is what the engine matches on.** `accepted_roles` is the column nothing reads (D10). Do not act on that old comment.
+
+---
+
+## 2026-07-26 — B1 (tenant-aware outbound email) — inbound-routing schema facts
+
+Read-only (`information_schema`) during the B1 hardening. Sandbox + Watermark tenants only; no writes (Supabase MCP read-only).
+
+### `public.company_channels` — NO `is_active` column; NO unique constraint on `channel_value`
+- Live columns: `id (uuid, PK default uuid_generate_v4()), company_id (uuid NOT NULL), channel_type (text NOT NULL), channel_value (text NOT NULL), created_at (timestamptz NOT NULL default now())`. **There is no `is_active` / `active` column** — a stale in-code doc comment in `src/security/sender-verification.ts` claimed an `is_active` column existed; corrected 2026-07-26. Neither `resolveCompanyId` nor `resolveTenantEmailAddress` filters on it (correct — it doesn't exist).
+- **`information_schema.table_constraints` for `company_channels` returned EMPTY** for the read-only role — i.e. no PRIMARY KEY / UNIQUE / FK constraints are visible to `cowork_ro`. Whether a UNIQUE on `channel_value` exists could NOT be confirmed. **Hazard:** `resolveCompanyId` uses `.maybeSingle()`, which THROWS if two rows share the same `channel_value` → that address's inbound mail would error → drop. **Provisioning discipline:** keep every tenant's `channel_value` globally unique. **Recommended hardening (gated DDL, Alexander):** `CREATE UNIQUE INDEX ON public.company_channels (channel_value);` (or on `(channel_type, channel_value)`).
+
+### Inbound recipient is LOWERCASED before the exact match (routing constraint)
+- `src/webhooks/email.ts` does `extractFirstEmailAddress(recipient).toLowerCase()` before `resolveCompanyId`. So `company_channels.channel_value` for an email channel **MUST be stored lowercase** or inbound mail to that tenant never matches and is dropped. Watermark (`aegis@aegis.quriasolutions.com`) + sandbox (`sandbox@aegis.quriasolutions.com`) are already lowercase. Fold this into any new-tenant provisioning.
+
+### `public.aegis_conversations.company_id` is NOT NULL
+- Confirmed — every logged conversation carries its tenant. `saveConversation` (`src/logger/conversation.ts`) writes `from_address = env.SENDGRID_FROM_EMAIL` (the apex) on outbound; verified read-only that **nothing anywhere reads `from_address` to resolve a tenant or route a reply** (grep: all `from_address` occurrences are writes/type-defs). Tenant routing is by `recipient` (inbound) + `company_id` (stored); threading by In-Reply-To/References + `thread_id`. The apex `from_address` under the B1 model is a harmless audit value.
+
+### SendGrid Inbound Parse is per-subdomain (de-risks the 2nd-tenant proof)
+- Not a DB fact but recorded here for the next builder. Watermark's `aegis@` and the sandbox's `sandbox@` both receive on the SAME host `aegis.quriasolutions.com`, which already has an MX → SendGrid Inbound Parse route that catches **every local-part** on that host. So a new **local-part** on that subdomain (e.g. `sandbox2@aegis.quriasolutions.com`) needs **no new SendGrid/DNS setup**. Only a new **subdomain** (e.g. `aegis@tenant2.quriasolutions.com`) requires a new MX record + Parse route — that's the real per-client production shape (Phase B2/B3), not needed for the B1 sandbox proof.

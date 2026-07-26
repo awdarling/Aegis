@@ -181,9 +181,18 @@ Inbound email is authenticated (ECDSA signature verification) and verified. Both
 
 ## Open phases
 
-### Phase 4.5 — Tenant-aware outbound From + threading (TENANT-1) — OPEN
+### Phase 4.5 — Tenant-aware outbound From + threading (TENANT-1 / B1) — CODE COMPLETE (IN REVIEW); live 2-tenant proof owed
 
-Outbound `From` is still the apex `aegis@quriasolutions.com` with `Reply-To` carrying the routing address. Works for single-tenant Watermark; **breaks reply routing the moment a second tenant onboards.** Fix: `sendEmail()` accepts `companyId` (or precomputed `fromAddress`); look up the tenant's email channel from `company_channels` (`channel_type='email'`, column `channel_value`); set `From` and `Reply-To` to it; verify `In-Reply-To`/`References` propagate; audit every `sendEmail` call site to pass tenant context. Not launch-blocking for Watermark alone.
+**Model (decided, do NOT re-open):** ONE authenticated apex `From` (`env.SENDGRID_FROM_EMAIL`) for SPF/DKIM/DMARC alignment; per-tenant routing via **Reply-To** = `company_channels.channel_value`. No per-tenant authenticated From.
+
+**Already built + confirmed in-code (2026-07-26, branch `feat/b1-tenant-aware-email`):**
+- `sendEmail()` requires `company_id`; `resolveTenantEmailAddress()` sets Reply-To from `company_channels` (`channel_type='email'`, `channel_value`), falling back to `AEGIS_REPLY_TO_EMAIL`. From = apex. In-Reply-To/References/Message-ID threading implemented.
+- **All 30 `sendEmail` call sites audited** — every one passes a tenant-derived `company_id` (`contact.` / `token.` / `tor.` / `session.` / `outreach.` / `params.` / schedule-row-resolved). Zero literals, zero `env.*`, zero hardcoded UUIDs; Watermark's prod UUID appears nowhere in `src`. The two fan-out endpoints resolve `companyId` FROM the schedule row and `distributeScheduleCore` re-guards `.eq('id',…).eq('company_id',…)`. **No call-site fixes needed.**
+- `saveConversation` writes `from_address = apex` — fine; nothing downstream routes off `from_address` (verified read-only).
+
+**Fixed this session (D4 / the core multi-tenant footgun):** `resolveCompanyId` (`sender-verification.ts`) no longer falls back to "the sole email-configured company." Strict exact-match only; no match → `security_event` + drop. This is what made the old design break/leak the instant tenant #2 existed. +5 unit tests (`sender-verification.test.ts`). tsc clean; full vitest **321/321**.
+
+**OWED for DONE (live, in the sandbox — nothing is done until this passes):** stand up the 2nd sandbox tenant (SQL: `Sandbox_Tenant2_B1_Setup.sql`), send from tenant A and tenant B (each Reply-To = its own address), reply to each, and confirm each reply routes to the CORRECT tenant + threads, with ZERO cross-talk. Verify in Supabase (conversations carry the right `company_id`; no misrouted `security_events`). **SendGrid note:** `sandbox2@aegis.quriasolutions.com` rides the EXISTING `aegis.quriasolutions.com` Inbound Parse route — no new infra. (A new *subdomain* would need MX + a Parse route.)
 
 ### Phase 6.5 — Email deliverability hardening (DELIV-1) — MONITOR (downgraded 2026-06-12)
 

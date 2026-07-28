@@ -181,7 +181,9 @@ Inbound email is authenticated (ECDSA signature verification) and verified. Both
 
 ## Open phases
 
-### Phase 4.5 — Tenant-aware outbound From + threading (TENANT-1 / B1) — CODE COMPLETE (IN REVIEW); live 2-tenant proof owed
+### Phase 4.5 — Tenant-aware outbound From + threading (TENANT-1 / B1) — ✅ DONE (LIVE-VERIFIED 2026-07-28)
+
+> **LIVE PROOF (2026-07-28):** stood up a 2nd sandbox tenant (`…0002` / `sandbox2@aegis.quriasolutions.com`) via `Sandbox_Tenant2_B1_Setup.sql` and ran the two-tenant round-trip: sent from tenant A and tenant B (each Reply-To = its own address), replied to each, and confirmed every reply routed to the CORRECT tenant + threaded with **ZERO cross-talk** — `aegis_conversations` carried the right `company_id` and `security_events` showed no drops/misroutes. SendGrid needed no new infra (same-subdomain address rode the existing Inbound Parse route). The apex-From + per-tenant Reply-To model + the `resolveCompanyId` strict-match fix are proven end-to-end. Build record below stays accurate.
 
 **Model (decided, do NOT re-open):** ONE authenticated apex `From` (`env.SENDGRID_FROM_EMAIL`) for SPF/DKIM/DMARC alignment; per-tenant routing via **Reply-To** = `company_channels.channel_value`. No per-tenant authenticated From.
 
@@ -192,7 +194,7 @@ Inbound email is authenticated (ECDSA signature verification) and verified. Both
 
 **Fixed this session (D4 / the core multi-tenant footgun):** `resolveCompanyId` (`sender-verification.ts`) no longer falls back to "the sole email-configured company." Strict exact-match only; no match → `security_event` + drop. This is what made the old design break/leak the instant tenant #2 existed. +5 unit tests (`sender-verification.test.ts`). tsc clean; full vitest **321/321**.
 
-**OWED for DONE (live, in the sandbox — nothing is done until this passes):** stand up the 2nd sandbox tenant (SQL: `Sandbox_Tenant2_B1_Setup.sql`), send from tenant A and tenant B (each Reply-To = its own address), reply to each, and confirm each reply routes to the CORRECT tenant + threads, with ZERO cross-talk. Verify in Supabase (conversations carry the right `company_id`; no misrouted `security_events`). **SendGrid note:** `sandbox2@aegis.quriasolutions.com` rides the EXISTING `aegis.quriasolutions.com` Inbound Parse route — no new infra. (A new *subdomain* would need MX + a Parse route.)
+**DONE — live-verified 2026-07-28** (see the LIVE PROOF at the top of this section). The two-tenant round-trip passed with zero cross-talk; `Sandbox_Tenant2_B1_Setup.sql` stood tenant B up on the existing `aegis.quriasolutions.com` Inbound Parse route (no new infra; a new *subdomain* would need MX + a Parse route).
 
 ### Phase 6.5 — Email deliverability hardening (DELIV-1) — MONITOR (downgraded 2026-06-12)
 
@@ -284,7 +286,7 @@ Inbound email is authenticated (ECDSA signature verification) and verified. Both
 - "Feels like a person" tone on every Aegis string — no "request received", "processing intent", "standby".
 - One Soteria action per response.
 - Always verify column names via `information_schema` before any INSERT/UPDATE — and remember `src/db/types.ts` is itself incomplete (missing `employees.sex`, `shift_requirements.accepted_roles`). See SCHEMA_DRIFT_LOG.md.
-- Classifier prompts must inject today's date (timezone-aware via `Intl.DateTimeFormat('en-CA', { timeZone: companyTimezone })`) — year-drift is a recurring class.
+- **EVERY date/weekday-resolving LLM prompt** — the classifier AND every extractor/generator (`extractSwapDetails`, coverage, time-off, onboarding, …) — must inject today's date in the **TENANT's timezone from `companies.timezone`** (never server UTC), formatted `Intl.DateTimeFormat('en-CA', { timeZone: companyTimezone })`, plus the shared `weekdayAnchors` table so the model never does weekday math. Year-drift and day-drift (server-UTC "today") are both recurring classes. **Corollary — match on tenant DATA, never a client's shift NAMES:** any matching/lookup (swaps, coverage, availability) resolves against the tenant's own schedule rows — dates, `start_time`/`end_time` — and derives AM/PM sense from those times, never from hardcoded shift-name strings. (WM-SWAP-TRADE-1, 2026-07-27: `chooseTradeShift` substring-filtered on Watermark's internal shift name and false-reported "no shift".)
 - Employee emails never link to Homebase (BUG-4 rule).
 - The schedule build is deterministic and LLM-free — no `withAnthropicRetry` there; it wraps intent classification and response generation only.
 

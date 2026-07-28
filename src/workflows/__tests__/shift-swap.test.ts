@@ -20,6 +20,7 @@ vi.mock('../../db/client', () => ({ supabase: { from: () => ({}) } }));
 vi.mock('../../ai/claude', () => ({
   generateReply: vi.fn(),
   classifyIntent: vi.fn(),
+  weekdayAnchors: () => ({ todayName: 'Monday', thisWeek: [], nextWeek: [] }),
   AnthropicOverloadError: class AnthropicOverloadError extends Error {},
 }));
 vi.mock('../../messaging/email', () => ({ sendEmail: vi.fn() }));
@@ -35,6 +36,7 @@ import {
   applySwapToAssignments,
   applyTradeToAssignments,
   chooseTradeShift,
+  descriptorAmPm,
   isReachableForOutreach,
   tradeableShiftsForCandidate,
   partitionSwapCandidates,
@@ -200,6 +202,81 @@ describe('chooseTradeShift (which of the target’s shifts you take)', () => {
 
   it('returns none when the target has no shifts that week', () => {
     expect(chooseTradeShift(data, 'nobody', null).kind).toBe('none');
+  });
+});
+
+describe('descriptorAmPm — tenant-agnostic AM/PM sense of a loose descriptor', () => {
+  it('reads a leading clock hour, NOT a trailing AM/PM word', () => {
+    expect(descriptorAmPm('Friday 9-3 PM')).toBe('day');  // 9am start → daytime, despite "PM"
+    expect(descriptorAmPm('Saturday 3-9 PM')).toBe('pm');
+    expect(descriptorAmPm('11 to 3')).toBe('day');
+  });
+  it('reads generic period words (no client vocabulary)', () => {
+    expect(descriptorAmPm('her morning shift')).toBe('day');
+    expect(descriptorAmPm('the afternoon')).toBe('pm');
+    expect(descriptorAmPm('evening')).toBe('pm');
+  });
+  it('is null when there is no time signal', () => {
+    expect(descriptorAmPm('Friday')).toBeNull();
+    expect(descriptorAmPm("Katie's shift")).toBeNull();
+  });
+});
+
+// WM-SWAP-TRADE-1 — the reported Watermark failure: Jenna "swapping my 3-9 PM on
+// Saturday for Katie Schillaci's 9-3 PM shift on Friday". Katie DOES work Friday
+// ("AM Weekday", 11:00–15:30), but the old code hard-filtered her shifts by the
+// descriptor "Friday 9-3 PM" — which never substring-matches the internal name —
+// and falsely replied "no shift that week". Resolve by DATE; tolerate loose time
+// language; never a false 'none' when the target has shifts. (Tenant-agnostic:
+// nothing here is keyed to Watermark's shift names.)
+describe('chooseTradeShift — day-first, tolerant of loose descriptors (WM-SWAP-TRADE-1)', () => {
+  const katieWeek = { assignments: [
+    a({ employee_id: 'katie', date: '2026-07-30', shift_name: 'AM Weekday', start_time: '11:00', end_time: '15:30' }),
+    a({ employee_id: 'katie', date: '2026-07-31', shift_name: 'AM Weekday', start_time: '11:00', end_time: '15:30' }),
+    a({ employee_id: 'katie', date: '2026-08-02', shift_name: 'Afternoon',  start_time: '15:00', end_time: '21:15' }),
+  ] };
+
+  it('resolves a time-descriptor that does NOT match the internal shift name (the exact reported bug)', () => {
+    const r = chooseTradeShift(katieWeek, 'katie', { shift_name: 'Friday 9-3 PM', date: '2026-07-31' });
+    expect(r.kind).toBe('one');
+    if (r.kind === 'one') expect(r.shift.date).toBe('2026-07-31');
+  });
+
+  it('resolves when the hint is only the day name ("Katie\'s Friday shift")', () => {
+    const r = chooseTradeShift(katieWeek, 'katie', { shift_name: 'Friday', date: '2026-07-31' });
+    expect(r.kind).toBe('one');
+    if (r.kind === 'one') expect(r.shift.date).toBe('2026-07-31');
+  });
+
+  it('never false-nones: a missing date falls back to "which?" (not "no shift")', () => {
+    const r = chooseTradeShift(katieWeek, 'katie', { shift_name: '9-3 PM', date: null });
+    expect(r.kind).not.toBe('none');
+  });
+
+  it('never false-nones: a WRONG date still does not claim "no shift"', () => {
+    const r = chooseTradeShift(katieWeek, 'katie', { shift_name: 'Friday 9-3 PM', date: '2026-08-01' });
+    expect(r.kind).not.toBe('none');
+  });
+
+  const twoSameDay = { assignments: [
+    a({ employee_id: 'katie', date: '2026-07-31', shift_name: 'AM Weekday', start_time: '11:00', end_time: '15:30' }),
+    a({ employee_id: 'katie', date: '2026-07-31', shift_name: 'Afternoon',  start_time: '15:00', end_time: '21:15' }),
+  ] };
+
+  it('disambiguates two-same-day shifts by AM/PM sense', () => {
+    const morning = chooseTradeShift(twoSameDay, 'katie', { shift_name: 'her morning', date: '2026-07-31' });
+    expect(morning.kind).toBe('one');
+    if (morning.kind === 'one') expect(morning.shift.shift_name).toBe('AM Weekday');
+
+    const afternoon = chooseTradeShift(twoSameDay, 'katie', { shift_name: 'the afternoon', date: '2026-07-31' });
+    expect(afternoon.kind).toBe('one');
+    if (afternoon.kind === 'one') expect(afternoon.shift.shift_name).toBe('Afternoon');
+  });
+
+  it('asks which when two-same-day and the descriptor gives no time signal', () => {
+    const r = chooseTradeShift(twoSameDay, 'katie', { shift_name: 'Friday', date: '2026-07-31' });
+    expect(r.kind).toBe('ambiguous');
+    if (r.kind === 'ambiguous') expect(r.shifts).toHaveLength(2);
   });
 });
 

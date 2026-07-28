@@ -1836,3 +1836,26 @@ Phase A ("prove it works live") is COMPLETE (swap #10, coverage #11, my-shifts #
 **OWED for DONE (LIVE, sandbox — "tests pass" ≠ "verified live"; only tests + code audit achieved so far):** run `Sandbox_Tenant2_B1_Setup.sql` (Alexander — MCP is read-only) to stand up tenant B (`…0002`, `sandbox2@aegis.quriasolutions.com`), then send from tenant A + tenant B, reply to each, and confirm each reply routes to the CORRECT tenant + threads with ZERO cross-talk; verify in Supabase (conversations carry the right company_id; no misrouted security_events). **SendGrid Inbound Parse: NO new infra** for the same-subdomain local-part `sandbox2@aegis.quriasolutions.com` (rides the existing `aegis.quriasolutions.com` route); a new subdomain would need MX + a Parse route.
 
 **Git steps (Alexander):** `cd` to the Aegis repo → `git fetch` → the branch `feat/b1-tenant-aware-email` needs pushing from an environment that can push (the cloud sandbox couldn't). Re-create it if needed: `git checkout -b feat/b1-tenant-aware-email origin/main`, apply commit `ba638ae` (or cherry-pick), `git push -u origin feat/b1-tenant-aware-email`, open a PR, review the diff, merge → Railway auto-deploys. Full session record: `claude/session-2026-07-26-B1-tenant-email.md`.
+
+---
+
+### 2026-07-27 — WM-SWAP-TRADE-1: directed trade falsely reported "coworker has no shift that week" — FIXED on branch, tests green, pending merge + live verify
+
+**Reported (Alexander, live Watermark).** Jenna Stibitz emailed *"I am swapping my 3-9 PM on Saturday for Katie Schillaci's 9-3 PM shift on Friday."* Aegis replied *"Katie Schillaci doesn't have a shift on the schedule that week to trade for"* — but Katie DID have a Friday shift. Aegis was not reading the live schedule correctly for trade coordination.
+
+**Investigation (read-only, evidence-first — no assumptions shipped).**
+- **Deploy check:** all prior swap fixes are on `main` and live (deployed `ba276c68`). Not a missing-deploy problem.
+- **Ground truth (live DB):** current published week `e220e909` (07-27→08-02) — Katie Schillaci **Fri 07-31 "AM Weekday" Lifeguard 11:00–15:30**; Jenna **Sat 08-01 "Afternoon" 15:00–21:15**. Both real.
+- **Schedule WAS read correctly:** the trade handler loads the schedule by Jenna's give-up date (08-01) → that's `e220e909`, which contains Katie's shifts, and Jenna's own shift was found in it. Not a schedule-read failure.
+- **Extraction empirically sampled (3× identical) + reproduced against the real code:** the model extracts `target_shift_date: "2026-07-31"` (CORRECT) but `target_shift_name: "Friday 9-3 PM"` (a day+time descriptor). *(Corrected an earlier hypothesis: date resolution was fine; the descriptor is the sole cause.)*
+- **Root cause (deterministic proof, real `chooseTradeShift` over real data):** `chooseTradeShift` applied the `shift_name` hint as a HARD substring filter — `"am weekday".includes("friday 9-3 pm")` → false → 0 candidates → false `{kind:'none'}`. Employees describe shifts by day+loose-time; that NEVER substring-matches a tenant's internal shift NAME. Even bare `"Friday"` fails (`"am weekday".includes("friday")` = false). This is a Config-over-code violation: matching keyed on a client's shift-name vocabulary instead of the schedule's own data.
+
+**Fix (branch `fix/swap-trade-target-resolution`, `src/workflows/shift-swap.ts`).**
+- `chooseTradeShift`: resolve the coworker's shift by **DATE first**; use the time/name only to disambiguate when they work MULTIPLE shifts that day; **NEVER return a false `none`** when the target has shifts that week — fall back to the `ambiguous` "which of these?" path. New tenant-agnostic `descriptorAmPm` derives AM/PM sense from the phrase (leading clock hour / morning-afternoon words) and matches each shift's **own `start_time`** — zero hardcoded shift vocabulary. Covers `trade` AND `pickup` (both route through `chooseTradeShift`). Existing `chooseTradeShift` tests unchanged + green.
+- **Multi-tenant hardening:** `handleInitiateSwap` computes "today" from the **tenant's `companies.timezone`** (was raw UTC — a latent wrong-day bug for non-UTC tenants) and feeds `extractSwapDetails` the shared `weekdayAnchors` table (same as the classifier), so bare weekdays resolve reliably for any client.
+- **Cross-week trades:** deliberately OUT of scope (handler loads only the requester's week).
+- **Tests:** `descriptorAmPm` + `WM-SWAP-TRADE-1` suite (the exact reported extraction → resolves to Katie's 07-31; bare day name; missing/wrong date never false-nones; two-same-day AM/PM disambiguation). tsc clean; **307 pass**.
+
+**Status: FIXED on branch, IN REVIEW — NOT merged.** Watermark production → branch → PR → merge → Railway. DONE needs a live re-test: Jenna re-sends the swap → Aegis sets up the trade to Katie's Friday shift and passes it to the manager. Patch delivered to `~/Desktop/Aegis/swap-trade-target-resolution.patch`.
+
+**Principle reinforced (docs updated this session):** (1) EVERY date/weekday-resolving LLM prompt — not just the classifier — injects tenant-local "today" from `companies.timezone` + the `weekdayAnchors` table; (2) matching/lookup logic keys on the tenant's own schedule data (dates, start/end times), never on a client's shift-name strings. Both added to `CLAUDE.md` (Aegis + Homebase).

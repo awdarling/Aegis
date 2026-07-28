@@ -9,7 +9,7 @@ import { reply } from '../messaging/reply';
 import { sendSms } from '../messaging/sms';
 import { sendEmail } from '../messaging/email';
 import { greeting, firstName } from '../messaging/greeting';
-import { generateReply } from '../ai/claude';
+import { generateReply, weekdayAnchors } from '../ai/claude';
 import { computeWageEstimate } from '../lib/schedule-simulator';
 import { env } from '../config/env';
 import {
@@ -1126,24 +1126,85 @@ export type TradeShiftChoice =
   | { kind: 'none' }
   | { kind: 'ambiguous'; shifts: ScheduleAssignment[] };
 
+// Rough AM/PM sense of a natural-language shift descriptor. TENANT-AGNOSTIC:
+// derives from a leading clock hour in the phrase ("9-3", "11 to 3", "3–9") or
+// the generic words morning/afternoon/etc. — never from any one client's shift
+// names. Returns 'day' (starts before 13:00) | 'pm' (13:00 or later) | null.
+// Deliberately tolerant: employees describe shifts loosely ("her 9-3 PM shift"
+// for an 11:00 start; the leading hour "9" wins over the trailing "PM"). Used
+// ONLY to disambiguate when a coworker has multiple shifts on the named day; it
+// can never eliminate the last candidate.
+export function descriptorAmPm(desc: string): 'day' | 'pm' | null {
+  const s = desc.toLowerCase();
+  const hasAm = /\bam\b/.test(s);
+  const hasPm = /\bpm\b/.test(s);
+  const range = s.match(/(\d{1,2})\s*(?::\d{2})?\s*(?:-|to|–|—)\s*(\d{1,2})/);
+  if (range) {
+    const start = parseInt(range[1], 10);
+    const end = parseInt(range[2], 10);
+    if (start > end) return 'day';              // e.g. "9-3", "11-3": crosses noon → a morning-start daytime shift
+    if (hasPm && !hasAm) return 'pm';           // "3-9 PM"
+    if (hasAm && !hasPm) return 'day';          // "9-11 AM"
+    if (start >= 12) return 'pm';
+    if (start >= 1 && start <= 6) return 'pm';  // "3-9" with no marker → afternoon/evening
+    return 'day';                                // "8-12", "9-11" → morning
+  }
+  if (/\b(morning|early|opening|open)\b/.test(s)) return 'day';
+  if (/\b(afternoon|evening|night|closing|close)\b/.test(s)) return 'pm';
+  if (hasAm) return 'day';
+  if (hasPm) return 'pm';
+  return null;
+}
+
+// Does this assignment START in the afternoon? Read from the schedule's OWN
+// start_time (tenant data), so it works for any client's shift structure.
+const shiftStartsPm = (a: ScheduleAssignment): boolean => (a.start_time ?? '00:00').slice(0, 5) >= '13:00';
+
+// Resolve which of the target's shifts the requester trades FOR. Employees name
+// a coworker's shift by DAY + a loose time ("her 9-3 PM shift on Friday"), which
+// never matches a tenant's internal shift NAME ("AM Weekday", "Afternoon"...).
+// So we resolve by the target's shift DATE first, use the time/name only to
+// disambiguate when they work MULTIPLE shifts that day, and NEVER return a false
+// 'none' when the target actually has shifts that week — we ask "which?" instead.
 export function chooseTradeShift(
   schedData: ScheduleData,
   targetId: string,
   hint: { shift_name?: string | null; date?: string | null } | null
 ): TradeShiftChoice {
   const targetShifts = schedData.assignments.filter(a => a.employee_id === targetId);
-  if (targetShifts.length === 0) return { kind: 'none' };
+  if (targetShifts.length === 0) return { kind: 'none' }; // genuinely nothing that week
 
+  // DATE-FIRST: prefer the coworker's shift(s) on the named day. If the hint date
+  // matches none of their shifts (a missed/garbled date), DON'T zero out — keep
+  // the full set and fall through to "which one?", never a false 'none'.
   let candidates = targetShifts;
-  if (hint?.date) candidates = candidates.filter(a => a.date === hint.date);
-  if (hint?.shift_name) {
+  if (hint?.date) {
+    const onDate = targetShifts.filter(a => a.date === hint.date);
+    if (onDate.length > 0) candidates = onDate;
+  }
+  if (candidates.length === 1) return { kind: 'one', shift: candidates[0] };
+
+  // Multiple shifts remain (e.g. a coworker working an AM and a PM the same day).
+  // SOFT-narrow by a genuine shift_name token that appears in the descriptor, then
+  // by AM/PM sense vs the shift's real start_time. Soft narrowing may reduce the
+  // set but MUST NOT eliminate the last candidate.
+  if (hint?.shift_name && candidates.length > 1) {
     const h = hint.shift_name.toLowerCase();
-    candidates = candidates.filter(a => a.shift_name.toLowerCase().includes(h));
+    let narrowed = candidates.filter(a =>
+      a.shift_name.toLowerCase().split(/\s+/).some(tok => tok.length > 2 && h.includes(tok)));
+    if (narrowed.length !== 1) {
+      const sense = descriptorAmPm(hint.shift_name);
+      if (sense) {
+        const bySense = candidates.filter(a => (sense === 'pm') === shiftStartsPm(a));
+        if (bySense.length > 0) narrowed = bySense;
+      }
+    }
+    if (narrowed.length === 1) return { kind: 'one', shift: narrowed[0] };
+    if (narrowed.length > 1) candidates = narrowed;
   }
 
   if (candidates.length === 1) return { kind: 'one', shift: candidates[0] };
-  if (candidates.length === 0) return { kind: 'none' };
-  return { kind: 'ambiguous', shifts: candidates };
+  return { kind: 'ambiguous', shifts: candidates }; // ask "which of these?" — never a false 'none'
 }
 
 // Executes an approved TRUE swap: TRADES two assignments between two employees
@@ -1606,6 +1667,29 @@ export function buildSwapAskText(params: {
   return { subject, text, isGiveaway };
 }
 
+// MULTI-TENANT: "today" must be the date in the TENANT's local timezone (their
+// companies.timezone row — the same source Homebase writes and the classifier
+// reads), never the server's UTC date. A UTC "today" near midnight resolves a
+// bare weekday to the wrong day for any non-UTC tenant. No timezone is ever
+// hard-coded to a specific client; unknown tenants fall back to America/New_York
+// (matching loadCompanyContext).
+async function companyLocalToday(companyId: string): Promise<string> {
+  const { data } = await supabase.from('companies').select('timezone').eq('id', companyId).single();
+  const tz = (data as { timezone: string | null } | null)?.timezone ?? 'America/New_York';
+  return new Intl.DateTimeFormat('en-CA', { timeZone: tz }).format(new Date());
+}
+
+// Deterministic weekday→date lookup lines for the extractor prompt. Reuses the
+// same weekdayAnchors the classifier uses, so the model never does weekday math
+// (the recurring year/day-drift bug). Covers the sender's AND the coworker's
+// bare weekdays ("my Saturday ... their Friday").
+function weekdayAnchorText(today: string): string {
+  const { todayName, thisWeek, nextWeek } = weekdayAnchors(today);
+  const fmt = (rows: { name: string; iso: string; isToday: boolean }[]) =>
+    rows.map(r => `${r.name}=${r.iso}${r.isToday ? ' (today)' : ''}`).join(', ');
+  return `Today is ${todayName}. Resolve EVERY bare weekday (the sender's and the coworker's) to a date using these tables EXACTLY; never compute weekday arithmetic yourself. THIS week: ${fmt(thisWeek)}. NEXT week (only for "next <weekday>"): ${fmt(nextWeek)}.`;
+}
+
 async function extractSwapDetails(body: string, today: string): Promise<{
   direction: SwapDirection;
   shift_date: string | null;
@@ -1617,6 +1701,7 @@ async function extractSwapDetails(body: string, today: string): Promise<{
 }> {
   const system =
     `You are a data extractor for a workforce scheduling system. Today is ${today}. ` +
+    `${weekdayAnchorText(today)} ` +
     'A shift swap moves a shift between two people. Determine the DIRECTION from the SENDER\'s point of view: ' +
     '"giveaway" = someone takes the SENDER\'s shift and the sender gets nothing back ("Emily is taking my Saturday shift", "Colin is covering my Thursday AM", "can someone take my Friday?"); ' +
     '"pickup" = the SENDER takes a coworker\'s shift ("I\'ll take Joe\'s Friday PM", "put me on Sam\'s Sunday shift"); ' +
@@ -2002,7 +2087,9 @@ export async function handleInitiateSwap(
   contact: VerifiedContact,
   extracted: Record<string, unknown>
 ): Promise<void> {
-  const today = new Date().toISOString().slice(0, 10);
+  // Tenant-local date (companies.timezone), NOT server UTC — so bare weekdays
+  // ("Saturday", "Friday") resolve to the right day for any client's timezone.
+  const today = await companyLocalToday(contact.company_id);
   const raw = await extractSwapDetails(message.body, today);
 
   const shiftDate = raw.shift_date ?? today;

@@ -1,48 +1,47 @@
 import type { Request, Response, NextFunction } from 'express';
-import twilio from 'twilio';
 import { env } from '../config/env';
 import { verifySendGridSignature } from '../security/sendgrid-signature';
+import {
+  verifyTelnyxSignature,
+  TELNYX_SIGNATURE_HEADER,
+  TELNYX_TIMESTAMP_HEADER,
+} from '../security/telnyx-signature';
 
-// Twilio signs every webhook with HMAC-SHA1 using the auth token.
-// Reject any request that doesn't pass this check — not just log it.
-export function verifyTwilioSignature(req: Request, res: Response, next: NextFunction): void {
-  if (process.env.SKIP_TWILIO_VERIFICATION === 'true') {
-    console.warn('[WARNING] Twilio signature verification BYPASSED — test mode only. Never use in production.');
+// Telnyx signs every webhook with Ed25519 over the exact bytes
+// `${telnyx-timestamp}|${rawBody}`. Verify (and reject on failure) before the
+// SMS handler runs. The express.json() verify hook wired on /webhooks/sms in
+// index.ts must have populated req.rawBody with the exact request bytes.
+export function verifyTelnyxRequest(req: Request, res: Response, next: NextFunction): void {
+  if (process.env.SKIP_TELNYX_VERIFICATION === 'true') {
+    console.warn('[telnyx-verify] signature verification BYPASSED — test mode only. Never use in production.');
     next();
     return;
   }
 
-  // Twilio decommissioned (SMS → Telgorithm): with no auth token we cannot
-  // verify any inbound signature, so reject. No Twilio numbers means no inbound
-  // SMS reaches this route anyway.
-  if (!env.TWILIO_AUTH_TOKEN) {
-    res.status(403).json({ error: 'Twilio not configured' });
+  const publicKey = env.TELNYX_PUBLIC_KEY;
+  if (!publicKey) {
+    // No signing key configured → we cannot trust any inbound webhook, reject.
+    res.status(403).json({ error: 'Telnyx not configured' });
     return;
   }
 
-  const signature = req.headers['x-twilio-signature'] as string | undefined;
-
-  if (!signature) {
-    res.status(403).json({ error: 'Missing Twilio signature' });
+  const signature = req.get(TELNYX_SIGNATURE_HEADER);
+  const timestamp = req.get(TELNYX_TIMESTAMP_HEADER);
+  if (!signature || !timestamp) {
+    res.status(403).json({ error: 'Missing Telnyx signature' });
     return;
   }
 
-  // Reconstruct the full public URL Twilio signed. Behind Railway's proxy
-  // req.protocol/host reflect the internal address, not what Twilio sees, so
-  // we use BASE_URL instead.
-  const url = `${env.BASE_URL.replace(/\/$/, '')}${req.originalUrl}`;
-  const params = req.body as Record<string, string>;
+  if (!req.rawBody) {
+    console.error('[telnyx-verify] rawBody missing — express.json verify hook not wired');
+    res.status(500).json({ error: 'raw body not captured' });
+    return;
+  }
 
-  const valid = twilio.validateRequest(
-    env.TWILIO_AUTH_TOKEN,
-    signature,
-    url,
-    params
-  );
-
+  const valid = verifyTelnyxSignature(publicKey, req.rawBody, signature, timestamp);
   if (!valid) {
-    console.warn('[middleware] Invalid Twilio signature from', req.ip);
-    res.status(403).json({ error: 'Invalid Twilio signature' });
+    console.warn('[telnyx-verify] invalid signature from', req.ip);
+    res.status(403).json({ error: 'Invalid Telnyx signature' });
     return;
   }
 

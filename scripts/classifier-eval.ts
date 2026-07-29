@@ -51,8 +51,6 @@ function ensureEnv(key: string, fallback: string): void {
 }
 ensureEnv('SUPABASE_URL', 'https://dummy.supabase.co');
 ensureEnv('SUPABASE_SERVICE_ROLE_KEY', 'dummy');
-ensureEnv('TWILIO_ACCOUNT_SID', 'dummy');
-ensureEnv('TWILIO_AUTH_TOKEN', 'dummy');
 ensureEnv('SENDGRID_API_KEY', 'dummy');
 ensureEnv('SENDGRID_FROM_EMAIL', 'dummy@example.com');
 

@@ -1,6 +1,6 @@
 # Aegis
 
-Aegis is an AI assistant manager for companies using Homebase scheduling software, built by Quria Solutions. It handles inbound communication from employees and managers via SMS (Twilio) and email (SendGrid Inbound Parse), classifying each message and executing the appropriate workflow: time-off requests, shift swaps, emergency coverage, schedule building, and general operational queries. Managers interact with Aegis through the same channels their team uses — no separate app or portal required.
+Aegis is an AI assistant manager for companies using Homebase scheduling software, built by Quria Solutions. It handles inbound communication from employees and managers via SMS (Telnyx) and email (SendGrid Inbound Parse), classifying each message and executing the appropriate workflow: time-off requests, shift swaps, emergency coverage, schedule building, and general operational queries. Managers interact with Aegis through the same channels their team uses — no separate app or portal required.
 
 ---
 
@@ -12,8 +12,11 @@ Aegis is an AI assistant manager for companies using Homebase scheduling softwar
 | `PORT` | No | `3000` | HTTP server port. Railway injects this automatically. |
 | `SUPABASE_URL` | **Yes** | — | Full Supabase project URL (Settings → API) |
 | `SUPABASE_SERVICE_ROLE_KEY` | **Yes** | — | Supabase service role key — bypasses RLS, keep secret |
-| `TWILIO_ACCOUNT_SID` | **Yes** | — | Twilio Account SID (Twilio Console dashboard) |
-| `TWILIO_AUTH_TOKEN` | **Yes** | — | Twilio Auth Token — also used to verify inbound webhook signatures |
+| `TELNYX_API_KEY` | No* | — | Telnyx v2 API key (Bearer) for outbound SMS. *Required for SMS; unset = email-first. |
+| `TELNYX_PUBLIC_KEY` | No* | — | Base64 Ed25519 public key to verify inbound Telnyx webhook signatures. *Required for SMS. |
+| `TELNYX_MESSAGING_PROFILE_ID` | No | — | Messaging profile (portal/webhook config; not sent in the send body) |
+| `EMAIL_ONLY` | No | `true` | While `true`, SMS is disabled and everything runs over email. Set `false` to enable SMS. |
+| `SKIP_TELNYX_VERIFICATION` | No | — | `true` bypasses inbound signature checks — local/Tier-0 testing only, never production |
 | `SENDGRID_API_KEY` | **Yes** | — | SendGrid API key with Mail Send and Inbound Parse permissions |
 | `SENDGRID_FROM_EMAIL` | **Yes** | — | Verified sender email address for all outbound mail |
 | `SENDGRID_FROM_NAME` | No | `Aegis` | Display name in the From field of outbound emails |
@@ -41,7 +44,7 @@ For local webhook testing, use [ngrok](https://ngrok.com/) or similar to expose 
 ```bash
 ngrok http 3000
 # Then set BASE_URL=https://your-ngrok-url.ngrok.io in .env
-# and point Twilio + SendGrid webhooks at that URL
+# and point Telnyx + SendGrid webhooks at that URL
 ```
 
 ---
@@ -60,18 +63,20 @@ To redeploy after a push, Railway triggers automatically if connected to the Git
 
 ## Post-deployment checklist
 
-### 1. Twilio — SMS webhook
+### 1. Telnyx — SMS webhook
 
-For each company's dedicated Twilio phone number:
+Each company has its own dedicated Telnyx number, tied to a Messaging Profile.
+Point that profile's inbound webhook at Aegis:
 
-1. Open [Twilio Console → Phone Numbers → Active Numbers](https://console.twilio.com/us1/develop/phone-numbers/manage/active).
-2. Click the number.
-3. Under **Messaging → A Message Comes In**, set:
-   - **Webhook**: `https://[BASE_URL]/webhooks/sms`
-   - **HTTP Method**: `HTTP POST`
-4. Save.
+1. Open the [Telnyx Portal → Messaging → Messaging Profiles](https://portal.telnyx.com/#/app/messaging).
+2. Open the profile the company's number belongs to.
+3. Under **Inbound Settings → Webhook URL**, set:
+   - **Webhook URL**: `https://[BASE_URL]/webhooks/sms`
+   - **Webhook API Version**: `API v2`
+4. Enable the carrier-level **HELP/STOP (advanced opt-out)** auto-responses on the profile.
+5. Save.
 
-Aegis verifies the `X-Twilio-Signature` header on every inbound request using `TWILIO_AUTH_TOKEN`. Requests that fail signature verification are silently dropped.
+Aegis verifies the `telnyx-signature-ed25519` header (Ed25519 over `${timestamp}|${body}`) on every inbound request using `TELNYX_PUBLIC_KEY`, within a 5-minute replay window. Requests that fail verification are rejected with `403`.
 
 ### 2. SendGrid — Inbound Parse webhook
 
@@ -88,7 +93,7 @@ Aegis verifies the `X-Twilio-Signature` header on every inbound request using `T
 For every client company, insert one row per active channel into the `company_channels` table in Supabase:
 
 ```sql
--- The Twilio number assigned to this company
+-- The Telnyx number assigned to this company (its own dedicated line)
 INSERT INTO company_channels (company_id, channel_type, channel_value)
 VALUES ('<company_uuid>', 'sms', '+15551234567');
 
@@ -103,9 +108,9 @@ These values are used by Aegis to match inbound messages to the correct company 
 
 ## How the webhooks work
 
-### Twilio (SMS)
+### Telnyx (SMS)
 
-When an SMS arrives at a Twilio number, Twilio makes an HTTP POST to the configured webhook URL with URL-encoded form fields (`From`, `To`, `Body`, and others). Aegis receives this at `POST /webhooks/sms`, verifies the `X-Twilio-Signature` header using the Auth Token to confirm the request genuinely came from Twilio, then parses the sender's phone number and message body. The sender is looked up against the `company_channels` and `employees`/`users` tables to verify their identity before any workflow logic runs. Twilio expects a 2xx response quickly — Aegis replies with `200 OK` immediately and processes the message asynchronously.
+When an SMS arrives at a company's Telnyx number, Telnyx makes an HTTP POST to the configured webhook URL with a JSON body (`data.event_type` = `message.received`, with the sender/recipient/text under `data.payload`). Aegis receives this at `POST /webhooks/sms`, verifies the `telnyx-signature-ed25519` header (Ed25519 over the exact `${timestamp}|${rawBody}` bytes) using `TELNYX_PUBLIC_KEY` to confirm the request genuinely came from Telnyx, then parses the sender's phone number and message body. The recipient number resolves to the tenant via `company_channels`, and the sender is looked up against `employees`/`users` to verify identity before any workflow logic runs. Delivery-receipt events (`message.sent`, `message.finalized`) are acknowledged and ignored. Telnyx expects a 2xx quickly — Aegis replies `200` immediately and processes the message asynchronously. The carrier-reserved keywords `STOP`/`HELP` are handled at the Telnyx messaging-profile (carrier) level and are never routed as workflow intents.
 
 ### SendGrid Inbound Parse (email)
 

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
 # End-to-end smoke test for every Aegis workflow against the deployed Railway URL.
-# Requires SKIP_TWILIO_VERIFICATION=true on the server so unsigned curl requests pass.
+# SMS now posts a Telnyx-shaped inbound webhook (application/json). Requires
+# SKIP_TELNYX_VERIFICATION=true on the server so unsigned curl requests pass.
 
 set -u
 
@@ -9,8 +10,9 @@ BASE_URL="https://aegis-production-3220.up.railway.app"
 MANAGER_PHONE="+16163280114"
 MANAGER_EMAIL="xander.w.darling@gmail.com"
 
-# Watermark Twilio number — the recipient ("To") for inbound SMS
-WATERMARK_TWILIO="+16167477953"
+# The tenant's own SMS number — the recipient ("to") of inbound SMS. This is
+# Watermark's Telnyx number; a different tenant uses its own number.
+WATERMARK_SMS_NUMBER="+16166164898"
 WATERMARK_INBOUND_EMAIL="watermark@mail.quriasolutions.com"
 
 # Seeded employee identifiers
@@ -23,11 +25,14 @@ EMAIL_URL="$BASE_URL/webhooks/email"
 send_sms() {
   local from="$1"
   local body="$2"
+  # Telnyx inbound webhook shape: data.event_type=message.received with the
+  # sender/recipient/text under data.payload.
   curl -X POST "$SMS_URL" \
-    --data-urlencode "From=$from" \
-    --data-urlencode "To=$WATERMARK_TWILIO" \
-    --data-urlencode "Body=$body" \
+    -H "Content-Type: application/json" \
+    --data @- <<JSON \
     --silent --output /dev/null --write-out "HTTP %{http_code}"
+{"data":{"event_type":"message.received","payload":{"from":{"phone_number":"$from"},"to":[{"phone_number":"$WATERMARK_SMS_NUMBER"}],"text":"$body"}}}
+JSON
   echo ""
 }
 

@@ -28,10 +28,16 @@ app.use((req, res, next) => {
   next();
 });
 
-// Raw body needed for Twilio signature verification — must come before json()
+// Telnyx posts application/json and signs Ed25519 over the EXACT raw bytes, so
+// capture req.rawBody in json()'s verify hook (before the body is parsed) for
+// the signature middleware, then hand the parsed JSON to the SMS handler.
 app.use(
   '/webhooks/sms',
-  express.urlencoded({ extended: false }),
+  express.json({
+    verify: (req, _res, buf) => {
+      (req as unknown as { rawBody: Buffer }).rawBody = buf;
+    },
+  }),
   smsWebhook
 );
 
@@ -51,12 +57,12 @@ app.get('/health', (_req, res) => {
 
 app.listen(env.PORT, () => {
   console.log(`Aegis running on port ${env.PORT} [${env.NODE_ENV}]`);
-  if (env.TWILIO_MESSAGING_SERVICE_SID) {
-    console.log(`[sms] sending via Messaging Service: ${env.TWILIO_MESSAGING_SERVICE_SID}`);
-  } else if (env.TWILIO_FROM_NUMBER) {
-    console.log(`[sms] sending via FROM number: ${env.TWILIO_FROM_NUMBER}`);
+  if (env.EMAIL_ONLY) {
+    console.log('[sms] EMAIL_ONLY mode — SMS disabled (email-first).');
+  } else if (env.TELNYX_API_KEY) {
+    console.log('[sms] provider: Telnyx — sending number resolves per-tenant from company_channels.');
   } else {
-    console.log('[sms] sending via FROM number: per-call options.from (no global env set)');
+    console.log('[sms] Telnyx not configured — SMS sends will be skipped.');
   }
   startCoverageTimeoutScheduler();
   startPayrollScheduler();

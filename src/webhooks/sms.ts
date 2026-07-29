@@ -1,6 +1,5 @@
 import { Router } from 'express';
-import twilio from 'twilio';
-import { verifyTwilioSignature } from '../middleware/verify-signature';
+import { verifyTelnyxRequest } from '../middleware/verify-signature';
 import { verifySender } from '../security/sender-verification';
 import { routeIntent } from '../router/intent-router';
 import { saveConversation } from '../logger/conversation';
@@ -9,63 +8,105 @@ import type { InboundMessage } from '../security/types';
 
 export const smsWebhook = Router();
 
+// Carrier-reserved compliance keywords (A2P 10DLC advanced opt-out). These are
+// handled at the CARRIER level by the Telnyx messaging profile — Telnyx auto-
+// suppresses future sends on STOP and can auto-respond to HELP. We recognize
+// them here only to make sure a bare keyword is NEVER routed as a workflow
+// intent (spec §2.2 / §3.7). The opt-in keywords (YES/START) are deliberately
+// NOT in this set — the onboarding opt-in is the one place a literal reply is a
+// real workflow answer, so it must route normally.
+const STOP_KEYWORDS = new Set([
+  'STOP',
+  'STOPALL',
+  'CANCEL',
+  'END',
+  'QUIT',
+  'UNSUBSCRIBE',
+  'REVOKE',
+  'OPTOUT',
+]);
 const HELP_KEYWORDS = new Set(['HELP', 'INFO']);
-const HELP_RESPONSE =
-  'Aegis by Quria Solutions: Scheduling assistant for your employer. ' +
+
+// Reference copy of the HELP/compliance text. The live responder is configured
+// on the Telnyx messaging profile (carrier level); this constant documents the
+// wording so the two stay in sync.
+export const HELP_RESPONSE =
+  'Aegis by Quria Solutions: scheduling assistant for your employer. ' +
   'Msg freq varies. Msg & data rates may apply. Reply STOP to opt out. ' +
-  'Support: awdarling@quriasolutions.com';
+  'Support: support@quriasolutions.com';
 
-// Optional — null when Twilio is decommissioned (SMS → Telgorithm). With no
-// numbers provisioned no inbound SMS arrives, so this path is inert; the guard
-// keeps it from constructing a client (which throws on undefined creds) at boot.
-const twilioClient =
-  env.TWILIO_ACCOUNT_SID && env.TWILIO_AUTH_TOKEN
-    ? twilio(env.TWILIO_ACCOUNT_SID, env.TWILIO_AUTH_TOKEN)
-    : null;
-
-async function sendHelpResponse(to: string): Promise<void> {
-  if (!twilioClient) {
-    console.warn('[sms] Twilio not configured — cannot send HELP response.');
-    return;
-  }
-  const payload: { to: string; body: string; from?: string; messagingServiceSid?: string } = {
-    to,
-    body: HELP_RESPONSE,
-  };
-  if (env.TWILIO_MESSAGING_SERVICE_SID) {
-    payload.messagingServiceSid = env.TWILIO_MESSAGING_SERVICE_SID;
-  } else if (env.TWILIO_FROM_NUMBER) {
-    payload.from = env.TWILIO_FROM_NUMBER;
-  } else {
-    throw new Error('No TWILIO_MESSAGING_SERVICE_SID or TWILIO_FROM_NUMBER configured');
-  }
-  await twilioClient.messages.create(payload);
+export function isStopKeyword(body: string): boolean {
+  return STOP_KEYWORDS.has(body.trim().toUpperCase());
+}
+export function isHelpKeyword(body: string): boolean {
+  return HELP_KEYWORDS.has(body.trim().toUpperCase());
 }
 
-smsWebhook.post('/', verifyTwilioSignature, async (req, res) => {
-  // Twilio sends URL-encoded body; express.urlencoded() has already parsed it
-  const body = req.body as Record<string, string>;
+// Minimal shape of a Telnyx inbound-message webhook.
+interface TelnyxInboundPayload {
+  from?: { phone_number?: string };
+  to?: Array<{ phone_number?: string }>;
+  text?: string;
+}
+interface TelnyxWebhookBody {
+  data?: {
+    event_type?: string;
+    payload?: TelnyxInboundPayload;
+  };
+}
+
+export interface ParsedTelnyxInbound {
+  eventType: string | null;
+  message: InboundMessage | null; // populated only for message.received
+}
+
+// Pure parser for a Telnyx webhook body. Telnyx posts many event types on this
+// endpoint (message.received for inbound, message.sent / message.finalized for
+// outbound delivery receipts); only message.received carries an inbound text.
+export function parseTelnyxInbound(body: TelnyxWebhookBody): ParsedTelnyxInbound {
+  const data = body?.data;
+  const eventType = typeof data?.event_type === 'string' ? data.event_type : null;
+
+  if (eventType !== 'message.received') {
+    return { eventType, message: null };
+  }
+
+  const payload = data?.payload ?? {};
+  const from = payload.from?.phone_number ?? '';
+  const to = Array.isArray(payload.to) ? payload.to[0]?.phone_number ?? '' : '';
+  const text = typeof payload.text === 'string' ? payload.text : '';
 
   const message: InboundMessage = {
-    sender: normalizePhone(body['From'] ?? ''),
-    recipient: normalizePhone(body['To'] ?? ''),
-    body: (body['Body'] ?? '').trim(),
+    sender: normalizePhone(from),
+    recipient: normalizePhone(to),
+    body: text.trim(),
     channel: 'sms',
   };
+  return { eventType, message };
+}
 
-  // Respond to Twilio immediately — it retries if we don't reply within 15s
-  // We return 200 before awaiting full processing, then process async
-  res.status(200).type('text/xml').send('<Response></Response>');
+smsWebhook.post('/', verifyTelnyxRequest, async (req, res) => {
+  // Telnyx sends application/json; express.json() (wired in index.ts, which also
+  // captures req.rawBody for signature verification) has already parsed it.
+  const parsed = parseTelnyxInbound(req.body as TelnyxWebhookBody);
 
-  // Email-only mode: SMS is disabled, so ignore any inbound SMS rather than
-  // routing it as a workflow. Inert in practice (no numbers are provisioned),
-  // but explicit while carrier registration is pending.
+  // Acknowledge immediately — Telnyx retries on non-2xx. We then process async.
+  res.status(200).json({ received: true });
+
+  // Ignore anything that isn't an inbound message (delivery receipts, etc.).
+  if (parsed.eventType !== 'message.received' || !parsed.message) {
+    return;
+  }
+  const message = parsed.message;
+
+  // Email-only mode: SMS is disabled, so ignore inbound rather than routing it.
+  // Env-controlled — sandbox testing runs with EMAIL_ONLY=false.
   if (env.EMAIL_ONLY) {
     console.warn('[sms] EMAIL_ONLY mode — ignoring inbound SMS.');
     return;
   }
 
-  console.log('[sms] request received, starting async processing');
+  console.log('[sms] message.received, starting async processing');
 
   try {
     if (!message.sender || !message.recipient || !message.body) {
@@ -73,13 +114,14 @@ smsWebhook.post('/', verifyTwilioSignature, async (req, res) => {
       return;
     }
 
-    if (HELP_KEYWORDS.has(message.body.toUpperCase())) {
-      console.log(`[sms] HELP keyword received from ${message.sender}, sending compliance response`);
-      try {
-        await sendHelpResponse(message.sender);
-      } catch (err) {
-        console.error('[sms] HELP response send failed:', err);
-      }
+    // Carrier-reserved keywords: never route as an intent. STOP suppression and
+    // the HELP reply are owned by the Telnyx messaging profile (carrier level).
+    if (isStopKeyword(message.body)) {
+      console.log(`[sms] STOP keyword from ${message.sender} — carrier handles opt-out; not routing.`);
+      return;
+    }
+    if (isHelpKeyword(message.body)) {
+      console.log(`[sms] HELP keyword from ${message.sender} — carrier handles the HELP reply; not routing.`);
       return;
     }
 
@@ -109,6 +151,6 @@ smsWebhook.post('/', verifyTwilioSignature, async (req, res) => {
 });
 
 function normalizePhone(raw: string): string {
-  // Twilio always sends E.164; strip whitespace just in case
+  // Telnyx sends E.164; strip whitespace just in case.
   return raw.trim();
 }

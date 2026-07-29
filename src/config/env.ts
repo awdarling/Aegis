@@ -9,22 +9,28 @@ const envSchema = z.object({
   SUPABASE_URL: z.string().url(),
   SUPABASE_SERVICE_ROLE_KEY: z.string().min(1),
 
-  // Twilio — OPTIONAL. SMS is being migrated off Twilio (→ Telgorithm). When
-  // these are unset, Aegis boots normally and runs email-first: SMS sends are
-  // skipped (sendSms returns false) and the inbound SMS webhook is inert. This
-  // lets the Twilio account be fully decommissioned without crashing the server
-  // or breaking any email workflow.
-  TWILIO_ACCOUNT_SID: z.string().optional(),
-  TWILIO_AUTH_TOKEN: z.string().optional(),
-  TWILIO_MESSAGING_SERVICE_SID: z.string().optional(),
-  TWILIO_FROM_NUMBER: z.string().optional(),
+  // Telnyx (SMS provider) — OPTIONAL. When unset, Aegis boots normally and runs
+  // email-first: outbound SMS is skipped (sendSms returns false) and the inbound
+  // SMS webhook rejects unsigned requests. The sending NUMBER is NOT here — each
+  // tenant's own Telnyx number lives in company_channels (channel_type='sms'),
+  // resolved per-tenant, so this config is number-agnostic across clients.
+  //   TELNYX_API_KEY               — v2 API key (Bearer) for outbound send
+  //   TELNYX_PUBLIC_KEY            — base64 Ed25519 key to verify inbound webhooks
+  //   TELNYX_MESSAGING_PROFILE_ID  — the messaging profile (portal/webhook config;
+  //                                  not sent in the request body — bound to the
+  //                                  number server-side)
+  // (SKIP_TELNYX_VERIFICATION is read straight from process.env for local/Tier-0
+  // testing, never in production — see src/middleware/verify-signature.ts.)
+  TELNYX_API_KEY: z.string().optional(),
+  TELNYX_PUBLIC_KEY: z.string().optional(),
+  TELNYX_MESSAGING_PROFILE_ID: z.string().optional(),
 
   // EMAIL-ONLY MODE. While true (the default), every workflow runs over email
   // and SMS is fully disabled — outbound SMS is skipped, the inbound SMS webhook
   // is inert, and channel selection always resolves to email so phone-on-file
   // employees are emailed rather than silently dropped. This is the intended
-  // state until carrier/A2P (Telnyx) registration completes; nothing is deleted,
-  // so setting EMAIL_ONLY=false (and configuring Twilio) restores SMS behavior.
+  // state until the consent chain clears counsel; nothing is deleted, so setting
+  // EMAIL_ONLY=false (and configuring Telnyx) restores SMS behavior.
   EMAIL_ONLY: z.string().default('true').transform((s) => s.toLowerCase() !== 'false'),
 
   // SendGrid

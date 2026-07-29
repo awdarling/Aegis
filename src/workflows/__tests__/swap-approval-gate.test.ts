@@ -22,8 +22,6 @@ vi.mock('../../config/env', () => ({
     ANTHROPIC_API_KEY: 'test',
     SENDGRID_API_KEY: 'test',
     SENDGRID_FROM_EMAIL: 'a@test.local',
-    TWILIO_ACCOUNT_SID: 'test',
-    TWILIO_AUTH_TOKEN: 'test',
     EMAIL_ONLY: true,
   },
 }));

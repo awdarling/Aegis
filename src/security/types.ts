@@ -17,7 +17,7 @@ export interface VerifiedContact {
 
 export interface InboundMessage {
   sender: string;       // normalized: E.164 phone or lowercase email
-  recipient: string;    // the Aegis channel value (Twilio number or inbound email address)
+  recipient: string;    // the Aegis channel value (the tenant's SMS number or inbound email address)
   body: string;
   channel: Channel;
   raw_subject?: string; // email only

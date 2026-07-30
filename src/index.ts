@@ -64,6 +64,10 @@ app.listen(env.PORT, () => {
   } else {
     console.log('[sms] Telnyx not configured — SMS sends will be skipped.');
   }
-  startCoverageTimeoutScheduler();
-  startPayrollScheduler();
+  if (env.RUN_SCHEDULERS) {
+    startCoverageTimeoutScheduler();
+    startPayrollScheduler();
+  } else {
+    console.log('[schedulers] DISABLED (RUN_SCHEDULERS=false) — webhooks-only mode; no cross-tenant background jobs.');
+  }
 });

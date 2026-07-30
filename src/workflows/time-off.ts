@@ -84,6 +84,22 @@ function formatShortDate(dateStr: string): string {
   });
 }
 
+// Natural yes/no for the time-off confirmation ("Want me to send that over?").
+// The confirmation is human now, so a literal "yes" is no longer required —
+// "yeah send it", "go for it", "please do", "sounds good" all confirm, and "not
+// quite", "hold on", "change it" all decline. Exported + pure for testing. A
+// reply that carries NEW dates is caught earlier as a submit_time_off correction
+// and never reaches here.
+export function isTimeOffAffirmation(body: string): boolean {
+  const b = body.trim().toLowerCase();
+  return /^(yes|yeah|yea|yep|yup|y\b|correct|confirmed|confirm|that'?s right|right|ok|okay|sure|send(?: it| that| it over)?|go (?:ahead|for it)|do it|please do|please|sounds good|looks good|that works|perfect|great|👍)/.test(b);
+}
+
+export function isTimeOffDenial(body: string): boolean {
+  const b = body.trim().toLowerCase();
+  return /^(no|nope|nah|n\b|wrong|incorrect|that'?s wrong|that'?s not right|not (?:quite|right|yet)|cancel|change|redo|restate|wait|hold on|don'?t)/.test(b);
+}
+
 // Escape user-supplied / dynamic text before inlining into branded HTML.
 function escapeHtmlTo(s: string): string {
   return s
@@ -1391,8 +1407,11 @@ export async function handleSubmitTimeOff(
   });
 
   const summary = formatRequestSummary(parsed);
+  // Human, conversational confirmation — no "(reply yes/no)" mechanics. The ask
+  // itself ("want me to send that over?") invites a natural yes/no, and the
+  // confirmation handler accepts natural affirmations, not just a literal "yes".
   const confirmText =
-    `${greeting(contact.name)}\n\nGot it — you're requesting ${summary} off for ${reason}. Is that correct? (Reply "yes" to confirm or "no" to restate.)` +
+    `${greeting(contact.name)}\n\nGot it — ${summary} off for ${reason}. Want me to send that over to your manager?` +
     availabilityFollowupNote(extracted);
 
   // Rich HTML sibling: reflect the employee's own words, present the requested
@@ -1408,7 +1427,7 @@ export async function handleSubmitTimeOff(
       `<p style="${pStyle}">${greeting(contact.name)}</p>` +
       `<p style="${pStyle}">Sure thing — here's the request I'll send over:</p>` +
       brandDetailRow(escapeHtmlTo(summary), `for ${escapeHtmlTo(reason)}`) +
-      `<p style="margin:4px 0 0;font-size:16px;line-height:1.65;color:${BRAND.textPrimary};">Want me to pass it to your manager? Just reply <strong>YES</strong> to confirm, or <strong>NO</strong> to restate it.</p>` +
+      `<p style="margin:4px 0 0;font-size:16px;line-height:1.65;color:${BRAND.textPrimary};">Want me to pass it to your manager? Just say the word — or tell me what to change.</p>` +
       psNote +
       `<p style="margin:22px 0 0;color:${BRAND.textSecondary};">— Aegis</p>`,
   });
@@ -1462,10 +1481,8 @@ export async function handlePendingTimeOffConfirmation(
 
   const body = trimmed.toLowerCase();
 
-  const isYes =
-    /^(yes|yeah|yep|y\b|correct|confirmed|confirm|that'?s right|right|ok|okay|sure)/.test(body);
-  const isNo =
-    /^(no|nope|n\b|wrong|incorrect|that'?s wrong|cancel|that'?s not right|nah)/.test(body);
+  const isYes = isTimeOffAffirmation(body);
+  const isNo = isTimeOffDenial(body);
 
   if (!isYes && !isNo) {
     // The employee didn't confirm and didn't submit a new request — but did they send
@@ -1492,7 +1509,7 @@ export async function handlePendingTimeOffConfirmation(
     await reply(
       contact,
       message,
-      'Reply "yes" to confirm your time-off request, "no" to resubmit with different details, or "start over" to cancel it.'
+      "Just let me know — should I send that to your manager? Or tell me what to change and I'll fix it up."
     );
     return;
   }
@@ -1502,7 +1519,7 @@ export async function handlePendingTimeOffConfirmation(
     await reply(
       contact,
       message,
-      'No problem — go ahead and restate your time-off with the correct dates and reason.'
+      "No worries — just send me the right date(s) and reason and I'll get it sorted."
     );
     return;
   }
@@ -1717,11 +1734,13 @@ export async function handlePendingTimeOffConfirmation(
   }
 
   const dateDisplay = formatDateRange(pending.start_date, pending.end_date);
+  // No second greeting here — they just replied in an active thread, so opening
+  // with "Hi Sam," again reads robotic. Keep it warm and conversational.
   await reply(
     contact,
     message,
-    `${greeting(contact.name)}\n\nGot it — I've sent your time-off for ${dateDisplay} to your manager. ` +
-      "I'll let you know as soon as they decide."
+    `Done — I've passed your time off for ${dateDisplay} along to your manager. ` +
+      "I'll let you know the moment they get back to me."
   );
 }
 

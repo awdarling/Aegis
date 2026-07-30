@@ -146,6 +146,9 @@ describe('onboarding opt-in gate over SMS', () => {
     expect(smsArg.from).toBe(TENANT_SMS_NUMBER);
     expect(smsArg.company_id).toBe(COMPANY_ID);
     expect(smsArg.body.toLowerCase()).toContain('name');
+    // Opening message sets the expectation up front (finish onboarding before
+    // anything else) instead of a per-message off-script fallback.
+    expect(smsArg.body.toLowerCase()).toContain('before asking me anything else');
 
     // Consent was logged for the audit trail.
     expect(h.inserts.some(i => i.table === 'activity_log' && i.rows.action === 'employee_opt_in_confirmed')).toBe(true);

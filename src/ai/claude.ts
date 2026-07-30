@@ -134,7 +134,7 @@ export async function classifyIntent(
   const parsed = coerceJsonObject<ClassifyResult>(text) ??
     { intent: 'unknown', confidence: 'low', extracted: {} };
 
-  return applyAvailabilityBackstop(parsed, message);
+  return applyBareTimeOffBackstop(applyAvailabilityBackstop(parsed, message), message);
 }
 
 // A purely-positive availability statement ("I can work …", "I'm available …")
@@ -167,6 +167,53 @@ export function applyAvailabilityBackstop(result: ClassifyResult, message: strin
     intent: 'update_availability',
     confidence: result.confidence,
     extracted: lastEnd ? { end_date: lastEnd } : {},
+  };
+}
+
+// A bare intent to request time off with NO date ("I want to request time off",
+// "I need to put in for a day off") kept landing in general_question, which then
+// hallucinated a "log into Homebase" process. It is unambiguously a time-off
+// REQUEST — route it to submit_time_off (the workflow then asks for the dates).
+// Deliberately narrow, mirroring looksLikePositiveAvailability: it fires ONLY for
+// an explicit want/need to take time off, with no date and no how-to/status
+// framing, so time-off QUERIES ("what time off do I have?"), how-to questions
+// ("how do I request time off?"), dated requests (the model handles those), and
+// availability phrasing ("take me off Thursdays") are all left untouched.
+export function looksLikeBareTimeOffRequest(body: string): boolean {
+  const b = body.trim().toLowerCase();
+  if (!b) return false;
+  // How-to / status / already-exists questions are NOT a new request.
+  if (/\b(how|what|when|where|why|status|already|approved|do i have|did i)\b/.test(b)) return false;
+  // Must be about TAKING time off specifically (not "leave early", not "off Tuesdays").
+  if (!/\b(time[-\s]?off|days? off|pto|vacation)\b/.test(b)) return false;
+  // Must read as wanting / needing to MAKE the request.
+  if (!/\b(request|put ?in|putting in|submit|take|book|get|need|want|wanna|would like|like to|gonna)\b/.test(b)) return false;
+  // If a concrete or relative date is present, the normal classifier handles it
+  // (and extracts the dates), so don't backstop those.
+  const hasDate =
+    /\b\d{1,2}(st|nd|rd|th)?\b/.test(b) ||
+    /\b(jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)/.test(b) ||
+    /\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/.test(b) ||
+    /\b(today|tomorrow|tonight|this week|next week|this weekend|next weekend)\b/.test(b);
+  return !hasDate;
+}
+
+// Deterministic backstop for the bare-time-off-request bug. ONLY upgrades from
+// the "general" buckets (general_question / operational_query / unknown) so it
+// can never override a confident, more specific action the model already found.
+export function applyBareTimeOffBackstop(result: ClassifyResult, message: string): ClassifyResult {
+  if (
+    result.intent !== 'general_question' &&
+    result.intent !== 'operational_query' &&
+    result.intent !== 'unknown'
+  ) {
+    return result;
+  }
+  if (!looksLikeBareTimeOffRequest(message)) return result;
+  return {
+    intent: 'submit_time_off',
+    confidence: result.confidence === 'low' ? 'medium' : result.confidence,
+    extracted: {},
   };
 }
 
@@ -307,6 +354,29 @@ does NOT apply to an until/through boundary on a recurring pattern.
 - A recurring pattern with NO end boundary → update_availability with NO end_date
   (a permanent change).
 
+## A bare intent with no specifics yet — route to the ACTION, never to a general question
+
+Someone may state they WANT to do something without giving the details yet. Classify by the
+action they are asking for; the workflow will then ask for the specifics. NEVER send these to
+general_question or operational_query.
+- "I want to request time off", "I need to put in for time off", "can I request a day off",
+  "I need some time off", "I'd like to take a vacation" (NO date given) → submit_time_off with
+  extracted {} (no dates). The time-off workflow asks which dates.
+- "I want to swap a shift", "I need someone to cover my shift", "can I trade a shift"
+  (no shift/coworker named) → initiate_swap with extracted {}.
+- "I want to change my availability", "I need to update when I can work" (no days given)
+  → update_availability with extracted {}.
+A bare intent is the ACTION itself. A question ABOUT the action ("how do I request time off?",
+"how does time off work here?") is capabilities (see below) — do not confuse the two.
+
+## Off-topic / unrelated messages → general_question
+
+If the message is not about this workplace at all — general knowledge or trivia, coding, math,
+essays or creative writing, world events, personal/medical/legal/financial advice, or anything
+unrelated to scheduling, shifts, time off, availability, coverage, staffing, the person's own
+work information, or how to use Aegis — classify it general_question. It is politely declined
+and redirected downstream; never invent an action to satisfy it.
+
 ## Informal / indirect phrasing
 
 Teen/informal register is common (lowercase, no punctuation, slang). Map:
@@ -427,6 +497,21 @@ User: "hey Aegis"
 
 User: "what can I ask you for?"
 {"intent":"capabilities","confidence":"high","extracted":{}}
+
+User: "how do I request time off?"
+{"intent":"capabilities","confidence":"high","extracted":{}}
+
+User: "I want to request time off"
+{"intent":"submit_time_off","confidence":"high","extracted":{}}
+
+User: "I need to put in for some time off"
+{"intent":"submit_time_off","confidence":"high","extracted":{}}
+
+User: "I want to swap a shift"
+{"intent":"initiate_swap","confidence":"high","extracted":{}}
+
+User: "what's the capital of France?"
+{"intent":"general_question","confidence":"high","extracted":{}}
 
 User: "For the week of June 29 to July 5 I can work Monday 11am to 3:30pm, Wednesday 11am to 3:30pm, and Thursday."
 {"intent":"update_availability","confidence":"high","extracted":{"end_date":"${currentYear}-07-05"}}

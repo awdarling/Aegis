@@ -563,7 +563,11 @@ Respond with ONLY valid JSON in this exact shape — no markdown, no explanation
     //       "end_time": "HH:MM" | null
     //     }
     //   ],
-    //   "reason": "...",
+    //   "reason": "...",   // Phrase it to read naturally right after "off for ___"
+    //     — INCLUDING an article when it needs one, so the confirmation isn't stilted.
+    //     "for a wedding in Somalia" → "a wedding in Somalia" (NOT "wedding in Somalia").
+    //     "for my sister's graduation" → "my sister's graduation". "for surgery" →
+    //     "surgery". "for personal reasons" → "personal reasons". null if none given.
     //   "also_mentions_availability": true | false
     // }
     //   COMBINED messages — a time-off request AND an availability statement in ONE

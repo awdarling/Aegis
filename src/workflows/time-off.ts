@@ -1407,11 +1407,15 @@ export async function handleSubmitTimeOff(
   });
 
   const summary = formatRequestSummary(parsed);
-  // Human, conversational confirmation — no "(reply yes/no)" mechanics. The ask
-  // itself ("want me to send that over?") invites a natural yes/no, and the
-  // confirmation handler accepts natural affirmations, not just a literal "yes".
+  // Human, conversational confirmation — no "(reply yes/no)" mechanics, and no
+  // email-style "Hi Sam,\n\n" header (too formal for a text). The name is woven
+  // inline ("Got it, Sam —"), the ask invites a natural yes/no, and the handler
+  // accepts natural affirmations. `reason` already carries its own article when
+  // it needs one (see the classifier), so "off for ${reason}" reads correctly.
+  const first = firstName(contact.name);
+  const lead = first ? `Got it, ${first} —` : 'Got it —';
   const confirmText =
-    `${greeting(contact.name)}\n\nGot it — ${summary} off for ${reason}. Want me to send that over to your manager?` +
+    `${lead} ${summary} off for ${reason}. Want me to send that over to your manager?` +
     availabilityFollowupNote(extracted);
 
   // Rich HTML sibling: reflect the employee's own words, present the requested

@@ -834,6 +834,60 @@ async function parseAvailabilityIntent(
   return { mode, slots: parsed.slots ?? [] };
 }
 
+// Onboarding availability CONFIRM review. Given the availability currently read
+// back to the employee and their reply, decide one action — and for a partial
+// correction ("looks good but drop Tuesday", "also add Sunday 10–2", "make
+// Friday afternoons") return the COMPLETE updated availability so we can apply it
+// and read the new version back, instead of making them start over. This is the
+// "feels like a person" path: a natural reply resolves cleanly, no keyword gate.
+export type AvailabilityConfirmReview =
+  | { action: 'confirm' }
+  | { action: 'revise'; slots: AvailabilitySlot[] }
+  | { action: 'restart' }
+  | { action: 'unclear' };
+
+async function reviewAvailabilityConfirmation(
+  current: AvailabilitySlot[],
+  reply: string,
+  bounds: ShiftBounds
+): Promise<AvailabilityConfirmReview> {
+  const currentList = formatAvailabilityList(current) || '(nothing yet)';
+  const response = await withAnthropicRetry(() =>
+    client.messages.create({
+      model: MODEL,
+      max_tokens: 512,
+      system:
+        `An employee is confirming their weekly availability during onboarding. ` +
+        `The availability currently on file is:\n${currentList}\n\n` +
+        `Read their reply and choose ONE action:\n` +
+        `- "confirm": they agree it's correct ("yep", "looks good", "that's right").\n` +
+        `- "revise": they want a SPECIFIC change — drop a day, add a day, or change hours ` +
+        `(including "looks good but ..."). Apply the change to the availability above and return the ` +
+        `COMPLETE updated availability in "slots" (every day+window they can work AFTER the change, not just the delta).\n` +
+        `- "restart": they reject it broadly or want to redo it all ("no", "that's wrong", "let me start over").\n` +
+        `- "unclear": off-topic, or you genuinely can't tell what they mean.\n` +
+        `Times HH:MM 24h, clamped to ${bounds.earliest_start}–${bounds.latest_end}. day_of_week 0=Sunday..6=Saturday. ` +
+        `Named periods (no explicit times): morning = ${bounds.earliest_start}–12:00, afternoon = 12:00–17:00, evening = 17:00–${bounds.latest_end}.\n` +
+        `Respond ONLY with JSON (no markdown): ` +
+        `{ "action": "confirm" } | { "action": "revise", "slots": [{ "day_of_week": 0, "start_time": "HH:MM", "end_time": "HH:MM" }] } | { "action": "restart" } | { "action": "unclear" }.`,
+      messages: [{ role: 'user', content: reply }],
+    })
+  );
+
+  const text = response.content[0].type === 'text' ? response.content[0].text : '';
+  const parsed = coerceJsonObject<{ action?: string; slots?: AvailabilitySlot[] }>(text);
+  switch (parsed?.action) {
+    case 'confirm':
+      return { action: 'confirm' };
+    case 'restart':
+      return { action: 'restart' };
+    case 'revise':
+      return { action: 'revise', slots: parsed.slots ?? [] };
+    default:
+      return { action: 'unclear' };
+  }
+}
+
 // Does this message describe a ROTATING availability change (a multi-week
 // cycle), e.g. "every other week"? Kept tight so ordinary changes don't match.
 export function isRotatingAvailabilityRequest(body: string): boolean {
@@ -1187,12 +1241,14 @@ async function sendAvailabilityStep(session: OnboardingSession, bounds: ShiftBou
   );
 }
 
-async function sendAvailabilityConfirmStep(session: OnboardingSession): Promise<void> {
+async function sendAvailabilityConfirmStep(session: OnboardingSession, intro?: string): Promise<void> {
   const list = formatAvailabilityList(session.collected.availability_parsed);
-  await textEmployee(
-    session,
-    `Got it. Let me confirm your availability:\n${list}\nDoes that look right? Reply YES to confirm or NO to make changes.`
-  );
+  // One clean, well-spaced message (blank lines around the day list, no bullets).
+  // The employee can confirm OR describe a change in natural language — the
+  // confirm handler applies partial corrections in place rather than making them
+  // start over, so there's no need for a robotic "reply YES/NO" prompt.
+  const lead = intro ?? `Okay, here's what I've got for you:`;
+  await textEmployee(session, `${lead}\n\n${list}\n\nDoes that look right?`);
 }
 
 async function sendTimeOffStep(session: OnboardingSession): Promise<void> {
@@ -1231,10 +1287,16 @@ async function handleOptInStep(
       },
     });
     // Combined YES-confirmation + name_confirm prompt. Subsequent inbound
-    // messages will land on handleNameConfirmStep.
+    // messages will land on handleNameConfirmStep. The opening message also sets
+    // the expectation up front — finish onboarding before anything else — so we
+    // never need a per-message "please finish onboarding" fallback (onboarding is
+    // a hard gate: the router short-circuits all other workflows until it's done).
     await textEmployeeRaw(
       session,
-      `Great, you're confirmed! Let's get you set up. What's your full name?`
+      `Great, you're confirmed! I'll get you set up with a few quick questions — ` +
+        `please finish these before asking me anything else. Once you're all set, ` +
+        `you can message me anytime for your schedule, time off, or swaps.\n\n` +
+        `First: what's your full name?`
     );
     return;
   }
@@ -1464,24 +1526,64 @@ async function handleAvailabilityConfirmStep(
   managerContact: VerifiedContact,
   managerMsg: InboundMessage
 ): Promise<void> {
-  const verdict = await claudeClassifyYesNo(
-    body,
-    `The employee was asked to confirm their availability. Did they confirm (yes) or request changes (no)?`
-  );
+  const bounds = await loadShiftBounds(session.company_id);
 
-  if (verdict === 'no') {
+  // Deterministic fast-paths (no LLM): a clean affirmation confirms (keeps the
+  // availability-confirm race fix, BUG-7); a clean bare "no" restarts. Anything
+  // else — including a partial correction like "looks good but drop Tuesday" —
+  // goes to the review model, which returns the full updated availability.
+  const affirm = classifyAffirmation(body);
+  let action: AvailabilityConfirmReview['action'];
+  if (affirm === 'yes') {
+    action = 'confirm';
+  } else if (affirm === 'no') {
+    action = 'restart';
+  } else {
+    const review = await reviewAvailabilityConfirmation(session.collected.availability_parsed, body, bounds);
+    if (review.action === 'revise') {
+      const clamped = review.slots
+        .map(s => ({
+          ...s,
+          start_time: clampTime(s.start_time, bounds.earliest_start, bounds.latest_end),
+          end_time: clampTime(s.end_time, bounds.earliest_start, bounds.latest_end),
+        }))
+        .filter(s => s.start_time < s.end_time);
+
+      if (clamped.length > 0) {
+        // Apply the correction in place and read the UPDATED availability back —
+        // never make them re-list everything for a one-line change.
+        session.collected.availability_raw =
+          `${session.collected.availability_raw ?? ''}\n[edit] ${body}`.trim();
+        session.collected.availability_parsed = clamped;
+        await saveOnboardingSession(session);
+        await sendAvailabilityConfirmStep(session, `Got it — here's your updated availability:`);
+        return;
+      }
+      // A revision that clears everything is really a restart.
+      action = 'restart';
+    } else {
+      action = review.action; // 'confirm' | 'restart' | 'unclear'
+    }
+  }
+
+  if (action === 'restart') {
     session.step = 'availability';
     session.collected.availability_raw = null;
     session.collected.availability_parsed = [];
     session.invalid_availability_attempts = 0;
-    const bounds = await loadShiftBounds(session.company_id);
     await saveOnboardingSession(session);
     await sendAvailabilityStep(session, bounds);
     return;
   }
 
+  if (action === 'unclear') {
+    // Re-read the availability back with a gentle nudge; no state change.
+    await sendAvailabilityConfirmStep(session, `Sorry, I want to get this right — here's what I have:`);
+    return;
+  }
+
+  // action === 'confirm' → save + advance.
   session.collected.availability_confirmed = true;
-  const bounds = await loadShiftBounds(session.company_id);
   const weeklyHours = totalWeeklyHours(session.collected.availability_parsed);
 
   if (weeklyHours < bounds.min_shift_hours) {

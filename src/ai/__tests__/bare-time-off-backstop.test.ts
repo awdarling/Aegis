@@ -43,6 +43,14 @@ describe('looksLikeBareTimeOffRequest', () => {
     expect(looksLikeBareTimeOffRequest('I want to swap a shift')).toBe(false);
     expect(looksLikeBareTimeOffRequest("what's the capital of France?")).toBe(false);
   });
+
+  it('does NOT fire on a cancellation/withdrawal (the "need" word matches even when negated)', () => {
+    // The real regression: "I don't need time off anymore" re-fired the workflow.
+    expect(looksLikeBareTimeOffRequest("I changed my mind. I don't need time off anymore")).toBe(false);
+    expect(looksLikeBareTimeOffRequest('never mind, cancel the time off')).toBe(false);
+    expect(looksLikeBareTimeOffRequest('forget the time off request')).toBe(false);
+    expect(looksLikeBareTimeOffRequest('I no longer need that day off')).toBe(false);
+  });
 });
 
 describe('applyBareTimeOffBackstop', () => {

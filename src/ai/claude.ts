@@ -184,6 +184,10 @@ export function looksLikeBareTimeOffRequest(body: string): boolean {
   if (!b) return false;
   // How-to / status / already-exists questions are NOT a new request.
   if (/\b(how|what|when|where|why|status|already|approved|do i have|did i)\b/.test(b)) return false;
+  // Cancellations, withdrawals, and negations are NOT a fresh request — the word
+  // "need" matches even in "I DON'T need time off anymore", so exclude those
+  // explicitly ("never mind", "changed my mind", "cancel", "no longer", etc.).
+  if (/\b(don'?t|do not|no longer|never ?mind|change[d]? my mind|cancel|withdraw|retract|forget|nvm|scratch that|nix)\b/.test(b)) return false;
   // Must be about TAKING time off specifically (not "leave early", not "off Tuesdays").
   if (!/\b(time[-\s]?off|days? off|pto|vacation)\b/.test(b)) return false;
   // Must read as wanting / needing to MAKE the request.
@@ -369,6 +373,11 @@ general_question or operational_query.
 A bare intent is the ACTION itself. A question ABOUT the action ("how do I request time off?",
 "how does time off work here?") is capabilities (see below) — do not confuse the two.
 
+NEVER treat a CANCELLATION or WITHDRAWAL as one of these actions. "I changed my mind, I don't
+need time off anymore", "never mind", "cancel that", "forget the time off", "I'm all set" are
+NOT submit_time_off (or any action) — the person is backing out. Classify them general_question;
+a brief, friendly acknowledgement is given downstream.
+
 ## Off-topic / unrelated messages → general_question
 
 If the message is not about this workplace at all — general knowledge or trivia, coding, math,
@@ -511,6 +520,12 @@ User: "I want to swap a shift"
 {"intent":"initiate_swap","confidence":"high","extracted":{}}
 
 User: "what's the capital of France?"
+{"intent":"general_question","confidence":"high","extracted":{}}
+
+User: "I changed my mind, I don't need time off anymore"
+{"intent":"general_question","confidence":"high","extracted":{}}
+
+User: "never mind, cancel that"
 {"intent":"general_question","confidence":"high","extracted":{}}
 
 User: "For the week of June 29 to July 5 I can work Monday 11am to 3:30pm, Wednesday 11am to 3:30pm, and Thursday."

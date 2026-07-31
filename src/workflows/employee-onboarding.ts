@@ -271,6 +271,12 @@ function availApprovalSource(companyId: string, employeeId: string): string {
   return `avail_pending_mgr:${companyId}:${employeeId}`;
 }
 
+// A short-lived "you interrupted your availability change with a different
+// request — want to switch?" offer. Held only until the employee answers yes/no.
+function availSwitchSource(employeeId: string): string {
+  return `avail_switch_pending:${employeeId}`;
+}
+
 function fanoutSource(companyId: string, managerIdentifier: string): string {
   return `onboarding_fanout:${companyId}:${managerIdentifier}`;
 }
@@ -844,9 +850,17 @@ export type AvailabilityConfirmReview =
   | { action: 'confirm' }
   | { action: 'revise'; slots: AvailabilitySlot[] }
   | { action: 'restart' }
+  | { action: 'different_intent'; intent: SwitchIntent }
   | { action: 'unclear' };
 
-async function reviewAvailabilityConfirmation(
+// The small set of "other requests" an employee might raise mid-availability-
+// confirm. Kept deliberately coarse — it only drives the friendly wording of the
+// "want to switch?" offer, not any real routing (the resumed message is
+// re-classified from scratch).
+export type SwitchIntent = 'time_off' | 'shift_swap' | 'coverage' | 'schedule_query' | 'other';
+const SWITCH_INTENTS: SwitchIntent[] = ['time_off', 'shift_swap', 'coverage', 'schedule_query', 'other'];
+
+export async function reviewAvailabilityConfirmation(
   current: AvailabilitySlot[],
   reply: string,
   bounds: ShiftBounds,
@@ -877,7 +891,11 @@ async function reviewAvailabilityConfirmation(
         `  CORRECTING A PREVIOUS EDIT — when they say a boundary was wrong ("not start at 3", "I meant until, not from"), the mistaken edge must come from their NORMAL availability (the reference), NOT the current wrong value. ` +
         `Example: current shows 3pm–5pm and they say "I can only work until 3, not start at 3" → their normal start is 9am, so set 9am–3pm.\n` +
         `- "restart": they reject it broadly or want to redo it all ("no", "that's wrong", "let me start over").\n` +
-        `- "unclear": off-topic, or you genuinely can't tell what they mean.\n` +
+        `- "different_intent": the reply is NOT about their availability at all — it's a separate request, e.g. taking time off, ` +
+        `swapping or covering a shift, or asking what shifts they have. Return { "action": "different_intent", "intent": "<label>" } ` +
+        `where label is one of: time_off, shift_swap, coverage, schedule_query, other. Use this ONLY when there is NO availability ` +
+        `change in the message; if it contains ANY availability edit, use "revise"; if you truly can't tell, use "unclear" (never "different_intent").\n` +
+        `- "unclear": off-topic in a way that isn't a clear separate request, or you genuinely can't tell what they mean.\n` +
         `Times HH:MM 24h, clamped to ${bounds.earliest_start}–${bounds.latest_end}. day_of_week 0=Sunday..6=Saturday. ` +
         `Named periods (no explicit times): morning = ${bounds.earliest_start}–12:00, afternoon = 12:00–17:00, evening = 17:00–${bounds.latest_end}.\n` +
         `Respond ONLY with JSON (no markdown): ` +
@@ -887,7 +905,7 @@ async function reviewAvailabilityConfirmation(
   );
 
   const text = response.content[0].type === 'text' ? response.content[0].text : '';
-  const parsed = coerceJsonObject<{ action?: string; slots?: AvailabilitySlot[] }>(text);
+  const parsed = coerceJsonObject<{ action?: string; slots?: AvailabilitySlot[]; intent?: string }>(text);
   switch (parsed?.action) {
     case 'confirm':
       return { action: 'confirm' };
@@ -895,6 +913,12 @@ async function reviewAvailabilityConfirmation(
       return { action: 'restart' };
     case 'revise':
       return { action: 'revise', slots: parsed.slots ?? [] };
+    case 'different_intent': {
+      const intent = SWITCH_INTENTS.includes(parsed.intent as SwitchIntent)
+        ? (parsed.intent as SwitchIntent)
+        : 'other';
+      return { action: 'different_intent', intent };
+    }
     default:
       return { action: 'unclear' };
   }
@@ -2237,6 +2261,84 @@ export async function getPendingAvailConfirm(
   }
 }
 
+// ── Mid-availability "switch to a different request?" offer ────────────────────
+
+export interface PendingIntentSwitch {
+  employee_id: string;
+  company_id: string;
+  // The employee's original interrupting message, replayed verbatim through the
+  // router (re-classified from scratch) if they confirm the switch.
+  interrupting_body: string;
+  intent: SwitchIntent;
+  expires_at: string;
+}
+
+// Friendly phrase naming the interrupting request, used in the switch offer.
+export function switchIntentPhrase(intent: SwitchIntent): string {
+  switch (intent) {
+    case 'time_off':
+      return 'put in a time-off request';
+    case 'shift_swap':
+      return 'set up that shift swap';
+    case 'coverage':
+      return 'sort out shift coverage';
+    case 'schedule_query':
+      return 'pull up your schedule';
+    default:
+      return 'take care of that';
+  }
+}
+
+export async function getPendingIntentSwitch(
+  companyId: string,
+  employeeId: string
+): Promise<(PendingIntentSwitch & { _memory_id: string }) | null> {
+  const { data } = await supabase
+    .from('aegis_memory')
+    .select('id, content')
+    .eq('company_id', companyId)
+    .eq('source', availSwitchSource(employeeId))
+    .maybeSingle();
+
+  if (!data) return null;
+
+  try {
+    const row = data as { id: string; content: string };
+    const pending = JSON.parse(row.content) as PendingIntentSwitch;
+    if (new Date(pending.expires_at) < new Date()) {
+      await supabase.from('aegis_memory').delete().eq('id', row.id);
+      return null;
+    }
+    return { ...pending, _memory_id: row.id };
+  } catch {
+    return null;
+  }
+}
+
+export async function clearPendingIntentSwitch(
+  companyId: string,
+  employeeId: string
+): Promise<void> {
+  await supabase
+    .from('aegis_memory')
+    .delete()
+    .eq('company_id', companyId)
+    .eq('source', availSwitchSource(employeeId));
+}
+
+// Cancels an in-flight availability-change confirmation (used when the employee
+// confirms they'd rather do something else instead).
+export async function clearPendingAvailConfirm(
+  companyId: string,
+  employeeId: string
+): Promise<void> {
+  await supabase
+    .from('aegis_memory')
+    .delete()
+    .eq('company_id', companyId)
+    .eq('source', availConfirmSource(employeeId));
+}
+
 export async function getPendingManagerAvailApproval(
   companyId: string
 ): Promise<(PendingManagerAvailApproval & { _memory_id: string }) | null> {
@@ -2501,6 +2603,7 @@ export async function handleAvailabilityConfirmResponse(
   const affirm = classifyAffirmation(body);
   let action: AvailabilityConfirmReview['action'];
   let revised: AvailabilitySlot[] | null = null;
+  let switchIntent: SwitchIntent | null = null;
 
   if (affirm === 'yes') {
     action = 'confirm';
@@ -2510,7 +2613,10 @@ export async function handleAvailabilityConfirmResponse(
     action = 'unclear';
   } else {
     const review = await reviewAvailabilityConfirmation(pending.proposed_availability, body, bounds, pending.current_availability);
-    if (review.action === 'revise') {
+    if (review.action === 'different_intent') {
+      action = 'different_intent';
+      switchIntent = review.intent;
+    } else if (review.action === 'revise') {
       const clamped = review.slots
         .map(s => ({
           ...s,
@@ -2540,6 +2646,40 @@ export async function handleAvailabilityConfirmResponse(
     };
     await supabase.from('aegis_memory').update({ content: JSON.stringify(updated) }).eq('id', _memory_id);
     await reply(contact, message, buildAvailChangeConfirmBody(revised, { customEndDate: updated.custom_end_date ?? null }));
+    return;
+  }
+
+  if (action === 'different_intent' && switchIntent) {
+    // They raised an unrelated request mid-availability-change. Don't silently
+    // swallow it into the availability flow (the old bug) and don't drop their
+    // pending change either — name the situation and let them choose. The
+    // pending availability row stays put; the router resumes the original
+    // message verbatim if they say YES.
+    const switchState: PendingIntentSwitch = {
+      employee_id: pending.employee_id,
+      company_id: contact.company_id,
+      interrupting_body: message.body,
+      intent: switchIntent,
+      expires_at: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+    };
+    await supabase
+      .from('aegis_memory')
+      .delete()
+      .eq('company_id', contact.company_id)
+      .eq('source', availSwitchSource(pending.employee_id));
+    await supabase.from('aegis_memory').insert({
+      company_id: contact.company_id,
+      memory_type: 'observation',
+      source: availSwitchSource(pending.employee_id),
+      content: JSON.stringify(switchState),
+    });
+    await reply(
+      contact,
+      message,
+      `Quick check — we're in the middle of updating your availability right now. ` +
+        `Do you want to cancel that and ${switchIntentPhrase(switchIntent)} instead? ` +
+        `Reply YES to switch, or just tell me the availability change you want.`
+    );
     return;
   }
 

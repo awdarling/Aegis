@@ -81,7 +81,13 @@ export function htmlFromText(text: string): string {
   return brandedEmailShell({ bodyHtml: paragraphs });
 }
 
-export async function sendEmail(options: EmailOptions): Promise<void> {
+// Returns true if SendGrid accepted the message, false if the send failed (e.g.
+// a 401 from a bad API key, or an unverified sender). Never throws — a failed
+// email must not crash a workflow — but callers that need to tell the user
+// whether the message actually went out (e.g. swap outreach) can check the
+// boolean instead of falsely reporting success. Bookkeeping (saveConversation)
+// failing does NOT flip the result: the email was still sent.
+export async function sendEmail(options: EmailOptions): Promise<boolean> {
   const tenantReplyTo = await resolveTenantEmailAddress(options.company_id);
   if (!tenantReplyTo) {
     console.warn(
@@ -156,7 +162,14 @@ export async function sendEmail(options: EmailOptions): Promise<void> {
         : {}),
       ...(Object.keys(threadingHeaders).length > 0 ? { headers: threadingHeaders } : {}),
     });
+  } catch (err) {
+    console.error('[email] send failed:', err);
+    return false;
+  }
 
+  // Bookkeeping — best-effort. The email already went out, so a logging failure
+  // must not report the send as failed.
+  try {
     await saveConversation({
       company_id: options.company_id,
       channel: 'email',
@@ -168,6 +181,8 @@ export async function sendEmail(options: EmailOptions): Promise<void> {
       thread_id: options.thread_id,
     });
   } catch (err) {
-    console.error('[email] send failed:', err);
+    console.warn('[email] saveConversation failed (email was sent):', err);
   }
+
+  return true;
 }

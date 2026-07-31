@@ -16,3 +16,13 @@ export function firstName(name?: string | null): string {
 export function greeting(name?: string | null): string {
   return `Hi ${firstName(name)},`;
 }
+
+// textOpener: the warm, inline opener for TEXT/SMS replies. The email-style
+// `greeting()` header ("Hi Sam,\n\n<body>") reads too formal in a text thread, so
+// text replies weave the name in with an em-dash lead ("Hey Sam — <body>").
+// Manager notification EMAILS deliberately keep `greeting()` — a greeting header
+// is conventional in email. Use this for any message a person reads as a text.
+export function textOpener(name?: string | null): string {
+  const f = firstName(name);
+  return f === 'there' ? 'Hey — ' : `Hey ${f} — `;
+}

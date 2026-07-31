@@ -192,6 +192,35 @@ async function notifyEmployee(
 
 // ── Swap decision handler ─────────────────────────────────────────────────────
 
+// Approval confirmations for a swap decision. Two shapes:
+//  • TRADE (both people exchange shifts): each person hears the shift they now work.
+//  • GIVEAWAY (one-way — receiver covers, requester is off): the RECEIVER is the
+//    coverer for BOTH parties, so both messages ground on the receiver, with the
+//    right per-recipient perspective. The old code passed requester_name into the
+//    receiver's own message, so the coverer was wrongly told the giver would cover
+//    (WM giveaway confirmation bug, 2026-08-01). Never name the requester as coverer.
+export function buildSwapDecisionMessages(
+  token: Pick<SwapDecisionToken, 'shift_name' | 'receiver_name' | 'target_shift_name'>,
+  isTrade: boolean,
+  dateLong: string,
+  targetDateLong: string,
+): { requesterMsg: string; receiverMsg: string } {
+  const tradeMsg = (worksShift: string, worksDate: string) =>
+    `Your shift trade has been approved! You're now on the ${worksShift} shift on ${worksDate}.`;
+  if (isTrade) {
+    return {
+      requesterMsg: tradeMsg(token.target_shift_name!, targetDateLong),
+      receiverMsg: tradeMsg(token.shift_name, dateLong),
+    };
+  }
+  // Giveaway: the receiver covers for both. The requester (giver) is told they're
+  // off; the receiver (coverer) is told they'll cover — never that the giver covers.
+  return {
+    requesterMsg: `Your shift swap has been approved! ${token.receiver_name} will cover your ${token.shift_name} shift on ${dateLong} — you're off.`,
+    receiverMsg: `Your shift swap has been approved! You'll cover the ${token.shift_name} shift on ${dateLong}.`,
+  };
+}
+
 async function handleSwapDecision(
   res: import('express').Response,
   requestId: string,
@@ -317,13 +346,7 @@ async function handleSwapDecision(
     const targetDateLong = token.target_shift_date
       ? new Date(token.target_shift_date + 'T12:00:00Z').toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' })
       : dateLong;
-    const approvedMsg = (name: string, role: string) =>
-      `Your shift swap has been approved! ${name} will cover the ${token.shift_name} (${role}) shift on ${dateLong}.`;
-    const tradeMsg = (worksShift: string, worksDate: string) =>
-      `Your shift trade has been approved! You're now on the ${worksShift} shift on ${worksDate}.`;
-
-    const requesterMsg = isTrade ? tradeMsg(token.target_shift_name!, targetDateLong) : approvedMsg(token.receiver_name, token.role);
-    const receiverMsg = isTrade ? tradeMsg(token.shift_name, dateLong) : approvedMsg(token.requester_name, token.role);
+    const { requesterMsg, receiverMsg } = buildSwapDecisionMessages(token, isTrade, dateLong, targetDateLong);
     const subj = isTrade ? 'Shift trade approved' : 'Swap approved';
 
     if (!env.EMAIL_ONLY && requester?.contact_phone && token.aegis_sms_channel) {

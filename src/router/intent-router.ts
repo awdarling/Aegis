@@ -52,6 +52,11 @@ import {
   handleManagerAvailabilityApproval,
   getOnboardingFanoutPending,
   handleOnboardingFanoutConfirm,
+  getPendingIntentSwitch,
+  clearPendingIntentSwitch,
+  clearPendingAvailConfirm,
+  buildAvailChangeConfirmBody,
+  classifyAffirmation,
 } from '../workflows/employee-onboarding';
 import {
   handleBroadcast,
@@ -125,6 +130,11 @@ async function routeIntentInner(
   message: InboundMessage,
   contact: VerifiedContact
 ): Promise<void> {
+  // Pre-classification pending-session handling runs before the dispatch
+  // try/catch below. Wrap it so an unexpected throw here surfaces a graceful
+  // reply instead of escaping to routeIntent's overload-only catch and dying
+  // silently (no reply to the sender).
+  try {
   // Phone-keyed onboarding lookup. Runs before role-based routing so that an
   // inbound SMS from a phone with an active onboarding session is handled as an
   // onboarding reply even when identity verification matched the sender to a
@@ -179,6 +189,43 @@ async function routeIntentInner(
       await handleSwapConfirmation(message, contact, pendingSwap);
       console.log('[router] EARLY RETURN', { reason: 'pending_swap_confirmation' });
       return;
+    }
+
+    // A pending "want to switch to a different request?" offer takes priority
+    // over the availability-confirm loop it interrupted. YES resumes the original
+    // request; NO keeps the availability change; anything else falls through to
+    // the availability-confirm handler below (which may re-offer or apply a real
+    // correction).
+    const pendingSwitch = await getPendingIntentSwitch(contact.company_id, contact.employee_id);
+    if (pendingSwitch) {
+      const decision = classifyAffirmation(message.body);
+      if (decision === 'yes') {
+        await clearPendingIntentSwitch(contact.company_id, contact.employee_id);
+        await clearPendingAvailConfirm(contact.company_id, contact.employee_id);
+        const resumed: InboundMessage = { ...message, body: pendingSwitch.interrupting_body };
+        console.log('[router] intent switch confirmed → resuming interrupted request');
+        await routeIntentInner(resumed, contact);
+        return;
+      }
+      if (decision === 'no') {
+        await clearPendingIntentSwitch(contact.company_id, contact.employee_id);
+        const avail = await getPendingAvailConfirm(contact.company_id, contact.employee_id);
+        if (avail) {
+          await reply(
+            contact,
+            message,
+            `No problem — keeping your availability update. ${buildAvailChangeConfirmBody(avail.proposed_availability, { customEndDate: avail.custom_end_date ?? null })}`
+          );
+        } else {
+          await reply(contact, message, `No problem. What would you like to do?`);
+        }
+        console.log('[router] EARLY RETURN', { reason: 'intent_switch_declined' });
+        return;
+      }
+      // Ambiguous reply: drop the offer and let the availability-confirm handler
+      // below interpret this message (a real correction applies; a fresh
+      // different-intent re-offers).
+      await clearPendingIntentSwitch(contact.company_id, contact.employee_id);
     }
 
     const pendingAvailConfirm = await getPendingAvailConfirm(contact.company_id, contact.employee_id);
@@ -242,6 +289,12 @@ async function routeIntentInner(
       console.log('[router] EARLY RETURN', { reason: 'onboarding_fanout_confirm' });
       return;
     }
+  }
+  } catch (err) {
+    if (err instanceof AnthropicOverloadError) throw err;
+    console.error('[router] pre-classification handler error:', err);
+    await reply(contact, message, 'Something went wrong on my end. Please try again in a moment.');
+    return;
   }
 
   // Classify intent — each role gets its own allowed intent list

@@ -10,7 +10,7 @@ import { classifyIntent, generateReply } from '../ai/claude';
 import { runSimulation, getWeekBounds, loadTimeOffPolicies as loadAllTimeOffPolicies } from '../lib/schedule-simulator';
 import { computeTimeOffViolations } from '../lib/time-off-policies';
 import { env } from '../config/env';
-import { firstName } from '../messaging/greeting';
+import { firstName, textOpener } from '../messaging/greeting';
 import {
   BRAND,
   brandedEmailShell,
@@ -82,6 +82,22 @@ function formatShortDate(dateStr: string): string {
     month: 'short',
     day: 'numeric',
   });
+}
+
+// Natural yes/no for the time-off confirmation ("Want me to send that over?").
+// The confirmation is human now, so a literal "yes" is no longer required —
+// "yeah send it", "go for it", "please do", "sounds good" all confirm, and "not
+// quite", "hold on", "change it" all decline. Exported + pure for testing. A
+// reply that carries NEW dates is caught earlier as a submit_time_off correction
+// and never reaches here.
+export function isTimeOffAffirmation(body: string): boolean {
+  const b = body.trim().toLowerCase();
+  return /^(yes|yeah|yea|yep|yup|y\b|correct|confirmed|confirm|that'?s right|right|ok|okay|sure|send(?: it| that| it over)?|go (?:ahead|for it)|do it|please do|please|sounds good|looks good|that works|perfect|great|👍)/.test(b);
+}
+
+export function isTimeOffDenial(body: string): boolean {
+  const b = body.trim().toLowerCase();
+  return /^(no|nope|nah|n\b|wrong|incorrect|that'?s wrong|that'?s not right|not (?:quite|right|yet)|cancel|change|redo|restate|wait|hold on|don'?t)/.test(b);
 }
 
 // Escape user-supplied / dynamic text before inlining into branded HTML.
@@ -862,6 +878,26 @@ ${brandActionCard('Action needed · Time off', cardInner)}`;
 // Loads the TO + employee, picks the employee's best channel (email first,
 // then SMS), sends the decision notification, and logs activity. Throws on
 // hard failure so the calling endpoint can return 5xx with a clear error.
+// Pure channel router for the employee decision notification. Reply on the
+// channel the employee SUBMITTED on: an SMS request gets an SMS decision. Rules:
+//   'sms'         — submitted by SMS (or has no email) AND SMS is possible
+//   'email'       — has an email (email-origin, or SMS unavailable)
+//   'skip'        — EMAIL_ONLY + phone-only: unreachable right now; skip the notice
+//   'unreachable' — neither email nor phone on file
+export type DecisionRoute = 'sms' | 'email' | 'skip' | 'unreachable';
+export function pickDecisionRoute(opts: {
+  originChannel?: 'sms' | 'email';
+  contactEmail: string | null;
+  contactPhone: string | null;
+  emailOnly: boolean;
+}): DecisionRoute {
+  const canSms = !!opts.contactPhone && !opts.emailOnly;
+  if (canSms && (opts.originChannel === 'sms' || !opts.contactEmail)) return 'sms';
+  if (opts.contactEmail) return 'email';
+  if (opts.emailOnly && opts.contactPhone) return 'skip';
+  return 'unreachable';
+}
+
 export async function sendDecisionNotification(
   requestId: string,
   decision: 'approved' | 'denied'
@@ -894,52 +930,50 @@ export async function sendDecisionNotification(
   const employee = empData as { id: string; name: string; contact_email: string | null; contact_phone: string | null };
 
   const dateRange = formatDateRange(tor.start_date, tor.end_date);
-  const greetingLine = greeting(employee.name);
+  const greetingLine = textOpener(employee.name);
   const text =
     decision === 'approved'
-      ? `${greetingLine}\n\nYour time-off request for ${dateRange} has been approved. Enjoy your time off!`
-      : `${greetingLine}\n\nYour time-off request for ${dateRange} has been denied. Please contact your manager if you have questions or would like to discuss alternatives.`;
+      ? `${greetingLine}Your time-off request for ${dateRange} has been approved. Enjoy your time off!`
+      : `${greetingLine}Your time-off request for ${dateRange} has been denied. Please contact your manager if you have questions or would like to discuss alternatives.`;
+
+  // Reply on the SAME channel the employee submitted on. The to_thread:<id> row
+  // (written at submission for both channels) records the origin channel and, for
+  // email, the thread metadata so we thread back into the original conversation.
+  // When the origin wasn't recorded (older requests), fall back to email-first.
+  const { data: metaRow } = await supabase
+    .from('aegis_memory')
+    .select('content')
+    .eq('source', `to_thread:${requestId}`)
+    .maybeSingle();
+  let originChannel: 'sms' | 'email' | undefined;
+  let threadId: string | undefined;
+  let rawSubject: string | undefined;
+  if (metaRow) {
+    try {
+      const meta = JSON.parse((metaRow as { content: string }).content) as {
+        channel?: 'sms' | 'email' | null;
+        thread_id?: string | null;
+        raw_subject?: string | null;
+      };
+      originChannel = meta.channel ?? undefined;
+      threadId = meta.thread_id ?? undefined;
+      rawSubject = meta.raw_subject ?? undefined;
+    } catch {
+      // Corrupted side row — proceed without origin / threading.
+    }
+  }
+
+  const route = pickDecisionRoute({
+    originChannel,
+    contactEmail: employee.contact_email,
+    contactPhone: employee.contact_phone,
+    emailOnly: env.EMAIL_ONLY,
+  });
 
   let channel: 'email' | 'sms';
   let sent_to: string;
 
-  if (employee.contact_email) {
-    // Lookup thread metadata persisted at TO creation so we thread back into
-    // the original submit thread instead of starting a fresh conversation.
-    const { data: metaRow } = await supabase
-      .from('aegis_memory')
-      .select('content')
-      .eq('source', `to_thread:${requestId}`)
-      .maybeSingle();
-    let threadId: string | undefined;
-    let rawSubject: string | undefined;
-    if (metaRow) {
-      try {
-        const meta = JSON.parse((metaRow as { content: string }).content) as {
-          thread_id?: string | null;
-          raw_subject?: string | null;
-        };
-        threadId = meta.thread_id ?? undefined;
-        rawSubject = meta.raw_subject ?? undefined;
-      } catch {
-        // Corrupted side row — proceed without threading.
-      }
-    }
-
-    const subject = rawSubject
-      ? normalizeReSubject(rawSubject)
-      : `Your time-off request has been ${decision}`;
-
-    await sendEmail({
-      to: employee.contact_email,
-      subject,
-      text,
-      company_id: tor.company_id,
-      thread_id: threadId,
-    });
-    channel = 'email';
-    sent_to = employee.contact_email;
-  } else if (employee.contact_phone && !env.EMAIL_ONLY) {
+  if (route === 'sms') {
     // SMS path needs the company's Aegis outbound number.
     const { data: channelRow } = await supabase
       .from('company_channels')
@@ -950,11 +984,11 @@ export async function sendDecisionNotification(
     const aegisSmsChannel = (channelRow as { channel_value: string } | null)?.channel_value ?? null;
     if (!aegisSmsChannel) {
       throw new Error(
-        `employee ${employee.id} has no email and company ${tor.company_id} has no Aegis SMS channel configured`
+        `employee ${employee.id} submitted by SMS but company ${tor.company_id} has no Aegis SMS channel configured`
       );
     }
     const sent = await sendSms({
-      to: employee.contact_phone,
+      to: employee.contact_phone!,
       from: aegisSmsChannel,
       body: text,
       company_id: tor.company_id,
@@ -963,8 +997,22 @@ export async function sendDecisionNotification(
       throw new Error(`SMS send failed for employee ${employee.id}`);
     }
     channel = 'sms';
-    sent_to = employee.contact_phone;
-  } else if (env.EMAIL_ONLY && employee.contact_phone) {
+    sent_to = employee.contact_phone!;
+  } else if (route === 'email') {
+    const subject = rawSubject
+      ? normalizeReSubject(rawSubject)
+      : `Your time-off request has been ${decision}`;
+
+    await sendEmail({
+      to: employee.contact_email!,
+      subject,
+      text,
+      company_id: tor.company_id,
+      thread_id: threadId,
+    });
+    channel = 'email';
+    sent_to = employee.contact_email!;
+  } else if (route === 'skip') {
     // Email-only mode + no email on file: SMS is disabled, so this employee is
     // currently unreachable. Log and skip the notice rather than throw — the
     // time-off decision itself already succeeded; only the notification is skipped.
@@ -972,7 +1020,7 @@ export async function sendDecisionNotification(
       `[time-off] EMAIL_ONLY: employee ${employee.id} has a phone but no email; SMS disabled — decision notice skipped.`
     );
     channel = 'email';
-    sent_to = employee.contact_phone;
+    sent_to = employee.contact_phone!;
   } else {
     throw new Error(`employee ${employee.id} has neither contact_email nor contact_phone`);
   }
@@ -1215,7 +1263,7 @@ async function notifyManager(
       to: managerPhone,
       from: aegisSmsNumber,
       body:
-        `${greeting(manager.name)} ${employee.name} submitted a time-off request for ${dateDisplay}. ` +
+        `${textOpener(manager.name)}${employee.name} submitted a time-off request for ${dateDisplay}. ` +
         `Full details and approval options are in your email from Aegis.`,
       company_id: companyId,
     });
@@ -1391,8 +1439,15 @@ export async function handleSubmitTimeOff(
   });
 
   const summary = formatRequestSummary(parsed);
+  // Human, conversational confirmation — no "(reply yes/no)" mechanics, and no
+  // email-style "Hi Sam,\n\n" header (too formal for a text). The name is woven
+  // inline ("Got it, Sam —"), the ask invites a natural yes/no, and the handler
+  // accepts natural affirmations. `reason` already carries its own article when
+  // it needs one (see the classifier), so "off for ${reason}" reads correctly.
+  const first = firstName(contact.name);
+  const lead = first ? `Got it, ${first} —` : 'Got it —';
   const confirmText =
-    `${greeting(contact.name)}\n\nGot it — you're requesting ${summary} off for ${reason}. Is that correct? (Reply "yes" to confirm or "no" to restate.)` +
+    `${lead} ${summary} off for ${reason}. Want me to send that over to your manager?` +
     availabilityFollowupNote(extracted);
 
   // Rich HTML sibling: reflect the employee's own words, present the requested
@@ -1408,7 +1463,7 @@ export async function handleSubmitTimeOff(
       `<p style="${pStyle}">${greeting(contact.name)}</p>` +
       `<p style="${pStyle}">Sure thing — here's the request I'll send over:</p>` +
       brandDetailRow(escapeHtmlTo(summary), `for ${escapeHtmlTo(reason)}`) +
-      `<p style="margin:4px 0 0;font-size:16px;line-height:1.65;color:${BRAND.textPrimary};">Want me to pass it to your manager? Just reply <strong>YES</strong> to confirm, or <strong>NO</strong> to restate it.</p>` +
+      `<p style="margin:4px 0 0;font-size:16px;line-height:1.65;color:${BRAND.textPrimary};">Want me to pass it to your manager? Just say the word — or tell me what to change.</p>` +
       psNote +
       `<p style="margin:22px 0 0;color:${BRAND.textSecondary};">— Aegis</p>`,
   });
@@ -1462,10 +1517,8 @@ export async function handlePendingTimeOffConfirmation(
 
   const body = trimmed.toLowerCase();
 
-  const isYes =
-    /^(yes|yeah|yep|y\b|correct|confirmed|confirm|that'?s right|right|ok|okay|sure)/.test(body);
-  const isNo =
-    /^(no|nope|n\b|wrong|incorrect|that'?s wrong|cancel|that'?s not right|nah)/.test(body);
+  const isYes = isTimeOffAffirmation(body);
+  const isNo = isTimeOffDenial(body);
 
   if (!isYes && !isNo) {
     // The employee didn't confirm and didn't submit a new request — but did they send
@@ -1492,7 +1545,7 @@ export async function handlePendingTimeOffConfirmation(
     await reply(
       contact,
       message,
-      'Reply "yes" to confirm your time-off request, "no" to resubmit with different details, or "start over" to cancel it.'
+      "Just let me know — should I send that to your manager? Or tell me what to change and I'll fix it up."
     );
     return;
   }
@@ -1502,7 +1555,7 @@ export async function handlePendingTimeOffConfirmation(
     await reply(
       contact,
       message,
-      'No problem — go ahead and restate your time-off with the correct dates and reason.'
+      "No worries — just send me the right date(s) and reason and I'll get it sorted."
     );
     return;
   }
@@ -1611,25 +1664,25 @@ export async function handlePendingTimeOffConfirmation(
 
   const requestId = (torData as { id: string }).id;
 
-  // Persist the inbound email's thread metadata so sendDecisionNotification —
-  // invoked by Homebase via /internal/notify-to-decision after a manager
-  // clicks the magic link — can thread the approve/deny email back into the
-  // original conversation. The decision_token (notifyManager / decision.ts)
-  // path carries this via its own payload; this side row is for the
-  // aegis_action_tokens path, which is fired by an external webhook and only
-  // gets requestId + decision. JSON blob in aegis_memory.content — no
-  // migration. Skipped for SMS submissions (no thread metadata to store).
-  if (pending.channel === 'email' && (pending.thread_id || pending.raw_subject)) {
-    await supabase.from('aegis_memory').insert({
-      company_id: contact.company_id,
-      memory_type: 'observation',
-      source: `to_thread:${requestId}`,
-      content: JSON.stringify({
-        thread_id: pending.thread_id ?? null,
-        raw_subject: pending.raw_subject ?? null,
-      }),
-    });
-  }
+  // Persist the ORIGIN CHANNEL (+ email thread metadata) so sendDecisionNotification
+  // — invoked by Homebase via /internal/notify-to-decision after a manager clicks
+  // Approve/Deny — replies to the employee on the SAME channel they submitted on
+  // (an SMS request gets an SMS decision, not an email), and threads the email
+  // reply back into the original conversation when the origin was email. The
+  // decision_token (notifyManager / decision.ts) path carries the channel via its
+  // own token; this side row is for the aegis_action_tokens path, which is fired
+  // by an external webhook and only gets requestId + decision. JSON blob in
+  // aegis_memory.content — no migration. Written for BOTH channels now.
+  await supabase.from('aegis_memory').insert({
+    company_id: contact.company_id,
+    memory_type: 'observation',
+    source: `to_thread:${requestId}`,
+    content: JSON.stringify({
+      channel: pending.channel,
+      thread_id: pending.thread_id ?? null,
+      raw_subject: pending.raw_subject ?? null,
+    }),
+  });
 
   await logActivity({
     company_id: contact.company_id,
@@ -1717,11 +1770,13 @@ export async function handlePendingTimeOffConfirmation(
   }
 
   const dateDisplay = formatDateRange(pending.start_date, pending.end_date);
+  // No second greeting here — they just replied in an active thread, so opening
+  // with "Hi Sam," again reads robotic. Keep it warm and conversational.
   await reply(
     contact,
     message,
-    `${greeting(contact.name)}\n\nGot it — I've sent your time-off for ${dateDisplay} to your manager. ` +
-      "I'll let you know as soon as they decide."
+    `Done — I've passed your time off for ${dateDisplay} along to your manager. ` +
+      "I'll let you know the moment they get back to me."
   );
 }
 
@@ -1787,7 +1842,7 @@ export async function handleQueryMyTimeOff(
     await reply(
       contact,
       message,
-      `${greeting(contact.name)}\n\nYou don't have any approved time off coming up. You can request time off by texting me the dates you need.`
+      `${textOpener(contact.name)}You don't have any approved time off coming up. You can request time off by texting me the dates you need.`
     );
     return;
   }
@@ -1837,7 +1892,7 @@ export async function handleQueryMyTimeOff(
       ? 'You have 1 approved time off period coming up:'
       : `You have ${rows.length} approved time off periods coming up:`;
 
-  await reply(contact, message, `${greeting(contact.name)}\n\n${header}\n\n${lines.join('\n')}`);
+  await reply(contact, message, `${textOpener(contact.name)}${header}\n\n${lines.join('\n')}`);
 }
 
 // Manager asks: "re-run the check on Shmubba's time off" / "recheck the time off
@@ -1908,7 +1963,7 @@ export async function handleRecheckTimeOff(
     await reply(
       contact,
       message,
-      `${greeting(contact.name)}\n\nI looked but couldn't find a pending time-off request${scope} to re-check. ` +
+      `${textOpener(contact.name)}I looked but couldn't find a pending time-off request${scope} to re-check. ` +
         "It may have already been approved or denied. If you can point me at the employee or the dates, I'll take another look."
     );
     return;
@@ -1932,7 +1987,7 @@ export async function handleRecheckTimeOff(
     await reply(
       contact,
       message,
-      `${greeting(contact.name)}\n\nI started to re-check ${targetFirst}'s time off for ${dateDisplay}, but the request seems to have gone missing on me — it may have just been acted on. Mind giving it another try in a moment?`
+      `${textOpener(contact.name)}I started to re-check ${targetFirst}'s time off for ${dateDisplay}, but the request seems to have gone missing on me — it may have just been acted on. Mind giving it another try in a moment?`
     );
     return;
   }
@@ -1941,7 +1996,7 @@ export async function handleRecheckTimeOff(
     await reply(
       contact,
       message,
-      `${greeting(contact.name)}\n\nI re-checked ${targetFirst}'s time off for ${dateDisplay}, but there's no shift schedule to measure it against yet — so I can't speak to coverage either way.${pickedNote} Once shift requirements are set up, I'll be able to give you a real read.`
+      `${textOpener(contact.name)}I re-checked ${targetFirst}'s time off for ${dateDisplay}, but there's no shift schedule to measure it against yet — so I can't speak to coverage either way.${pickedNote} Once shift requirements are set up, I'll be able to give you a real read.`
     );
     return;
   }
@@ -1965,6 +2020,6 @@ export async function handleRecheckTimeOff(
   await reply(
     contact,
     message,
-    `${greeting(contact.name)}\n\nRe-checked ${targetName}'s time off for ${dateDisplay} against everything approved so far — ${lean}.${pickedNote}${tail}`
+    `${textOpener(contact.name)}Re-checked ${targetName}'s time off for ${dateDisplay} against everything approved so far — ${lean}.${pickedNote}${tail}`
   );
 }

@@ -1,7 +1,7 @@
 import { supabase } from '../db/client';
 import { logActivity } from '../logger/activity-log';
 import { reply } from '../messaging/reply';
-import { greeting } from '../messaging/greeting';
+import { textOpener } from '../messaging/greeting';
 import { generateReply } from '../ai/claude';
 import { coerceJsonObject } from '../utils/coerce-json';
 import { computeWageEstimate } from '../lib/schedule-simulator';
@@ -14,6 +14,8 @@ import {
   type AvailabilitySlot,
 } from './employee-onboarding';
 import type { InboundMessage, VerifiedContact } from '../security/types';
+import { aegisSystemFacts, aegisScopeGuard } from '../router/system-knowledge';
+import type { CapabilityRole } from '../router/capabilities';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -362,6 +364,25 @@ function prettyDate(date: string): string {
   return `${WEEKDAY[d.getUTCDay()]} ${d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' })}`;
 }
 
+// Which half of the day a shift starts in, derived from its start TIME (not the
+// shift name — sense comes from the tenant's real times, per the data rule).
+// Empty when the time is missing/unparseable so the caller falls back to the name.
+function shiftSegment(startTime: string): string {
+  const h = Number(startTime.slice(0, 2));
+  if (!Number.isFinite(h)) return '';
+  return h < 12 ? 'AM' : 'PM';
+}
+
+// One on-duty person rendered as "Name (AM, 9:00 AM–1:00 PM)" — segment + time so
+// a "who's working" answer reads operationally, not as a bare list of names.
+// Degrades to just the name when the assignment has no usable times.
+function formatStaffOnDuty(a: AssignmentLite): string {
+  const seg = shiftSegment(a.start_time);
+  const times = a.start_time && a.end_time ? `${fmtShiftTime(a.start_time)}–${fmtShiftTime(a.end_time)}` : '';
+  const detail = [seg, times].filter(Boolean).join(', ');
+  return detail ? `${a.employee_name} (${detail})` : a.employee_name;
+}
+
 // Pull every assignment out of the fetched schedule rows (schedules.data.assignments).
 export function collectAssignments(scheduleRows: unknown[]): AssignmentLite[] {
   const out: AssignmentLite[] = [];
@@ -401,15 +422,26 @@ export function summarizeStaffingByDate(assignments: AssignmentLite[]): string {
     const dayAssigns = byDate.get(date)!;
     // Distinct PEOPLE (one person on two shifts the same day counts once).
     const distinct = new Set(dayAssigns.map(a => a.employee_id || a.employee_name));
-    const byRole = new Map<string, Set<string>>();
+    const byRole = new Map<string, AssignmentLite[]>();
     for (const a of dayAssigns) {
-      const set = byRole.get(a.role) ?? new Set<string>();
-      set.add(a.employee_name);
-      byRole.set(a.role, set);
+      const list = byRole.get(a.role) ?? [];
+      list.push(a);
+      byRole.set(a.role, list);
     }
     const roleParts = [...byRole.entries()]
       .sort((x, y) => x[0].localeCompare(y[0]))
-      .map(([role, names]) => `${role || 'Staff'} (${names.size}): ${[...names].sort().join(', ')}`);
+      .map(([role, list]) => {
+        // Count DISTINCT people in the role, but list each shift they work so a
+        // "who's working" answer carries segment + time, not just a name (a
+        // double shows once in the count, twice in the detail).
+        const headcount = new Set(list.map(a => a.employee_id || a.employee_name)).size;
+        const detail = list
+          .slice()
+          .sort((a, b) => a.employee_name.localeCompare(b.employee_name) || a.start_time.localeCompare(b.start_time))
+          .map(formatStaffOnDuty)
+          .join(', ');
+        return `${role || 'Staff'} (${headcount}): ${detail}`;
+      });
     lines.push(`${prettyDate(date)}: ${distinct.size} on duty — ${roleParts.join('; ')}`);
   }
   return lines.join('\n');
@@ -460,6 +492,57 @@ export function buildDataContext(fetchedData: Record<string, unknown[]>): string
     }
   }
   return blocks.join('\n\n');
+}
+
+// ── Free-form answer system prompt ────────────────────────────────────────────
+//
+// EVERY free-form answer the assistant generates for an operational_query or a
+// general_question flows through this one builder — so this is the single place
+// that guarantees three things at once:
+//   1. GROUNDING (aegisSystemFacts): the answer is anchored to how Aegis actually
+//      works, so it can never invent a process that doesn't exist. This is what
+//      closes the "to request time off, log into Homebase" hallucination — an
+//      employee has no Homebase login; they just text Aegis.
+//   2. SCOPE (aegisScopeGuard): Aegis stays a workforce assistant and declines
+//      off-domain asks (trivia, coding, essays, math…) instead of behaving like a
+//      free general-purpose chatbot.
+//   3. NO LEAK (noLeakGuard): the answer never exposes the data plumbing.
+// Exported + pure so all three can be asserted in tests without an LLM call.
+export function buildOperationalAnswerSystem(
+  role: CapabilityRole,
+  personality: string,
+  today: string,
+  name: string
+): string {
+  // Never let the answer expose the plumbing. Headcount/coverage questions were
+  // leaking internals ("the data is truncated", "the complete payload", "pull the
+  // June 17 slice from Homebase") — Aegis should sound like a manager, not a
+  // database. If a fact genuinely isn't here, say so plainly and offer to pull it.
+  const noLeakGuard =
+    `Answer plainly, in your own voice, and NEVER mention how you got the information — ` +
+    `no talk of data, payloads, records, JSON, schedules being "loaded"/"truncated"/"provided", or "pulling from Homebase". ` +
+    `If you genuinely don't have what's needed, say so in one short, natural sentence and offer to pull it up (e.g. "I don't have that week's schedule in front of me — want me to pull it up?") — never explain the internals or apologize for the system.`;
+
+  const roleScope =
+    role === 'employee'
+      ? `You are answering a question from ${name}, an employee. ` +
+        `Only answer questions about their own schedule, their own time off, their own availability, and their own shifts. ` +
+        `You CAN answer things like: when their next shift is, what they're scheduled this week, how many hours they have, and who they're working alongside on a given day. ` +
+        `For "who am I working with" you may share coworkers' names and roles on a shift this employee is ALSO on — but never reveal anyone's wages, availability, hours totals, or personal details.`
+      : `You can answer staffing questions like how many people were on a given day, who was working (and in what role), who's free/available, where coverage is short, and who's near their max weekly hours. ` +
+        `The staffing summary below already gives you exact per-day headcounts and who was on by role — treat those counts as authoritative and answer with them directly.`;
+
+  // Order matters: personality (voice) → date → GROUNDING → SCOPE → role data
+  // scope → no-leak. Grounding and scope come before the role scope so the model
+  // reads "here's how the system works and what's off-limits" before it decides
+  // how to answer.
+  return [
+    personality,
+    `Today is ${today}.`,
+    aegisSystemFacts(role),
+    aegisScopeGuard(role),
+    `${roleScope} Be direct and specific. ${noLeakGuard}`,
+  ].join('\n\n');
 }
 
 // ── Operational query handler ─────────────────────────────────────────────────
@@ -518,27 +601,12 @@ Available Homebase tables (all scoped to this company):
   // never has to parse — or hedge about — a truncated raw JSON blob.
   const dataContext = buildDataContext(fetchedData);
 
-  // Never let the answer expose the plumbing. Headcount/coverage questions were
-  // leaking internals ("the data is truncated", "the complete payload", "pull the
-  // June 17 slice from Homebase") — Aegis should sound like a manager, not a
-  // database. If a fact genuinely isn't here, say so plainly and offer to pull it.
-  const noLeakGuard =
-    ` Answer plainly, in your own voice, and NEVER mention how you got the information — ` +
-    `no talk of data, payloads, records, JSON, schedules being "loaded"/"truncated"/"provided", or "pulling from Homebase". ` +
-    `If you genuinely don't have what's needed, say so in one short, natural sentence and offer to pull it up (e.g. "I don't have that week's schedule in front of me — want me to pull it up?") — never explain the internals or apologize for the system.`;
-
-  const answerSystem =
-    contact.role === 'employee'
-      ? `${personality}\n\nToday is ${today}. ` +
-        `You are answering a question from ${contact.name}, an employee. ` +
-        `Only answer questions about their own schedule, their own time off, their own availability, and their own shifts. ` +
-        `You CAN answer things like: when their next shift is, what they're scheduled this week, how many hours they have, and who they're working alongside on a given day. ` +
-        `For "who am I working with" you may share coworkers' names and roles on a shift this employee is ALSO on — but never reveal anyone's wages, availability, hours totals, or personal details. ` +
-        `Be direct and specific.${noLeakGuard}`
-      : `${personality}\n\nToday is ${today}. ` +
-        `You can answer staffing questions like how many people were on a given day, who was working (and in what role), who's free/available, where coverage is short, and who's near their max weekly hours. ` +
-        `The staffing summary below already gives you exact per-day headcounts and who was on by role — treat those counts as authoritative and answer with them directly. ` +
-        `Be direct and specific.${noLeakGuard}`;
+  const answerSystem = buildOperationalAnswerSystem(
+    contact.role as CapabilityRole,
+    personality,
+    today,
+    contact.name
+  );
 
   const answer = await generateReply(answerSystem, `Question: ${message.body}\n\nWhat I know:\n${dataContext || 'Nothing on file for this one.'}`, []);
 
@@ -1435,11 +1503,11 @@ function fmtShiftTime(t: string): string {
 
 // Pure: turn an employee's shift list into a warm reply. Tested directly.
 export function formatMyShiftsReply(employeeName: string, shifts: MyShift[], scope: ShiftScope): string {
-  const hi = greeting(employeeName);
+  const hi = textOpener(employeeName);
   if (shifts.length === 0) {
     return scope.kind === 'date'
-      ? `${hi}\n\nYou're not scheduled on ${fmtShiftDate(scope.date)} — looks like you've got that day off. If you were expecting a shift, reply here or check with your manager and we'll sort it out.`
-      : `${hi}\n\nYou don't have any upcoming shifts on the schedule right now. If that seems off, reply here or check with your manager and we'll take a look.`;
+      ? `${hi}you're not scheduled on ${fmtShiftDate(scope.date)} — looks like you've got that day off. If you were expecting a shift, reply here or check with your manager and we'll sort it out.`
+      : `${hi}you don't have any upcoming shifts on the schedule right now. If that seems off, reply here or check with your manager and we'll take a look.`;
   }
   const totalHours = Math.round(shifts.reduce((s, a) => s + a.hours, 0) * 10) / 10;
   const lead = scope.kind === 'date'
@@ -1449,7 +1517,7 @@ export function formatMyShiftsReply(employeeName: string, shifts: MyShift[], sco
     .map(s => `• ${fmtShiftDate(s.date)} — ${s.role} (${s.shift_name}), ${fmtShiftTime(s.start_time)}–${fmtShiftTime(s.end_time)}, ${s.hours}h`)
     .join('\n');
   const tail = scope.kind === 'date' ? '' : `\n\nThat's ${totalHours}h in all.`;
-  return `${hi}\n\n${lead}\n\n${lines}${tail}\n\nIf anything looks off, just reply here or reach out to your manager.`;
+  return `${hi}${lead}\n\n${lines}${tail}\n\nIf anything looks off, just reply here or reach out to your manager.`;
 }
 
 export async function handleMyShiftsQuery(

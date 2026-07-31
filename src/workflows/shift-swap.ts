@@ -8,7 +8,7 @@ import { logActivity } from '../logger/activity-log';
 import { reply } from '../messaging/reply';
 import { sendSms } from '../messaging/sms';
 import { sendEmail } from '../messaging/email';
-import { greeting, firstName } from '../messaging/greeting';
+import { greeting, firstName, textOpener } from '../messaging/greeting';
 import { generateReply, weekdayAnchors } from '../ai/claude';
 import { computeWageEstimate } from '../lib/schedule-simulator';
 import { env } from '../config/env';
@@ -555,7 +555,7 @@ export async function resolveSwapProposal(params: {
       receiverPhone: receiver.contact_phone ?? null,
       aegisSmsNumber,
       subject: `Update on the ${p.shift_name} trade`,
-      text: `${greeting(receiver.name)} thanks for offering to trade — ${firstName(p.requester_name)} decided to keep their original shift, so this trade won't go ahead. No action needed on your end.`,
+      text: `${textOpener(receiver.name)}thanks for offering to trade — ${firstName(p.requester_name)} decided to keep their original shift, so this trade won't go ahead. No action needed on your end.`,
       company_id: params.company_id,
     });
 
@@ -608,7 +608,7 @@ export async function resolveSwapProposal(params: {
     receiverPhone: receiver.contact_phone ?? null,
     aegisSmsNumber,
     subject: `Your trade with ${firstName(p.requester_name)} — pending manager`,
-    text: `${greeting(receiver.name)} ${firstName(p.requester_name)} agreed to the trade! It's with your manager for the final OK now — I'll let you know the moment it's confirmed.`,
+    text: `${textOpener(receiver.name)}${firstName(p.requester_name)} agreed to the trade! It's with your manager for the final OK now — I'll let you know the moment it's confirmed.`,
     company_id: params.company_id,
   });
 
@@ -832,7 +832,7 @@ export async function buildSwapBroadcastEmail(params: {
     ? ` Or, if you'd rather trade, you can swap one of your own shifts for it.`
     : '';
   const text =
-    `${greeting(params.candidate.name)} this is Aegis. ` +
+    `${textOpener(params.candidate.name)}this is Aegis. ` +
     `${params.requester_name} can't work their ${shiftDesc} and is hoping a teammate can help out.` +
     (willingList ? ` In return, ${firstName(params.requester_name)} can work: ${willingList}.` : '') +
     ` You can pick the shift up and add it to your schedule.${swapLineText} ` +
@@ -920,7 +920,7 @@ export async function buildSwapProposalEmail(params: {
 
   const subject = `${firstName(params.receiver_name)} can take your ${params.shift_name} shift — trade?`;
   const text =
-    `${greeting(params.requester.name)} good news — ${params.receiver_name} can take your ${giveUp}. ` +
+    `${textOpener(params.requester.name)}good news — ${params.receiver_name} can take your ${giveUp}. ` +
     `In return, you'd take their ${getBack}. Does that trade work for you? ` +
     `Tap Agree to send it to your manager for the final OK, or Decline to pass.`;
 
@@ -1657,9 +1657,9 @@ export function buildSwapAskText(params: {
   const theirShift = `${params.requesterName}'s ${params.shiftName} shift (${params.shiftStart}–${params.shiftEnd}, ${params.role}) on ${params.shiftDateDisplay}`;
   const isGiveaway = !params.targetShiftName;
   const text = isGiveaway
-    ? `${greeting(params.receiverName)} this is Aegis. ${params.requesterName} says you agreed to take ${theirShift}. ` +
+    ? `${textOpener(params.receiverName)}this is Aegis.${params.requesterName} says you agreed to take ${theirShift}. ` +
       `Can you confirm you'll cover it? Reply YES or NO.`
-    : `${greeting(params.receiverName)} this is Aegis. ${params.requesterName} would like to trade shifts with you — ` +
+    : `${textOpener(params.receiverName)}this is Aegis.${params.requesterName} would like to trade shifts with you — ` +
       `you'd give up your ${params.targetShiftName} shift on ${params.targetShiftDateDisplay ?? params.shiftDateDisplay} and pick up ${theirShift}. Want to do it? Reply YES or NO.`;
   const subject = isGiveaway
     ? `Shift coverage request from ${params.requesterName}`
@@ -2015,14 +2015,14 @@ async function executeSwapNow(params: {
 
     await reply(
       requesterContactIn, requesterMsgIn,
-      `${greeting(requester.name)} ${receiver.name} has agreed to cover your ${shiftDesc} — but I couldn't put it on the schedule yet because that week isn't published. Your manager will confirm it. Plan on working the shift until you hear it's locked in.`,
+      `${textOpener(requester.name)}${receiver.name} has agreed to cover your ${shiftDesc} — but I couldn't put it on the schedule yet because that week isn't published. Your manager will confirm it. Plan on working the shift until you hear it's locked in.`,
     );
     await sendOutreachMessage({
       receiverEmail: receiver.contact_email ?? null,
       receiverPhone: receiver.contact_phone ?? null,
       aegisSmsNumber: params.aegis_sms_channel,
       subject: `Covering ${requester.name}'s ${shift_name} shift — not final yet`,
-      text: `${greeting(receiver.name)} thanks for agreeing to cover ${requester.name}'s ${shiftDesc}. It isn't on the schedule yet because that week hasn't been published — your manager will confirm it. I'll let you know when it's locked in.`,
+      text: `${textOpener(receiver.name)}thanks for agreeing to cover ${requester.name}'s ${shiftDesc}. It isn't on the schedule yet because that week hasn't been published — your manager will confirm it. I'll let you know when it's locked in.`,
       company_id,
     });
 
@@ -2056,7 +2056,7 @@ async function executeSwapNow(params: {
   const swapId = (swapRow as { id: string } | null)?.id ?? 'unknown';
 
   // Notify requester
-  await reply(requesterContactIn, requesterMsgIn, `${greeting(requester.name)} your swap has been confirmed! ${receiver.name} will cover your ${shiftDesc}.`);
+  await reply(requesterContactIn, requesterMsgIn, `${textOpener(requester.name)}your swap has been confirmed! ${receiver.name} will cover your ${shiftDesc}.`);
 
   // Notify receiver — EMAIL-FIRST (SMS only once A2P clears).
   await sendOutreachMessage({
@@ -2064,7 +2064,7 @@ async function executeSwapNow(params: {
     receiverPhone: receiver.contact_phone ?? null,
     aegisSmsNumber: params.aegis_sms_channel,
     subject: `You're covering a ${shift_name} shift on ${formatShortDate(shift_date)}`,
-    text: `${greeting(receiver.name)} your swap with ${requester.name} is confirmed. You're covering the ${shiftDesc}.`,
+    text: `${textOpener(receiver.name)}your swap with ${requester.name} is confirmed. You're covering the ${shiftDesc}.`,
     company_id,
   });
 
@@ -2699,7 +2699,7 @@ export async function handleSwapOutreachResponse(
       aegisSmsNumber: smsChannel,
       subject: `Can you take a ${outreach.shift_name} shift on ${formatShortDate(outreach.shift_date)}?`,
       text:
-        `${greeting(nextEmp.name)} this is Aegis. ` +
+        `${textOpener(nextEmp.name)}this is Aegis. ` +
         `${outreach.requester_name} is looking for someone to take their ${outreach.shift_name} shift ` +
         `(${outreach.shift_start}–${outreach.shift_end}, ${outreach.role}) on ${formatDisplayDate(outreach.shift_date)}. ` +
         'Would you like to take this shift? Reply YES or NO.',

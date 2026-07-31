@@ -13,7 +13,7 @@ import { logActivity } from '../logger/activity-log';
 import { sendSms } from '../messaging/sms';
 import { sendEmail } from '../messaging/email';
 import { reply, sendInThreadAck } from '../messaging/reply';
-import { greeting, firstName as firstNameOf } from '../messaging/greeting';
+import { greeting, firstName as firstNameOf, textOpener } from '../messaging/greeting';
 import {
   BRAND,
   brandedEmailShell,
@@ -2622,7 +2622,7 @@ export async function handleAvailabilityConfirmResponse(
   await reply(
     contact,
     message,
-    `${greeting(contact.name)}\n\nYour availability request has been sent to your manager for approval. You'll hear back soon.`
+    `${textOpener(contact.name)}your availability request has been sent to your manager for approval. You'll hear back soon.`
   );
 }
 
@@ -3109,7 +3109,7 @@ async function notifyEmployeeOfAvailabilityDecision(
     matched_identifier: pending.employee_sender,
     channel: pending.employee_channel,
   };
-  await reply(employeeContact, employeeMessage, `${greeting(pending.employee_name)}\n\n${bodyText}`);
+  await reply(employeeContact, employeeMessage, `${textOpener(pending.employee_name)}${bodyText}`);
 }
 
 // ── Proactive expiry (called by scheduler) ────────────────────────────────────

@@ -10,7 +10,7 @@ import { classifyIntent, generateReply } from '../ai/claude';
 import { runSimulation, getWeekBounds, loadTimeOffPolicies as loadAllTimeOffPolicies } from '../lib/schedule-simulator';
 import { computeTimeOffViolations } from '../lib/time-off-policies';
 import { env } from '../config/env';
-import { firstName } from '../messaging/greeting';
+import { firstName, textOpener } from '../messaging/greeting';
 import {
   BRAND,
   brandedEmailShell,
@@ -910,11 +910,11 @@ export async function sendDecisionNotification(
   const employee = empData as { id: string; name: string; contact_email: string | null; contact_phone: string | null };
 
   const dateRange = formatDateRange(tor.start_date, tor.end_date);
-  const greetingLine = greeting(employee.name);
+  const greetingLine = textOpener(employee.name);
   const text =
     decision === 'approved'
-      ? `${greetingLine}\n\nYour time-off request for ${dateRange} has been approved. Enjoy your time off!`
-      : `${greetingLine}\n\nYour time-off request for ${dateRange} has been denied. Please contact your manager if you have questions or would like to discuss alternatives.`;
+      ? `${greetingLine}Your time-off request for ${dateRange} has been approved. Enjoy your time off!`
+      : `${greetingLine}Your time-off request for ${dateRange} has been denied. Please contact your manager if you have questions or would like to discuss alternatives.`;
 
   let channel: 'email' | 'sms';
   let sent_to: string;
@@ -1231,7 +1231,7 @@ async function notifyManager(
       to: managerPhone,
       from: aegisSmsNumber,
       body:
-        `${greeting(manager.name)} ${employee.name} submitted a time-off request for ${dateDisplay}. ` +
+        `${textOpener(manager.name)}${employee.name} submitted a time-off request for ${dateDisplay}. ` +
         `Full details and approval options are in your email from Aegis.`,
       company_id: companyId,
     });
@@ -1810,7 +1810,7 @@ export async function handleQueryMyTimeOff(
     await reply(
       contact,
       message,
-      `${greeting(contact.name)}\n\nYou don't have any approved time off coming up. You can request time off by texting me the dates you need.`
+      `${textOpener(contact.name)}You don't have any approved time off coming up. You can request time off by texting me the dates you need.`
     );
     return;
   }
@@ -1860,7 +1860,7 @@ export async function handleQueryMyTimeOff(
       ? 'You have 1 approved time off period coming up:'
       : `You have ${rows.length} approved time off periods coming up:`;
 
-  await reply(contact, message, `${greeting(contact.name)}\n\n${header}\n\n${lines.join('\n')}`);
+  await reply(contact, message, `${textOpener(contact.name)}${header}\n\n${lines.join('\n')}`);
 }
 
 // Manager asks: "re-run the check on Shmubba's time off" / "recheck the time off
@@ -1931,7 +1931,7 @@ export async function handleRecheckTimeOff(
     await reply(
       contact,
       message,
-      `${greeting(contact.name)}\n\nI looked but couldn't find a pending time-off request${scope} to re-check. ` +
+      `${textOpener(contact.name)}I looked but couldn't find a pending time-off request${scope} to re-check. ` +
         "It may have already been approved or denied. If you can point me at the employee or the dates, I'll take another look."
     );
     return;
@@ -1955,7 +1955,7 @@ export async function handleRecheckTimeOff(
     await reply(
       contact,
       message,
-      `${greeting(contact.name)}\n\nI started to re-check ${targetFirst}'s time off for ${dateDisplay}, but the request seems to have gone missing on me — it may have just been acted on. Mind giving it another try in a moment?`
+      `${textOpener(contact.name)}I started to re-check ${targetFirst}'s time off for ${dateDisplay}, but the request seems to have gone missing on me — it may have just been acted on. Mind giving it another try in a moment?`
     );
     return;
   }
@@ -1964,7 +1964,7 @@ export async function handleRecheckTimeOff(
     await reply(
       contact,
       message,
-      `${greeting(contact.name)}\n\nI re-checked ${targetFirst}'s time off for ${dateDisplay}, but there's no shift schedule to measure it against yet — so I can't speak to coverage either way.${pickedNote} Once shift requirements are set up, I'll be able to give you a real read.`
+      `${textOpener(contact.name)}I re-checked ${targetFirst}'s time off for ${dateDisplay}, but there's no shift schedule to measure it against yet — so I can't speak to coverage either way.${pickedNote} Once shift requirements are set up, I'll be able to give you a real read.`
     );
     return;
   }
@@ -1988,6 +1988,6 @@ export async function handleRecheckTimeOff(
   await reply(
     contact,
     message,
-    `${greeting(contact.name)}\n\nRe-checked ${targetName}'s time off for ${dateDisplay} against everything approved so far — ${lean}.${pickedNote}${tail}`
+    `${textOpener(contact.name)}Re-checked ${targetName}'s time off for ${dateDisplay} against everything approved so far — ${lean}.${pickedNote}${tail}`
   );
 }

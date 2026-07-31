@@ -1,7 +1,7 @@
 import { supabase } from '../db/client';
 import { logActivity } from '../logger/activity-log';
 import { reply } from '../messaging/reply';
-import { greeting } from '../messaging/greeting';
+import { textOpener } from '../messaging/greeting';
 import { generateReply } from '../ai/claude';
 import { coerceJsonObject } from '../utils/coerce-json';
 import { computeWageEstimate } from '../lib/schedule-simulator';
@@ -1473,11 +1473,11 @@ function fmtShiftTime(t: string): string {
 
 // Pure: turn an employee's shift list into a warm reply. Tested directly.
 export function formatMyShiftsReply(employeeName: string, shifts: MyShift[], scope: ShiftScope): string {
-  const hi = greeting(employeeName);
+  const hi = textOpener(employeeName);
   if (shifts.length === 0) {
     return scope.kind === 'date'
-      ? `${hi}\n\nYou're not scheduled on ${fmtShiftDate(scope.date)} — looks like you've got that day off. If you were expecting a shift, reply here or check with your manager and we'll sort it out.`
-      : `${hi}\n\nYou don't have any upcoming shifts on the schedule right now. If that seems off, reply here or check with your manager and we'll take a look.`;
+      ? `${hi}you're not scheduled on ${fmtShiftDate(scope.date)} — looks like you've got that day off. If you were expecting a shift, reply here or check with your manager and we'll sort it out.`
+      : `${hi}you don't have any upcoming shifts on the schedule right now. If that seems off, reply here or check with your manager and we'll take a look.`;
   }
   const totalHours = Math.round(shifts.reduce((s, a) => s + a.hours, 0) * 10) / 10;
   const lead = scope.kind === 'date'
@@ -1487,7 +1487,7 @@ export function formatMyShiftsReply(employeeName: string, shifts: MyShift[], sco
     .map(s => `• ${fmtShiftDate(s.date)} — ${s.role} (${s.shift_name}), ${fmtShiftTime(s.start_time)}–${fmtShiftTime(s.end_time)}, ${s.hours}h`)
     .join('\n');
   const tail = scope.kind === 'date' ? '' : `\n\nThat's ${totalHours}h in all.`;
-  return `${hi}\n\n${lead}\n\n${lines}${tail}\n\nIf anything looks off, just reply here or reach out to your manager.`;
+  return `${hi}${lead}\n\n${lines}${tail}\n\nIf anything looks off, just reply here or reach out to your manager.`;
 }
 
 export async function handleMyShiftsQuery(

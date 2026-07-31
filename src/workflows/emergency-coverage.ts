@@ -3,7 +3,7 @@ import { logActivity } from '../logger/activity-log';
 import { reply } from '../messaging/reply';
 import { sendSms } from '../messaging/sms';
 import { sendEmail } from '../messaging/email';
-import { greeting } from '../messaging/greeting';
+import { greeting, textOpener } from '../messaging/greeting';
 import {
   BRAND,
   brandedEmailShell,
@@ -1132,7 +1132,7 @@ export async function dispatchOutreach(params: {
   const dateStr = formatDisplayDate(session.shift_date);
   const si = session.shift_info;
   const body =
-    `${greeting(employee.name)} this is Aegis. ` +
+    `${textOpener(employee.name)}this is Aegis. ` +
     `${session.callout_employee_name} is out and we need coverage for the ` +
     `${si.shift_name} shift (${si.start_time}–${si.end_time}, ${si.role}) on ${dateStr}. ` +
     `Can you come in?\n\nReply YES to accept or NO to decline.`;
@@ -1232,7 +1232,7 @@ async function notifyEmployeeShiftFilled(
   outreach: ActiveOutreach,
   employee: Employee
 ): Promise<void> {
-  const body = `${greeting(employee.name)} the ${outreach.shift_info.shift_name} shift on ${formatShortDate(outreach.shift_date)} has been filled — no response needed. Thanks!`;
+  const body = `${textOpener(employee.name)}the ${outreach.shift_info.shift_name} shift on ${formatShortDate(outreach.shift_date)} has been filled — no response needed. Thanks!`;
   if (outreach.employee_channel === 'email' && (outreach.employee_email || employee.contact_email)) {
     await sendEmail({
       to: (outreach.employee_email ?? employee.contact_email)!,

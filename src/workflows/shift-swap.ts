@@ -2365,12 +2365,14 @@ async function sendOutreachMessage(params: {
       bodyHtml: `<p style="margin:0;font-size:16px;color:${BRAND.textPrimary};line-height:1.65;">${safe}</p>`,
       preheader: subject,
     });
-    await sendEmail({ to: receiverEmail, subject, text, html, company_id });
-    return 'email';
+    // Only report 'email' if the send actually went through — a swallowed
+    // SendGrid failure must not make us tell the requester we reached the coworker.
+    const ok = await sendEmail({ to: receiverEmail, subject, text, html, company_id });
+    return ok ? 'email' : 'none';
   }
   if (!env.EMAIL_ONLY && receiverPhone && aegisSmsNumber) {
-    await sendSms({ to: receiverPhone, from: aegisSmsNumber, body: text, company_id });
-    return 'sms';
+    const ok = await sendSms({ to: receiverPhone, from: aegisSmsNumber, body: text, company_id });
+    return ok ? 'sms' : 'none';
   }
   return 'none';
 }
@@ -2471,11 +2473,22 @@ export async function handleSwapConfirmation(
     });
     const isGiveaway = ask.isGiveaway;
 
-    await sendOutreachMessage({
+    const delivered = await sendOutreachMessage({
       receiverEmail, receiverPhone, aegisSmsNumber,
       subject: ask.subject,
       text: ask.text, company_id: contact.company_id,
     });
+
+    if (delivered === 'none') {
+      // The message to the coworker didn't go through — don't claim it did.
+      // Clear the outreach so a retry starts clean rather than colliding with a
+      // dangling session.
+      await clearSwapOutreach(contact.company_id, receiver.id);
+      await reply(contact, message,
+        `I tried to reach ${firstName(receiver.name)} but couldn't get the message through just now. Give it a minute and send it again, or let your manager know so it doesn't slip.`
+      );
+      return;
+    }
 
     await reply(contact, message,
       `I've reached out to ${receiver.name} about ${isGiveaway ? 'covering your shift' : 'the trade'}. I'll let you know as soon as I hear back.`

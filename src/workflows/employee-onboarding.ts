@@ -2419,23 +2419,7 @@ export async function handleUpdateAvailability(
     content: JSON.stringify(pending),
   });
 
-  const proposedDisplay = formatAvailabilityList(proposed);
-  let confirmBody: string;
-  if (assumedFullWeek) {
-    // We inferred "available the whole week except what you can't do" because
-    // nothing was on file — say so plainly so they can catch a wrong assumption.
-    const tail = customEndDate
-      ? ` This would run through ${formatDateRange(customEndDate, customEndDate)}, then back to normal.`
-      : '';
-    confirmBody =
-      `You don't have any availability on file yet, so I'm reading that as: you can work your usual hours every day EXCEPT what you mentioned.${tail}\n\n` +
-      `Here's what I'd set:\n${proposedDisplay}\n\n` +
-      `Reply YES to send it to your manager — or NO to redo it, then just tell me the exact days and times you CAN work.`;
-  } else if (customEndDate) {
-    confirmBody = `Got it — through ${formatDateRange(customEndDate, customEndDate)} you'd be available:\n${proposedDisplay}\nThen you're back to your normal hours. Look right? Reply YES and I'll send it to your manager to approve — or NO and we'll fix it.`;
-  } else {
-    confirmBody = `Got it — here's what I'd set your availability to:\n${proposedDisplay}\nLook right? Reply YES and I'll pass it to your manager to approve — or NO and we'll tweak it.`;
-  }
+  const confirmBody = buildAvailChangeConfirmBody(proposed, { customEndDate, assumedFullWeek });
 
   // Rich HTML sibling of the plain confirmBody: reflect the employee's own words
   // back, then the proposed availability as accent detail rows, then the reply-YES
@@ -2459,27 +2443,106 @@ export async function handleUpdateAvailability(
   await reply(contact, message, confirmBody, confirmHtml);
 }
 
+// Human, correction-friendly read-back for an availability CHANGE
+// (update_availability). No robotic "reply YES/NO" — it invites either a yes or a
+// partial correction, which handleAvailabilityConfirmResponse applies in place.
+export function buildAvailChangeConfirmBody(
+  proposed: AvailabilitySlot[],
+  opts: { customEndDate?: string | null; assumedFullWeek?: boolean } = {}
+): string {
+  const proposedDisplay = formatAvailabilityList(proposed);
+  if (opts.assumedFullWeek) {
+    const tail = opts.customEndDate
+      ? ` This would run through ${formatDateRange(opts.customEndDate, opts.customEndDate)}, then back to normal.`
+      : '';
+    return (
+      `You don't have any availability on file yet, so I'm reading that as: you can work your usual hours every day EXCEPT what you mentioned.${tail}\n\n` +
+      `Here's what I'd set:\n${proposedDisplay}\n\n` +
+      `Does that look right? If so, just say the word and I'll pass it to your manager — otherwise tell me what to change.`
+    );
+  }
+  if (opts.customEndDate) {
+    return (
+      `Got it — through ${formatDateRange(opts.customEndDate, opts.customEndDate)} you'd be available:\n${proposedDisplay}\n` +
+      `Then you're back to your normal hours. Does that look right? If so I'll pass it to your manager — otherwise tell me what to change.`
+    );
+  }
+  return (
+    `Got it — here's what I'd set your availability to:\n${proposedDisplay}\n` +
+    `Does that look right? If so I'll pass it to your manager to approve — otherwise tell me what to change.`
+  );
+}
+
 export async function handleAvailabilityConfirmResponse(
   message: InboundMessage,
   contact: VerifiedContact,
   pending: PendingAvailUpdate & { _memory_id: string }
 ): Promise<void> {
-  const lower = message.body.trim().toLowerCase();
-  const isYes = /^(yes|yeah|yep|y\b|correct|confirmed|ok|okay|sure)/i.test(lower);
-  const isNo = /^(no|nope|n\b|cancel|wrong|nah)/i.test(lower);
+  const body = message.body.trim();
+  const bounds = await loadShiftBounds(contact.company_id);
 
-  if (!isYes && !isNo) {
-    await reply(contact, message, `Please reply YES to send to your manager or NO to cancel.`);
+  // Smart confirmation, matching the onboarding availability step: a clean yes
+  // confirms and a clean "no"/"start over" restarts, but a PARTIAL CORRECTION
+  // ("no, the latest I can work is 3pm", "drop Tuesday") is applied in place and
+  // read back — never scrap everything for a one-line fix. Rotations skip the
+  // partial-correction model (they can't be expressed as flat slots).
+  const affirm = classifyAffirmation(body);
+  let action: AvailabilityConfirmReview['action'];
+  let revised: AvailabilitySlot[] | null = null;
+
+  if (affirm === 'yes') {
+    action = 'confirm';
+  } else if (affirm === 'no') {
+    action = 'restart';
+  } else if (pending.rotation) {
+    action = 'unclear';
+  } else {
+    const review = await reviewAvailabilityConfirmation(pending.proposed_availability, body, bounds);
+    if (review.action === 'revise') {
+      const clamped = review.slots
+        .map(s => ({
+          ...s,
+          start_time: clampTime(s.start_time, bounds.earliest_start, bounds.latest_end),
+          end_time: clampTime(s.end_time, bounds.earliest_start, bounds.latest_end),
+        }))
+        .filter(s => s.start_time < s.end_time);
+      if (clamped.length > 0) {
+        revised = clamped;
+        action = 'revise';
+      } else {
+        action = 'restart'; // a correction that clears everything is really a restart
+      }
+    } else {
+      action = review.action; // 'confirm' | 'restart' | 'unclear'
+    }
+  }
+
+  if (action === 'revise' && revised) {
+    // Apply the correction in place, re-store the pending, read the UPDATED
+    // availability back — keep them in the confirm loop instead of starting over.
+    const { _memory_id, ...rest } = pending;
+    const updated: PendingAvailUpdate = {
+      ...rest,
+      proposed_availability: revised,
+      availability_raw: `${pending.availability_raw ?? ''}\n[edit] ${body}`.trim(),
+    };
+    await supabase.from('aegis_memory').update({ content: JSON.stringify(updated) }).eq('id', _memory_id);
+    await reply(contact, message, buildAvailChangeConfirmBody(revised, { customEndDate: updated.custom_end_date ?? null }));
+    return;
+  }
+
+  if (action === 'unclear') {
+    await reply(contact, message, `Sorry, I want to get this right. ${buildAvailChangeConfirmBody(pending.proposed_availability, { customEndDate: pending.custom_end_date ?? null })}`);
     return;
   }
 
   await supabase.from('aegis_memory').delete().eq('id', pending._memory_id);
 
-  if (isNo) {
+  if (action === 'restart') {
     await reply(
       contact,
       message,
-      `No problem — I've scrapped that. To redo it, just send me the days and times you can work (or describe the rotation again) and I'll set it back up.`
+      `No problem — I've scrapped that. Just send me the days and times you can work (or describe the change again) and I'll set it back up.`
     );
     return;
   }

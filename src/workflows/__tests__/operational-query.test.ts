@@ -60,9 +60,12 @@ describe('summarizeStaffingByDate', () => {
     expect(summary).toMatch(/Jun 17: 3 on duty/);
   });
 
-  it('breaks the day down by role with names', () => {
-    expect(summary).toContain('Headguard (1): Erin Berigan');
-    expect(summary).toMatch(/Lifeguard \(2\): Audrey Rook, Lucas Penn/);
+  it("breaks the day down by role, with each person's segment + shift time", () => {
+    // Headcount still collapses Erin's same-day double to 1, but BOTH her shifts show.
+    expect(summary).toContain('Headguard (1): Erin Berigan (AM, 11:00 AM–3:30 PM), Erin Berigan (PM, 3:30 PM–9:15 PM)');
+    expect(summary).toMatch(/Lifeguard \(2\):/);
+    expect(summary).toContain('Audrey Rook (AM, 9:00 AM–3:00 PM)');
+    expect(summary).toContain('Lucas Penn (PM, 3:00 PM–9:15 PM)');
   });
 
   it('reports each date present', () => {

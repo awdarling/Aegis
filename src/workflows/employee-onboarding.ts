@@ -2676,9 +2676,9 @@ export async function handleAvailabilityConfirmResponse(
     await reply(
       contact,
       message,
-      `Quick check — we're in the middle of updating your availability right now. ` +
-        `Do you want to cancel that and ${switchIntentPhrase(switchIntent)} instead? ` +
-        `Reply YES to switch, or just tell me the availability change you want.`
+      `Hang on — we're right in the middle of updating your availability. ` +
+        `Want me to set that aside and ${switchIntentPhrase(switchIntent)} instead? ` +
+        `Just say the word and I'll switch over — or keep going with the availability change and I'll stick with that.`
     );
     return;
   }

@@ -130,6 +130,11 @@ async function routeIntentInner(
   message: InboundMessage,
   contact: VerifiedContact
 ): Promise<void> {
+  // Pre-classification pending-session handling runs before the dispatch
+  // try/catch below. Wrap it so an unexpected throw here surfaces a graceful
+  // reply instead of escaping to routeIntent's overload-only catch and dying
+  // silently (no reply to the sender).
+  try {
   // Phone-keyed onboarding lookup. Runs before role-based routing so that an
   // inbound SMS from a phone with an active onboarding session is handled as an
   // onboarding reply even when identity verification matched the sender to a
@@ -284,6 +289,12 @@ async function routeIntentInner(
       console.log('[router] EARLY RETURN', { reason: 'onboarding_fanout_confirm' });
       return;
     }
+  }
+  } catch (err) {
+    if (err instanceof AnthropicOverloadError) throw err;
+    console.error('[router] pre-classification handler error:', err);
+    await reply(contact, message, 'Something went wrong on my end. Please try again in a moment.');
+    return;
   }
 
   // Classify intent — each role gets its own allowed intent list

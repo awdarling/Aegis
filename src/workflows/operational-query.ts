@@ -364,6 +364,25 @@ function prettyDate(date: string): string {
   return `${WEEKDAY[d.getUTCDay()]} ${d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' })}`;
 }
 
+// Which half of the day a shift starts in, derived from its start TIME (not the
+// shift name — sense comes from the tenant's real times, per the data rule).
+// Empty when the time is missing/unparseable so the caller falls back to the name.
+function shiftSegment(startTime: string): string {
+  const h = Number(startTime.slice(0, 2));
+  if (!Number.isFinite(h)) return '';
+  return h < 12 ? 'AM' : 'PM';
+}
+
+// One on-duty person rendered as "Name (AM, 9:00 AM–1:00 PM)" — segment + time so
+// a "who's working" answer reads operationally, not as a bare list of names.
+// Degrades to just the name when the assignment has no usable times.
+function formatStaffOnDuty(a: AssignmentLite): string {
+  const seg = shiftSegment(a.start_time);
+  const times = a.start_time && a.end_time ? `${fmtShiftTime(a.start_time)}–${fmtShiftTime(a.end_time)}` : '';
+  const detail = [seg, times].filter(Boolean).join(', ');
+  return detail ? `${a.employee_name} (${detail})` : a.employee_name;
+}
+
 // Pull every assignment out of the fetched schedule rows (schedules.data.assignments).
 export function collectAssignments(scheduleRows: unknown[]): AssignmentLite[] {
   const out: AssignmentLite[] = [];
@@ -403,15 +422,26 @@ export function summarizeStaffingByDate(assignments: AssignmentLite[]): string {
     const dayAssigns = byDate.get(date)!;
     // Distinct PEOPLE (one person on two shifts the same day counts once).
     const distinct = new Set(dayAssigns.map(a => a.employee_id || a.employee_name));
-    const byRole = new Map<string, Set<string>>();
+    const byRole = new Map<string, AssignmentLite[]>();
     for (const a of dayAssigns) {
-      const set = byRole.get(a.role) ?? new Set<string>();
-      set.add(a.employee_name);
-      byRole.set(a.role, set);
+      const list = byRole.get(a.role) ?? [];
+      list.push(a);
+      byRole.set(a.role, list);
     }
     const roleParts = [...byRole.entries()]
       .sort((x, y) => x[0].localeCompare(y[0]))
-      .map(([role, names]) => `${role || 'Staff'} (${names.size}): ${[...names].sort().join(', ')}`);
+      .map(([role, list]) => {
+        // Count DISTINCT people in the role, but list each shift they work so a
+        // "who's working" answer carries segment + time, not just a name (a
+        // double shows once in the count, twice in the detail).
+        const headcount = new Set(list.map(a => a.employee_id || a.employee_name)).size;
+        const detail = list
+          .slice()
+          .sort((a, b) => a.employee_name.localeCompare(b.employee_name) || a.start_time.localeCompare(b.start_time))
+          .map(formatStaffOnDuty)
+          .join(', ');
+        return `${role || 'Staff'} (${headcount}): ${detail}`;
+      });
     lines.push(`${prettyDate(date)}: ${distinct.size} on duty — ${roleParts.join('; ')}`);
   }
   return lines.join('\n');

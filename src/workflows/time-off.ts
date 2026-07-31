@@ -878,6 +878,26 @@ ${brandActionCard('Action needed · Time off', cardInner)}`;
 // Loads the TO + employee, picks the employee's best channel (email first,
 // then SMS), sends the decision notification, and logs activity. Throws on
 // hard failure so the calling endpoint can return 5xx with a clear error.
+// Pure channel router for the employee decision notification. Reply on the
+// channel the employee SUBMITTED on: an SMS request gets an SMS decision. Rules:
+//   'sms'         — submitted by SMS (or has no email) AND SMS is possible
+//   'email'       — has an email (email-origin, or SMS unavailable)
+//   'skip'        — EMAIL_ONLY + phone-only: unreachable right now; skip the notice
+//   'unreachable' — neither email nor phone on file
+export type DecisionRoute = 'sms' | 'email' | 'skip' | 'unreachable';
+export function pickDecisionRoute(opts: {
+  originChannel?: 'sms' | 'email';
+  contactEmail: string | null;
+  contactPhone: string | null;
+  emailOnly: boolean;
+}): DecisionRoute {
+  const canSms = !!opts.contactPhone && !opts.emailOnly;
+  if (canSms && (opts.originChannel === 'sms' || !opts.contactEmail)) return 'sms';
+  if (opts.contactEmail) return 'email';
+  if (opts.emailOnly && opts.contactPhone) return 'skip';
+  return 'unreachable';
+}
+
 export async function sendDecisionNotification(
   requestId: string,
   decision: 'approved' | 'denied'
@@ -916,46 +936,44 @@ export async function sendDecisionNotification(
       ? `${greetingLine}Your time-off request for ${dateRange} has been approved. Enjoy your time off!`
       : `${greetingLine}Your time-off request for ${dateRange} has been denied. Please contact your manager if you have questions or would like to discuss alternatives.`;
 
+  // Reply on the SAME channel the employee submitted on. The to_thread:<id> row
+  // (written at submission for both channels) records the origin channel and, for
+  // email, the thread metadata so we thread back into the original conversation.
+  // When the origin wasn't recorded (older requests), fall back to email-first.
+  const { data: metaRow } = await supabase
+    .from('aegis_memory')
+    .select('content')
+    .eq('source', `to_thread:${requestId}`)
+    .maybeSingle();
+  let originChannel: 'sms' | 'email' | undefined;
+  let threadId: string | undefined;
+  let rawSubject: string | undefined;
+  if (metaRow) {
+    try {
+      const meta = JSON.parse((metaRow as { content: string }).content) as {
+        channel?: 'sms' | 'email' | null;
+        thread_id?: string | null;
+        raw_subject?: string | null;
+      };
+      originChannel = meta.channel ?? undefined;
+      threadId = meta.thread_id ?? undefined;
+      rawSubject = meta.raw_subject ?? undefined;
+    } catch {
+      // Corrupted side row — proceed without origin / threading.
+    }
+  }
+
+  const route = pickDecisionRoute({
+    originChannel,
+    contactEmail: employee.contact_email,
+    contactPhone: employee.contact_phone,
+    emailOnly: env.EMAIL_ONLY,
+  });
+
   let channel: 'email' | 'sms';
   let sent_to: string;
 
-  if (employee.contact_email) {
-    // Lookup thread metadata persisted at TO creation so we thread back into
-    // the original submit thread instead of starting a fresh conversation.
-    const { data: metaRow } = await supabase
-      .from('aegis_memory')
-      .select('content')
-      .eq('source', `to_thread:${requestId}`)
-      .maybeSingle();
-    let threadId: string | undefined;
-    let rawSubject: string | undefined;
-    if (metaRow) {
-      try {
-        const meta = JSON.parse((metaRow as { content: string }).content) as {
-          thread_id?: string | null;
-          raw_subject?: string | null;
-        };
-        threadId = meta.thread_id ?? undefined;
-        rawSubject = meta.raw_subject ?? undefined;
-      } catch {
-        // Corrupted side row — proceed without threading.
-      }
-    }
-
-    const subject = rawSubject
-      ? normalizeReSubject(rawSubject)
-      : `Your time-off request has been ${decision}`;
-
-    await sendEmail({
-      to: employee.contact_email,
-      subject,
-      text,
-      company_id: tor.company_id,
-      thread_id: threadId,
-    });
-    channel = 'email';
-    sent_to = employee.contact_email;
-  } else if (employee.contact_phone && !env.EMAIL_ONLY) {
+  if (route === 'sms') {
     // SMS path needs the company's Aegis outbound number.
     const { data: channelRow } = await supabase
       .from('company_channels')
@@ -966,11 +984,11 @@ export async function sendDecisionNotification(
     const aegisSmsChannel = (channelRow as { channel_value: string } | null)?.channel_value ?? null;
     if (!aegisSmsChannel) {
       throw new Error(
-        `employee ${employee.id} has no email and company ${tor.company_id} has no Aegis SMS channel configured`
+        `employee ${employee.id} submitted by SMS but company ${tor.company_id} has no Aegis SMS channel configured`
       );
     }
     const sent = await sendSms({
-      to: employee.contact_phone,
+      to: employee.contact_phone!,
       from: aegisSmsChannel,
       body: text,
       company_id: tor.company_id,
@@ -979,8 +997,22 @@ export async function sendDecisionNotification(
       throw new Error(`SMS send failed for employee ${employee.id}`);
     }
     channel = 'sms';
-    sent_to = employee.contact_phone;
-  } else if (env.EMAIL_ONLY && employee.contact_phone) {
+    sent_to = employee.contact_phone!;
+  } else if (route === 'email') {
+    const subject = rawSubject
+      ? normalizeReSubject(rawSubject)
+      : `Your time-off request has been ${decision}`;
+
+    await sendEmail({
+      to: employee.contact_email!,
+      subject,
+      text,
+      company_id: tor.company_id,
+      thread_id: threadId,
+    });
+    channel = 'email';
+    sent_to = employee.contact_email!;
+  } else if (route === 'skip') {
     // Email-only mode + no email on file: SMS is disabled, so this employee is
     // currently unreachable. Log and skip the notice rather than throw — the
     // time-off decision itself already succeeded; only the notification is skipped.
@@ -988,7 +1020,7 @@ export async function sendDecisionNotification(
       `[time-off] EMAIL_ONLY: employee ${employee.id} has a phone but no email; SMS disabled — decision notice skipped.`
     );
     channel = 'email';
-    sent_to = employee.contact_phone;
+    sent_to = employee.contact_phone!;
   } else {
     throw new Error(`employee ${employee.id} has neither contact_email nor contact_phone`);
   }
@@ -1632,25 +1664,25 @@ export async function handlePendingTimeOffConfirmation(
 
   const requestId = (torData as { id: string }).id;
 
-  // Persist the inbound email's thread metadata so sendDecisionNotification —
-  // invoked by Homebase via /internal/notify-to-decision after a manager
-  // clicks the magic link — can thread the approve/deny email back into the
-  // original conversation. The decision_token (notifyManager / decision.ts)
-  // path carries this via its own payload; this side row is for the
-  // aegis_action_tokens path, which is fired by an external webhook and only
-  // gets requestId + decision. JSON blob in aegis_memory.content — no
-  // migration. Skipped for SMS submissions (no thread metadata to store).
-  if (pending.channel === 'email' && (pending.thread_id || pending.raw_subject)) {
-    await supabase.from('aegis_memory').insert({
-      company_id: contact.company_id,
-      memory_type: 'observation',
-      source: `to_thread:${requestId}`,
-      content: JSON.stringify({
-        thread_id: pending.thread_id ?? null,
-        raw_subject: pending.raw_subject ?? null,
-      }),
-    });
-  }
+  // Persist the ORIGIN CHANNEL (+ email thread metadata) so sendDecisionNotification
+  // — invoked by Homebase via /internal/notify-to-decision after a manager clicks
+  // Approve/Deny — replies to the employee on the SAME channel they submitted on
+  // (an SMS request gets an SMS decision, not an email), and threads the email
+  // reply back into the original conversation when the origin was email. The
+  // decision_token (notifyManager / decision.ts) path carries the channel via its
+  // own token; this side row is for the aegis_action_tokens path, which is fired
+  // by an external webhook and only gets requestId + decision. JSON blob in
+  // aegis_memory.content — no migration. Written for BOTH channels now.
+  await supabase.from('aegis_memory').insert({
+    company_id: contact.company_id,
+    memory_type: 'observation',
+    source: `to_thread:${requestId}`,
+    content: JSON.stringify({
+      channel: pending.channel,
+      thread_id: pending.thread_id ?? null,
+      raw_subject: pending.raw_subject ?? null,
+    }),
+  });
 
   await logActivity({
     company_id: contact.company_id,

@@ -657,10 +657,14 @@ function escapeHtml(s: string): string {
     .replace(/'/g, '&#39;');
 }
 
+// Natural yes/no — the swap prompts are conversational ("Want me to run it by
+// Riley?"), so accept real replies, not just a literal "yes": "yeah do it",
+// "go for it", "send it", "sounds good" all confirm; "not quite", "hold on",
+// "never mind" all decline.
 export function parseYesNo(body: string): 'yes' | 'no' | 'unclear' {
   const lower = body.trim().toLowerCase();
-  if (/^(yes|yeah|yep|sure|ok|okay|correct|confirm|that'?s right|right)/.test(lower)) return 'yes';
-  if (/^(no|nope|can'?t|wrong|incorrect|cancel|nah|don'?t)/.test(lower)) return 'no';
+  if (/^(yes|yeah|yea|yep|yup|sure|ok|okay|correct|confirm(ed)?|that'?s right|right|send(?: it| that| it over)?|go (?:ahead|for it)|do it|please do|please|sounds good|looks good|that works|perfect|great|👍)/.test(lower)) return 'yes';
+  if (/^(no|nope|nah|can'?t|cannot|wrong|incorrect|cancel|don'?t|not (?:quite|right|yet)|never ?mind|hold on|wait|stop|forget it)/.test(lower)) return 'no';
   return 'unclear';
 }
 
@@ -1657,10 +1661,10 @@ export function buildSwapAskText(params: {
   const theirShift = `${params.requesterName}'s ${params.shiftName} shift (${params.shiftStart}–${params.shiftEnd}, ${params.role}) on ${params.shiftDateDisplay}`;
   const isGiveaway = !params.targetShiftName;
   const text = isGiveaway
-    ? `${textOpener(params.receiverName)}this is Aegis.${params.requesterName} says you agreed to take ${theirShift}. ` +
-      `Can you confirm you'll cover it? Reply YES or NO.`
-    : `${textOpener(params.receiverName)}this is Aegis.${params.requesterName} would like to trade shifts with you — ` +
-      `you'd give up your ${params.targetShiftName} shift on ${params.targetShiftDateDisplay ?? params.shiftDateDisplay} and pick up ${theirShift}. Want to do it? Reply YES or NO.`;
+    ? `${textOpener(params.receiverName)}this is Aegis. ${params.requesterName} says you agreed to take ${theirShift}. ` +
+      `Can you confirm you'll cover it? Just reply yes or no.`
+    : `${textOpener(params.receiverName)}this is Aegis. ${params.requesterName} would like to trade shifts with you — ` +
+      `you'd give up your ${params.targetShiftName} shift on ${params.targetShiftDateDisplay ?? params.shiftDateDisplay} and pick up ${theirShift}. Want to do it? Just reply yes or no.`;
   const subject = isGiveaway
     ? `Shift coverage request from ${params.requesterName}`
     : `Shift trade request from ${params.requesterName}`;
@@ -2191,7 +2195,7 @@ export async function handleInitiateSwap(
       await storePendingSwap(pending);
 
       await reply(contact, message,
-        `Got it — ${firstName(targetEmployee.name)} would take your ${shift.shift_name} shift on ${formatDisplayDate(shiftDate)} (${shift.start_time}–${shift.end_time}) and you'd be off, no shift back. Reply "yes" and I'll check with ${firstName(targetEmployee.name)} to confirm, then pass it to your manager to approve. Reply "no" to cancel.`
+        `Got it — ${firstName(targetEmployee.name)} would take your ${shift.shift_name} shift on ${formatDisplayDate(shiftDate)} (${shift.start_time}–${shift.end_time}) and you'd be off, no shift back. Want me to check with ${firstName(targetEmployee.name)} and line it up with your manager?`
       );
       return;
     }
@@ -2290,7 +2294,7 @@ export async function handleInitiateSwap(
     await storePendingSwap(pending);
 
     await reply(contact, message,
-      `Just to confirm the trade: you'd give up your ${shift.shift_name} shift on ${formatDisplayDate(shiftDate)} and pick up ${targetEmployee.name}'s ${targetShift.shift_name} shift on ${formatDisplayDate(targetShift.date)}. Reply "yes" to send it to ${firstName(targetEmployee.name)}, or "no" to cancel.`
+      `Just so I've got it: you'd give up your ${shift.shift_name} shift on ${formatDisplayDate(shiftDate)} and pick up ${targetEmployee.name}'s ${targetShift.shift_name} shift on ${formatDisplayDate(targetShift.date)}. Want me to run it by ${firstName(targetEmployee.name)}?`
     );
   } else {
     // Mode 2: facilitated — quick feasibility check
@@ -2338,7 +2342,7 @@ export async function handleInitiateSwap(
       : `Since you didn't mention days you could work instead, I'll send it as a straight pickup (no trade). If you'd like to allow trades, tell me which days you can work. `;
 
     await reply(contact, message,
-      `You want someone to take your ${shift.shift_name} shift (${shift.role}, ${shift.start_time}–${shift.end_time}) on ${formatDisplayDate(shiftDate)}. ${candidateNote}${tradeNote}Reply "yes" to send it to the team, or "no" to cancel.`
+      `You want someone to take your ${shift.shift_name} shift (${shift.role}, ${shift.start_time}–${shift.end_time}) on ${formatDisplayDate(shiftDate)}. ${candidateNote}${tradeNote}Want me to ask the team?`
     );
   }
 }
@@ -2381,7 +2385,7 @@ export async function handleSwapConfirmation(
 
   if (answer === 'unclear') {
     await reply(contact, message,
-      'Please reply "yes" to confirm your swap request or "no" to cancel.'
+      "Just let me know — should I set that swap up? Or tell me no and I'll drop it."
     );
     return;
   }
@@ -2626,7 +2630,7 @@ export async function handleSwapOutreachResponse(
 
   if (answer === 'unclear') {
     await reply(contact, message,
-      `Please reply "yes" to accept the ${outreach.shift_name} shift on ${formatShortDate(outreach.shift_date)} or "no" to decline.`
+      `Just let me know — can you take the ${outreach.shift_name} shift on ${formatShortDate(outreach.shift_date)}? A yes or no works.`
     );
     return;
   }

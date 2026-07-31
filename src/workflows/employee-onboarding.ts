@@ -849,21 +849,33 @@ export type AvailabilityConfirmReview =
 async function reviewAvailabilityConfirmation(
   current: AvailabilitySlot[],
   reply: string,
-  bounds: ShiftBounds
+  bounds: ShiftBounds,
+  // The employee's NORMAL availability on file (availability-change flow). Lets
+  // the model rebuild a boundary they didn't restate — essential when they're
+  // UNDOING a previous edit ("not start at 3", which needs their real start).
+  reference?: AvailabilitySlot[]
 ): Promise<AvailabilityConfirmReview> {
   const currentList = formatAvailabilityList(current) || '(nothing yet)';
+  const referenceBlock =
+    reference && reference.length > 0
+      ? `\nFor reference, the employee's NORMAL availability on file is:\n${formatAvailabilityList(reference)}\n` +
+        `(Use it to fill any boundary they don't restate — especially when they're correcting a previous change.)\n`
+      : '';
   const response = await withAnthropicRetry(() =>
     client.messages.create({
       model: MODEL,
       max_tokens: 512,
       system:
-        `An employee is confirming their weekly availability during onboarding. ` +
-        `The availability currently on file is:\n${currentList}\n\n` +
+        `An employee is reviewing the weekly availability I just read back to them. ` +
+        `The version I currently have is:\n${currentList}\n${referenceBlock}\n` +
         `Read their reply and choose ONE action:\n` +
         `- "confirm": they agree it's correct ("yep", "looks good", "that's right").\n` +
-        `- "revise": they want a SPECIFIC change — drop a day, add a day, or change hours ` +
-        `(including "looks good but ..."). Apply the change to the availability above and return the ` +
+        `- "revise": they want a SPECIFIC change. Apply it to the CURRENT version above and return the ` +
         `COMPLETE updated availability in "slots" (every day+window they can work AFTER the change, not just the delta).\n` +
+        `  TIME BOUNDARIES — apply precisely: "until <t>" / "before <t>" / "only until <t>" / "off after <t>" sets that day's END to <t> and KEEPS the start. ` +
+        `"from <t>" / "starting at <t>" / "after <t>" sets the START to <t> and KEEPS the end.\n` +
+        `  CORRECTING A PREVIOUS EDIT — when they say a boundary was wrong ("not start at 3", "I meant until, not from"), the mistaken edge must come from their NORMAL availability (the reference), NOT the current wrong value. ` +
+        `Example: current shows 3pm–5pm and they say "I can only work until 3, not start at 3" → their normal start is 9am, so set 9am–3pm.\n` +
         `- "restart": they reject it broadly or want to redo it all ("no", "that's wrong", "let me start over").\n` +
         `- "unclear": off-topic, or you genuinely can't tell what they mean.\n` +
         `Times HH:MM 24h, clamped to ${bounds.earliest_start}–${bounds.latest_end}. day_of_week 0=Sunday..6=Saturday. ` +
@@ -2497,7 +2509,7 @@ export async function handleAvailabilityConfirmResponse(
   } else if (pending.rotation) {
     action = 'unclear';
   } else {
-    const review = await reviewAvailabilityConfirmation(pending.proposed_availability, body, bounds);
+    const review = await reviewAvailabilityConfirmation(pending.proposed_availability, body, bounds, pending.current_availability);
     if (review.action === 'revise') {
       const clamped = review.slots
         .map(s => ({

@@ -13,7 +13,7 @@ vi.mock('../../messaging/reply', () => ({ reply: vi.fn(), sendInThreadAck: vi.fn
 vi.mock('../../ai/claude', () => ({ withAnthropicRetry: (fn: () => unknown) => fn() }));
 vi.mock('../../logger/activity-log', () => ({ logActivity: vi.fn() }));
 
-import { buildAvailChangeConfirmBody } from '../employee-onboarding';
+import { buildAvailChangeConfirmBody, mergeDayScopedAvailability } from '../employee-onboarding';
 
 const SLOTS = [
   { day_of_week: 1, start_time: '09:00', end_time: '15:00' },
@@ -50,5 +50,44 @@ describe('buildAvailChangeConfirmBody — human, correction-friendly read-back',
     expect(body).toMatch(/don't have any availability on file/i);
     expect(body).toMatch(/does that look right/i);
     expect(body).not.toMatch(/reply\s+"?yes"?/i);
+  });
+});
+
+
+describe('mergeDayScopedAvailability — per-day merge (AVAIL-MERGE-1)', () => {
+  const current = [
+    { day_of_week: 1, start_time: '09:00', end_time: '17:00' },
+    { day_of_week: 2, start_time: '09:00', end_time: '17:00' },
+    { day_of_week: 6, start_time: '09:00', end_time: '17:00' },
+  ];
+  it('edits only the named day and keeps the rest (never zeroes the week)', () => {
+    const out = mergeDayScopedAvailability(current, [{ day_of_week: 6, start_time: '15:00', end_time: '17:00' }]);
+    expect(out.filter(s => s.day_of_week === 6)).toEqual([{ day_of_week: 6, start_time: '15:00', end_time: '17:00' }]);
+    expect(out.filter(s => s.day_of_week === 1)).toEqual([{ day_of_week: 1, start_time: '09:00', end_time: '17:00' }]);
+    expect(out.filter(s => s.day_of_week === 2)).toEqual([{ day_of_week: 2, start_time: '09:00', end_time: '17:00' }]);
+    expect(out.length).toBe(3);
+  });
+  it('replaces an existing day rather than duplicating it', () => {
+    const out = mergeDayScopedAvailability(current, [{ day_of_week: 1, start_time: '10:00', end_time: '14:00' }]);
+    expect(out.filter(s => s.day_of_week === 1)).toEqual([{ day_of_week: 1, start_time: '10:00', end_time: '14:00' }]);
+    expect(out.length).toBe(3);
+  });
+});
+
+describe('buildAvailChangeConfirmBody — merged (per-day) variant', () => {
+  it('says it changes only the mentioned day(s) and keeps the rest', () => {
+    const body = buildAvailChangeConfirmBody(SLOTS, { merged: true });
+    expect(body).toMatch(/keep your other days/i);
+    expect(body).toMatch(/does that look right/i);
+    expect(body).toMatch(/tell me what to change/i);
+  });
+});
+
+describe('buildAvailChangeConfirmBody — exclusive (only-days) variant', () => {
+  it('makes clear it replaces the employee\'s other days', () => {
+    const body = buildAvailChangeConfirmBody(SLOTS, { exclusive: true });
+    expect(body).toMatch(/only/i);
+    expect(body).toMatch(/replaces your other days/i);
+    expect(body).toMatch(/does that look right/i);
   });
 });

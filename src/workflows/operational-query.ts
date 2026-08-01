@@ -262,10 +262,11 @@ function getNextWeekBounds(today: string): { weekStart: string; weekEnd: string 
 
 // ── Fetch plan execution ──────────────────────────────────────────────────────
 
-async function executeFetchPlan(
+export async function executeFetchPlan(
   plan: FetchPlan,
   companyId: string,
-  today: string
+  today: string,
+  role?: CapabilityRole
 ): Promise<Record<string, unknown[]>> {
   const results: Record<string, unknown[]> = {};
 
@@ -323,6 +324,11 @@ async function executeFetchPlan(
       }
     }
 
+    // Employees only ever see the posted (published) roster — never unpublished drafts.
+    if (item.table === 'schedules' && role === 'employee') {
+      q = q.eq('status', 'published');
+    }
+
     if (item.order) q = q.order(item.order.field, { ascending: item.order.ascending });
     if (item.limit) q = q.limit(item.limit);
 
@@ -364,9 +370,10 @@ function prettyDate(date: string): string {
   return `${WEEKDAY[d.getUTCDay()]} ${d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' })}`;
 }
 
-// Which half of the day a shift starts in, derived from its start TIME (not the
-// shift name — sense comes from the tenant's real times, per the data rule).
-// Empty when the time is missing/unparseable so the caller falls back to the name.
+// Fallback only: a rough AM/PM segment derived from a shift's start TIME, used to
+// label a shift ONLY when it has no tenant shift_name. Every other user-facing
+// shift label comes from the tenant's own shift_name (see formatStaffOnDuty), never
+// a hardcoded AM/PM — a client's shift names must survive across tenants.
 function shiftSegment(startTime: string): string {
   const h = Number(startTime.slice(0, 2));
   if (!Number.isFinite(h)) return '';
@@ -377,9 +384,13 @@ function shiftSegment(startTime: string): string {
 // a "who's working" answer reads operationally, not as a bare list of names.
 // Degrades to just the name when the assignment has no usable times.
 function formatStaffOnDuty(a: AssignmentLite): string {
-  const seg = shiftSegment(a.start_time);
+  // Label the shift by the tenant's OWN name (shift_name) — never a hardcoded
+  // AM/PM. The client defines its shift names ("AM", "Flex", "Twilight"…) and
+  // Aegis must echo them so onboarding a new client stays a data-only change. A
+  // time-derived AM/PM segment is only a fallback for a shift with no name.
+  const label = a.shift_name.trim() || shiftSegment(a.start_time);
   const times = a.start_time && a.end_time ? `${fmtShiftTime(a.start_time)}–${fmtShiftTime(a.end_time)}` : '';
-  const detail = [seg, times].filter(Boolean).join(', ');
+  const detail = [label, times].filter(Boolean).join(', ');
   return detail ? `${a.employee_name} (${detail})` : a.employee_name;
 }
 
@@ -467,7 +478,25 @@ function summarizeGaps(scheduleRows: unknown[]): string {
 // Build the answer-prompt context from the fetched tables. Schedules become a
 // readable staffing summary; every other table lists FULL rows (never chopped
 // mid-record), capped by row count rather than character count.
-export function buildDataContext(fetchedData: Record<string, unknown[]>): string {
+// Comp/PII columns an employee-facing answer must never be handed — even as raw
+// context. The model is also instructed not to reveal them, but we don't put them
+// in front of it at all (defense in depth). Pure/deterministic — no extra LLM call.
+const EMPLOYEE_REDACTED_FIELDS = new Set<string>([
+  'individual_wage', 'wage', 'wage_rate', 'hourly_wage',
+  'contact_phone', 'contact_email', 'phone', 'email',
+  'aegis_access', 'is_veteran', 'sex', 'max_weekly_hours',
+]);
+function redactForEmployee(row: unknown): unknown {
+  if (!row || typeof row !== 'object') return row;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(row as Record<string, unknown>)) {
+    if (EMPLOYEE_REDACTED_FIELDS.has(k)) continue;
+    out[k] = v;
+  }
+  return out;
+}
+
+export function buildDataContext(fetchedData: Record<string, unknown[]>, role?: CapabilityRole): string {
   const blocks: string[] = [];
   for (const [table, rows] of Object.entries(fetchedData)) {
     if (!rows || rows.length === 0) continue;
@@ -486,7 +515,8 @@ export function buildDataContext(fetchedData: Record<string, unknown[]>): string
       blocks.push(block);
     } else {
       const MAX_ROWS = 80;
-      const shown = rows.slice(0, MAX_ROWS).map(r => JSON.stringify(r)).join('\n');
+      const source = role === 'employee' ? rows.map(redactForEmployee) : rows;
+      const shown = source.slice(0, MAX_ROWS).map(r => JSON.stringify(r)).join('\n');
       const more = rows.length > MAX_ROWS ? `\n…and ${rows.length - MAX_ROWS} more` : '';
       blocks.push(`${table} (${rows.length}):\n${shown}${more}`);
     }
@@ -526,9 +556,9 @@ export function buildOperationalAnswerSystem(
   const roleScope =
     role === 'employee'
       ? `You are answering a question from ${name}, an employee. ` +
-        `Only answer questions about their own schedule, their own time off, their own availability, and their own shifts. ` +
-        `You CAN answer things like: when their next shift is, what they're scheduled this week, how many hours they have, and who they're working alongside on a given day. ` +
-        `For "who am I working with" you may share coworkers' names and roles on a shift this employee is ALSO on — but never reveal anyone's wages, availability, hours totals, or personal details.`
+        `Answer questions about their own schedule, their own time off, their own availability, their own hours, and their own shifts. ` +
+        `You can also tell them who is working on any given day and in what role and shift time — the posted schedule is shared with the whole team, so the roster is not private; share it plainly for any day they ask about, whether or not they're on it themselves, and never disclaim or hedge about whose shifts they can see. ` +
+        `Never reveal anyone else's wages, personal availability, total hours, contact information, or other personal details — only who is on, their role, and the shift time.`
       : `You can answer staffing questions like how many people were on a given day, who was working (and in what role), who's free/available, where coverage is short, and who's near their max weekly hours. ` +
         `The staffing summary below already gives you exact per-day headcounts and who was on by role — treat those counts as authoritative and answer with them directly.`;
 
@@ -594,12 +624,12 @@ Available Homebase tables (all scoped to this company):
   }
 
   // Step 2: Execute the fetch plan
-  const fetchedData = await executeFetchPlan(plan, contact.company_id, today);
+  const fetchedData = await executeFetchPlan(plan, contact.company_id, today, contact.role as CapabilityRole);
 
   // Step 3: Ask Claude to answer with the data. The context is pre-summarized
   // into clean facts (esp. schedules → per-date headcount + names) so the model
   // never has to parse — or hedge about — a truncated raw JSON blob.
-  const dataContext = buildDataContext(fetchedData);
+  const dataContext = buildDataContext(fetchedData, contact.role as CapabilityRole);
 
   const answerSystem = buildOperationalAnswerSystem(
     contact.role as CapabilityRole,

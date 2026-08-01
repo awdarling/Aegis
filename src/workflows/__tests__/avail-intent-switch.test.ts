@@ -15,7 +15,7 @@ vi.mock('../../messaging/reply', () => ({ reply: vi.fn(), sendInThreadAck: vi.fn
 vi.mock('../../ai/claude', () => ({ withAnthropicRetry: (fn: () => unknown) => fn() }));
 vi.mock('../../logger/activity-log', () => ({ logActivity: vi.fn() }));
 
-import { reviewAvailabilityConfirmation, switchIntentPhrase } from '../employee-onboarding';
+import { reviewAvailabilityConfirmation, switchIntentPhrase, classifySwitchReply, parseAvailabilityIntent } from '../employee-onboarding';
 
 const bounds: any = { earliest_start: '09:00', latest_end: '21:00' };
 const proposed: any = [{ day_of_week: 1, start_time: '15:00', end_time: '17:00' }];
@@ -56,5 +56,39 @@ describe('switchIntentPhrase — friendly wording for the switch offer', () => {
     expect(switchIntentPhrase('coverage')).toMatch(/coverage/i);
     expect(switchIntentPhrase('schedule_query')).toMatch(/schedule/i);
     expect(switchIntentPhrase('other' as any)).toMatch(/take care/i);
+  });
+});
+
+describe('classifySwitchReply — LLM fallback for an ambiguous switch reply (Bug 2)', () => {
+  beforeEach(() => h.createMock.mockReset());
+  it('maps a natural switch-yes to "switch"', async () => {
+    llm({ decision: 'switch' });
+    expect(await classifySwitchReply('Yea, I want to switch', 'shift_swap')).toBe('switch');
+  });
+  it('maps a keep-availability reply to "keep"', async () => {
+    llm({ decision: 'keep' });
+    expect(await classifySwitchReply('no, keep my availability change', 'shift_swap')).toBe('keep');
+  });
+  it('falls back to "unclear" on an unrecognized decision', async () => {
+    llm({ decision: 'maybe' });
+    expect(await classifySwitchReply('hmm', 'shift_swap')).toBe('unclear');
+  });
+});
+
+describe('parseAvailabilityIntent — exclusive vs partial scope (only-days replacement)', () => {
+  beforeEach(() => h.createMock.mockReset());
+  it('marks an "only" restatement as exclusive', async () => {
+    llm({ mode: 'set', scope: 'exclusive', slots: [{ day_of_week: 6, start_time: '09:00', end_time: '21:00' }] });
+    const r = await parseAvailabilityIntent('I can only work on Saturdays', bounds);
+    expect(r.mode).toBe('set');
+    expect(r.scope).toBe('exclusive');
+  });
+  it('marks a day-scoped edit as partial', async () => {
+    llm({ mode: 'set', scope: 'partial', slots: [{ day_of_week: 6, start_time: '15:00', end_time: '17:00' }] });
+    expect((await parseAvailabilityIntent('change Saturday to 3-5', bounds)).scope).toBe('partial');
+  });
+  it('forces scope to partial for a remove even if the model says exclusive', async () => {
+    llm({ mode: 'remove', scope: 'exclusive', slots: [{ day_of_week: 3, start_time: '00:00', end_time: '23:59' }] });
+    expect((await parseAvailabilityIntent("I can't work Wednesdays", bounds)).scope).toBe('partial');
   });
 });

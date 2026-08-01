@@ -77,6 +77,30 @@ describe('summarizeStaffingByDate', () => {
   });
 });
 
+// Scalability: the shift label must be the TENANT'S own shift_name, never a
+// hardcoded AM/PM. A client with "Twilight"/"Flex" shifts must hear those names.
+describe('summarizeStaffingByDate — labels by tenant shift_name, not a hardcoded AM/PM', () => {
+  const row = {
+    data: {
+      assignments: [
+        { date: '2026-06-20', employee_id: 'e9', employee_name: 'Dana Fox', shift_name: 'Twilight', role: 'Guard', start_time: '17:00', end_time: '23:00', hours: 6 },
+        { date: '2026-06-20', employee_id: 'e8', employee_name: 'Kai Ng', shift_name: '', role: 'Guard', start_time: '09:00', end_time: '13:00', hours: 4 },
+      ],
+      gaps: [],
+    },
+  };
+  const summary = summarizeStaffingByDate(collectAssignments([row]));
+
+  it("uses the client's shift name even when the clock would say PM", () => {
+    expect(summary).toContain('Dana Fox (Twilight, 5:00 PM–11:00 PM)');
+    expect(summary).not.toMatch(/Dana Fox \(PM,/);
+  });
+
+  it('falls back to a time-derived segment only when a shift is unnamed', () => {
+    expect(summary).toContain('Kai Ng (AM, 9:00 AM–1:00 PM)');
+  });
+});
+
 describe('buildDataContext', () => {
   it('renders schedules as a readable staffing summary, not a raw JSON dump', () => {
     const ctx = buildDataContext({ schedules: [scheduleRow] });
@@ -101,6 +125,18 @@ describe('buildDataContext', () => {
 
   it('skips empty tables', () => {
     expect(buildDataContext({ employees: [], schedules: [] })).toBe('');
+  });
+
+  it('redacts wage and contact columns from non-schedule tables for employees', () => {
+    const employees = [{ id: 'e1', name: 'Sam Rivera', primary_role: 'Lifeguard', individual_wage: 21.5, contact_phone: '+16163280114', contact_email: 'sam@x.test', max_weekly_hours: 40 }];
+    const emp = buildDataContext({ employees }, 'employee');
+    expect(emp).toContain('Sam Rivera');
+    expect(emp).toContain('Lifeguard');
+    expect(emp).not.toMatch(/individual_wage|21\.5|contact_phone|16163280114|contact_email|sam@x\.test|max_weekly_hours/);
+    // Managers (and the default no-role path) still get the full rows.
+    const mgr = buildDataContext({ employees }, 'manager');
+    expect(mgr).toMatch(/individual_wage/);
+    expect(mgr).toMatch(/contact_phone/);
   });
 });
 

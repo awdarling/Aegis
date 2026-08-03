@@ -8,7 +8,7 @@ import { logActivity } from '../logger/activity-log';
 import { reply } from '../messaging/reply';
 import { sendSms } from '../messaging/sms';
 import { sendEmail } from '../messaging/email';
-import { greeting, firstName, textOpener } from '../messaging/greeting';
+import { greeting, firstName, textOpener, managerAlertSms } from '../messaging/greeting';
 import { generateReply, weekdayAnchors } from '../ai/claude';
 import { computeWageEstimate } from '../lib/schedule-simulator';
 import { env } from '../config/env';
@@ -647,6 +647,20 @@ function formatShortDate(dateStr: string): string {
   });
 }
 
+// Read a requester's willing WEEKDAYS (0=Sun..6=Sat integers) back to them by name,
+// e.g. [3] -> "Wednesday", [1,3] -> "Monday or Wednesday". '' when none were given.
+export function formatWeekdayNames(days: number[]): string {
+  const NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+  const labels = [...new Set(days)]
+    .filter(d => Number.isInteger(d) && d >= 0 && d <= 6)
+    .sort((a, b) => a - b)
+    .map(d => NAMES[d]);
+  if (labels.length === 0) return '';
+  if (labels.length === 1) return labels[0];
+  if (labels.length === 2) return `${labels[0]} or ${labels[1]}`;
+  return `${labels.slice(0, -1).join(', ')}, or ${labels[labels.length - 1]}`;
+}
+
 // Escape user-supplied / dynamic text before inlining into branded HTML.
 function escapeHtml(s: string): string {
   return s
@@ -866,10 +880,17 @@ export async function buildSwapBroadcastEmail(params: {
     ) +
     brandedButtonRow(buttons);
 
+  // When both options exist, spell out what each button actually does — pickup and
+  // trade are easy to confuse, and the choice changes what the coworker owes back.
+  const buttonExplainer = swapUrl
+    ? `<p style="margin:0 0 12px;font-size:14px;color:${BRAND.silver};line-height:1.6;"><strong>Pick up this shift</strong> adds it to your schedule — nothing owed back. <strong>Offer a swap</strong> lets you hand ${escapeHtml(firstName(params.requester_name))} one of your own shifts${willingList ? ` on ${escapeHtml(willingList)}` : ''} in return.</p>`
+    : '';
+
   const bodyHtml =
     `<p style="margin:0 0 16px;font-size:16px;color:${BRAND.textPrimary};line-height:1.65;">${escapeHtml(greeting(params.candidate.name))}</p>` +
     `<p style="margin:0 0 4px;font-size:16px;color:${BRAND.textPrimary};line-height:1.65;">${askLine}${tradeLine}</p>` +
     brandActionCard('Shift available', cardInner) +
+    buttonExplainer +
     `<p style="margin:0 0 0;font-size:14px;color:${BRAND.silver};line-height:1.6;">First person to lock it in gets it, and your manager gives the final okay before anything changes. Thanks for being flexible.</p>`;
 
   const html = brandedEmailShell({ bodyHtml, preheader: subject });
@@ -1573,8 +1594,24 @@ export async function buildSwapCandidates(params: {
   const ns = shift_start.slice(0, 5);
   const ne = shift_end.slice(0, 5);
 
+  // Anyone already assigned to a shift that OVERLAPS the target block that day can't
+  // cover it — they're either already on this very shift or on a conflicting one, so
+  // asking them to pick it up is nonsense. (Reported miss: a coworker already working
+  // the same shift was still broadcast a request to cover it.) Availability alone
+  // doesn't catch this — it says when they CAN work, not what they're already on.
+  const busyOverlappingTarget = new Set<string>();
+  if (schedData) {
+    for (const a of schedData.assignments) {
+      if (a.date !== shift_date) continue;
+      if (a.start_time.slice(0, 5) < ne && a.end_time.slice(0, 5) > ns) {
+        busyOverlappingTarget.add(a.employee_id);
+      }
+    }
+  }
+
   const candidates = employees.filter(emp => {
     if (emp.id === requester_id) return false;
+    if (busyOverlappingTarget.has(emp.id)) return false;
     if (onTO.has(emp.id)) return false;
     if (neverConflictIds.has(emp.id)) return false;
     if (!isQualified(emp.qualified_roles, acceptedRoles)) return false;
@@ -1975,7 +2012,11 @@ ${brandActionCard(`Action needed · Shift ${isTrade ? 'trade' : 'swap'}`, `${det
     await sendSms({
       to: managerPhone,
       from: params.aegis_sms_channel,
-      body: `${requester.name} and ${receiver.name} want to swap the ${shift_name} shift on ${formatShortDate(shift_date)}. Full details and approval options are in your email from Aegis.`,
+      body: managerAlertSms({
+        managerName: manager.name,
+        summary: `${requester.name} and ${receiver.name} arranged a ${isTrade ? 'shift trade' : 'shift swap'} — ${shift_name} on ${formatShortDate(shift_date)} — and just need your sign-off.`,
+        inbox: 'approve',
+      }),
       company_id,
     });
   }
@@ -2382,8 +2423,9 @@ export async function handleInitiateSwap(
       : "I didn't find anyone available right now, but ";
     // If they told me which days they can work, the broadcast also offers a trade;
     // otherwise it goes out as pickup-only.
+    const willingDayNames = formatWeekdayNames(raw.willing_days);
     const tradeNote = raw.willing_days.length > 0
-      ? `Anyone who'd rather trade can offer you a shift on a day you said you can work. `
+      ? `Anyone who'd rather trade can offer you a shift on ${willingDayNames} in return. `
       : `Since you didn't mention days you could work instead, I'll send it as a straight pickup (no trade). If you'd like to allow trades, tell me which days you can work. `;
 
     await reply(contact, message,
@@ -2666,9 +2708,10 @@ export async function handleSwapConfirmation(
     });
 
     const swapCount = partition.swap.filter(s => contactedIds.includes(s.employee.id)).length;
+    const willingDatesLabel = [...willingDates].sort().map(formatShortDate).join(', ');
     await reply(contact, message,
       `Done — I've emailed ${contactedIds.length} teammate${contactedIds.length !== 1 ? 's' : ''} about your ${pending.shift_name} shift on ${formatDisplayDate(pending.shift_date)}` +
-      (swapCount > 0 ? ` (${swapCount} of them can also offer a trade)` : '') +
+      (swapCount > 0 ? ` (${swapCount} of them can also trade you a shift on ${willingDatesLabel})` : '') +
       `. The first to accept gets it, and I'll loop in your manager for the final OK. I'll let you know as soon as someone takes it.`
     );
 

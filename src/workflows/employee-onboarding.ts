@@ -13,7 +13,7 @@ import { logActivity } from '../logger/activity-log';
 import { sendSms } from '../messaging/sms';
 import { sendEmail } from '../messaging/email';
 import { reply, sendInThreadAck } from '../messaging/reply';
-import { greeting, firstName as firstNameOf, textOpener } from '../messaging/greeting';
+import { greeting, firstName as firstNameOf, textOpener, managerAlertSms } from '../messaging/greeting';
 import {
   BRAND,
   brandedEmailShell,
@@ -2975,6 +2975,17 @@ export async function handleAvailabilityConfirmResponse(
         token_payload: approval as unknown as Record<string, unknown>,
       });
       await sendEmail({ to: mgr.email, subject, text, html, company_id: contact.company_id });
+      // A manager with a phone ALSO gets a short SMS nudge — context (who + what)
+      // plus a warm hand-off to the email where Approve/Deny lives — so they aren't
+      // relying on noticing the email. Same principle as the time-off / swap alerts.
+      if (smsAvailable) {
+        await sendSms({
+          to: managerPhone!,
+          from: aegisSmsChannel!,
+          body: managerAlertSms({ managerName: mgr.name, summary: headline, inbox: 'approve' }),
+          company_id: contact.company_id,
+        });
+      }
     } else {
       // SMS-only manager: buttons aren't possible over SMS, so keep the
       // reply-"YES"/"NO" text path.

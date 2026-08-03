@@ -26,3 +26,26 @@ export function textOpener(name?: string | null): string {
   const f = firstName(name);
   return f === 'there' ? 'Hey — ' : `Hey ${f} — `;
 }
+
+// managerAlertSms: ONE voice for every manager NOTIFICATION text. A manager alert
+// should never read like a dumb "you have 1 notification" — it leads with the who /
+// what / when / why so the manager can decide from the text alone whether to open
+// their inbox now or later, then hands off warmly to the email where the actual
+// approve/deny (or detail) lives. `summary` is that informative line; `inbox` names
+// what's waiting so the hand-off is specific, not generic. Omit `inbox` for a pure FYI.
+export function managerAlertSms(params: {
+  managerName?: string | null;
+  summary: string;
+  inbox?: 'approve' | 'action' | 'details' | null;
+}): string {
+  const { managerName, summary, inbox } = params;
+  const tail =
+    inbox === 'approve'
+      ? " I've put the details and an approve/deny link in your email — take a look whenever you get a chance."
+      : inbox === 'action'
+      ? " The details and how to handle it are in your email whenever you get a chance."
+      : inbox === 'details'
+      ? " Full details are in your email if you want them."
+      : '';
+  return `${textOpener(managerName)}${summary}${tail}`;
+}

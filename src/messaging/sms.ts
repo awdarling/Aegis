@@ -62,6 +62,17 @@ export async function sendSms(options: SmsOptions): Promise<boolean> {
 
   if (!result.ok) {
     console.error('[sms] send failed:', result.error);
+    // Make the failure visible in the DB, not just the console — a send that never
+    // reaches a phone was previously invisible except in server stdout. Marked
+    // distinctly so it can never be mistaken for a delivered message.
+    await saveConversation({
+      company_id: options.company_id,
+      channel: 'sms',
+      direction: 'outbound',
+      content: `[SEND FAILED — ${result.error}] ${options.body}`,
+      from_address: fromNumber,
+      to_address: options.to,
+    });
     return false;
   }
 

@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { supabase } from '../db/client';
+import { formatDateRange } from '../workflows/time-off-manager-email';
 import { logActivity } from '../logger/activity-log';
 import { sendEmail } from '../messaging/email';
 import { sendSms } from '../messaging/sms';
@@ -191,10 +192,19 @@ async function notifyEmployee(
   action: 'approve' | 'deny'
 ): Promise<void> {
   const verb = action === 'approve' ? 'approved' : 'denied';
+  // Name the date(s) so an employee with several requests in flight knows exactly
+  // which one this decision covers.
+  const { data: torDates } = await supabase
+    .from('time_off_requests')
+    .select('start_date, end_date')
+    .eq('id', token.request_id)
+    .maybeSingle();
+  const tr = torDates as { start_date: string; end_date: string } | null;
+  const forDates = tr ? ` for ${formatDateRange(tr.start_date, tr.end_date)}` : '';
   const messageText =
     action === 'approve'
-      ? `Great news! Your time-off request has been approved. Enjoy your time off!`
-      : `Your time-off request has been denied. Please contact your manager if you have questions or would like to discuss alternatives.`;
+      ? `Great news! Your time-off request${forDates} has been approved. Enjoy your time off!`
+      : `Your time-off request${forDates} has been denied. Please contact your manager if you have questions or would like to discuss alternatives.`;
 
   const subject = token.raw_subject
     ? normalizeReSubject(token.raw_subject)

@@ -1006,11 +1006,35 @@ export async function sendDecisionNotification(
       body: text,
       company_id: tor.company_id,
     });
-    if (!sent) {
-      throw new Error(`SMS send failed for employee ${employee.id}`);
+    if (sent) {
+      channel = 'sms';
+      sent_to = employee.contact_phone!;
+    } else if (employee.contact_email) {
+      // SMS send failed (transient Telnyx error or unreachable number). The
+      // decision notice is the single highest-stakes message, so fall back to
+      // email rather than dropping it — mirrors notifyEmployeeDecision (H2).
+      // Previously this path threw, silently losing the notice (DRIFT_REGISTER H3).
+      console.warn(
+        `[time-off] decision SMS failed for employee ${employee.id}; falling back to email`
+      );
+      const subject = rawSubject
+        ? normalizeReSubject(rawSubject)
+        : `Your time-off request has been ${decision}`;
+      await sendEmail({
+        to: employee.contact_email,
+        subject,
+        text,
+        company_id: tor.company_id,
+        thread_id: threadId,
+      });
+      channel = 'email';
+      sent_to = employee.contact_email;
+    } else {
+      // SMS failed and no email on file — genuinely unreachable right now.
+      throw new Error(
+        `SMS send failed for employee ${employee.id} and no email address on file to fall back to`
+      );
     }
-    channel = 'sms';
-    sent_to = employee.contact_phone!;
   } else if (route === 'email') {
     const subject = rawSubject
       ? normalizeReSubject(rawSubject)

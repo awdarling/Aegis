@@ -1220,6 +1220,11 @@ async function notifyManager(
     aegis_sms_channel: aegisSmsNumber,
     thread_id: pending.thread_id ?? null,
     raw_subject: pending.raw_subject ?? null,
+    // Carry the manager identity so the approve/deny decision is attributed to
+    // the manager on time_off_requests.decided_by + the activity feed (not the
+    // 'aegis' default). manager was resolved above from users (role manager/owner).
+    manager_user_id: manager.id,
+    manager_name: manager.name,
     expires_at: tokenExpiry,
   };
 

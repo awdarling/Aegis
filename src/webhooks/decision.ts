@@ -73,6 +73,10 @@ interface TimeOffDecisionToken {
   aegis_sms_channel: string | null;
   thread_id?: string | null;
   raw_subject?: string | null;
+  // The manager the approve/deny link was sent to — used to attribute the
+  // decision (decided_by + activity feed) to the person, not a system default.
+  manager_user_id?: string | null;
+  manager_name?: string | null;
   expires_at: string;
 }
 
@@ -604,12 +608,14 @@ decisionWebhook.get('/', async (req, res) => {
 
   const employee = empData as Employee | null;
 
-  // Update time_off_requests status
+  // Update time_off_requests status. Attribute the decision to the manager the
+  // approve/deny link was sent to, so the record credits the person who acted.
   await supabase
     .from('time_off_requests')
     .update({
       status: action === 'approve' ? 'approved' : 'denied',
       decided_at: new Date().toISOString(),
+      decided_by: decisionToken.manager_user_id ?? null,
     })
     .eq('id', requestId);
 
@@ -646,17 +652,23 @@ decisionWebhook.get('/', async (req, res) => {
 
   // Log the decision
   const decisionPast = action === 'approve' ? 'approved' : 'denied';
+  const deciderName = decisionToken.manager_name ?? null;
   await logActivity({
     company_id: decisionToken.company_id,
+    // A manager clicked the approve/deny link — credit the manager, not the
+    // 'aegis' default (which read on the feed as the assistant deciding itself).
+    actor: 'manager',
+    actor_name: deciderName,
     action: `time_off_${decisionPast}`,
     entity_type: 'time_off_request',
     entity_id: requestId,
-    summary: `Time-off request for ${decisionToken.employee_name} ${decisionPast} via email link`,
+    summary: `Time-off request for ${decisionToken.employee_name} ${decisionPast}${deciderName ? ` by ${deciderName}` : ''} via email link`,
     metadata: {
       employee_id: decisionToken.employee_id,
       start_date: tor.start_date,
       end_date: tor.end_date,
       reason: tor.reason,
+      decided_by: decisionToken.manager_user_id ?? null,
     },
   });
 

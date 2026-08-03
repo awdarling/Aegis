@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { classifyCoverageButton, classifyCoverageBatchButton } from '../emergency-coverage';
+import { classifyCoverageButton, classifyCoverageBatchButton, remainingUncontacted } from '../emergency-coverage';
 import type { ActiveOutreach } from '../emergency-coverage';
 
 function outreach(over: Partial<ActiveOutreach> = {}): ActiveOutreach {
@@ -64,8 +64,27 @@ describe('classifyCoverageBatchButton', () => {
     expect(classifyCoverageBatchButton({ candidate_pool: pool, shown_count: 1 }, 'send')).toBe('sent');
   });
 
-  it('send with the pool already exhausted resolves to exhausted', () => {
-    expect(classifyCoverageBatchButton({ candidate_pool: pool, shown_count: 3 }, 'send')).toBe('exhausted');
-    expect(classifyCoverageBatchButton({ candidate_pool: [], shown_count: 0 }, 'send')).toBe('exhausted');
+  it('send with everyone already contacted resolves to exhausted', () => {
+    expect(classifyCoverageBatchButton({ candidate_pool: pool, outreach_results: pool.map(p => ({ employee_id: p.employee_id })) }, 'send')).toBe('exhausted');
+    expect(classifyCoverageBatchButton({ candidate_pool: [], outreach_results: [] }, 'send')).toBe('exhausted');
+  });
+
+  // Regression (batch 2b): contacting only a SUBSET by name left shown_count at
+  // the full displayed count, so the first decline falsely reported exhaustion.
+  it('send after contacting only a SUBSET still offers the rest', () => {
+    expect(classifyCoverageBatchButton({ candidate_pool: pool, outreach_results: [{ employee_id: 'a' }] }, 'send')).toBe('sent');
+  });
+});
+
+describe('remainingUncontacted (batch 2b)', () => {
+  const pool = [{ employee_id: 'a' }, { employee_id: 'b' }, { employee_id: 'c' }];
+  it('excludes contacted employees and the called-out employee', () => {
+    expect(remainingUncontacted(pool, [{ employee_id: 'a' }], 'b').map(c => c.employee_id)).toEqual(['c']);
+  });
+  it('returns the whole pool when nobody has been contacted', () => {
+    expect(remainingUncontacted(pool, [], null)).toHaveLength(3);
+  });
+  it('returns empty when everyone has been contacted', () => {
+    expect(remainingUncontacted(pool, pool.map(p => ({ employee_id: p.employee_id })), null)).toHaveLength(0);
   });
 });

@@ -158,6 +158,33 @@ function errorPage(message: string): string {
 
 // ── Time-off notification ─────────────────────────────────────────────────────
 
+// Decision notices are the single most important message in a flow, so they must
+// never be silently dropped. Send over the employee's channel, but ALWAYS fall
+// back to email if the SMS send fails or returns false (a transient Telnyx error
+// or an unreachable/invalid number must not lose a decision). Mirrors the
+// submission-confirmation path. (DRIFT_REGISTER H2 / batch 2a)
+export async function notifyEmployeeDecision(opts: {
+  company_id: string;
+  smsChannel: string | null;
+  phone: string | null;
+  email: string | null;
+  body: string;
+  subject: string;
+  thread_id?: string | null;
+}): Promise<boolean> {
+  if (!env.EMAIL_ONLY && opts.phone && opts.smsChannel) {
+    const ok = await sendSms({ to: opts.phone, from: opts.smsChannel, body: opts.body, company_id: opts.company_id });
+    if (ok) return true;
+    console.warn(`[decision-notify] SMS send failed for company ${opts.company_id}; falling back to email`);
+  }
+  if (opts.email) {
+    await sendEmail({ to: opts.email, subject: opts.subject, text: opts.body, company_id: opts.company_id, thread_id: opts.thread_id ?? undefined });
+    return true;
+  }
+  console.error(`[decision-notify] no channel available to deliver decision notice for company ${opts.company_id}`);
+  return false;
+}
+
 async function notifyEmployee(
   token: TimeOffDecisionToken,
   employee: Employee,
@@ -169,25 +196,22 @@ async function notifyEmployee(
       ? `Great news! Your time-off request has been approved. Enjoy your time off!`
       : `Your time-off request has been denied. Please contact your manager if you have questions or would like to discuss alternatives.`;
 
-  if (!env.EMAIL_ONLY && token.employee_channel === 'sms' && token.aegis_sms_channel) {
-    await sendSms({
-      to: token.employee_contact,
-      from: token.aegis_sms_channel,
-      body: messageText,
-      company_id: token.company_id,
-    });
-  } else if (token.employee_channel === 'email') {
-    const subject = token.raw_subject
-      ? normalizeReSubject(token.raw_subject)
-      : `Your time-off request has been ${verb}`;
-    await sendEmail({
-      to: token.employee_contact,
-      subject,
-      text: messageText,
-      company_id: token.company_id,
-      thread_id: token.thread_id ?? undefined,
-    });
-  }
+  const subject = token.raw_subject
+    ? normalizeReSubject(token.raw_subject)
+    : `Your time-off request has been ${verb}`;
+  // SMS only when that's the employee's channel; the email fallback uses their
+  // address on file (or the email-channel contact).
+  const phone = token.employee_channel === 'sms' ? token.employee_contact : null;
+  const email = employee.contact_email ?? (token.employee_channel === 'email' ? token.employee_contact : null);
+  await notifyEmployeeDecision({
+    company_id: token.company_id,
+    smsChannel: token.aegis_sms_channel,
+    phone,
+    email,
+    body: messageText,
+    subject,
+    thread_id: token.thread_id,
+  });
 }
 
 // ── Swap decision handler ─────────────────────────────────────────────────────
@@ -349,16 +373,8 @@ async function handleSwapDecision(
     const { requesterMsg, receiverMsg } = buildSwapDecisionMessages(token, isTrade, dateLong, targetDateLong);
     const subj = isTrade ? 'Shift trade approved' : 'Swap approved';
 
-    if (!env.EMAIL_ONLY && requester?.contact_phone && token.aegis_sms_channel) {
-      await sendSms({ to: requester.contact_phone, from: token.aegis_sms_channel, body: requesterMsg, company_id: token.company_id });
-    } else if (requester?.contact_email) {
-      await sendEmail({ to: requester.contact_email, subject: subj, text: requesterMsg, company_id: token.company_id });
-    }
-    if (!env.EMAIL_ONLY && receiver?.contact_phone && token.aegis_sms_channel) {
-      await sendSms({ to: receiver.contact_phone, from: token.aegis_sms_channel, body: receiverMsg, company_id: token.company_id });
-    } else if (receiver?.contact_email) {
-      await sendEmail({ to: receiver.contact_email, subject: subj, text: receiverMsg, company_id: token.company_id });
-    }
+    await notifyEmployeeDecision({ company_id: token.company_id, smsChannel: token.aegis_sms_channel, phone: requester?.contact_phone ?? null, email: requester?.contact_email ?? null, body: requesterMsg, subject: subj });
+    await notifyEmployeeDecision({ company_id: token.company_id, smsChannel: token.aegis_sms_channel, phone: receiver?.contact_phone ?? null, email: receiver?.contact_email ?? null, body: receiverMsg, subject: subj });
   } else {
     // Denied — no schedule change is involved, so the status write is safe to
     // do first. (D2 only reorders the APPROVE path, where a status of
@@ -374,16 +390,8 @@ async function handleSwapDecision(
     // Notify both
     const deniedMsg = `Your shift ${isTrade ? 'trade' : 'swap'} request for the ${token.shift_name} shift on ${new Date(token.shift_date + 'T12:00:00Z').toLocaleDateString('en-US', { month: 'long', day: 'numeric' })} has been denied by your manager. Please contact them if you have questions.`;
     const subj = isTrade ? 'Shift trade denied' : 'Swap denied';
-    if (!env.EMAIL_ONLY && requester?.contact_phone && token.aegis_sms_channel) {
-      await sendSms({ to: requester.contact_phone, from: token.aegis_sms_channel, body: deniedMsg, company_id: token.company_id });
-    } else if (requester?.contact_email) {
-      await sendEmail({ to: requester.contact_email, subject: subj, text: deniedMsg, company_id: token.company_id });
-    }
-    if (!env.EMAIL_ONLY && receiver?.contact_phone && token.aegis_sms_channel) {
-      await sendSms({ to: receiver.contact_phone, from: token.aegis_sms_channel, body: deniedMsg, company_id: token.company_id });
-    } else if (receiver?.contact_email) {
-      await sendEmail({ to: receiver.contact_email, subject: subj, text: deniedMsg, company_id: token.company_id });
-    }
+    await notifyEmployeeDecision({ company_id: token.company_id, smsChannel: token.aegis_sms_channel, phone: requester?.contact_phone ?? null, email: requester?.contact_email ?? null, body: deniedMsg, subject: subj });
+    await notifyEmployeeDecision({ company_id: token.company_id, smsChannel: token.aegis_sms_channel, phone: receiver?.contact_phone ?? null, email: receiver?.contact_email ?? null, body: deniedMsg, subject: subj });
   }
 
   const decisionPast = action === 'approve' ? 'approved' : 'denied';

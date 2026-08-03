@@ -3,6 +3,7 @@ import { logActivity } from '../logger/activity-log';
 import { reply } from '../messaging/reply';
 import { supabase } from '../db/client';
 import type { InboundMessage, VerifiedContact } from '../security/types';
+import { parseYesNo } from '../utils/yes-no';
 
 // Workflow handlers
 import {
@@ -95,6 +96,14 @@ const QURIA_ONLY_INTENTS = new Set([
 ]);
 
 // ── Main router ───────────────────────────────────────────────────────────────
+
+// Availability approval is inbox-only (batch 2c): only an email yes/no reply (or
+// the email buttons, handled elsewhere) applies a decision. SMS replies and
+// non-decision messages (e.g. a fresh call-out) must NOT be captured by the
+// pending availability prompt.
+export function shouldProcessAvailApprovalReply(channel: 'sms' | 'email', body: string): boolean {
+  return channel === 'email' && parseYesNo(body) !== 'unclear';
+}
 
 export async function routeIntent(
   message: InboundMessage,
@@ -302,8 +311,13 @@ async function routeIntentInner(
       return;
     }
 
+    // Availability approval is INBOX-ONLY (batch 2c): a manager decides via the
+    // email Approve/Deny buttons, or by replying yes/no to that email — never
+    // over SMS (an employment action must not ride an SMS reply), and a message
+    // that isn't a clear yes/no (e.g. a fresh call-out) must fall through to its
+    // real intent instead of being swallowed by the pending prompt.
     const pendingAvailApproval = await getPendingManagerAvailApproval(contact.company_id);
-    if (pendingAvailApproval) {
+    if (pendingAvailApproval && shouldProcessAvailApprovalReply(message.channel, message.body)) {
       await handleManagerAvailabilityApproval(message, contact, pendingAvailApproval);
       console.log('[router] EARLY RETURN', { reason: 'manager_avail_approval' });
       return;

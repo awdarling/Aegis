@@ -701,3 +701,112 @@ decisionWebhook.get('/', async (req, res) => {
   const employeeName = decisionToken.employee_name;
   res.send(confirmationPage(employeeName, action));
 });
+
+
+// ── Homebase-UI swap approval → execute + notify (B7) ─────────────────────────
+//
+// The manager email button (handleSwapDecision) was the ONLY swap approval that
+// executed the schedule change AND notified both employees; a manager approving a
+// swap in the Homebase UI just flipped swap_requests.status and stopped (the
+// confirmed gap). Homebase now POSTs { swap_request_id, decision } to
+// /internal/notify-swap-decision, which calls this: reconstruct the context from
+// the row (Homebase sends only the id), then run the SAME execute + confirm the
+// email path does, reusing buildSwapDecisionMessages so both speak identically.
+//
+// GIVEAWAY / PICKUP ONLY: swap_requests has NO target-shift columns (verified
+// against the live DB 2026-07-31), so a two-way trade's return shift cannot be
+// reconstructed from the row alone. Trades keep going through the manager email
+// button, whose decision token carries the target shift. A Homebase-UI approval
+// is a one-way pickup, so this covers the real path. (To approve trades in the
+// UI too, add target_shift_date/name/role columns to swap_requests first.)
+type SwapNotifyResult = { status: 'approved' | 'denied' | 'noop'; notified: number; reason?: string };
+
+async function loadSwapEmployee(companyId: string, employeeId: string) {
+  const { data } = await supabase.from('employees')
+    .select('id, name, contact_email, contact_phone')
+    .eq('id', employeeId).eq('company_id', companyId).single();
+  return data as { id: string; name: string; contact_email: string | null; contact_phone: string | null } | null;
+}
+
+// One employee-facing notice, routed like the email-button path: SMS when live +
+// the person has a phone + the tenant has an Aegis number, else email. Returns
+// whether a channel was used (email honesty flows through sendEmail's boolean).
+async function sendSwapNotice(
+  to: { contact_email: string | null; contact_phone: string | null },
+  body: string, subject: string, aegisSmsChannel: string | null, companyId: string,
+): Promise<boolean> {
+  if (!env.EMAIL_ONLY && to.contact_phone && aegisSmsChannel) {
+    await sendSms({ to: to.contact_phone, from: aegisSmsChannel, body, company_id: companyId });
+    return true;
+  }
+  if (to.contact_email) {
+    return sendEmail({ to: to.contact_email, subject, text: body, company_id: companyId });
+  }
+  return false;
+}
+
+export async function sendSwapDecisionNotification(
+  swapRequestId: string,
+  decision: 'approved' | 'denied',
+): Promise<SwapNotifyResult> {
+  const { data: swapRow } = await supabase.from('swap_requests').select('*').eq('id', swapRequestId).maybeSingle();
+  if (!swapRow) return { status: 'noop', notified: 0, reason: 'swap request not found' };
+  const swap = swapRow as {
+    id: string; company_id: string; status: string;
+    requesting_employee_id: string; receiving_employee_id: string | null;
+    shift_date: string; shift_name: string; role: string;
+  };
+  // Idempotent + safe: only a still-pending swap with a known coverer can execute.
+  if (swap.status !== 'pending_manager') return { status: 'noop', notified: 0, reason: `swap already ${swap.status}` };
+  if (!swap.receiving_employee_id) return { status: 'noop', notified: 0, reason: 'no coworker has taken this shift yet' };
+
+  const [requester, receiver] = await Promise.all([
+    loadSwapEmployee(swap.company_id, swap.requesting_employee_id),
+    loadSwapEmployee(swap.company_id, swap.receiving_employee_id),
+  ]);
+  if (!requester || !receiver) return { status: 'noop', notified: 0, reason: 'employee record missing' };
+
+  // Tenant Aegis outbound SMS number (null → email fallback) — same lookup the
+  // time-off decision path uses.
+  const { data: channelRow } = await supabase.from('company_channels')
+    .select('channel_value').eq('company_id', swap.company_id).eq('channel_type', 'sms').maybeSingle();
+  const aegisSmsChannel = (channelRow as { channel_value: string } | null)?.channel_value ?? null;
+
+  const dateLong = new Date(swap.shift_date + 'T12:00:00Z').toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
+  const dateShort = new Date(swap.shift_date + 'T12:00:00Z').toLocaleDateString('en-US', { month: 'long', day: 'numeric' });
+
+  if (decision === 'denied') {
+    await supabase.from('swap_requests').update({ status: 'denied', decided_at: new Date().toISOString(), decided_by: null }).eq('id', swap.id);
+    const msg = `Your shift coverage request for the ${swap.shift_name} shift on ${dateShort} has been denied by your manager. Please contact them if you have questions.`;
+    let notified = 0;
+    if (await sendSwapNotice(requester, msg, 'Coverage denied', aegisSmsChannel, swap.company_id)) notified++;
+    if (await sendSwapNotice(receiver, msg, 'Coverage denied', aegisSmsChannel, swap.company_id)) notified++;
+    return { status: 'denied', notified };
+  }
+
+  // Approve. The schedule write is authoritative (D2): apply first, and only mark
+  // approved + notify if it actually lands — otherwise leave it pending and say why.
+  const { data: schedRow } = await supabase.from('schedules').select('id, data').is('deleted_at', null)
+    .eq('company_id', swap.company_id).eq('status', 'published')
+    .lte('week_start', swap.shift_date).gte('week_end', swap.shift_date)
+    .order('generated_at', { ascending: false }).limit(1).maybeSingle();
+  if (!schedRow) return { status: 'noop', notified: 0, reason: `no published schedule covers ${swap.shift_date}` };
+
+  const applied = await executeScheduleSwap(
+    swap.company_id, (schedRow as { id: string }).id, swap.shift_date, swap.shift_name,
+    swap.requesting_employee_id, swap.receiving_employee_id, receiver.name,
+  );
+  if (!applied.ok) return { status: 'noop', notified: 0, reason: applied.reason };
+
+  await supabase.from('swap_requests').update({
+    status: 'approved', schedule_id: applied.schedule_id, decided_at: new Date().toISOString(), decided_by: null,
+  }).eq('id', swap.id);
+
+  const { requesterMsg, receiverMsg } = buildSwapDecisionMessages(
+    { shift_name: swap.shift_name, receiver_name: receiver.name, target_shift_name: null }, false, dateLong, dateLong,
+  );
+  let notified = 0;
+  if (await sendSwapNotice(requester, requesterMsg, 'Coverage approved', aegisSmsChannel, swap.company_id)) notified++;
+  if (await sendSwapNotice(receiver, receiverMsg, 'Coverage approved', aegisSmsChannel, swap.company_id)) notified++;
+  return { status: 'approved', notified };
+}

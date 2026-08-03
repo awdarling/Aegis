@@ -16,3 +16,19 @@ export function isAlreadyDistributed(row: DistributableRow, force: boolean): boo
   if (force) return false;
   return row.distributed_at != null;
 }
+
+// True when this employee IS the manager who initiated the distribution (matched
+// by the contact value(s) they messaged from). distributeScheduleCore uses it to
+// skip the redundant "your schedule posted" employee notice for the distributing
+// manager, who also gets the manager confirmation. Pure + dependency-free so it
+// can be unit-checked in isolation. (batch 2d)
+export function isInitiatingManagerContact(
+  emp: { contact_email?: string | null; contact_phone?: string | null },
+  excludeContacts: string[],
+): boolean {
+  if (!excludeContacts.length) return false;
+  return (
+    (!!emp.contact_email && excludeContacts.includes(emp.contact_email)) ||
+    (!!emp.contact_phone && excludeContacts.includes(emp.contact_phone))
+  );
+}

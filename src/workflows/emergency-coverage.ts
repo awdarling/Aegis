@@ -1577,11 +1577,11 @@ async function blastNextBatch(
   contact: VerifiedContact,
   session: CoverageSession
 ): Promise<void> {
-  const pool = session.candidate_pool ?? [];
-  const shown = session.shown_count ?? 0;
-  const next = pool
-    .slice(shown, shown + NEXT_BATCH_SIZE)
-    .filter(c => c.employee_id !== session.callout_employee_id);
+  const next = remainingUncontacted(
+    session.candidate_pool ?? [],
+    session.outreach_results,
+    session.callout_employee_id,
+  ).slice(0, NEXT_BATCH_SIZE);
 
   if (next.length === 0) {
     await clearSession(session);
@@ -1598,9 +1598,25 @@ async function blastNextBatch(
   await blastBatch({
     message,
     contact,
-    session: { ...session, shown_count: shown + next.length },
+    session,
     employees,
   });
+}
+
+// Which candidates have NOT yet been contacted — the basis for "is there another
+// batch to send?". Bug fix (batch 2b): the old check compared shown_count (how
+// many were DISPLAYED) to pool length, so contacting a SUBSET by name — which
+// leaves shown_count at the full displayed count — falsely read as "reached
+// everyone." Contact decisions must key off who was actually contacted
+// (outreach_results), never the display count; shown_count stays for "show me
+// more" pagination only.
+export function remainingUncontacted<T extends { employee_id: string }>(
+  pool: T[],
+  outreachResults: { employee_id: string }[],
+  calloutId: string | null,
+): T[] {
+  const contacted = new Set(outreachResults.map(r => r.employee_id));
+  return pool.filter(c => c.employee_id !== calloutId && !contacted.has(c.employee_id));
 }
 
 // Pure decision for the manager's "send another batch?" button (#11): given the
@@ -1611,14 +1627,17 @@ async function blastNextBatch(
 //  • send, pool exhausted  → exhausted
 export type CoverageBatchOutcome = 'sent' | 'stopped' | 'exhausted' | 'not_found';
 export function classifyCoverageBatchButton(
-  session: { candidate_pool?: { employee_id: string }[]; shown_count?: number } | null,
+  session: { candidate_pool?: { employee_id: string }[]; outreach_results?: { employee_id: string }[]; callout_employee_id?: string | null; shown_count?: number } | null,
   action: 'send' | 'stop',
 ): CoverageBatchOutcome {
   if (!session) return 'not_found';
   if (action === 'stop') return 'stopped';
-  const pool = session.candidate_pool ?? [];
-  const shown = session.shown_count ?? 0;
-  return shown >= pool.length ? 'exhausted' : 'sent';
+  const remaining = remainingUncontacted(
+    session.candidate_pool ?? [],
+    session.outreach_results ?? [],
+    session.callout_employee_id ?? null,
+  );
+  return remaining.length > 0 ? 'sent' : 'exhausted';
 }
 
 // #11 — the email-BUTTON version of the "send another batch?" prompt. Called by
@@ -1694,8 +1713,7 @@ export async function promptForNextBatchOrExhaust(params: {
 }): Promise<void> {
   const { session, managerContact, managerMessage, updatedResults } = params;
   const pool = session.candidate_pool ?? [];
-  const shown = session.shown_count ?? 0;
-  const moreAvailable = shown < pool.length;
+  const moreAvailable = remainingUncontacted(pool, updatedResults, session.callout_employee_id).length > 0;
 
   if (moreAvailable) {
     await updateSession({
@@ -1752,7 +1770,7 @@ export async function promptForNextBatchOrExhaust(params: {
       company_id: session.company_id,
       action: 'emergency_coverage_prompt_next_batch',
       summary: `Asked manager whether to contact another batch for ${session.callout_employee_name}'s shift`,
-      metadata: { shift_date: session.shift_date, shift_name: session.shift_info.shift_name, already_contacted: shown },
+      metadata: { shift_date: session.shift_date, shift_name: session.shift_info.shift_name, already_contacted: new Set(updatedResults.map(r => r.employee_id)).size },
     });
   } else {
     await clearSession(session);

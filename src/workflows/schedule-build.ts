@@ -4,7 +4,7 @@ import { reply, sendInThreadAck } from '../messaging/reply';
 import { sendEmail } from '../messaging/email';
 import { greeting } from '../messaging/greeting';
 import { BRAND, brandedEmailShell, brandDetailRow } from '../messaging/brand';
-import { isAlreadyDistributed } from '../lib/distribute-guard';
+import { isAlreadyDistributed, isInitiatingManagerContact } from '../lib/distribute-guard';
 import { computeChangedEmployeeIds } from '../lib/schedule-diff';
 import { buildTemplatedScheduleGridHtml, type EmailScheduleTemplate } from './templated-grid';
 import { sendSms } from '../messaging/sms';
@@ -2025,7 +2025,8 @@ function buildWeekEventsText(events: Event[]): string {
 export async function distributeScheduleCore(
   scheduleId: string,
   companyId: string,
-  force = false
+  force = false,
+  excludeContacts: string[] = []
 ): Promise<DistributeScheduleResult> {
   type ScheduleRow = { id: string; week_start: string; week_end: string; data: ScheduleData; status: string; distributed_at: string | null };
 
@@ -2099,6 +2100,9 @@ export async function distributeScheduleCore(
   const errors: Array<{ employee_id: string; reason: string }> = [];
 
   for (const emp of employees) {
+    // Skip the initiating manager — they get the manager confirmation, not the
+    // redundant employee "your schedule posted" notice (batch 2d).
+    if (isInitiatingManagerContact(emp, excludeContacts)) continue;
     const myShifts = schedData.assignments
       .filter(a => a.employee_id === emp.id)
       .sort((a, b) => a.date.localeCompare(b.date));
@@ -2315,7 +2319,12 @@ export async function handleDistributeSchedule(
     await sendInThreadAck({ message, contact, bodyText: ackBody });
   }
 
-  const result = await distributeScheduleCore(scheduleRow.id, contact.company_id);
+  const result = await distributeScheduleCore(
+    scheduleRow.id,
+    contact.company_id,
+    false,
+    [contact.matched_identifier, message.sender].filter((v): v is string => !!v),
+  );
 
   // Guard tripped: schedule already distributed — no messages were sent.
   if (result.already_distributed) {

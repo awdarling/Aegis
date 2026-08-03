@@ -15,7 +15,7 @@ vi.mock('../../logger/activity-log', () => ({ logActivity: vi.fn() }));
 vi.mock('../../lib/schedule-simulator', () => ({ computeWageEstimate: vi.fn() }));
 vi.mock('../payroll', () => ({ handleWageRateSync: vi.fn() }));
 
-import { formatPlainValue, buildUpdateConfirmation } from '../operational-query';
+import { formatPlainValue, buildUpdateConfirmation, normalizeFieldName } from '../operational-query';
 
 describe('formatPlainValue', () => {
   it('prints strings without quotes (the JSON.stringify bug)', () => {
@@ -43,5 +43,23 @@ describe('buildUpdateConfirmation', () => {
     expect(msg).toContain('Want me to change it to 32');
     expect(msg).not.toContain('(yes/no)');
     expect(msg).not.toContain('"32"');
+  });
+});
+
+describe('normalizeFieldName (edit field synonyms, batch 3c)', () => {
+  it('maps max-hours phrasings to max_weekly_hours', () => {
+    for (const p of ['max hours', 'Max Hours', 'weekly cap', 'hour cap', 'max weekly hours', 'max hrs']) {
+      expect(normalizeFieldName(p)).toBe('max_weekly_hours');
+    }
+  });
+  it('passes real column names through unchanged', () => {
+    expect(normalizeFieldName('max_weekly_hours')).toBe('max_weekly_hours');
+    expect(normalizeFieldName('active')).toBe('active');
+    expect(normalizeFieldName('contact_phone')).toBe('contact_phone');
+  });
+  it('maps other common synonyms', () => {
+    expect(normalizeFieldName('role')).toBe('primary_role');
+    expect(normalizeFieldName('phone')).toBe('contact_phone');
+    expect(normalizeFieldName('email address')).toBe('contact_email');
   });
 });

@@ -13,6 +13,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 const h = vi.hoisted(() => {
   const writes: { table: string; op: string; rows?: unknown }[] = [];
   let employeeRow: Record<string, unknown> | null = null;
+  let availabilityPresent = false;
 
   function makeBuilder(table: string) {
     const b: Record<string, unknown> = {
@@ -43,12 +44,14 @@ const h = vi.hoisted(() => {
   // Reads via awaited list queries (no single())
   function thenDataFor(table: string): unknown {
     if (table === 'shift_requirements') return [{ role: 'guard' }, { role: 'Lifeguard' }];
+    if (table === 'availability') return availabilityPresent ? [{ employee_id: 'x' }] : null;
     return null; // shift_types → [] → loadShiftBounds default bounds (06:00–23:00, 4h)
   }
 
   return {
     writes, makeBuilder,
     setEmployee: (e: Record<string, unknown>) => { employeeRow = e; },
+    setAvailabilityPresent: (v: boolean) => { availabilityPresent = v; },
     createMock: vi.fn(),
     sendSmsMock: vi.fn(async () => true),
     sendEmailMock: vi.fn(async () => {}),
@@ -115,6 +118,7 @@ function lastSms(): string {
 beforeEach(() => {
   h.writes.length = 0;
   h.sendSmsMock.mockClear();
+  h.setAvailabilityPresent(false);
   h.setEmployee({
     id: EMPLOYEE_ID, name: 'Sam Rivera', contact_phone: EMPLOYEE_PHONE, contact_email: null,
     company_id: COMPANY_ID, primary_role: null, active: true, aegis_access: 'employee',
@@ -137,59 +141,82 @@ beforeEach(() => {
   });
 });
 
-describe('full onboarding walk over SMS (Tier 0)', () => {
-  it('drives a new hire from opt-in through completion, saving email/role/availability', async () => {
+describe('smart onboarding walk over SMS (B6)', () => {
+  it('phone-only hire: opt-in skips name + email, collects role + availability, completes', async () => {
     const s = makeSession();
 
-    // 1. Opt-in
+    // 1. Opt-in → B6 smart routing skips the redundant name question and (phone on
+    //    file, so contact is complete) the email step, going to the first missing
+    //    field: role.
     await handleOnboardingResponse(inbound('YES'), CONTACT, s);
     expect(s.opt_in_confirmed).toBe(true);
-    expect(s.step).toBe('name_confirm');
-    expect(lastSms().toLowerCase()).toContain('full name');
-
-    // 2. Name
-    await handleOnboardingResponse(inbound('Sam Rivera'), CONTACT, s);
-    expect(s.collected.name_confirmed).toBe(true);
-    expect(s.step).toBe('email');
-    expect(lastSms().toLowerCase()).toContain('email');
-
-    // 3. Email
-    await handleOnboardingResponse(inbound('sam@example.com'), CONTACT, s);
-    expect(s.collected.email).toBe('sam@example.com');
     expect(s.step).toBe('role');
-    expect(lastSms()).toContain('guard'); // role list
+    expect(lastSms()).toContain('guard');
+    expect(lastSms().toLowerCase()).toContain('confirmed');
 
-    // 4. Role (reply "2" → sorted roles ['Lifeguard','guard'] → 'guard')
+    // 2. Role (reply "2" → sorted ['Lifeguard','guard'] → 'guard')
     await handleOnboardingResponse(inbound('2'), CONTACT, s);
     expect(s.collected.role).toBe('guard');
     expect(s.step).toBe('availability');
     expect(lastSms().toLowerCase()).toContain('availability');
 
-    // 5. Availability (free text → parsed to 3 slots)
+    // 3. Availability → parsed to 3 slots
     await handleOnboardingResponse(inbound('Mon and Tue 9-5, Thursday 1-9'), CONTACT, s);
     expect(s.collected.availability_parsed).toHaveLength(3);
     expect(s.step).toBe('availability_confirm');
     expect(lastSms()).toContain('Does that look right?');
 
-    // 6. Confirm availability (clean affirmation)
+    // 4. Confirm availability
     await handleOnboardingResponse(inbound('looks good'), CONTACT, s);
     expect(s.collected.availability_confirmed).toBe(true);
     expect(s.step).toBe('time_off');
     expect(lastSms().toLowerCase()).toContain('upcoming dates');
 
-    // 7. Time off (none) → completion
+    // 5. Time off (none) → completion
     await handleOnboardingResponse(inbound('nothing coming up'), CONTACT, s);
     expect(s.step).toBe('complete');
     expect(lastSms().toLowerCase()).toContain('all set');
 
-    // Completion writes: employee email + role, availability rows, session cleared.
+    // Name + email were NEVER asked (phone on file); role + availability written.
+    const bodies = h.sendSmsMock.mock.calls.map(c => (c[0] as { body: string }).body.toLowerCase());
+    expect(bodies.some(b => b.includes('full name'))).toBe(false);
+    expect(bodies.some(b => b.includes('email address'))).toBe(false);
     const empUpdate = h.writes.find(
       w => w.table === 'employees' && w.op === 'update' &&
-        (w.rows as Record<string, unknown>).contact_email === 'sam@example.com' &&
         (w.rows as Record<string, unknown>).primary_role === 'guard'
     );
     expect(empUpdate).toBeTruthy();
     expect(h.writes.some(w => w.table === 'availability' && w.op === 'insert')).toBe(true);
     expect(h.writes.some(w => w.table === 'aegis_memory' && w.op === 'delete')).toBe(true);
+  });
+
+  it('fully-complete employee: consent + warm close, with NO field prompts', async () => {
+    h.setEmployee({
+      id: EMPLOYEE_ID, name: 'Sam Rivera', contact_phone: EMPLOYEE_PHONE, contact_email: 'sam@example.com',
+      company_id: COMPANY_ID, primary_role: 'guard', active: true, aegis_access: 'employee',
+      qualified_roles: ['guard'],
+    });
+    h.setAvailabilityPresent(true);
+    const s = makeSession();
+
+    // Consent → nothing to collect → warm intro + the always-asked time-off question.
+    await handleOnboardingResponse(inbound('YES'), CONTACT, s);
+    expect(s.opt_in_confirmed).toBe(true);
+    expect(s.step).toBe('time_off');
+    const afterConsent = lastSms().toLowerCase();
+    expect(afterConsent).toContain('already have everything');
+    expect(afterConsent).toContain('upcoming');
+
+    // Time-off "no" → warm complete-record close.
+    await handleOnboardingResponse(inbound('no'), CONTACT, s);
+    expect(s.step).toBe('complete');
+    expect(lastSms().toLowerCase()).toContain('already have everything');
+
+    // No name / email / role / availability prompt was ever sent.
+    const bodies = h.sendSmsMock.mock.calls.map(c => (c[0] as { body: string }).body.toLowerCase());
+    expect(bodies.some(b => b.includes('full name'))).toBe(false);
+    expect(bodies.some(b => b.includes('email address'))).toBe(false);
+    expect(bodies.some(b => b.includes('your role'))).toBe(false);
+    expect(bodies.some(b => b.includes('availability'))).toBe(false);
   });
 });

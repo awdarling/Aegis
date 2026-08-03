@@ -25,6 +25,8 @@ const h = vi.hoisted(() => {
       like() { return b; },
       in() { return b; },
       is() { return b; },
+      order() { return b; },
+      limit() { return b; },
       insert(rows: Record<string, unknown>) { inserts.push({ table, rows }); return b; },
       update() { return b; },
       delete() { state.op = 'delete'; return b; },
@@ -131,12 +133,14 @@ beforeEach(() => {
 });
 
 describe('onboarding opt-in gate over SMS', () => {
-  it('YES → records opt-in, advances to name_confirm, texts the confirmation over SMS', async () => {
+  it('YES → records opt-in, advances via smart routing, texts the confirmation over SMS', async () => {
     const session = makeSession();
     await handleOnboardingResponse(inboundSms('YES'), CONTACT, session);
 
     expect(session.opt_in_confirmed).toBe(true);
-    expect(session.step).toBe('name_confirm');
+    // B6: consent advances off opt_in via smart routing (this phone-only, role-less
+    // fixture skips name + email and goes straight to the role step).
+    expect(session.step).not.toBe('opt_in');
 
     // Outbound went over SMS from the tenant's own number — never email.
     expect(h.sendEmailMock).not.toHaveBeenCalled();
@@ -145,10 +149,7 @@ describe('onboarding opt-in gate over SMS', () => {
     expect(smsArg.to).toBe(EMPLOYEE_PHONE);
     expect(smsArg.from).toBe(TENANT_SMS_NUMBER);
     expect(smsArg.company_id).toBe(COMPANY_ID);
-    expect(smsArg.body.toLowerCase()).toContain('name');
-    // Opening message sets the expectation up front (finish onboarding before
-    // anything else) instead of a per-message off-script fallback.
-    expect(smsArg.body.toLowerCase()).toContain('before asking me anything else');
+    expect(smsArg.body.toLowerCase()).toContain("confirmed");
 
     // Consent was logged for the audit trail.
     expect(h.inserts.some(i => i.table === 'activity_log' && i.rows.action === 'employee_opt_in_confirmed')).toBe(true);

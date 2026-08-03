@@ -86,6 +86,10 @@ export interface OnboardingSession {
   // Message-ID here and skip an exact-id repeat. Optional/back-compat: absent on
   // sessions created before this field existed.
   last_processed_message_id?: string | null;
+  // B6 smart onboarding: which fields were missing at consent, so mid-flow
+  // transitions can skip a step whose data is already on file. Absent on
+  // pre-B6 sessions (they fall back to the full walk).
+  smart_needs?: { needsEmail: boolean; needsRole: boolean; needsAvailability: boolean };
 }
 
 interface ShiftBounds {
@@ -532,31 +536,44 @@ async function loadCompanyName(companyId: string): Promise<string> {
   return (data as { name: string } | null)?.name ?? 'your company';
 }
 
-async function getIncompleteEmployees(companyId: string): Promise<Employee[]> {
-  const { data: empData } = await supabase
+// B6 smart onboarding — per-employee "what's still missing?" resolver.
+// Completeness = a reachable contact (phone OR email) + a role (primary_role or
+// qualified_roles) + availability on file. Corrects the old getIncompleteEmployees
+// quirks: it required BOTH phone AND email (so an email-only or phone-only hire
+// always read "incomplete"), and checked primary_role which is NOT NULL (dead).
+export function resolveOnboardingNeeds(
+  employee: { contact_phone?: string | null; contact_email?: string | null; primary_role?: string | null; qualified_roles?: string[] | null },
+  hasAvailability: boolean,
+): { needsEmail: boolean; needsRole: boolean; needsAvailability: boolean } {
+  const hasContact = !!(employee.contact_phone || employee.contact_email);
+  const hasRole = !!employee.primary_role || (Array.isArray(employee.qualified_roles) && employee.qualified_roles.length > 0);
+  return {
+    needsEmail: !hasContact,
+    needsRole: !hasRole,
+    needsAvailability: !hasAvailability,
+  };
+}
+
+async function hasAvailabilityOnFile(companyId: string, employeeId: string): Promise<boolean> {
+  const { data } = await supabase
+    .from('availability')
+    .select('employee_id')
+    .eq('company_id', companyId)
+    .eq('employee_id', employeeId)
+    .limit(1);
+  return ((data ?? []) as unknown[]).length > 0;
+}
+
+// All active employees — the candidate pool for "onboard my team". B6: consent +
+// intro go to EVERYONE (complete or not); the per-employee smart flow decides
+// which questions, if any, get asked.
+async function getActiveEmployees(companyId: string): Promise<Employee[]> {
+  const { data } = await supabase
     .from('employees')
     .select('*')
     .eq('company_id', companyId)
     .eq('active', true);
-
-  const employees = (empData ?? []) as Employee[];
-
-  const { data: availData } = await supabase
-    .from('availability')
-    .select('employee_id')
-    .eq('company_id', companyId);
-
-  const withAvail = new Set(
-    ((availData ?? []) as { employee_id: string }[]).map(r => r.employee_id)
-  );
-
-  return employees.filter(
-    e =>
-      !e.contact_phone ||
-      !e.contact_email ||
-      !e.primary_role ||
-      !withAvail.has(e.id)
-  );
+  return (data ?? []) as Employee[];
 }
 
 // ── Formatting ────────────────────────────────────────────────────────────────
@@ -1334,6 +1351,7 @@ async function sendTimeOffStep(session: OnboardingSession): Promise<void> {
 async function handleOptInStep(
   body: string,
   session: OnboardingSession & { _memory_id: string },
+  employee: Employee,
   companyName: string
 ): Promise<void> {
   const trimmed = body.trim().toLowerCase();
@@ -1342,8 +1360,6 @@ async function handleOptInStep(
 
   if (isYes) {
     session.opt_in_confirmed = true;
-    session.step = 'name_confirm';
-    await saveOnboardingSession(session);
     await logActivity({
       company_id: session.company_id,
       action: 'employee_opt_in_confirmed',
@@ -1356,18 +1372,10 @@ async function handleOptInStep(
         company_name: companyName,
       },
     });
-    // Combined YES-confirmation + name_confirm prompt. Subsequent inbound
-    // messages will land on handleNameConfirmStep. The opening message also sets
-    // the expectation up front — finish onboarding before anything else — so we
-    // never need a per-message "please finish onboarding" fallback (onboarding is
-    // a hard gate: the router short-circuits all other workflows until it's done).
-    await textEmployeeRaw(
-      session,
-      `Great, you're confirmed! I'll get you set up with a few quick questions — ` +
-        `please finish these before asking me anything else. Once you're all set, ` +
-        `you can message me anytime for your schedule, time off, or swaps.\n\n` +
-        `First: what's your full name?`
-    );
+    // B6 smart onboarding: skip the redundant name question and any step whose
+    // data is already on file — ask only what's genuinely missing (plus upcoming
+    // time off), or close warmly when the record is already complete.
+    await proceedAfterConsent(session, employee);
     return;
   }
 
@@ -1396,6 +1404,62 @@ async function handleOptInStep(
   await textEmployeeRaw(
     session,
     `Please reply YES to receive scheduling notifications or NO to opt out. You won't receive further messages until you reply.`
+  );
+}
+
+// B6: after consent, route to only the missing fields (or a warm "all set"
+// close). Always skips the name question; skips email/role/availability whose
+// data is already on file. Records the resolved needs on the session so the
+// mid-flow transitions can also skip availability when it's already known.
+async function proceedAfterConsent(
+  session: OnboardingSession & { _memory_id: string },
+  employee: Employee,
+): Promise<void> {
+  const hasAvail = await hasAvailabilityOnFile(session.company_id, employee.id);
+  const needs = resolveOnboardingNeeds(employee, hasAvail);
+  session.smart_needs = needs;
+  session.collected.name_confirmed = true;
+
+  if (needs.needsEmail) {
+    session.step = 'email';
+    await saveOnboardingSession(session);
+    await textEmployee(
+      session,
+      `Great, you're confirmed! You're mostly set up already — I just need an email address so I can send you your schedule each week. What's the best one?`
+    );
+    return;
+  }
+  if (needs.needsRole) {
+    session.step = 'role';
+    const roles = await loadRoles(session.company_id);
+    await saveOnboardingSession(session);
+    const list = roles.map((r, i) => `${i + 1}. ${r}`).join('\n');
+    await textEmployee(
+      session,
+      `Great, you're confirmed! You're mostly set up already — I just need your role:\n${list}\nReply with a number.`
+    );
+    return;
+  }
+  if (needs.needsAvailability) {
+    session.step = 'availability';
+    const bounds = await loadShiftBounds(session.company_id);
+    await saveOnboardingSession(session);
+    await textEmployee(
+      session,
+      `Great, you're confirmed! You're mostly set up already — the last thing I need is your availability. ` +
+        `Tell me which days you can work and what hours (we schedule between ${formatTime12h(bounds.earliest_start)} and ${formatTime12h(bounds.latest_end)}). ` +
+        `You can speak naturally — for example: "Monday through Friday after 3pm and all day weekends."`
+    );
+    return;
+  }
+  // Nothing left to collect — warm intro-and-close, but still ask the
+  // forward-looking upcoming-time-off question (never captured otherwise).
+  session.step = 'time_off';
+  await saveOnboardingSession(session);
+  await textEmployee(
+    session,
+    `Great, you're confirmed, and it looks like I already have everything I need on file — welcome aboard! ` +
+      `One quick thing: any upcoming dates you know you won't be available (a vacation, appointments)? Reply NO if nothing comes to mind.`
   );
 }
 
@@ -1429,10 +1493,7 @@ async function handleNameConfirmStep(
     await saveOnboardingSession(session);
     await sendRoleStep(session, roles);
   } else {
-    session.step = 'availability';
-    const bounds = await loadShiftBounds(session.company_id);
-    await saveOnboardingSession(session);
-    await sendAvailabilityStep(session, bounds);
+    await goToAvailabilityOrTimeOff(session);
   }
 }
 
@@ -1456,10 +1517,7 @@ async function handleEmailStep(
       await saveOnboardingSession(session);
       await sendRoleStep(session, roles);
     } else {
-      session.step = 'availability';
-      const bounds = await loadShiftBounds(session.company_id);
-      await saveOnboardingSession(session);
-      await sendAvailabilityStep(session, bounds);
+      await goToAvailabilityOrTimeOff(session);
     }
     return;
   }
@@ -1510,10 +1568,7 @@ async function handleEmailStep(
     await saveOnboardingSession(session);
     await sendRoleStep(session, roles);
   } else {
-    session.step = 'availability';
-    const bounds = await loadShiftBounds(session.company_id);
-    await saveOnboardingSession(session);
-    await sendAvailabilityStep(session, bounds);
+    await goToAvailabilityOrTimeOff(session);
   }
 }
 
@@ -1530,10 +1585,26 @@ async function handleRoleStep(
   }
 
   session.collected.role = roles[num - 1];
-  session.step = 'availability';
-  const bounds = await loadShiftBounds(session.company_id);
-  await saveOnboardingSession(session);
-  await sendAvailabilityStep(session, bounds);
+  await goToAvailabilityOrTimeOff(session);
+}
+
+// B6: after email/role, go to availability only if it's still missing; otherwise
+// skip straight to the always-asked time-off step. Defaults to asking (pre-B6
+// sessions without smart_needs keep the full walk).
+async function goToAvailabilityOrTimeOff(
+  session: OnboardingSession & { _memory_id: string },
+): Promise<void> {
+  const needsAvail = session.smart_needs ? session.smart_needs.needsAvailability : true;
+  if (needsAvail) {
+    session.step = 'availability';
+    const bounds = await loadShiftBounds(session.company_id);
+    await saveOnboardingSession(session);
+    await sendAvailabilityStep(session, bounds);
+  } else {
+    session.step = 'time_off';
+    await saveOnboardingSession(session);
+    await sendTimeOffStep(session);
+  }
 }
 
 async function handleAvailabilityStep(
@@ -1819,10 +1890,15 @@ async function completeOnboarding(
 ): Promise<void> {
   const firstName = session.employee_name.split(' ')[0];
 
+  const completeRecord = session.smart_needs
+    ? !session.smart_needs.needsEmail && !session.smart_needs.needsRole && !session.smart_needs.needsAvailability
+    : false;
   await textEmployee(
     session,
-    `You're all set ${firstName}. I've saved your availability and contact info. ` +
-      `I'll send you your schedule each week. Welcome to the team!`
+    completeRecord
+      ? `Thanks ${firstName}! Looks like I already have everything I need on file. ` +
+          `I'll send you your schedule each week — reach out any time if you need me or have any questions. Welcome aboard!`
+      : `You're all set ${firstName}! I'll send you your schedule each week. Welcome to the team!`
   );
 
   // Write to employees table
@@ -1942,7 +2018,7 @@ export async function handleOnboardingResponse(
   switch (session.step) {
     case 'opt_in': {
       const companyName = await loadCompanyName(session.company_id);
-      await handleOptInStep(message.body, session, companyName);
+      await handleOptInStep(message.body, session, employee, companyName);
       break;
     }
     case 'name_confirm': {
@@ -2003,28 +2079,18 @@ export async function handleInitiateOnboarding(
   let candidates: Employee[];
 
   if (targetName) {
-    const incomplete = await getIncompleteEmployees(contact.company_id);
+    const all = await getActiveEmployees(contact.company_id);
     const lower = targetName.toLowerCase();
-    candidates = incomplete.filter(e => e.name.toLowerCase().includes(lower));
+    candidates = all.filter(e => e.name.toLowerCase().includes(lower));
 
     if (candidates.length === 0) {
-      const { data: allData } = await supabase
-        .from('employees')
-        .select('*')
-        .eq('company_id', contact.company_id)
-        .eq('active', true);
-      const all = (allData ?? []) as Employee[];
-      const found = all.find(e => e.name.toLowerCase().includes(lower));
-
-      if (found) {
-        await reply(contact, message, `${found.name} already has all required information on file.`);
-      } else {
-        await reply(contact, message, `I couldn't find an employee matching "${targetName}". Please check the name and try again.`);
-      }
+      await reply(contact, message, `I couldn't find an employee matching "${targetName}". Please check the name and try again.`);
       return;
     }
 
-    // Named target — proceed immediately, even if substring matches multiple.
+    // Named target — proceed immediately (B6: onboard even a fully-complete
+    // record; consent + intro still go out, and the smart flow skips any
+    // questions whose answers are already on file).
     await executeOnboardingForCandidates(
       candidates,
       companyName,
@@ -2036,10 +2102,11 @@ export async function handleInitiateOnboarding(
     return;
   }
 
-  // No name specified — onboard all incomplete employees.
-  candidates = await getIncompleteEmployees(contact.company_id);
+  // No name specified — onboard the whole active team (B6: consent + intro go to
+  // everyone; the per-employee smart flow asks only for what's missing).
+  candidates = await getActiveEmployees(contact.company_id);
   if (candidates.length === 0) {
-    await reply(contact, message, `All active employees already have their information on file. No onboarding needed.`);
+    await reply(contact, message, `There are no active employees to onboard.`);
     return;
   }
 

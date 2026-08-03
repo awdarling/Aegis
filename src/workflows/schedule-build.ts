@@ -2124,7 +2124,7 @@ export async function distributeScheduleCore(
         // so context (e.g. "PM Lifeguard") is preserved without a noisy column.
         const intro = hasShifts
           ? `You're on for ${shiftCount} shift${shiftCount === 1 ? '' : 's'} this week — ${totalHours}h in total. Here's how your week looks:`
-          : `You're not on the schedule this week, so enjoy the time off. If you were expecting shifts, just reply to this email or check with your manager and we'll get it sorted.`;
+          : `You're not on the schedule this week, so enjoy the time off. If you were expecting shifts, check with your manager and they'll get it sorted.`;
 
         // The employee's OWN shifts as accent detail rows (person-first list),
         // e.g. "Monday, Jun 16 — PM Lifeguard · 1:00 – 9:00 PM". Employee summary
@@ -2148,7 +2148,7 @@ ${weekEventsHtml}
 <h3 style="margin:26px 0 10px;font-size:16px;color:${BRAND.textPrimary};">Here's the whole team's week:</h3>
 ${teamGridHtml}
 <p style="margin:8px 0 0;line-height:1.5;color:${BRAND.textMuted};font-size:12px;">Positions are in grey next to each name. <span style="color:${BRAND.badText};font-weight:bold;">UNFILLED</span> marks an open slot.</p>
-<p style="margin:20px 0 4px;line-height:1.5;color:${BRAND.textSecondary};">If anything here doesn't look right, just reply to this email or reach out to your manager — we'll get it fixed.</p>
+<p style="margin:20px 0 4px;line-height:1.5;color:${BRAND.textSecondary};">If anything here doesn't look right, reach out to your manager and they'll get it fixed.</p>
 <p style="margin:18px 0 0;color:${BRAND.textSecondary};">See you this week,<br>${companyName}</p>`;
 
         const html = brandedEmailShell({
@@ -2161,7 +2161,7 @@ ${teamGridHtml}
         const text = hasShifts
           ? `${greetingLine}\n\n${intro}\n\n` +
             myShifts.map(s => `• ${formatDisplayDate(s.date)} — ${s.role} (${s.shift_name}), ${formatTime(s.start_time)}–${formatTime(s.end_time)}, ${s.hours}h`).join('\n') +
-            `\n\nThat's ${totalHours}h across the week.${eventsBlock}\n\nIf anything here doesn't look right, just reply to this email or reach out to your manager — we'll get it fixed.\n\nSee you this week,\n${companyName}`
+            `\n\nThat's ${totalHours}h across the week.${eventsBlock}\n\nIf anything here doesn't look right, reach out to your manager and they'll get it fixed.\n\nSee you this week,\n${companyName}`
           : `${greetingLine}\n\n${intro}${eventsBlock}\n\nSee you soon,\n${companyName}`;
 
         await sendEmail({
@@ -2181,10 +2181,10 @@ ${teamGridHtml}
     if (!env.EMAIL_ONLY && emp.contact_phone && aegisSmsChannel) {
       try {
         const smsBody = emp.contact_email
-          ? `${companyName}: Your schedule for ${weekLabel} has been posted. Check your email for details.`
+          ? `Your schedule for ${weekLabel} is posted — check your email for the details.`
           : hasShifts
-            ? `${companyName} schedule ${weekLabel}: ${myShifts.slice(0, 3).map(s => `${new Date(s.date + 'T12:00:00Z').toLocaleDateString('en-US', { weekday: 'short' })} ${s.shift_name}`).join(', ')}${myShifts.length > 3 ? ` +${myShifts.length - 3} more` : ''}`
-            : `${companyName}: No shifts scheduled for ${weekLabel}.`;
+            ? `Your shifts for ${weekLabel}: ${myShifts.slice(0, 3).map(s => `${new Date(s.date + 'T12:00:00Z').toLocaleDateString('en-US', { weekday: 'short' })} ${s.shift_name}`).join(', ')}${myShifts.length > 3 ? ` +${myShifts.length - 3} more` : ''}`
+            : `You're not on the schedule for ${weekLabel} — enjoy the week off.`;
 
         const ok = await sendSms({ to: emp.contact_phone, from: aegisSmsChannel, body: smsBody, company_id: companyId });
         if (ok) {
@@ -2457,7 +2457,7 @@ export async function notifyScheduleChangesCore(
         const shiftCount = myNew.length;
         const intro = hasShifts
           ? `Your schedule for ${weekLabel} was just updated. Here are your current shifts — ${shiftCount} shift${shiftCount === 1 ? '' : 's'}, ${totalHours}h in total:`
-          : `Your schedule for ${weekLabel} was just updated, and you're no longer on the schedule this week. If that doesn't look right, just reply to this email or check with your manager.`;
+          : `Your schedule for ${weekLabel} was just updated, and you're no longer on the schedule this week. If that doesn't look right, check with your manager.`;
 
         // Updated-schedule (republish) email — same accent detail-row treatment
         // as the normal distribution, driven by the employee's new shifts.
@@ -2479,7 +2479,7 @@ ${weekEventsHtml}
 <h3 style="margin:26px 0 10px;font-size:16px;color:${BRAND.textPrimary};">Here's the whole team's updated week:</h3>
 ${teamGridHtml}
 <p style="margin:8px 0 0;line-height:1.5;color:${BRAND.textMuted};font-size:12px;">Positions are in grey next to each name. <span style="color:${BRAND.badText};font-weight:bold;">UNFILLED</span> marks an open slot.</p>
-<p style="margin:20px 0 4px;line-height:1.5;color:${BRAND.textSecondary};">If anything here doesn't look right, just reply to this email or reach out to your manager — we'll get it fixed.</p>
+<p style="margin:20px 0 4px;line-height:1.5;color:${BRAND.textSecondary};">If anything here doesn't look right, reach out to your manager and they'll get it fixed.</p>
 <p style="margin:18px 0 0;color:${BRAND.textSecondary};">Thanks for rolling with the change,<br>${companyName}</p>`;
 
         const html = brandedEmailShell({
@@ -2492,7 +2492,7 @@ ${teamGridHtml}
         const text = hasShifts
           ? `${greetingLine}\n\n${intro}\n\n` +
             myNew.map(s => `• ${formatDisplayDate(s.date)} — ${s.role} (${s.shift_name}), ${formatTime(s.start_time)}–${formatTime(s.end_time)}, ${s.hours}h`).join('\n') +
-            `\n\nThat's ${totalHours}h across the week.${eventsBlock}\n\nIf anything here doesn't look right, just reply to this email or reach out to your manager — we'll get it fixed.\n\nThanks for rolling with the change,\n${companyName}`
+            `\n\nThat's ${totalHours}h across the week.${eventsBlock}\n\nIf anything here doesn't look right, reach out to your manager and they'll get it fixed.\n\nThanks for rolling with the change,\n${companyName}`
           : `${greetingLine}\n\n${intro}${eventsBlock}\n\nThanks,\n${companyName}`;
 
         await sendEmail({
@@ -2512,10 +2512,10 @@ ${teamGridHtml}
     if (!env.EMAIL_ONLY && emp.contact_phone && aegisSmsChannel) {
       try {
         const smsBody = emp.contact_email
-          ? `${companyName}: Your schedule for ${weekLabel} changed. Check your email for your updated shifts.`
+          ? `Your schedule for ${weekLabel} changed — check your email for the update.`
           : hasShifts
-            ? `${companyName} updated schedule ${weekLabel}: ${myNew.slice(0, 3).map(s => `${new Date(s.date + 'T12:00:00Z').toLocaleDateString('en-US', { weekday: 'short' })} ${s.shift_name}`).join(', ')}${myNew.length > 3 ? ` +${myNew.length - 3} more` : ''}`
-            : `${companyName}: Your shifts for ${weekLabel} changed — you're no longer scheduled this week.`;
+            ? `Your updated shifts for ${weekLabel}: ${myNew.slice(0, 3).map(s => `${new Date(s.date + 'T12:00:00Z').toLocaleDateString('en-US', { weekday: 'short' })} ${s.shift_name}`).join(', ')}${myNew.length > 3 ? ` +${myNew.length - 3} more` : ''}`
+            : `Your schedule for ${weekLabel} changed — you're not on the schedule this week.`;
         const ok = await sendSms({ to: emp.contact_phone, from: aegisSmsChannel, body: smsBody, company_id: companyId });
         if (ok) {
           texted++;

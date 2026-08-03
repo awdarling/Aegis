@@ -154,6 +154,37 @@ const CREATABLE_COLUMNS: Record<string, Set<string>> = {
   events: new Set([...EDITABLE_COLUMNS.events]),
 };
 
+// Manager phrasings → real column names. The edit parser occasionally echoes the
+// manager's words ("max hours", "weekly cap") instead of the column
+// ("max_weekly_hours"), which then trips the allow-list even though the column
+// itself is editable. Normalize known synonyms here; unknown fields pass through
+// unchanged (the allow-list still guards them). (batch 3c)
+const FIELD_SYNONYMS: Record<string, string> = {
+  'max hours': 'max_weekly_hours',
+  'max weekly hours': 'max_weekly_hours',
+  'weekly hours': 'max_weekly_hours',
+  'weekly cap': 'max_weekly_hours',
+  'hour cap': 'max_weekly_hours',
+  'hours cap': 'max_weekly_hours',
+  'weekly hour cap': 'max_weekly_hours',
+  'max hrs': 'max_weekly_hours',
+  'wage': 'individual_wage',
+  'pay': 'individual_wage',
+  'pay rate': 'individual_wage',
+  'hourly rate': 'hourly_rate',
+  'hourly wage': 'hourly_rate',
+  'role': 'primary_role',
+  'position': 'primary_role',
+  'phone': 'contact_phone',
+  'phone number': 'contact_phone',
+  'email': 'contact_email',
+  'email address': 'contact_email',
+};
+export function normalizeFieldName(field: string): string {
+  const key = field.trim().toLowerCase().replace(/_/g, ' ').replace(/\s+/g, ' ');
+  return FIELD_SYNONYMS[key] ?? field.trim();
+}
+
 function assertEditableColumn(table: string, field: string): void {
   const allowed = EDITABLE_COLUMNS[table];
   if (!allowed) throw new Error(`I can't edit ${table} records by message.`);
@@ -679,6 +710,10 @@ export async function handleHomebaseEdit(
     return;
   }
   const parsed: ParsedEdit = parsedEdit;
+
+  // Normalize a manager's field phrasing to the real column before anything
+  // downstream (record lookup, allow-list check, confirm copy) uses it. (3c)
+  if (parsed.field) parsed.field = normalizeFieldName(parsed.field);
 
   // Availability changes are multi-row + natural-language, so they get their own
   // handler (reuses the availability engine) rather than the generic field editor.

@@ -1679,6 +1679,25 @@ async function handleAvailabilityConfirmStep(
   await sendTimeOffStep(session);
 }
 
+// Deterministic "no upcoming time off" detector for onboarding. A clear, unambiguous
+// negative completes onboarding without re-gating (cheaper + more reliable than the
+// LLM). Anything not in this tight set falls through to the LLM classifier and then a
+// warm re-confirm — a missed upcoming time-off = weeks of bad schedules, so we never
+// SILENTLY complete on ambiguity. Intentionally exact-match: it must never fire on a
+// message that names a date.
+export function isClearNoTimeOff(body: string): boolean {
+  const t = body.trim().toLowerCase().replace(/[.!,?]+/g, ' ').replace(/\s+/g, ' ').trim();
+  const negatives = new Set([
+    'no', 'nope', 'nah', 'none', 'nothing', 'negative', 'nada',
+    'no thanks', 'no dates', 'no time off', 'no time', 'not really',
+    "i'm good", 'im good', 'all good', "we're good", 'were good',
+    'not right now', 'not at the moment', 'none right now', 'none at the moment',
+    "don't have any", 'dont have any', 'no i dont', "no i don't",
+    'no not right now', 'no all good', "no i'm good", 'no im good',
+  ]);
+  return negatives.has(t);
+}
+
 async function handleTimeOffStep(
   body: string,
   session: OnboardingSession & { _memory_id: string },
@@ -1691,12 +1710,14 @@ async function handleTimeOffStep(
     // Don't silently complete on an empty parse — confirm the employee really
     // means "no time off" before closing out the workflow. Claude classifies
     // whether the message is a clear no vs. ambiguous mention.
-    const clearlyNoTimeOff = await claudeClassifyYesNo(
-      body,
-      `The employee was asked if they have any upcoming time off. Did they clearly say they have no upcoming time off?`
-    );
+    const clearlyNoTimeOff =
+      isClearNoTimeOff(body) ||
+      (await claudeClassifyYesNo(
+        body,
+        `The employee was asked if they have any upcoming time off. Did they clearly say they have no upcoming time off?`
+      )) === 'yes';
 
-    if (clearlyNoTimeOff === 'yes') {
+    if (clearlyNoTimeOff) {
       session.step = 'complete';
       await saveOnboardingSession(session);
       await completeOnboarding(session, managerContact, managerMsg);
@@ -1706,8 +1727,8 @@ async function handleTimeOffStep(
     // Ambiguous — stay in the time_off step and ask for clarification.
     await textEmployee(
       session,
-      `Just to confirm — you don't have any upcoming dates you need off? ` +
-        `Reply YES if that's correct, or tell me the specific dates.`
+      `Just want to make sure I've got it right — no upcoming dates you need off? ` +
+        `If that's right, a quick "yep" and you're all set, or send me the dates.`
     );
     return;
   }
@@ -1801,7 +1822,7 @@ async function completeOnboarding(
   await textEmployee(
     session,
     `You're all set ${firstName}. I've saved your availability and contact info. ` +
-      `You'll receive your schedule from Aegis each week. Welcome to the team.`
+      `I'll send you your schedule each week. Welcome to the team!`
   );
 
   // Write to employees table

@@ -2925,7 +2925,7 @@ export async function handleRespondSwap(
     return;
   }
   await reply(contact, message,
-    "I don't have an active swap request pending for you. If you received a swap request from Aegis, please check your recent messages."
+    "I don't have an active swap request pending for you. If you got a swap request from me, please check your recent messages."
   );
 }
 

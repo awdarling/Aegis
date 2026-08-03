@@ -390,6 +390,19 @@ function computeShiftHours(startTime: string, endTime: string): number {
   return Math.round((mins / 60) * 10) / 10;
 }
 
+export const COVERAGE_TIER_LABELS: Record<number, string> = { 1: 'Best options', 2: 'Would hit overtime', 3: 'Already working today' };
+
+export function formatCoverageCandidateLine(
+  rank: number,
+  name: string,
+  phone: string | null,
+  weeklyHours: number,
+  overtimeNote: string
+): string {
+  const phonePart = phone ? `${formatPhone(phone)} \u2022 ` : '';
+  return `${rank}. ${name} \u2022 ${phonePart}${weeklyHours.toFixed(1)}h so far this week${overtimeNote}`;
+}
+
 function formatPhone(phone: string | null): string {
   if (!phone) return 'no phone on file';
   const d = phone.replace(/\D/g, '');
@@ -943,8 +956,8 @@ function buildCandidateMessage(
   const dateStr = formatDisplayDate(shiftDate);
   const roleLabel = shiftAcceptedRoles(shiftInfo).join(' or ');
   const header =
-    `Coverage needed: ${shiftInfo.shift_name} (${roleLabel}) on ${dateStr}\n` +
-    `Shift: ${shiftInfo.start_time}–${shiftInfo.end_time}\nAbsent: ${calledOutName}` +
+    `${calledOutName} is out for the ${shiftInfo.shift_name} on ${dateStr} ` +
+    `(${shiftInfo.start_time}–${shiftInfo.end_time}, ${roleLabel}).` +
     doublesWarning;
 
   if (display.length === 0) {
@@ -994,21 +1007,21 @@ ${brandActionCard('Coverage · No candidates found', noOneCardInner)}`;
   }
 
   // Build text sections by tier
-  const sections: string[] = [header, ''];
+  const sections: string[] = [header, '', "Here's who can cover:"];
   let currentTier = 0;
   let rank = 1;
 
   for (const c of display) {
     if (c.tier !== currentTier) {
       currentTier = c.tier;
-      const labels: Record<number, string> = { 1: 'PREFERRED', 2: 'OVERTIME RISK', 3: 'ALREADY WORKING' };
+      const labels = COVERAGE_TIER_LABELS;
       sections.push(labels[currentTier] ?? '');
     }
     const overtimeNote = c.would_exceed_max
       ? ` ⚠ would be ${(c.current_weekly_hours + c.shift_hours).toFixed(1)}h (max ${c.employee.max_weekly_hours}h)`
       : '';
     sections.push(
-      `${rank}. ${c.employee.name} (${c.employee.primary_role}) • ${formatPhone(c.employee.contact_phone)} • ${c.current_weekly_hours.toFixed(1)}h this wk${overtimeNote}`
+      formatCoverageCandidateLine(rank, c.employee.name, c.employee.contact_phone, c.current_weekly_hours, overtimeNote)
     );
     rank++;
   }
@@ -1019,7 +1032,7 @@ ${brandActionCard('Coverage · No candidates found', noOneCardInner)}`;
   }
 
   sections.push('');
-  sections.push("Reply ALL and I'll reach out to everyone on this list, a name (or names) to contact just them, or tell me you'll handle it yourself.");
+  sections.push("Reply ALL and I'll reach out to everyone here, send me a name or two to contact just them, or tell me you've got it handled.");
 
   const text = sections.join('\n');
 

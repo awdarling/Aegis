@@ -1,6 +1,7 @@
 import { supabase } from '../db/client';
 import { logActivity } from '../logger/activity-log';
 import { reply } from '../messaging/reply';
+import { parseYesNo } from '../utils/yes-no';
 import { textOpener } from '../messaging/greeting';
 import { generateReply } from '../ai/claude';
 import { coerceJsonObject } from '../utils/coerce-json';
@@ -788,10 +789,10 @@ async function handleBannedPairEdit(
   const action: 'create' | 'delete' = r.action === 'delete' ? 'delete' : 'create';
 
   const confirmMsg = action === 'delete'
-    ? `Remove the rule keeping ${empA!.name} and ${empB!.name} apart? They'd be schedulable together again. (yes/no)`
+    ? `Want me to drop the rule keeping ${empA!.name} and ${empB!.name} apart? They'd be able to work the same shift again.`
     : severity === 'never'
-      ? `Got it — ${empA!.name} and ${empB!.name} should never be scheduled on the same shift. I'll make that a hard rule the scheduler enforces. Confirm? (yes/no)`
-      : `Got it — I'll try to keep ${empA!.name} and ${empB!.name} off the same shift, but it won't block a schedule if it's the only way to cover. Confirm? (yes/no)`;
+      ? `Got it — ${empA!.name} and ${empB!.name} should never be on the same shift. Want me to lock that in as a hard rule?`
+      : `Got it — I'll keep ${empA!.name} and ${empB!.name} off the same shift where I can, but I won't leave a shift short if they're the only cover. Want me to set that up?`;
 
   const pending: PendingEdit = {
     company_id: contact.company_id,
@@ -923,7 +924,7 @@ async function handleExperienceRuleEdit(
     seasonStart || seasonEnd
       ? ` from ${seasonStart ? fmt(seasonStart) : 'now'}${seasonEnd ? ` through ${fmt(seasonEnd)}` : ' onward'}`
       : ' (ongoing)';
-  const confirmMsg = `Set a staffing rule: the ${shiftLabel} shift${dayLabel}${roleLabel} needs ${need}${seasonLabel}. The schedule will staff it that way from now on. Confirm? (yes/no)`;
+  const confirmMsg = `Here's the rule: the ${shiftLabel} shift${dayLabel}${roleLabel} needs ${need}${seasonLabel}. I'll staff it that way from now on — want me to lock it in?`;
 
   const pending: PendingEdit = {
     company_id: contact.company_id,
@@ -981,7 +982,7 @@ async function handleAvailabilityEdit(
   }
 
   const proposedDisplay = formatAvailabilityList(change.proposed);
-  const confirmMsg = `Update ${emp.name}'s availability to:\n${proposedDisplay}\n\nConfirm? (yes/no)`;
+  const confirmMsg = `Here's ${emp.name}'s availability as I'd set it:\n${proposedDisplay}\n\nWant me to save that?`;
 
   const pending: PendingEdit = {
     company_id: contact.company_id,
@@ -1057,7 +1058,7 @@ async function handleUpdateEdit(
     policyPatch = coerced.patch;
     const currentStr = currentValue === null || currentValue === undefined ? 'not set' : String(currentValue);
     confirmMsg =
-      `${policyKey.replace(/_/g, ' ')} is currently ${currentStr}. Change it to ${coerced.display}? (yes/no)`;
+      `${policyKey.replace(/_/g, ' ')} is currently ${currentStr}. Want me to change it to ${coerced.display}?`;
   } else {
     confirmMsg = buildUpdateConfirmation(parsed, currentValue, personality);
   }
@@ -1089,10 +1090,10 @@ async function handleCreateEdit(
 ): Promise<void> {
   const fields = parsed.create_fields ?? {};
   const preview = Object.entries(fields)
-    .map(([k, v]) => `  ${k}: ${JSON.stringify(v)}`)
+    .map(([k, v]) => `  ${k.replace(/_/g, ' ')}: ${formatPlainValue(v)}`)
     .join('\n');
 
-  const confirmMsg = `Create new ${parsed.entity_type}:\n${preview}\n\nConfirm? (yes/no)`;
+  const confirmMsg = `Here's the new ${parsed.entity_type} I'll create:\n${preview}\n\nWant me to go ahead?`;
 
   const pending: PendingEdit = {
     company_id: contact.company_id,
@@ -1132,7 +1133,7 @@ async function handleDeleteEdit(
 
   const record = rows[0];
   const displayName = String(record[lookupCol] ?? parsed.entity_name);
-  const confirmMsg = `Delete ${parsed.entity_type} "${displayName}"? This cannot be undone. (yes/no)`;
+  const confirmMsg = `Want me to delete ${parsed.entity_type} "${displayName}"? Heads up — I can't undo this.`;
 
   const pending: PendingEdit = {
     company_id: contact.company_id,
@@ -1148,7 +1149,15 @@ async function handleDeleteEdit(
   await reply(contact, message, confirmMsg);
 }
 
-function buildUpdateConfirmation(parsed: ParsedEdit, currentValue: unknown, _personality: string): string {
+export function formatPlainValue(v: unknown): string {
+  if (v === null || v === undefined) return 'not set';
+  if (typeof v === 'boolean') return v ? 'yes' : 'no';
+  if (Array.isArray(v)) return v.map(x => String(x)).join(', ');
+  if (typeof v === 'object') return JSON.stringify(v);
+  return String(v);
+}
+
+export function buildUpdateConfirmation(parsed: ParsedEdit, currentValue: unknown, _personality: string): string {
   const currentStr = currentValue === null || currentValue === undefined
     ? 'not set'
     : typeof currentValue === 'boolean'
@@ -1162,7 +1171,7 @@ function buildUpdateConfirmation(parsed: ParsedEdit, currentValue: unknown, _per
       : String(parsed.new_value);
 
   const fieldLabel = (parsed.field ?? '').replace(/_/g, ' ');
-  return `${parsed.entity_name}'s ${fieldLabel} is currently ${currentStr}. Change to ${newStr}? (yes/no)`;
+  return `${parsed.entity_name}'s ${fieldLabel} is currently ${currentStr}. Want me to change it to ${newStr}?`;
 }
 
 // ── Edit confirmation handler ─────────────────────────────────────────────────
@@ -1172,21 +1181,23 @@ export async function handleEditConfirmation(
   contact: VerifiedContact,
   pending: PendingEdit & { _memory_id?: string }
 ): Promise<void> {
-  const body = message.body.trim().toLowerCase();
-  const isYes = /^(yes|yeah|yep|confirm|correct|ok|okay|do it|go ahead|sure)/.test(body);
-  const isNo = /^(no|nope|cancel|stop|don'?t|wait|never mind|nevermind)/.test(body);
+  const answer = parseYesNo(message.body);
 
-  if (!isYes && !isNo) {
+  if (answer === 'unclear') {
+    const actioning =
+      pending.action === 'delete' ? 'remove it' :
+      pending.action === 'create' ? 'create it' :
+      'make the change';
     await reply(contact, message,
-      `I'm waiting for your confirmation. Reply "yes" to proceed with the ${pending.action} or "no" to cancel.`
+      `Just let me know — a yes and I'll ${actioning}, or no to cancel.`
     );
     return;
   }
 
   await clearPendingEdit(contact.company_id, contact.matched_identifier);
 
-  if (isNo) {
-    await reply(contact, message, 'Cancelled — no changes made.');
+  if (answer === 'no') {
+    await reply(contact, message, `No problem — I didn't change anything.`);
     return;
   }
 
@@ -1213,25 +1224,25 @@ export async function handleEditConfirmation(
 
     const isStructural = ['policies', 'wage_rates', 'shift_types', 'shift_requirements', 'shift_experience_rules', 'employee_conflicts'].includes(pending.table);
     const doneMsg = pending.table === 'availability'
-      ? `Done — ${pending.entity_name}'s availability updated.`
+      ? `Updated ${pending.entity_name}'s availability.`
       : pending.table === 'shift_experience_rules'
-        ? `Done — the staffing rule for the ${pending.entity_name} shift is set. I'll enforce it on every build going forward.`
+        ? `The staffing rule for the ${pending.entity_name} shift is set — I'll enforce it on every build from now on.`
       // D8 — say plainly what the rule will DO, so the manager knows whether it's a
       // hard block or a soft preference without having to look it up.
       : pending.table === 'employee_conflicts'
         ? (pending.action === 'delete'
-            ? `Done — ${pending.conflict_pair?.name_1} and ${pending.conflict_pair?.name_2} can be scheduled together again.`
+            ? `${pending.conflict_pair?.name_1} and ${pending.conflict_pair?.name_2} can work together again.`
             : pending.conflict_pair?.severity === 'never'
-              ? `Done — ${pending.conflict_pair?.name_1} and ${pending.conflict_pair?.name_2} will never be put on the same shift. I'll enforce that on every build, and flag it if a swap would break it.`
-              : `Done — I'll keep ${pending.conflict_pair?.name_1} and ${pending.conflict_pair?.name_2} apart where I can, and tell you before approving a swap that puts them together.`)
+              ? `${pending.conflict_pair?.name_1} and ${pending.conflict_pair?.name_2} won't be put on the same shift — I'll enforce that on every build and flag any swap that would break it.`
+              : `I'll keep ${pending.conflict_pair?.name_1} and ${pending.conflict_pair?.name_2} apart where I can, and check with you before approving a swap that puts them together.`)
       : pending.action === 'create'
-        ? `Done — ${pending.entity_type} "${pending.entity_name}" created.`
+        ? `Created ${pending.entity_type} "${pending.entity_name}".`
         : pending.action === 'delete'
-          ? `Done — ${pending.entity_type} "${pending.entity_name}" deleted.`
-          : `Done — ${pending.entity_name}'s ${(pending.field ?? '').replace(/_/g, ' ')} updated to ${JSON.stringify(pending.new_value)}.`;
+          ? `Deleted ${pending.entity_type} "${pending.entity_name}".`
+          : `${pending.entity_name}'s ${(pending.field ?? '').replace(/_/g, ' ')} is now ${formatPlainValue(pending.new_value)}.`;
 
     const footerMsg = isStructural
-      ? ' This affects how Aegis builds schedules — worth verifying in Homebase.'
+      ? ' This changes how I build schedules — worth a look in Homebase to be sure.'
       : '';
 
     await reply(contact, message, doneMsg + footerMsg);

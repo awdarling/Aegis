@@ -38,12 +38,17 @@ describe('buildCapabilitiesReply', () => {
     expect(reply).toMatch(/^Hey Shmubba —/);
     expect(reply).toMatch(/Request time off/);
     expect(reply).not.toMatch(/Build a schedule/);
+    // No doubled header: the single employee group drops its "Here to help with:"
+    // sub-heading, which otherwise reads redundantly right under the intro line.
+    expect(reply).not.toMatch(/Here to help with/i);
   });
 
-  it('lists manager actions for a manager', () => {
+  it('lists manager actions for a manager, keeping section headings', () => {
     const reply = buildCapabilitiesReply('manager', 'Alexander');
     expect(reply).toMatch(/Build a schedule/);
     expect(reply).toMatch(/As a manager/);
+    // Managers have multiple groups, so the section labels stay meaningful.
+    expect(reply).toMatch(/For your own schedule/);
   });
 
   it('works without a name', () => {

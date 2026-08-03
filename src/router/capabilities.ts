@@ -72,7 +72,11 @@ export function buildCapabilitiesReply(role: CapabilityRole, name?: string | nul
 
   const blocks = groups.map((g) => {
     const lines = g.items.map((i) => `• ${i}`).join('\n');
-    return `${g.heading}:\n${lines}`;
+    // A single group (the employee case) needs no sub-heading — the intro already
+    // frames the list, and "Here to help with:" directly under "here's what I can
+    // help you with:" reads as a doubled header. Managers keep their headings,
+    // which are meaningful section labels ("For your own schedule" / "As a manager").
+    return groups.length === 1 ? lines : `${g.heading}:\n${lines}`;
   });
 
   const intro =

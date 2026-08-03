@@ -67,11 +67,21 @@ describe('sendSms — email-only guard, provider guard, per-tenant number', () =
     expect(h.sendTelnyxMessage).not.toHaveBeenCalled();
   });
 
-  it('returns false when the provider send fails', async () => {
+  it('returns false when the provider send fails, and logs the failure to the DB', async () => {
     h.sendTelnyxMessage.mockResolvedValue({ ok: false, error: 'boom' });
     const sent = await sendSms({ to: '+1', from: '+16166164898', body: 'hi', company_id: 'c1' });
     expect(sent).toBe(false);
-    expect(h.saveConversation).not.toHaveBeenCalled();
+    // A failed send is no longer invisible: it's written to the conversation,
+    // distinctly marked so it can't be mistaken for a delivered message.
+    expect(h.saveConversation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        company_id: 'c1',
+        channel: 'sms',
+        direction: 'outbound',
+        content: '[SEND FAILED — boom] hi',
+        to_address: '+1',
+      }),
+    );
   });
 });
 

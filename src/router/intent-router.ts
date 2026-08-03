@@ -336,7 +336,7 @@ async function routeIntentInner(
   } catch (err) {
     if (err instanceof AnthropicOverloadError) throw err;
     console.error('[router] pre-classification handler error:', err);
-    await reply(contact, message, 'Something went wrong on my end. Please try again in a moment.');
+    await reply(contact, message, "Something went wrong on my end and I couldn't finish that — could you send your request again with the details? I may have lost the thread on that one.");
     return;
   }
 
@@ -522,7 +522,7 @@ async function routeIntentInner(
     await reply(
       contact,
       message,
-      'Something went wrong on my end. Please try again in a moment.'
+      "Something went wrong on my end and I couldn't finish that — could you send your request again with the details? I may have lost the thread on that one."
     );
   }
 }

@@ -10,7 +10,7 @@ import { classifyIntent, generateReply } from '../ai/claude';
 import { runSimulation, getWeekBounds, loadTimeOffPolicies as loadAllTimeOffPolicies } from '../lib/schedule-simulator';
 import { computeTimeOffViolations } from '../lib/time-off-policies';
 import { env } from '../config/env';
-import { firstName, textOpener } from '../messaging/greeting';
+import { firstName, textOpener, managerAlertSms } from '../messaging/greeting';
 import {
   BRAND,
   brandedEmailShell,
@@ -98,6 +98,19 @@ export function isTimeOffAffirmation(body: string): boolean {
 export function isTimeOffDenial(body: string): boolean {
   const b = body.trim().toLowerCase();
   return /^(no|nope|nah|n\b|wrong|incorrect|that'?s wrong|that'?s not right|not (?:quite|right|yet)|cancel|change|redo|restate|wait|hold on|don'?t)/.test(b);
+}
+
+// A mid-flow CANCELLATION (drop the whole request) — distinct from a correction
+// ("no, make it Thursday"). Word-boundary (NOT anchored), so a variety of natural
+// phrasings clear the pending: "changed my mind, I don't need it", "never mind",
+// "don't want time off", "forget it", "cancel". Scoped so a date correction like
+// "no, I don't need Friday, just Thursday" is NOT caught. Deterministic — no LLM.
+export function isTimeOffCancellation(body: string): boolean {
+  const b = body.trim().toLowerCase();
+  if (/\b(chang(?:e|ed)\s+my\s+mind|never\s?mind|nvm|scratch\s+that|forget\s+(?:it|that|the\s+time\s?off|about\s+it)|scrap\s+(?:it|that)|withdraw|retract|nix\s+(?:it|that)|cancel)\b/.test(b)) return true;
+  if (/\b(?:don'?t|do\s+not|no\s+longer)\s+(?:need|want)\s+(?:it\s+anymore|it|any(?:\s+time\s?off)?|the\s+time\s?off|time\s?off)\b/.test(b)) return true;
+  if (/\bi'?m\s+(?:all\s+set|good(?:\s+now)?)\b/.test(b)) return true;
+  return false;
 }
 
 // Escape user-supplied / dynamic text before inlining into branded HTML.
@@ -1262,9 +1275,11 @@ async function notifyManager(
     await sendSms({
       to: managerPhone,
       from: aegisSmsNumber,
-      body:
-        `${textOpener(manager.name)}${employee.name} submitted a time-off request for ${dateDisplay}. ` +
-        `Full details and approval options are in your email from Aegis.`,
+      body: managerAlertSms({
+        managerName: manager.name,
+        summary: `${employee.name} wants ${dateDisplay} off${pending.reason ? ` for ${pending.reason}` : ''}.`,
+        inbox: 'approve',
+      }),
       company_id: companyId,
     });
   }
@@ -1488,6 +1503,20 @@ export async function handlePendingTimeOffConfirmation(
       contact,
       message,
       "Cleared that pending one. Send me the new dates whenever you're ready."
+    );
+    return;
+  }
+
+  // Natural mid-flow cancellation ("changed my mind, I don't need it", "never mind",
+  // "don't want time off", "forget it") — clear the pending cleanly instead of
+  // re-asking or treating it as a correction. Runs BEFORE the classifier (no LLM
+  // cost on a cancel), and is distinct from a date correction.
+  if (isTimeOffCancellation(trimmed)) {
+    await clearPendingTimeOff(contact.company_id, contact.employee_id!);
+    await reply(
+      contact,
+      message,
+      "No problem — I've scrapped that time-off request. Just let me know if you need anything else."
     );
     return;
   }

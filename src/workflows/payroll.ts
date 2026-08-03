@@ -1,4 +1,5 @@
 import { supabase } from '../db/client';
+import { managerAlertSms } from '../messaging/greeting';
 import { logActivity } from '../logger/activity-log';
 import { reply } from '../messaging/reply';
 import { sendEmail } from '../messaging/email';
@@ -194,7 +195,7 @@ export async function handleWageRateSync(params: {
         await sendSms({
           to: managerPhone,
           from: aegisChannel,
-          body: `${employeeName}'s wage updated to $${newRate}/hr in Engage.`,
+          body: managerAlertSms({ summary: `${employeeName}'s pay rate is now $${newRate}/hr — I synced it to Engage for you.` }),
           company_id: companyId,
         });
       }
@@ -217,7 +218,7 @@ export async function handleWageRateSync(params: {
         await sendSms({
           to: managerPhone,
           from: aegisChannel,
-          body: `Could not sync ${employeeName}'s wage to Engage: ${result.message}. Please update manually.`,
+          body: managerAlertSms({ summary: `Heads up — I couldn't sync ${employeeName}'s pay rate ($${newRate}/hr) to Engage (${result.message}); you'll need to update it manually.` }),
           company_id: companyId,
         });
       }

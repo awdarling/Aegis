@@ -13,7 +13,7 @@ vi.mock('../../messaging/reply', () => ({ reply: vi.fn(), sendInThreadAck: vi.fn
 vi.mock('../../ai/claude', () => ({ withAnthropicRetry: vi.fn(), generateReply: vi.fn(), classifyIntent: vi.fn() }));
 vi.mock('../../logger/activity-log', () => ({ logActivity: vi.fn() }));
 
-import { isTimeOffAffirmation, isTimeOffDenial } from '../time-off';
+import { isTimeOffAffirmation, isTimeOffDenial, isTimeOffCancellation } from '../time-off';
 
 // The confirmation is human now ("Want me to send that over to your manager?"),
 // so it must accept natural replies — not only a literal "yes".
@@ -42,6 +42,31 @@ describe('isTimeOffDenial', () => {
   it('does not treat a yes as no', () => {
     for (const s of ['yes', 'send it', 'go for it', 'sounds good']) {
       expect(isTimeOffDenial(s)).toBe(false);
+    }
+  });
+});
+
+describe('isTimeOffCancellation — mid-flow cancels (varied phrasings)', () => {
+  it('catches a variety of natural cancellations', () => {
+    for (const cancel of [
+      "Actually I changed my mind I don't need it anymore",
+      "No, don't send it. I don't need any time off.",
+      "No, I don't want time off.",
+      "never mind",
+      "cancel",
+      "forget it",
+      "I'm all set",
+    ]) {
+      expect(isTimeOffCancellation(cancel)).toBe(true);
+    }
+  });
+  it('does NOT treat a date correction as a cancellation', () => {
+    for (const keep of [
+      "no, I don't need Friday, just Thursday",
+      "change it to the 8th",
+      "not quite - make it the morning",
+    ]) {
+      expect(isTimeOffCancellation(keep)).toBe(false);
     }
   });
 });

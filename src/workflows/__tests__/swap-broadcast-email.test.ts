@@ -83,6 +83,9 @@ describe('buildSwapBroadcastEmail — swap-eligible candidate', () => {
 
     expect(html).toContain(">Pick up this shift</a>");
     expect(html).toContain(">Offer a swap</a>");
+    // Spell out what each button does — pickup and trade are easy to confuse.
+    expect(html).toContain("<strong>Pick up this shift</strong> adds it to your schedule");
+    expect(html).toContain("<strong>Offer a swap</strong> lets you hand");
     expect(subject).toContain('Saturday AM');
     expect(text).toMatch(/John Jones/);
     // Employee-facing: never a Homebase CTA.
@@ -97,6 +100,8 @@ describe('buildSwapBroadcastEmail — pickup-only candidate', () => {
     expect(h.tokenInserts.map(t => t.action_type)).toEqual(['swap_pickup']);
     expect(html).toContain(">Pick up this shift</a>");
     expect(html).not.toContain(">Offer a swap</a>");
+    // No swap button => no swap explainer either.
+    expect(html).not.toContain("<strong>Offer a swap</strong> lets you hand");
   });
 
   it('mentions the days the requester can work in return', async () => {

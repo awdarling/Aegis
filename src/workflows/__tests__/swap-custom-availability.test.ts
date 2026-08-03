@@ -162,3 +162,44 @@ describe('buildSwapCandidates — custom availability', () => {
     expect(out.map(e => e.id)).not.toContain('req');
   });
 });
+
+
+// ── Already-on-shift exclusion ────────────────────────────────────────────────
+// A coworker already assigned to a shift that OVERLAPS the target block can't cover
+// it. Reported live 2026-08-01: Casey, already working the Mon AM shift, was still
+// broadcast a request to cover that same Mon AM shift. buildSwapCandidates now drops
+// anyone whose existing assignment that day overlaps the target time.
+describe('buildSwapCandidates — already-on-shift exclusion', () => {
+  it('drops a candidate already assigned to a shift that overlaps the target block', async () => {
+    data.custom_availability = []; // clean control — Bob eligible via recurring availability
+    data.schedulesRow = {
+      data: {
+        assignments: [
+          // Carol is already working 15:00–21:00 that day — the very block on offer.
+          { employee_id: 'carol', date: SHIFT_DATE, shift_name: 'PM', role: 'Lifeguard', start_time: '15:00', end_time: '21:00' },
+        ],
+        gaps: [], summary: '',
+      },
+      week_start: '2026-07-05', week_end: '2026-07-11',
+    };
+    const ids = (await buildSwapCandidates(CALL)).map(e => e.id);
+    expect(ids).not.toContain('carol'); // already on an overlapping shift
+    expect(ids).toContain('bob');       // free that day → still eligible
+  });
+
+  it('keeps a candidate whose only shift that day does NOT overlap the target block', async () => {
+    data.custom_availability = [];
+    data.schedulesRow = {
+      data: {
+        assignments: [
+          // Carol works 09:00–13:00 — earlier, no overlap with the 15:00–21:00 target.
+          { employee_id: 'carol', date: SHIFT_DATE, shift_name: 'AM', role: 'Lifeguard', start_time: '09:00', end_time: '13:00' },
+        ],
+        gaps: [], summary: '',
+      },
+      week_start: '2026-07-05', week_end: '2026-07-11',
+    };
+    const ids = (await buildSwapCandidates(CALL)).map(e => e.id);
+    expect(ids).toContain('carol');
+  });
+});

@@ -47,6 +47,7 @@ import {
   type HardConflictRow,
   type TradeSide,
   pickUpcomingShift,
+  formatWeekdayNames,
 } from '../shift-swap';
 import { reply } from '../../messaging/reply';
 import type { Employee } from '../../db/types';
@@ -516,5 +517,24 @@ describe('pickUpcomingShift — no date named: resolve upcoming, never assume to
     const r = pickUpcomingShift([A('me', '2026-08-01', 'AM'), A('me', '2026-08-02', 'PM', '13:00')], 'me', today, 'PM');
     expect(r.kind).toBe('one');
     expect(r.kind === 'one' && r.shift.shift_name).toBe('PM');
+  });
+});
+
+
+describe('formatWeekdayNames — reading willing days back to the requester', () => {
+  it('names a single day', () => {
+    expect(formatWeekdayNames([3])).toBe('Wednesday');
+  });
+  it('joins two days with "or"', () => {
+    expect(formatWeekdayNames([1, 3])).toBe('Monday or Wednesday');
+  });
+  it('sorts, dedupes, and Oxford-joins three or more', () => {
+    expect(formatWeekdayNames([5, 1, 1, 3])).toBe('Monday, Wednesday, or Friday');
+  });
+  it('returns empty string when no days were given', () => {
+    expect(formatWeekdayNames([])).toBe('');
+  });
+  it('ignores out-of-range integers', () => {
+    expect(formatWeekdayNames([7, -1, 2])).toBe('Tuesday');
   });
 });

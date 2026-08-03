@@ -27,11 +27,11 @@ import { env } from '../config/env';
 import { withAnthropicRetry } from '../ai/claude';
 // D21 — reuse the real time-off flow's partial-window resolver so onboarding and
 // the normal flow cannot disagree about what "the afternoon" means.
-import { resolvePartialWindow } from './time-off';
+import { resolvePartialWindow, createTimeOffRequestAndNotify } from './time-off';
 import { generateActionToken } from '../lib/aegis-actions/tokens';
 import { formatDateRange } from './time-off';
 import type { InboundMessage, VerifiedContact } from '../security/types';
-import type { Employee } from '../db/types';
+import type { Employee, PartialDayDetail } from '../db/types';
 
 const client = new Anthropic({ apiKey: env.ANTHROPIC_API_KEY });
 const MODEL = 'claude-sonnet-4-6';
@@ -1804,6 +1804,28 @@ async function handleTimeOffStep(
     return;
   }
 
+  // Load the employee record once so each request runs the SAME create+notify
+  // path the normal time-off flow uses — coverage simulation, the rich manager
+  // approve/deny email, and the manager SMS alert — instead of the old bare
+  // insert + one-line manager text that gave the new hire no confirmation and
+  // the manager no way to decide (Alexander: "flag and send emails with action
+  // items the exact same way all the other workflows do").
+  const { data: empData } = await supabase
+    .from('employees')
+    .select('*')
+    .eq('id', session.employee_id)
+    .eq('company_id', session.company_id)
+    .single();
+  const employee = empData as Employee | null;
+
+  // The channel/contact the new hire submitted on, so the manager's eventual
+  // approve/deny decision is delivered back to them the same way (the shared
+  // core stamps a to_thread row from pending.channel/sender).
+  const employeeContact =
+    session.employee_channel === 'sms' ? session.employee_phone : session.employee_email;
+
+  const submittedRanges: string[] = [];
+
   for (const entry of dates) {
     const start_date = entry.start_date;
     const end_date = entry.end_date ?? entry.start_date;
@@ -1814,14 +1836,7 @@ async function handleTimeOffStep(
     // full_day rather than dropping the request — losing it entirely is worse
     // than over-blocking, and the manager still sees it to approve.
     let timeOffType: 'full_day' | 'partial' = 'full_day';
-    let partialDays: Array<{
-      date: string;
-      type: 'custom_hours';
-      shift_id: null;
-      shift_name: null;
-      start_time: string;
-      end_time: string;
-    }> | null = null;
+    let partialDays: PartialDayDetail[] | null = null;
 
     if (entry.time_off_type === 'partial') {
       const window = resolvePartialWindow(entry);
@@ -1838,47 +1853,68 @@ async function handleTimeOffStep(
       }
     }
 
-    const { data: torData } = await supabase
-      .from('time_off_requests')
-      .insert({
+    let requestId: string | null = null;
+    if (employee) {
+      requestId = await createTimeOffRequestAndNotify(session.company_id, employee, {
         employee_id: session.employee_id,
-        company_id: session.company_id,
         start_date,
         end_date,
         reason: 'submitted during onboarding',
-        status: 'pending',
-        requested_at: new Date().toISOString(),
-        // Previously omitted entirely — the column DEFAULTS to 'full_day', so an
-        // onboarding request could never be partial no matter what the new hire said.
+        channel: session.employee_channel,
+        sender: employeeContact ?? '',
+        recipient: session.aegis_sms_channel,
+        // Pending-confirmation TTL field; unused by the create/notify core (it
+        // mints its own decision-token expiry). Set to a sane 24h to satisfy the type.
+        expires_at: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
         time_off_type: timeOffType,
         partial_days: partialDays,
-      })
-      .select('id')
-      .single();
-
-    if (torData) {
-      const tor = torData as { id: string };
-      await logActivity({
-        company_id: session.company_id,
-        action: 'time_off_request_created',
-        entity_type: 'time_off_request',
-        entity_id: tor.id,
-        summary: `${session.employee_name} requested time off during onboarding for ${formatDateRange(start_date, end_date)}`,
-        metadata: { source: 'onboarding' },
       });
-      const dateStr = start_date === end_date ? start_date : `${start_date} to ${end_date}`;
-      await reply(
-        managerContact,
-        managerMsg,
-        `${session.employee_name} requested time off for ${dateStr} during onboarding. Status: pending your approval.`
-      );
+    } else {
+      // Defensive: no employee row (should never happen mid-onboarding). Save the
+      // request bare so it isn't lost, even though we can't run the full notify.
+      console.error('[onboarding] no employee record for time-off submission', {
+        company_id: session.company_id,
+        employee_id: session.employee_id,
+      });
+      const { data: torData } = await supabase
+        .from('time_off_requests')
+        .insert({
+          employee_id: session.employee_id,
+          company_id: session.company_id,
+          start_date,
+          end_date,
+          reason: 'submitted during onboarding',
+          status: 'pending',
+          requested_at: new Date().toISOString(),
+          time_off_type: timeOffType,
+          partial_days: partialDays,
+        })
+        .select('id')
+        .single();
+      requestId = (torData as { id: string } | null)?.id ?? null;
+    }
+
+    if (requestId) {
+      submittedRanges.push(formatDateRange(start_date, end_date));
     }
   }
 
-  session.collected.time_off_submitted = true;
+  if (submittedRanges.length > 0) {
+    session.collected.time_off_submitted = true;
+    // Employee confirmation — mirror the normal flow's "passed it to your manager"
+    // acknowledgement so onboarding time off is a real, confirmed request, not a
+    // silent "you're all set" (the exact gap Alexander flagged on his test run).
+    const list = submittedRanges.join(' and ');
+    await textEmployee(
+      session,
+      `Got it — I've sent your time off (${list}) to your manager to approve. ` +
+        "I'll let you know as soon as they get back to me."
+    );
+  }
+
   session.step = 'complete';
   await saveOnboardingSession(session);
-  await completeOnboarding(session, managerContact, managerMsg);
+  await completeOnboarding(session, managerContact, managerMsg, submittedRanges);
 }
 
 // ── Completion ────────────────────────────────────────────────────────────────
@@ -1886,7 +1922,8 @@ async function handleTimeOffStep(
 async function completeOnboarding(
   session: OnboardingSession & { _memory_id: string },
   managerContact: VerifiedContact,
-  managerMsg: InboundMessage
+  managerMsg: InboundMessage,
+  timeOffRanges: string[] = []
 ): Promise<void> {
   const firstName = session.employee_name.split(' ')[0];
 
@@ -1969,7 +2006,128 @@ async function completeOnboarding(
     `${session.employee_name} completed onboarding. ${weeklyHours.toFixed(1)}h/week availability saved.${flagNote}`
   );
 
+  // Manager audit summary email — a full record of everything the new hire set
+  // up (name, role, contact, the availability that was auto-applied, and any
+  // time off now pending). Availability auto-applies during onboarding; this is
+  // the flag/notification the manager reviews, not an approval gate (Alexander:
+  // "the manager gets an email stating what their availability was set to...
+  // copies of all of their answers for easy auditing"). Best-effort — a summary
+  // failure must never fail the onboarding completion.
+  try {
+    await sendOnboardingSummaryEmail(session, weeklyHours, timeOffRanges);
+  } catch (err) {
+    console.error('[onboarding] manager summary email failed (non-fatal):', err);
+  }
+
   await clearOnboardingSession(session.company_id, session.employee_id);
+}
+
+// Manager-facing onboarding audit summary. Sent once, at completion, to the
+// first manager/owner with an email on file (resolved the same way the time-off
+// flow finds a manager). Lists every answer the new hire gave — contact, role,
+// the availability that was applied, weekly hours, low-availability flag, and
+// any time off now pending — so the manager has one auditable record without
+// digging through the activity feed. Plain-text + branded HTML parts.
+async function sendOnboardingSummaryEmail(
+  session: OnboardingSession & { _memory_id: string },
+  weeklyHours: number,
+  timeOffRanges: string[]
+): Promise<void> {
+  const { data: managerData } = await supabase
+    .from('users')
+    .select('email, name, role')
+    .eq('company_id', session.company_id)
+    .in('role', ['manager', 'owner'])
+    .order('role', { ascending: true })
+    .limit(1)
+    .maybeSingle();
+  const manager = managerData as { email: string | null; name: string } | null;
+
+  if (!manager?.email) {
+    console.warn('[onboarding] no manager/owner email on file — summary email skipped', {
+      company_id: session.company_id,
+    });
+    return;
+  }
+
+  const companyName = await loadCompanyName(session.company_id);
+  const slots = session.collected.availability_parsed;
+  const role = session.collected.role ?? '—';
+  const contactEmail = session.collected.email ?? session.employee_email ?? '—';
+  const contactPhone = session.employee_phone ?? '—';
+
+  // HTML-escape only the values that originate from user/free-text input; day
+  // names, formatted times and the hour count are safe constants.
+  const esc = (s: string): string =>
+    s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+  // ── Plain-text part (also what any text-only client / SMS-style reader sees) ──
+  const availText = slots.length > 0 ? formatAvailabilityList(slots) : 'No availability provided';
+  const textLines = [
+    `${session.employee_name} finished onboarding. Here's everything they set up, for your records:`,
+    '',
+    `Name: ${session.employee_name}`,
+    `Role: ${role}`,
+    `Contact email: ${contactEmail}`,
+    `Contact phone: ${contactPhone}`,
+    '',
+    `Availability (${weeklyHours.toFixed(1)}h/week) — applied automatically:`,
+    availText,
+  ];
+  if (session.flagged_low_availability) {
+    textLines.push('', `Note: limited availability flagged (${weeklyHours.toFixed(1)}h/week).`);
+  }
+  textLines.push(
+    '',
+    timeOffRanges.length > 0
+      ? `Time off requested during onboarding (pending your approval): ${timeOffRanges.join(', ')}. You'll get a separate email to approve or deny each one.`
+      : 'No time off requested during onboarding.'
+  );
+  textLines.push('', 'Availability was applied automatically. If anything needs adjusting, you can edit it in Homebase.');
+  const text = textLines.join('\n');
+
+  // ── Branded HTML part ────────────────────────────────────────────────────────
+  const availHtml =
+    slots.length > 0
+      ? availabilityDetailRowsHtml(slots)
+      : `<p style="color:${BRAND.textSecondary};margin:0 0 16px;">No availability provided.</p>`;
+  const flagHtml = session.flagged_low_availability
+    ? `<div style="margin:4px 0 20px;padding:12px 14px;background:${BRAND.warnBg};border:1px solid ${BRAND.warnBorder};border-radius:8px;color:${BRAND.warnText};font-size:14px;">Limited availability flagged — ${weeklyHours.toFixed(1)}h/week.</div>`
+    : '';
+  const timeOffHtml =
+    timeOffRanges.length > 0
+      ? brandSectionLabel('Time off requested (pending your approval)') +
+        timeOffRanges.map(r => brandDetailRow(esc(r), 'Pending your approval')).join('') +
+        `<p style="color:${BRAND.textSecondary};font-size:14px;margin:4px 0 16px;">You'll get a separate email to approve or deny each request.</p>`
+      : brandSectionLabel('Time off') +
+        `<p style="color:${BRAND.textSecondary};margin:0 0 16px;">None requested during onboarding.</p>`;
+
+  const bodyHtml =
+    `<p style="margin:0 0 18px;">${esc(session.employee_name)} finished onboarding. Here's everything they set up, for your records.</p>` +
+    brandSectionLabel('Details') +
+    brandDetailRow('Name', esc(session.employee_name)) +
+    brandDetailRow('Role', esc(role)) +
+    brandDetailRow('Contact email', esc(contactEmail)) +
+    brandDetailRow('Contact phone', esc(contactPhone)) +
+    brandSectionLabel(`Availability set (${weeklyHours.toFixed(1)}h/week) — applied automatically`) +
+    availHtml +
+    flagHtml +
+    timeOffHtml +
+    `<p style="margin:18px 0 0;color:${BRAND.textSecondary};font-size:14px;">Availability was applied automatically. If anything needs adjusting, you can edit it in Homebase.</p>`;
+
+  const html = brandedEmailShell({
+    bodyHtml,
+    companyName,
+    preheader: `${session.employee_name} completed onboarding`,
+  });
+
+  await sendEmail({
+    to: manager.email,
+    subject: `${session.employee_name} completed onboarding — summary`,
+    text,
+    html,
+    company_id: session.company_id,
+  });
 }
 
 // ── Public: employee response handler ────────────────────────────────────────

@@ -1541,6 +1541,207 @@ export async function handleSubmitTimeOff(
 
 // Step 2: Employee replies yes/no to confirmation — runs simulation and submits.
 // Called by the router's pre-classification pending check.
+// Shared submission core: run the coverage simulation, create the
+// time_off_request (status pending), record origin channel + activity, compute
+// advisory violations, and notify the manager the full way (rich approve/deny
+// email + SMS alert). Returns the new request id, or null if the insert failed.
+//
+// This is the single seam both the normal SMS/email time-off confirmation
+// (handlePendingTimeOffConfirmation) and the onboarding time-off step share, so
+// an onboarding request is indistinguishable from a normal one downstream —
+// same coverage analysis, same manager email, same attribution. Callers own the
+// employee-facing reply (they have the inbound message/channel context).
+export async function createTimeOffRequestAndNotify(
+  companyId: string,
+  employee: Employee,
+  pending: PendingTimeOff
+): Promise<string | null> {
+  // Stage 1: simulate the specific requested day(s). If the company hasn't
+  // configured shift_requirements, the simulator throws NO_SHIFT_REQUIREMENTS;
+  // swallow that case and continue with stage1Result=null so TO creation isn't
+  // gated on scheduling setup. Coverage analysis is advisory, not a precondition.
+  let stage1Result: SimulationResult | null = null;
+  try {
+    stage1Result = await runSimulation({
+      company_id: companyId,
+      period_start: pending.start_date,
+      period_end: pending.end_date,
+      new_time_off: {
+        employee_id: employee.id,
+        start_date: pending.start_date,
+        end_date: pending.end_date,
+      },
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg === 'NO_SHIFT_REQUIREMENTS') {
+      console.log('[time-off] stage-1 simulator skipped — no shift_requirements configured', {
+        company_id: companyId,
+      });
+    } else {
+      throw err;
+    }
+  }
+
+  // Stage 2: full week — only runs if Stage 1 succeeded and is feasible.
+  let stage2Result: SimulationResult | null = null;
+  if (stage1Result && stage1Result.overall_feasible) {
+    const { weekStart, weekEnd } = getWeekBounds(pending.start_date, pending.end_date);
+    try {
+      stage2Result = await runSimulation({
+        company_id: companyId,
+        period_start: weekStart,
+        period_end: weekEnd,
+        new_time_off: {
+          employee_id: employee.id,
+          start_date: pending.start_date,
+          end_date: pending.end_date,
+        },
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg === 'NO_SHIFT_REQUIREMENTS') {
+        console.log('[time-off] stage-2 simulator skipped — no shift_requirements configured', {
+          company_id: companyId,
+        });
+      } else {
+        throw err;
+      }
+    }
+  }
+
+  // Log to Homebase — create time_off_request with status: pending
+  const { data: torData, error: torError } = await supabase
+    .from('time_off_requests')
+    .insert({
+      employee_id: employee.id,
+      company_id: companyId,
+      start_date: pending.start_date,
+      end_date: pending.end_date,
+      reason: pending.reason,
+      status: 'pending',
+      requested_at: new Date().toISOString(),
+      time_off_type: pending.time_off_type ?? 'full_day',
+      partial_days: pending.partial_days ?? null,
+    })
+    .select('id')
+    .single();
+
+  if (torError || !torData) {
+    console.error('[time-off] failed to create time_off_request:', torError);
+    return null;
+  }
+
+  const requestId = (torData as { id: string }).id;
+
+  // Persist the ORIGIN CHANNEL (+ email thread metadata) so sendDecisionNotification
+  // — invoked by Homebase via /internal/notify-to-decision after a manager clicks
+  // Approve/Deny — replies to the employee on the SAME channel they submitted on
+  // (an SMS request gets an SMS decision, not an email), and threads the email
+  // reply back into the original conversation when the origin was email. The
+  // decision_token (notifyManager / decision.ts) path carries the channel via its
+  // own token; this side row is for the aegis_action_tokens path, which is fired
+  // by an external webhook and only gets requestId + decision. JSON blob in
+  // aegis_memory.content — no migration. Written for BOTH channels now.
+  await supabase.from('aegis_memory').insert({
+    company_id: companyId,
+    memory_type: 'observation',
+    source: `to_thread:${requestId}`,
+    content: JSON.stringify({
+      channel: pending.channel,
+      thread_id: pending.thread_id ?? null,
+      raw_subject: pending.raw_subject ?? null,
+    }),
+  });
+
+  await logActivity({
+    company_id: companyId,
+    action: 'time_off_request_created',
+    entity_type: 'time_off_request',
+    entity_id: requestId,
+    summary: `${employee.name} submitted a time-off request for ${formatDateRange(pending.start_date, pending.end_date)}`,
+    metadata: {
+      reason: pending.reason,
+      stage1_feasible: stage1Result?.overall_feasible ?? null,
+      stage2_feasible: stage2Result?.overall_feasible ?? null,
+      stage1_coverage_after: stage1Result?.coverage_rate_after ?? null,
+      stage2_coverage_after: stage2Result?.coverage_rate_after ?? null,
+    },
+  });
+
+  // Compute advisory policy violations (consecutive-days chain + notice period).
+  // Does NOT block submission — violations are surfaced in the manager email
+  // so they can factor into the approve/deny decision.
+  let violations: TimeOffViolations | null = null;
+  try {
+    violations = await computeTimeOffViolations({
+      employee_id: employee.id,
+      start_date: pending.start_date,
+      end_date: pending.end_date,
+      company_id: companyId,
+    });
+    console.log('[time-off] violations computed', violations);
+  } catch (err) {
+    console.warn('[time-off] violation computation failed; proceeding without:', err);
+  }
+
+  // Notify manager (non-blocking — errors are caught and logged).
+  // Email-channel submissions get the rich aegis_action_tokens magic-link
+  // email; SMS-channel submissions stay on the existing notifyManager path
+  // (legacy ad-hoc token + manager SMS).
+  try {
+    if (pending.channel === 'email') {
+      const torRow: TimeOffRequest = {
+        id: requestId,
+        employee_id: employee.id,
+        company_id: companyId,
+        start_date: pending.start_date,
+        end_date: pending.end_date,
+        reason: pending.reason,
+        status: 'pending',
+        requested_at: new Date().toISOString(),
+        decided_at: null,
+        decided_by: null,
+        aegis_recommendation: null,
+        aegis_reasoning: null,
+        time_off_type: pending.time_off_type ?? 'full_day',
+        partial_days: pending.partial_days ?? null,
+      };
+      // Resolve company name once for the email header / payload.
+      const { data: companyData } = await supabase
+        .from('companies')
+        .select('name')
+        .eq('id', companyId)
+        .single();
+      const companyName = (companyData as { name: string } | null)?.name ?? 'Your Company';
+
+      await notifyManagersByEmail(
+        companyId,
+        companyName,
+        employee,
+        torRow,
+        pending,
+        stage1Result,
+        stage2Result,
+        violations
+      );
+    } else {
+      await notifyManager(companyId, employee, pending, requestId, stage1Result, stage2Result, violations);
+    }
+  } catch (err) {
+    console.error('[time-off] manager notification failed:', err);
+    await logActivity({
+      company_id: companyId,
+      action: 'time_off_manager_notification_failed',
+      entity_id: requestId,
+      summary: 'Manager notification failed — request is still logged',
+      metadata: { error: String(err) },
+    });
+  }
+
+  return requestId;
+}
+
 export async function handlePendingTimeOffConfirmation(
   message: InboundMessage,
   contact: VerifiedContact,
@@ -1664,192 +1865,16 @@ export async function handlePendingTimeOffConfirmation(
     return;
   }
 
-  // Stage 1: simulate the specific requested day(s). If the company hasn't
-  // configured shift_requirements, the simulator throws NO_SHIFT_REQUIREMENTS;
-  // swallow that case and continue with stage1Result=null so TO creation isn't
-  // gated on scheduling setup. Coverage analysis is advisory, not a precondition.
-  let stage1Result: SimulationResult | null = null;
-  try {
-    stage1Result = await runSimulation({
-      company_id: contact.company_id,
-      period_start: pending.start_date,
-      period_end: pending.end_date,
-      new_time_off: {
-        employee_id: employee.id,
-        start_date: pending.start_date,
-        end_date: pending.end_date,
-      },
-    });
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    if (msg === 'NO_SHIFT_REQUIREMENTS') {
-      console.log('[time-off] stage-1 simulator skipped — no shift_requirements configured', {
-        company_id: contact.company_id,
-      });
-    } else {
-      throw err;
-    }
-  }
-
-  // Stage 2: full week — only runs if Stage 1 succeeded and is feasible.
-  let stage2Result: SimulationResult | null = null;
-  if (stage1Result && stage1Result.overall_feasible) {
-    const { weekStart, weekEnd } = getWeekBounds(pending.start_date, pending.end_date);
-    try {
-      stage2Result = await runSimulation({
-        company_id: contact.company_id,
-        period_start: weekStart,
-        period_end: weekEnd,
-        new_time_off: {
-          employee_id: employee.id,
-          start_date: pending.start_date,
-          end_date: pending.end_date,
-        },
-      });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (msg === 'NO_SHIFT_REQUIREMENTS') {
-        console.log('[time-off] stage-2 simulator skipped — no shift_requirements configured', {
-          company_id: contact.company_id,
-        });
-      } else {
-        throw err;
-      }
-    }
-  }
-
-  // Log to Homebase — create time_off_request with status: pending
-  const { data: torData, error: torError } = await supabase
-    .from('time_off_requests')
-    .insert({
-      employee_id: employee.id,
-      company_id: contact.company_id,
-      start_date: pending.start_date,
-      end_date: pending.end_date,
-      reason: pending.reason,
-      status: 'pending',
-      requested_at: new Date().toISOString(),
-      time_off_type: pending.time_off_type ?? 'full_day',
-      partial_days: pending.partial_days ?? null,
-    })
-    .select('id')
-    .single();
-
-  if (torError || !torData) {
-    console.error('[time-off] failed to create time_off_request:', torError);
+  // Sim + create request + notify manager — the full treatment, shared with the
+  // onboarding time-off step so both channels behave identically (D21/onboarding).
+  const requestId = await createTimeOffRequestAndNotify(contact.company_id, employee, pending);
+  if (!requestId) {
     await reply(
       contact,
       message,
       'There was an issue saving your request. Please try again or contact your manager directly.'
     );
     return;
-  }
-
-  const requestId = (torData as { id: string }).id;
-
-  // Persist the ORIGIN CHANNEL (+ email thread metadata) so sendDecisionNotification
-  // — invoked by Homebase via /internal/notify-to-decision after a manager clicks
-  // Approve/Deny — replies to the employee on the SAME channel they submitted on
-  // (an SMS request gets an SMS decision, not an email), and threads the email
-  // reply back into the original conversation when the origin was email. The
-  // decision_token (notifyManager / decision.ts) path carries the channel via its
-  // own token; this side row is for the aegis_action_tokens path, which is fired
-  // by an external webhook and only gets requestId + decision. JSON blob in
-  // aegis_memory.content — no migration. Written for BOTH channels now.
-  await supabase.from('aegis_memory').insert({
-    company_id: contact.company_id,
-    memory_type: 'observation',
-    source: `to_thread:${requestId}`,
-    content: JSON.stringify({
-      channel: pending.channel,
-      thread_id: pending.thread_id ?? null,
-      raw_subject: pending.raw_subject ?? null,
-    }),
-  });
-
-  await logActivity({
-    company_id: contact.company_id,
-    action: 'time_off_request_created',
-    entity_type: 'time_off_request',
-    entity_id: requestId,
-    summary: `${employee.name} submitted a time-off request for ${formatDateRange(pending.start_date, pending.end_date)}`,
-    metadata: {
-      reason: pending.reason,
-      stage1_feasible: stage1Result?.overall_feasible ?? null,
-      stage2_feasible: stage2Result?.overall_feasible ?? null,
-      stage1_coverage_after: stage1Result?.coverage_rate_after ?? null,
-      stage2_coverage_after: stage2Result?.coverage_rate_after ?? null,
-    },
-  });
-
-  // Compute advisory policy violations (consecutive-days chain + notice period).
-  // Does NOT block submission — violations are surfaced in the manager email
-  // so they can factor into the approve/deny decision.
-  let violations: TimeOffViolations | null = null;
-  try {
-    violations = await computeTimeOffViolations({
-      employee_id: employee.id,
-      start_date: pending.start_date,
-      end_date: pending.end_date,
-      company_id: contact.company_id,
-    });
-    console.log('[time-off] violations computed', violations);
-  } catch (err) {
-    console.warn('[time-off] violation computation failed; proceeding without:', err);
-  }
-
-  // Notify manager (non-blocking — errors are caught and logged).
-  // Email-channel submissions get the rich aegis_action_tokens magic-link
-  // email; SMS-channel submissions stay on the existing notifyManager path
-  // (legacy ad-hoc token + manager SMS).
-  try {
-    if (pending.channel === 'email') {
-      const torRow: TimeOffRequest = {
-        id: requestId,
-        employee_id: employee.id,
-        company_id: contact.company_id,
-        start_date: pending.start_date,
-        end_date: pending.end_date,
-        reason: pending.reason,
-        status: 'pending',
-        requested_at: new Date().toISOString(),
-        decided_at: null,
-        decided_by: null,
-        aegis_recommendation: null,
-        aegis_reasoning: null,
-        time_off_type: pending.time_off_type ?? 'full_day',
-        partial_days: pending.partial_days ?? null,
-      };
-      // Resolve company name once for the email header / payload.
-      const { data: companyData } = await supabase
-        .from('companies')
-        .select('name')
-        .eq('id', contact.company_id)
-        .single();
-      const companyName = (companyData as { name: string } | null)?.name ?? 'Your Company';
-
-      await notifyManagersByEmail(
-        contact.company_id,
-        companyName,
-        employee,
-        torRow,
-        pending,
-        stage1Result,
-        stage2Result,
-        violations
-      );
-    } else {
-      await notifyManager(contact.company_id, employee, pending, requestId, stage1Result, stage2Result, violations);
-    }
-  } catch (err) {
-    console.error('[time-off] manager notification failed:', err);
-    await logActivity({
-      company_id: contact.company_id,
-      action: 'time_off_manager_notification_failed',
-      entity_id: requestId,
-      summary: 'Manager notification failed — request is still logged',
-      metadata: { error: String(err) },
-    });
   }
 
   const dateDisplay = formatDateRange(pending.start_date, pending.end_date);

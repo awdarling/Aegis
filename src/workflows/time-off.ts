@@ -19,7 +19,7 @@ import {
   brandReflect,
   brandDetailRow,
 } from '../messaging/brand';
-import { buildTimeOffManagerEmail, buildTimeOffResolutionEmail, type TimeOffRecommendation } from './time-off-manager-email';
+import { buildTimeOffManagerEmail, buildTimeOffResolutionEmail, describePartialDay, buildPartialSummaryText, type TimeOffRecommendation } from './time-off-manager-email';
 import type { InboundMessage, VerifiedContact } from '../security/types';
 import type { Employee, PartialDayDetail, Policy, TimeOffRequest } from '../db/types';
 import type { SimulationResult } from '../lib/schedule-simulator';
@@ -308,7 +308,8 @@ async function generateTimeOffRecommendation(
   reason: string,
   stage1: SimulationResult,
   stage2: SimulationResult | null,
-  policies: Policy[]
+  policies: Policy[],
+  partialSummary?: string | null
 ): Promise<DecisionRecommendation> {
   const systemPrompt =
     'You are Aegis, an AI workforce assistant. Analyze a time-off request and provide a recommendation. ' +
@@ -318,7 +319,7 @@ async function generateTimeOffRecommendation(
   const policyText =
     policies.length > 0
       ? policies
-          .map(p => `${p.policy_key}: ${p.policy_value}${p.description ? ` — ${p.description}` : ''}`)
+          .map(p => `${p.policy_key}: ${p.policy_value}${stripDemo(p.description) ? ` — ${stripDemo(p.description)}` : ''}`)
           .join('\n')
       : 'No time-off policies configured.';
 
@@ -331,7 +332,9 @@ async function generateTimeOffRecommendation(
 
   const context = [
     `Employee: ${employee.name}`,
-    `Requested dates: ${startDate} to ${endDate}`,
+    partialSummary
+      ? `Requested: PARTIAL DAY — ${partialSummary} (employee is out ONLY during this window, not the full day; weigh coverage for that window)`
+      : `Requested dates: ${startDate} to ${endDate}`,
     `Reason: ${reason}`,
     '',
     'STAGE 1 — Target day(s) simulation:',
@@ -612,6 +615,13 @@ function formatViolationLines(violations: TimeOffViolations | null): string[] {
   return lines;
 }
 
+// Strip sandbox "— Demo…" / "Demo:" annotations off a policy description so they
+// never reach a real manager's inbox (production polish). Keeps any real prefix.
+function stripDemo(desc?: string | null): string {
+  if (!desc) return '';
+  return desc.replace(/\s*[—-]\s*Demo\b.*$/i, '').replace(/^\s*Demo\b.*$/i, '').trim();
+}
+
 function buildManagerEmail(params: {
   employeeName: string;
   managerName: string;
@@ -625,6 +635,8 @@ function buildManagerEmail(params: {
   denyUrl: string;
   policies: Policy[];
   violations: TimeOffViolations | null;
+  timeOffType?: 'full_day' | 'partial' | null;
+  partialDays?: PartialDayDetail[] | null;
 }): { subject: string; text: string; html: string } {
   const {
     employeeName,
@@ -639,11 +651,19 @@ function buildManagerEmail(params: {
     denyUrl,
     policies,
     violations,
+    timeOffType,
+    partialDays,
   } = params;
   const violationLines = formatViolationLines(violations);
 
-  const dateDisplay = formatDateRange(startDate, endDate);
-  const subject = `Time-Off Request — ${employeeName} (${formatShortDate(startDate)}${startDate !== endDate ? ` – ${formatShortDate(endDate)}` : ''})`;
+  // Partial-day requests must render the actual window (e.g. "Wed Aug 12 —
+  // 9:00 AM–1:00 PM"), not a whole day — a manager approving needs to see it's
+  // only the morning. (H1: this path previously dropped the partial info.)
+  const isPartial = timeOffType === 'partial' && !!partialDays && partialDays.length > 0;
+  const dateDisplay = isPartial
+    ? `${partialDays!.map(describePartialDay).join('; ')} (partial day)`
+    : formatDateRange(startDate, endDate);
+  const subject = `Time-Off Request — ${employeeName} (${formatShortDate(startDate)}${startDate !== endDate ? ` – ${formatShortDate(endDate)}` : ''}${isPartial ? ', partial' : ''})`;
   const employeeFirst = firstName(employeeName);
 
   // Plain text version. Sim/alternates/recommendation sections are only
@@ -651,7 +671,7 @@ function buildManagerEmail(params: {
   const text = [
     greeting(managerName),
     '',
-    `${employeeFirst} just put in a time-off request, and I've taken a first pass at the coverage picture for you. ` +
+    `${employeeFirst} just put in a ${isPartial ? 'partial-day ' : ''}time-off request, and I've taken a first pass at the coverage picture for you. ` +
       `The details are below — either link records your decision right away, and I'll let ${employeeFirst} know which way it went, so there's nothing else you'll need to do.`,
     '',
     ...(violationLines.length > 0
@@ -695,7 +715,7 @@ function buildManagerEmail(params: {
         ]
       : []),
     policies.length > 0
-      ? `COMPANY POLICIES (time-off):\n${policies.map(p => `  ${p.policy_key}: ${p.policy_value}${p.description ? ' — ' + p.description : ''}`).join('\n')}`
+      ? `COMPANY POLICIES (time-off):\n${policies.map(p => `  ${p.policy_key}: ${p.policy_value}${stripDemo(p.description) ? ' — ' + stripDemo(p.description) : ''}`).join('\n')}`
       : '',
     '',
     ...(recommendation
@@ -725,7 +745,7 @@ function buildManagerEmail(params: {
   // Conclusion-first intro — the whole ask sits above the card.
   const introHtml = `
 <p style="margin:0 0 12px;font-size:16px;color:${BRAND.textPrimary};">${escapeHtmlTo(greeting(managerName))}</p>
-<p style="margin:0;font-size:16px;color:${BRAND.textPrimary};line-height:1.65;">${escapeHtmlTo(employeeFirst)} just put in a time-off request, and I've taken a first pass at the coverage picture for you. Everything's in the card below — either button records your decision right away, and I'll let ${escapeHtmlTo(employeeFirst)} know which way it went, so there's nothing else you'll need to do.</p>`;
+<p style="margin:0;font-size:16px;color:${BRAND.textPrimary};line-height:1.65;">${escapeHtmlTo(employeeFirst)} just put in a ${isPartial ? 'partial-day ' : ''}time-off request, and I've taken a first pass at the coverage picture for you. Everything's in the card below — either button records your decision right away, and I'll let ${escapeHtmlTo(employeeFirst)} know which way it went, so there's nothing else you'll need to do.</p>`;
 
   // Policy considerations — warn-tinted callout (omitted when no violations).
   const policyConsiderationsHtml =
@@ -826,7 +846,7 @@ function buildManagerEmail(params: {
       ? `<ul style="margin:6px 0 0;padding-left:18px;">${policies
           .map(
             p =>
-              `<li style="margin:0 0 6px;font-size:14px;color:${BRAND.textPrimary};"><strong>${escapeHtmlTo(p.policy_key)}:</strong> ${escapeHtmlTo(p.policy_value)}${p.description ? ' — ' + escapeHtmlTo(p.description) : ''}</li>`
+              `<li style="margin:0 0 6px;font-size:14px;color:${BRAND.textPrimary};"><strong>${escapeHtmlTo(p.policy_key)}:</strong> ${escapeHtmlTo(p.policy_value)}${stripDemo(p.description) ? ' — ' + escapeHtmlTo(stripDemo(p.description)) : ''}</li>`
           )
           .join('')}</ul>`
       : `<div style="font-size:14px;color:${BRAND.textSecondary};">No time-off policies configured.</div>`
@@ -1260,7 +1280,10 @@ async function notifyManager(
       pending.reason,
       stage1,
       stage2,
-      policies
+      policies,
+      pending.time_off_type === 'partial' && pending.partial_days?.length
+        ? buildPartialSummaryText(pending.partial_days)
+        : null
     );
 
     // Persist recommendation so Homebase can display it
@@ -1287,6 +1310,8 @@ async function notifyManager(
     denyUrl,
     policies,
     violations,
+    timeOffType: pending.time_off_type ?? 'full_day',
+    partialDays: pending.partial_days ?? null,
   });
 
   await sendEmail({

@@ -589,10 +589,11 @@ export function buildOperationalAnswerSystem(
     role === 'employee'
       ? `You are answering a question from ${name}, an employee. ` +
         `Answer questions about their own schedule, their own time off, their own availability, their own hours, and their own shifts. ` +
-        `You can also tell them who is working on any given day and in what role and shift time — the posted schedule is shared with the whole team, so the roster is not private; share it plainly for any day they ask about, whether or not they're on it themselves, and never disclaim or hedge about whose shifts they can see. ` +
+        `You can also tell them who is working on any given day, in what role and shift time — and if they ask about a specific shift ("who's on Monday night", or a shift by name), scope it to just that shift using the shift name and time shown for each person. The posted schedule is shared with the whole team, so the roster is not private; share it plainly for any day they ask about, whether or not they're on it themselves, and never disclaim or hedge about whose shifts they can see. ` +
         `Never reveal anyone else's wages, personal availability, total hours, contact information, or other personal details — only who is on, their role, and the shift time.`
       : `You can answer staffing questions like how many people were on a given day, who was working (and in what role), who's free/available, where coverage is short, and who's near their max weekly hours. ` +
-        `The staffing summary below already gives you exact per-day headcounts and who was on by role — treat those counts as authoritative and answer with them directly.`;
+        `The staffing summary below already gives you exact per-day headcounts and who was on by role — treat those counts as authoritative and answer with them directly. ` +
+        `When someone asks about a specific SHIFT rather than the whole day ("who's on the PM shift Monday", "who's working Twilight on Saturday"), scope your answer to just that shift: each person in the summary is tagged with their shift name and start–end time, so match the shift they named — by the tenant's shift name, or by AM/PM read from the times shown — and list only the people on it.`;
 
   // Order matters: personality (voice) → date → GROUNDING → SCOPE → role data
   // scope → no-leak. Grounding and scope come before the role scope so the model

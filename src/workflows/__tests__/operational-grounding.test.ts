@@ -54,6 +54,11 @@ describe('buildOperationalAnswerSystem — employee', () => {
     expect(sys).not.toMatch(/shift this employee is ALSO on/i);
     expect(sys).toMatch(/never reveal anyone else'?s[^.]*wages/i);
   });
+
+  it("supports shift-scoped who's-working answers (batch 4a)", () => {
+    expect(sys).toMatch(/specific shift/i);
+    expect(sys).toContain('scope it to just that shift');
+  });
 });
 
 describe('buildOperationalAnswerSystem — manager', () => {
@@ -67,5 +72,9 @@ describe('buildOperationalAnswerSystem — manager', () => {
 
   it('allows manager staffing answers', () => {
     expect(sys).toMatch(/staffing|headcount|coverage/i);
+  });
+
+  it('supports shift-scoped staffing answers (batch 4a)', () => {
+    expect(sys).toContain('scope your answer to just that shift');
   });
 });

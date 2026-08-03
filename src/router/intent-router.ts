@@ -57,6 +57,7 @@ import {
   clearPendingAvailConfirm,
   buildAvailChangeConfirmBody,
   classifyAffirmation,
+  classifySwitchReply,
 } from '../workflows/employee-onboarding';
 import {
   handleBroadcast,
@@ -222,8 +223,36 @@ async function routeIntentInner(
         console.log('[router] EARLY RETURN', { reason: 'intent_switch_declined' });
         return;
       }
-      // Ambiguous reply: drop the offer and let the availability-confirm handler
-      // below interpret this message (a real correction applies; a fresh
+      // Deterministic fast-path couldn't decide (a clean yes/no is free; this reply
+      // wasn't one). Spend ONE small classification so a natural "yea, I want to
+      // switch" isn't misread as ambiguous. Only genuinely unclear replies fall
+      // through to the availability-confirm handler below.
+      const smart = await classifySwitchReply(message.body, pendingSwitch.intent);
+      if (smart === 'switch') {
+        await clearPendingIntentSwitch(contact.company_id, contact.employee_id);
+        await clearPendingAvailConfirm(contact.company_id, contact.employee_id);
+        const resumed: InboundMessage = { ...message, body: pendingSwitch.interrupting_body };
+        console.log('[router] intent switch confirmed (llm) → resuming interrupted request');
+        await routeIntentInner(resumed, contact);
+        return;
+      }
+      if (smart === 'keep') {
+        await clearPendingIntentSwitch(contact.company_id, contact.employee_id);
+        const availKeep = await getPendingAvailConfirm(contact.company_id, contact.employee_id);
+        if (availKeep) {
+          await reply(
+            contact,
+            message,
+            `No problem — keeping your availability update. ${buildAvailChangeConfirmBody(availKeep.proposed_availability, { customEndDate: availKeep.custom_end_date ?? null })}`
+          );
+        } else {
+          await reply(contact, message, `No problem. What would you like to do?`);
+        }
+        console.log('[router] EARLY RETURN', { reason: 'intent_switch_declined_llm' });
+        return;
+      }
+      // Still genuinely unclear: drop the offer and let the availability-confirm
+      // handler below interpret this message (a real correction applies; a fresh
       // different-intent re-offers).
       await clearPendingIntentSwitch(contact.company_id, contact.employee_id);
     }

@@ -47,6 +47,13 @@ describe('buildOperationalAnswerSystem — employee', () => {
     expect(sys).toMatch(/never mention how you got the information/i);
     expect(sys).toMatch(/their own schedule|their own shifts/i);
   });
+
+  it('opens the posted roster (no disclose-then-disclaim) but protects sensitive fields', () => {
+    expect(sys).toMatch(/shared with the whole team/i);
+    expect(sys).toMatch(/who is working on any given day/i);
+    expect(sys).not.toMatch(/shift this employee is ALSO on/i);
+    expect(sys).toMatch(/never reveal anyone else'?s[^.]*wages/i);
+  });
 });
 
 describe('buildOperationalAnswerSystem — manager', () => {

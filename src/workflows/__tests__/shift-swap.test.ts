@@ -46,6 +46,7 @@ import {
   handleRespondSwap,
   type HardConflictRow,
   type TradeSide,
+  pickUpcomingShift,
 } from '../shift-swap';
 import { reply } from '../../messaging/reply';
 import type { Employee } from '../../db/types';
@@ -490,5 +491,30 @@ describe('handleRespondSwap fallback (BUG-6 residual)', () => {
     await handleRespondSwap(msg("I'll take the Friday shift"), contact, {}, 'accept');
     const text = (reply as any).mock.calls[0][2] as string;
     expect(text).toMatch(/active swap request pending/i);
+  });
+});
+
+describe('pickUpcomingShift — no date named: resolve upcoming, never assume today (Bug 3)', () => {
+  const A = (employee_id: string, date: string, shift_name: string, start_time = '09:00') =>
+    ({ employee_id, employee_name: employee_id, date, shift_name, role: 'Guard', start_time, end_time: '13:00', hours: 4 } as any);
+  const today = '2026-08-01';
+  it('returns the single upcoming shift when there is exactly one', () => {
+    const r = pickUpcomingShift([A('me', '2026-08-01', 'PM', '13:00'), A('other', '2026-08-01', 'AM')], 'me', today);
+    expect(r.kind).toBe('one');
+    expect(r.kind === 'one' && r.shift.shift_name).toBe('PM');
+  });
+  it('asks (ambiguous) when the requester has multiple upcoming shifts', () => {
+    const r = pickUpcomingShift([A('me', '2026-08-01', 'AM'), A('me', '2026-08-02', 'PM', '13:00')], 'me', today);
+    expect(r.kind).toBe('ambiguous');
+    expect(r.kind === 'ambiguous' && r.shifts.length).toBe(2);
+  });
+  it('ignores past shifts and returns none when nothing is upcoming', () => {
+    const r = pickUpcomingShift([A('me', '2026-07-20', 'AM')], 'me', today);
+    expect(r.kind).toBe('none');
+  });
+  it('narrows by a shift-name hint when given', () => {
+    const r = pickUpcomingShift([A('me', '2026-08-01', 'AM'), A('me', '2026-08-02', 'PM', '13:00')], 'me', today, 'PM');
+    expect(r.kind).toBe('one');
+    expect(r.kind === 'one' && r.shift.shift_name).toBe('PM');
   });
 });

@@ -141,7 +141,7 @@ function confirmationPage(employeeName: string, action: 'approve' | 'deny'): str
     headingColor: statusColor,
     icon: action === 'approve' ? '✓' : '✕',
     iconColor: statusColor,
-    body: `Request ${verb}. Aegis has notified ${escapeHtml(employeeName)}.`,
+    body: `Request ${verb}. I've let ${escapeHtml(employeeName)} know.`,
   });
 }
 

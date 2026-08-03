@@ -1004,6 +1004,30 @@ export function findRequesterShift(schedData: ScheduleData, requesterId: string,
   return schedData.assignments.find(a => a.employee_id === requesterId && a.date === shiftDate) ?? null;
 }
 
+// When a swap message names no date, don't assume "today" — resolve the requester's
+// UPCOMING shifts (date >= today, current schedule) so the caller can use the single
+// obvious one or ask which. Pure, so it is unit-tested without a database.
+export type UpcomingShiftChoice =
+  | { kind: 'one'; shift: ScheduleAssignment }
+  | { kind: 'ambiguous'; shifts: ScheduleAssignment[] }
+  | { kind: 'none' };
+
+export function pickUpcomingShift(
+  assignments: ScheduleAssignment[],
+  requesterId: string,
+  today: string,
+  nameHint?: string | null
+): UpcomingShiftChoice {
+  const mine = assignments
+    .filter(a => a.employee_id === requesterId && a.date >= today)
+    .sort((a, b) => a.date.localeCompare(b.date) || (a.start_time ?? '').localeCompare(b.start_time ?? ''));
+  const hinted = nameHint ? mine.filter(a => a.shift_name.toLowerCase().includes(nameHint.toLowerCase())) : [];
+  const pool = hinted.length > 0 ? hinted : mine;
+  if (pool.length === 0) return { kind: 'none' };
+  if (pool.length === 1) return { kind: 'one', shift: pool[0] };
+  return { kind: 'ambiguous', shifts: pool };
+}
+
 // Pure transform: reassign the requester's matching shift (date + shift_name) to
 // the receiver. Returns a new assignments array; everything else is untouched.
 // Extracted from executeScheduleSwap so the swap effect can be unit-tested
@@ -2096,29 +2120,50 @@ export async function handleInitiateSwap(
   const today = await companyLocalToday(contact.company_id);
   const raw = await extractSwapDetails(message.body, today);
 
-  const shiftDate = raw.shift_date ?? today;
   const shiftNameHint = raw.shift_name ?? null;
   const targetName = raw.target_employee_name ?? null;
 
-  // Find the requester's shift in the schedule
-  const schedule = await findSchedule(contact.company_id, shiftDate);
+  // Resolve WHICH shift to swap. If the message named a date, use it. If it did NOT,
+  // don't silently assume "today" (that surfaced a confusing "no shift on <today>")
+  // — resolve the requester's upcoming shift and use the single obvious one, or ask
+  // which when there is more than one.
+  let shiftDate: string;
   let shift: ScheduleAssignment | null = null;
-  if (schedule) {
-    shift = findRequesterShift(schedule.data, contact.employee_id!, shiftDate);
-    // If we have a hint but no exact match, try to find by shift_name
-    if (!shift && shiftNameHint) {
-      shift = schedule.data.assignments.find(a =>
-        a.date === shiftDate && a.shift_name.toLowerCase().includes(shiftNameHint.toLowerCase())
-      ) ?? null;
+  let schedule: { id: string; data: ScheduleData } | null = null;
+  if (raw.shift_date) {
+    shiftDate = raw.shift_date;
+    schedule = await findSchedule(contact.company_id, shiftDate);
+    if (schedule) {
+      shift = findRequesterShift(schedule.data, contact.employee_id!, shiftDate);
+      if (!shift && shiftNameHint) {
+        shift = schedule.data.assignments.find(a =>
+          a.date === shiftDate && a.shift_name.toLowerCase().includes(shiftNameHint.toLowerCase())
+        ) ?? null;
+      }
     }
-  }
-
-  if (!shift) {
-    await reply(contact, message,
-      `I couldn't find a shift for you on ${formatDisplayDate(shiftDate)}${shiftNameHint ? ` matching "${shiftNameHint}"` : ''}. ` +
-      "Double-check the date, or reach out to your manager if you think there's a shift missing."
-    );
-    return;
+    if (!shift) {
+      await reply(contact, message,
+        `I couldn't find a shift for you on ${formatDisplayDate(shiftDate)}${shiftNameHint ? ` matching "${shiftNameHint}"` : ''}. ` +
+        "Double-check the date, or reach out to your manager if you think there's a shift missing."
+      );
+      return;
+    }
+  } else {
+    schedule = await findSchedule(contact.company_id, today);
+    const choice = pickUpcomingShift(schedule?.data.assignments ?? [], contact.employee_id!, today, shiftNameHint);
+    if (choice.kind === 'none') {
+      await reply(contact, message,
+        `I don't see any upcoming shifts on your schedule to swap${shiftNameHint ? ` matching "${shiftNameHint}"` : ''}. If that seems off, check with your manager.`
+      );
+      return;
+    }
+    if (choice.kind === 'ambiguous') {
+      const list = choice.shifts.map(a => `your ${a.shift_name} shift on ${formatDisplayDate(a.date)}`).join(', or ');
+      await reply(contact, message, `Which shift did you want to swap — ${list}? Just tell me which one.`);
+      return;
+    }
+    shift = choice.shift;
+    shiftDate = choice.shift.date;
   }
 
   const shiftHours = shift.hours ?? computeShiftHours(shift.start_time, shift.end_time);
@@ -2583,8 +2628,11 @@ export async function handleSwapConfirmation(
         })),
         token_payload: { requester_id: contact.employee_id! },
       });
-      await sendEmail({ to: cand.contact_email, subject, text, html, company_id: contact.company_id });
-      contactedIds.push(cand.id);
+      // Honest count: only tally a teammate we ACTUALLY reached. A swallowed
+      // SendGrid failure must not make us tell the requester we emailed them
+      // (mirrors the directed path). If none go through, the fallback below fires.
+      const ok = await sendEmail({ to: cand.contact_email, subject, text, html, company_id: contact.company_id });
+      if (ok) contactedIds.push(cand.id);
     }
 
     if (contactedIds.length === 0) {
@@ -2877,7 +2925,7 @@ export async function handleRespondSwap(
     return;
   }
   await reply(contact, message,
-    "I don't have an active swap request pending for you. If you received a swap request from Aegis, please check your recent messages."
+    "I don't have an active swap request pending for you. If you got a swap request from me, please check your recent messages."
   );
 }
 

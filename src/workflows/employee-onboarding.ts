@@ -802,9 +802,9 @@ async function claudeParseAvailability(
 // they stated when they CANNOT work (negative — subtract from current). For
 // "remove" the slots are the windows to take away. Lets employees talk naturally
 // ("I can't work Wednesdays anymore", "no mornings until Aug 1").
-export type AvailabilityIntent = { mode: 'set' | 'remove'; slots: AvailabilitySlot[] };
+export type AvailabilityIntent = { mode: 'set' | 'remove'; slots: AvailabilitySlot[]; scope: 'exclusive' | 'partial' };
 
-async function parseAvailabilityIntent(
+export async function parseAvailabilityIntent(
   message: string,
   bounds: ShiftBounds
 ): Promise<AvailabilityIntent> {
@@ -818,6 +818,7 @@ async function parseAvailabilityIntent(
         `"set" = the employee states when they CAN work (positive); ` +
         `"remove" = the employee states when they CANNOT work (negative — phrases like ` +
         `"I can't work...", "no more...", "take me off...", "stop scheduling me...", "no <day/period>..."). ` +
+        `For mode "set", also decide SCOPE: "exclusive" when the employee states their COMPLETE availability — the ONLY days/times they can work, replacing everything else ("I can only work Saturdays", "I'm only available weekends", "just Mondays and Wednesdays now", "my availability is ..."); "partial" when they are editing or adding specific day(s) and leaving the rest of the week as-is ("change Saturday to 3-5", "I can work Saturday mornings", "also add Sunday 10-2"). When unsure use "partial". For mode "remove", scope is always "partial". ` +
         `Then list the day+time windows the message refers to — the windows they CAN work (mode "set") ` +
         `or the windows they CANNOT work (mode "remove"). ` +
         // Same named-period rules as the positive parser.
@@ -827,17 +828,18 @@ async function parseAvailabilityIntent(
         `Day words: "weekdays" = Mon–Fri; "weekends" = Sat + Sun; a plural weekday ("Mondays") = that weekday. ` +
         `Ignore any trailing date boundary like "until <date>". day_of_week: 0=Sunday..6=Saturday. Times HH:MM (24h). ` +
         `Respond ONLY with JSON (no markdown): ` +
-        `{ "mode": "set" | "remove", "slots": [{ "day_of_week": 0, "start_time": "HH:MM", "end_time": "HH:MM" }] }. ` +
-        `If nothing clear can be parsed: { "mode": "set", "slots": [] }.`,
+        `{ "mode": "set" | "remove", "scope": "exclusive" | "partial", "slots": [{ "day_of_week": 0, "start_time": "HH:MM", "end_time": "HH:MM" }] }. ` +
+        `If nothing clear can be parsed: { "mode": "set", "scope": "partial", "slots": [] }.`,
       messages: [{ role: 'user', content: message }],
     })
   );
 
   const text = response.content[0].type === 'text' ? response.content[0].text : '';
-  const parsed = coerceJsonObject<{ mode?: string; slots?: AvailabilitySlot[] }>(text);
-  if (!parsed) return { mode: 'set', slots: [] };
+  const parsed = coerceJsonObject<{ mode?: string; scope?: string; slots?: AvailabilitySlot[] }>(text);
+  if (!parsed) return { mode: 'set', slots: [], scope: 'partial' };
   const mode: 'set' | 'remove' = parsed.mode === 'remove' ? 'remove' : 'set';
-  return { mode, slots: parsed.slots ?? [] };
+  const scope: 'exclusive' | 'partial' = mode === 'set' && parsed.scope === 'exclusive' ? 'exclusive' : 'partial';
+  return { mode, slots: parsed.slots ?? [], scope };
 }
 
 // Onboarding availability CONFIRM review. Given the availability currently read
@@ -922,6 +924,38 @@ export async function reviewAvailabilityConfirmation(
     default:
       return { action: 'unclear' };
   }
+}
+
+// Ambiguous-reply fallback for the "want to switch?" offer. The router first tries
+// the deterministic classifyAffirmation (a clean yes/no costs no model call); only a
+// reply that can't resolve deterministically reaches here, so this spends ONE small
+// classification. Returns 'switch' (do the interrupted request), 'keep' (stay on the
+// availability change), or 'unclear' (fall through to the availability-confirm handler).
+export async function classifySwitchReply(
+  reply: string,
+  intent: SwitchIntent
+): Promise<'switch' | 'keep' | 'unclear'> {
+  const what = switchIntentPhrase(intent);
+  const response = await withAnthropicRetry(() =>
+    client.messages.create({
+      model: MODEL,
+      max_tokens: 64,
+      system:
+        `An employee was updating their weekly availability, then raised a different request (to ${what}). ` +
+        `I asked whether they want to set the availability change aside and do that instead, or keep going with the availability change. ` +
+        `Read their reply and choose ONE:\n` +
+        `- "switch": they want to set the availability change aside and do the other thing (e.g. "yes", "yeah switch", "do the swap instead", "I don't want to change my availability, I want to swap").\n` +
+        `- "keep": they want to KEEP the availability change and not switch ("no, keep it", "stick with the availability change").\n` +
+        `- "unclear": you genuinely can't tell.\n` +
+        `Respond ONLY with JSON (no markdown): { "decision": "switch" | "keep" | "unclear" }.`,
+      messages: [{ role: 'user', content: reply }],
+    })
+  );
+  const text = response.content[0].type === 'text' ? response.content[0].text : '';
+  const parsed = coerceJsonObject<{ decision?: string }>(text);
+  if (parsed?.decision === 'switch') return 'switch';
+  if (parsed?.decision === 'keep') return 'keep';
+  return 'unclear';
 }
 
 // Does this message describe a ROTATING availability change (a multi-week
@@ -1645,6 +1679,25 @@ async function handleAvailabilityConfirmStep(
   await sendTimeOffStep(session);
 }
 
+// Deterministic "no upcoming time off" detector for onboarding. A clear, unambiguous
+// negative completes onboarding without re-gating (cheaper + more reliable than the
+// LLM). Anything not in this tight set falls through to the LLM classifier and then a
+// warm re-confirm — a missed upcoming time-off = weeks of bad schedules, so we never
+// SILENTLY complete on ambiguity. Intentionally exact-match: it must never fire on a
+// message that names a date.
+export function isClearNoTimeOff(body: string): boolean {
+  const t = body.trim().toLowerCase().replace(/[.!,?]+/g, ' ').replace(/\s+/g, ' ').trim();
+  const negatives = new Set([
+    'no', 'nope', 'nah', 'none', 'nothing', 'negative', 'nada',
+    'no thanks', 'no dates', 'no time off', 'no time', 'not really',
+    "i'm good", 'im good', 'all good', "we're good", 'were good',
+    'not right now', 'not at the moment', 'none right now', 'none at the moment',
+    "don't have any", 'dont have any', 'no i dont', "no i don't",
+    'no not right now', 'no all good', "no i'm good", 'no im good',
+  ]);
+  return negatives.has(t);
+}
+
 async function handleTimeOffStep(
   body: string,
   session: OnboardingSession & { _memory_id: string },
@@ -1657,12 +1710,14 @@ async function handleTimeOffStep(
     // Don't silently complete on an empty parse — confirm the employee really
     // means "no time off" before closing out the workflow. Claude classifies
     // whether the message is a clear no vs. ambiguous mention.
-    const clearlyNoTimeOff = await claudeClassifyYesNo(
-      body,
-      `The employee was asked if they have any upcoming time off. Did they clearly say they have no upcoming time off?`
-    );
+    const clearlyNoTimeOff =
+      isClearNoTimeOff(body) ||
+      (await claudeClassifyYesNo(
+        body,
+        `The employee was asked if they have any upcoming time off. Did they clearly say they have no upcoming time off?`
+      )) === 'yes';
 
-    if (clearlyNoTimeOff === 'yes') {
+    if (clearlyNoTimeOff) {
       session.step = 'complete';
       await saveOnboardingSession(session);
       await completeOnboarding(session, managerContact, managerMsg);
@@ -1672,8 +1727,8 @@ async function handleTimeOffStep(
     // Ambiguous — stay in the time_off step and ask for clarification.
     await textEmployee(
       session,
-      `Just to confirm — you don't have any upcoming dates you need off? ` +
-        `Reply YES if that's correct, or tell me the specific dates.`
+      `Just want to make sure I've got it right — no upcoming dates you need off? ` +
+        `If that's right, a quick "yep" and you're all set, or send me the dates.`
     );
     return;
   }
@@ -1767,7 +1822,7 @@ async function completeOnboarding(
   await textEmployee(
     session,
     `You're all set ${firstName}. I've saved your availability and contact info. ` +
-      `You'll receive your schedule from Aegis each week. Welcome to the team.`
+      `I'll send you your schedule each week. Welcome to the team!`
   );
 
   // Write to employees table
@@ -2461,8 +2516,16 @@ export async function handleUpdateAvailability(
     end_time: clampTime(s.end_time, bounds.earliest_start, bounds.latest_end),
   });
 
+  // A bounded "until <date>" change is a TEMPORARY (date-limited) custom override,
+  // not a permanent availability change; computed up-front so the set path can tell
+  // a permanent day-scoped edit (which MERGES per day) from a temporary override.
+  const endRaw = typeof extracted.end_date === 'string' ? extracted.end_date.trim() : '';
+  const customEndDate = /^\d{4}-\d{2}-\d{2}$/.test(endRaw) ? endRaw : null;
+
   let proposed: AvailabilitySlot[];
   let assumedFullWeek = false;
+  let merged = false;
+  let exclusive = false;
   if (intent.mode === 'remove') {
     let baseline: AvailabilitySlot[];
     if (currentAvail.length === 0) {
@@ -2489,8 +2552,8 @@ export async function handleUpdateAvailability(
       return;
     }
   } else {
-    proposed = intent.slots.map(clamp).filter(s => s.start_time < s.end_time);
-    if (proposed.length === 0) {
+    const changed = intent.slots.map(clamp).filter(s => s.start_time < s.end_time);
+    if (changed.length === 0) {
       await reply(
         contact,
         message,
@@ -2499,13 +2562,21 @@ export async function handleUpdateAvailability(
       );
       return;
     }
+    if (customEndDate || currentAvail.length === 0 || intent.scope === 'exclusive') {
+      // Temporary (until-date) override, nothing on file yet, OR an EXCLUSIVE
+      // restatement ("I can only work Saturdays") → the named days ARE the whole
+      // picture; replace, don't merge.
+      proposed = changed;
+      exclusive = intent.scope === 'exclusive' && currentAvail.length > 0;
+    } else {
+      // Per-day MERGE (AVAIL-MERGE-1): a permanent day-scoped change edits only the
+      // named day(s) and keeps every other day already on file — it never silently
+      // zeroes out the rest of the week. Full replacement stays opt-in via the remove
+      // path or an explicit "I can only work X". Deterministic — no LLM call.
+      proposed = mergeDayScopedAvailability(currentAvail, changed);
+      merged = proposed.length > changed.length;
+    }
   }
-
-  // A bounded "until <date>" change is a TEMPORARY (date-limited) custom override,
-  // not a permanent availability change. The classifier surfaces end_date when it
-  // sees the boundary; we only treat it as custom when it's a valid YYYY-MM-DD.
-  const endRaw = typeof extracted.end_date === 'string' ? extracted.end_date.trim() : '';
-  const customEndDate = /^\d{4}-\d{2}-\d{2}$/.test(endRaw) ? endRaw : null;
 
   const pending: PendingAvailUpdate = {
     employee_id: employeeId,
@@ -2533,7 +2604,7 @@ export async function handleUpdateAvailability(
     content: JSON.stringify(pending),
   });
 
-  const confirmBody = buildAvailChangeConfirmBody(proposed, { customEndDate, assumedFullWeek });
+  const confirmBody = buildAvailChangeConfirmBody(proposed, { customEndDate, assumedFullWeek, merged, exclusive });
 
   // Rich HTML sibling of the plain confirmBody: reflect the employee's own words
   // back, then the proposed availability as accent detail rows, then the reply-YES
@@ -2543,7 +2614,11 @@ export async function handleUpdateAvailability(
     ? `You don't have any availability on file yet, so I'm reading this as: you can work your usual hours every day <strong>except</strong> what you mentioned.${customEndDate ? ` This would run through <strong>${formatDateRange(customEndDate, customEndDate)}</strong>, then back to normal.` : ''} Here's what I'd set:`
     : customEndDate
       ? `Got it — through <strong>${formatDateRange(customEndDate, customEndDate)}</strong>, here's the availability I have for you. After that you're back to your normal hours.`
-      : `Got it — here's the new availability I have for you:`;
+      : exclusive
+        ? `Got it — going forward you'll be available ONLY on the day(s) you named (this replaces your other days). Here's your full availability after that:`
+        : merged
+          ? `Got it — I'll change just the day(s) you mentioned and keep your other days as they are. Here's your full availability after that:`
+          : `Got it — here's the new availability I have for you:`;
   const pStyle = `margin:0 0 16px;font-size:16px;line-height:1.65;color:${BRAND.textPrimary};`;
   const confirmHtml = brandedEmailShell({
     bodyHtml:
@@ -2557,12 +2632,27 @@ export async function handleUpdateAvailability(
   await reply(contact, message, confirmBody, confirmHtml);
 }
 
+// Per-day merge for a permanent day-scoped availability change (AVAIL-MERGE-1): the
+// named day(s) replace only those days; every other day already on file is kept, so a
+// change like "Saturday to 3-5pm" never zeroes out the rest of the week. Pure and
+// deterministic — no LLM call.
+export function mergeDayScopedAvailability(
+  current: AvailabilitySlot[],
+  changed: AvailabilitySlot[]
+): AvailabilitySlot[] {
+  const changedDays = new Set(changed.map(s => s.day_of_week));
+  const kept = current.filter(s => !changedDays.has(s.day_of_week));
+  return [...kept, ...changed].sort(
+    (a, b) => a.day_of_week - b.day_of_week || a.start_time.localeCompare(b.start_time)
+  );
+}
+
 // Human, correction-friendly read-back for an availability CHANGE
 // (update_availability). No robotic "reply YES/NO" — it invites either a yes or a
 // partial correction, which handleAvailabilityConfirmResponse applies in place.
 export function buildAvailChangeConfirmBody(
   proposed: AvailabilitySlot[],
-  opts: { customEndDate?: string | null; assumedFullWeek?: boolean } = {}
+  opts: { customEndDate?: string | null; assumedFullWeek?: boolean; merged?: boolean; exclusive?: boolean } = {}
 ): string {
   const proposedDisplay = formatAvailabilityList(proposed);
   if (opts.assumedFullWeek) {
@@ -2579,6 +2669,18 @@ export function buildAvailChangeConfirmBody(
     return (
       `Got it — through ${formatDateRange(opts.customEndDate, opts.customEndDate)} you'd be available:\n${proposedDisplay}\n` +
       `Then you're back to your normal hours. Does that look right? If so I'll pass it to your manager — otherwise tell me what to change.`
+    );
+  }
+  if (opts.exclusive) {
+    return (
+      `Got it — going forward you'll be available ONLY on the day(s) you named. This replaces your other days. Here's your full availability after that:\n${proposedDisplay}\n` +
+      `Does that look right? If so I'll pass it to your manager to approve — otherwise tell me what to change.`
+    );
+  }
+  if (opts.merged) {
+    return (
+      `Got it — I'll change just the day(s) you mentioned and keep your other days as they are. Here's your full availability after that:\n${proposedDisplay}\n` +
+      `Does that look right? If so I'll pass it to your manager to approve — otherwise tell me what to change.`
     );
   }
   return (

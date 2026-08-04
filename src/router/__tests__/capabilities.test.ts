@@ -3,6 +3,7 @@ import {
   buildCapabilitiesReply,
   allowedActionsLine,
   capabilityGroups,
+  isCapabilitiesQuery,
 } from '../capabilities';
 
 describe('capabilityGroups', () => {
@@ -54,6 +55,38 @@ describe('buildCapabilitiesReply', () => {
   it('works without a name', () => {
     const reply = buildCapabilitiesReply('employee');
     expect(reply).toMatch(/^Hey —/);
+  });
+});
+
+describe('isCapabilitiesQuery', () => {
+  it('matches standalone capabilities questions regardless of casing/punctuation', () => {
+    for (const s of [
+      'What can you do?',
+      'what can you do',
+      'What can you help with?',
+      'what can you help me with',
+      'What do you do?',
+      'how can you help',
+      'How can you help me?',
+      'what are you able to do',
+      'what else can you do',
+      'Hey Aegis, what can you do?',
+    ]) {
+      expect(isCapabilitiesQuery(s), s).toBe(true);
+    }
+  });
+
+  it('does NOT fire on real requests that happen to contain "what can you do"', () => {
+    for (const s of [
+      'what can you do about getting Saturday covered',
+      'I need someone to cover the PM shift on Saturday, someone called out.',
+      'Avery Stone just called out for her Saturday morning lifeguard shift. I need help finding coverage.',
+      'can you build next week',
+      'what time is my shift on Friday',
+      '',
+    ]) {
+      expect(isCapabilitiesQuery(s), s).toBe(false);
+    }
   });
 });
 

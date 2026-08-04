@@ -2272,6 +2272,30 @@ ${teamGridHtml}
 
 // ── Distribute handler ────────────────────────────────────────────────────────
 
+// Pick which schedule row to distribute for a target week, given every non-
+// deleted published/draft row for that week_start. The NEWEST build (by
+// generated_at) wins, tie-broken to the published row.
+//
+// Why newest-wins and not published-first: when a manager rebuilds a week that
+// already has a published+distributed schedule, the fresh build lands as a NEW
+// `draft` alongside the OLD `published` row. Preferring published (the old code)
+// selected the STALE row, whose distributed_at was set on the prior send — so
+// "distribute it" right after an approved rebuild hit the re-distribution guard
+// and refused ("already sent on <old date>"), and the freshly built week never
+// went out. Distributing the newest build is the manager's intent; distribute-
+// Core then supersedes any older published row for the same week. Pure + tested.
+export function pickScheduleToDistribute<
+  T extends { id: string; status: string; generated_at: string }
+>(rows: T[]): T | null {
+  if (rows.length === 0) return null;
+  return [...rows].sort((a, b) => {
+    const byGenerated = Date.parse(b.generated_at) - Date.parse(a.generated_at);
+    if (byGenerated !== 0) return byGenerated;
+    if (a.status !== b.status) return a.status === 'published' ? -1 : 1;
+    return 0;
+  })[0];
+}
+
 export async function handleDistributeSchedule(
   message: InboundMessage,
   contact: VerifiedContact,
@@ -2287,19 +2311,17 @@ export async function handleDistributeSchedule(
   const { weekStart, weekEnd } = parseTargetWeek(extracted, settings);
   const weekLabel = `${formatShortDate(weekStart)}–${formatShortDate(weekEnd)}`;
 
-  // Select the schedule for THAT week_start (not "latest"). Prefer a published
-  // one over a draft; newest generated_at within the week breaks any tie.
-  type ScheduleRow = { id: string };
-  let scheduleRow: ScheduleRow | null = null;
-  for (const status of ['published', 'draft'] as const) {
-    const { data } = await supabase
-      .from('schedules').select('id').is('deleted_at', null)
-      .eq('company_id', contact.company_id)
-      .eq('status', status)
-      .eq('week_start', weekStart)
-      .order('generated_at', { ascending: false }).limit(1).maybeSingle();
-    if (data) { scheduleRow = data as ScheduleRow; break; }
-  }
+  // Select the schedule for THAT week_start (not "latest"). Among the week's
+  // published/draft rows, distribute the NEWEST build (see pickScheduleToDistribute)
+  // — NOT published-first, which would grab a stale prior-distributed row and make
+  // "distribute it" refuse right after a rebuild.
+  type ScheduleRow = { id: string; status: string; generated_at: string };
+  const { data: weekRows } = await supabase
+    .from('schedules').select('id, status, generated_at').is('deleted_at', null)
+    .eq('company_id', contact.company_id)
+    .eq('week_start', weekStart)
+    .in('status', ['published', 'draft']);
+  const scheduleRow = pickScheduleToDistribute((weekRows ?? []) as ScheduleRow[]);
 
   if (!scheduleRow) {
     // Do NOT fall back to a different week — say so plainly.

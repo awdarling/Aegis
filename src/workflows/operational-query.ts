@@ -86,6 +86,17 @@ const ALLOWED_TABLES = new Set([
   'events', 'employee_conflicts', 'aegis_memory', 'activity_log',
 ]);
 
+// Tables that are PERSONAL to one employee (keyed by employee_id). When an
+// EMPLOYEE self-queries ("what's my availability", "where's my time off?"), the
+// LLM fetch plan can't know their UUID, so without forcing this scope the plan
+// pulls the WHOLE company's rows — and the answer model, told to only reveal the
+// asker's own and never anyone else's, can't tell which rows are "mine" and
+// returns nothing/wrong. Scoping to self both fixes the read and is a privacy
+// backstop (an employee can never fetch a coworker's availability/time off here).
+const EMPLOYEE_SELF_SCOPED_TABLES = new Set<string>([
+  'availability', 'time_off_requests',
+]);
+
 // Entity type → Supabase table mapping
 const ENTITY_TABLE: Record<string, string> = {
   employee: 'employees',
@@ -298,7 +309,8 @@ export async function executeFetchPlan(
   plan: FetchPlan,
   companyId: string,
   today: string,
-  role?: CapabilityRole
+  role?: CapabilityRole,
+  selfEmployeeId?: string | null
 ): Promise<Record<string, unknown[]>> {
   const results: Record<string, unknown[]> = {};
 
@@ -359,6 +371,14 @@ export async function executeFetchPlan(
     // Employees only ever see the posted (published) roster — never unpublished drafts.
     if (item.table === 'schedules' && role === 'employee') {
       q = q.eq('status', 'published');
+    }
+
+    // Force self-scope on personal tables for an employee, so "my availability" /
+    // "my time off" resolves to THEIR rows (the LLM plan can't supply the UUID).
+    // Applied last so the date_context branch above — which rebuilds `q` for
+    // time_off_requests — can't drop it.
+    if (role === 'employee' && selfEmployeeId && EMPLOYEE_SELF_SCOPED_TABLES.has(item.table)) {
+      q = q.eq('employee_id', selfEmployeeId);
     }
 
     if (item.order) q = q.order(item.order.field, { ascending: item.order.ascending });
@@ -656,8 +676,15 @@ Available Homebase tables (all scoped to this company):
     };
   }
 
-  // Step 2: Execute the fetch plan
-  const fetchedData = await executeFetchPlan(plan, contact.company_id, today, contact.role as CapabilityRole);
+  // Step 2: Execute the fetch plan. Pass the asker's employee_id so an employee's
+  // self-queries (availability, time off) are scoped to their own rows.
+  const fetchedData = await executeFetchPlan(
+    plan,
+    contact.company_id,
+    today,
+    contact.role as CapabilityRole,
+    contact.employee_id,
+  );
 
   // Step 3: Ask Claude to answer with the data. The context is pre-summarized
   // into clean facts (esp. schedules → per-date headcount + names) so the model

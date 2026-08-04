@@ -66,7 +66,7 @@ import {
   getActiveBroadcastSession,
 } from '../workflows/broadcast';
 import { handleNotifyDayClosure } from '../workflows/day-closure';
-import { buildCapabilitiesReply, allowedActionsLine, type CapabilityRole } from './capabilities';
+import { buildCapabilitiesReply, allowedActionsLine, isCapabilitiesQuery, type CapabilityRole } from './capabilities';
 
 // ── Permission sets ───────────────────────────────────────────────────────────
 
@@ -169,6 +169,25 @@ async function routeIntentInner(
       console.log('[router] EARLY RETURN', { reason: 'onboarding_email_session' });
       return;
     }
+  }
+
+  // Deterministic capabilities short-circuit. A standalone "what can you do?"
+  // must ALWAYS get the role-aware capabilities reply, regardless of prior
+  // conversational context. It runs AFTER the onboarding-session lookups above
+  // (a guided onboarding flow keeps its own handling) but BEFORE every other
+  // pending-state handler, because those handlers otherwise swallow it: the live
+  // bug was a manager with an open emergency-coverage session ("awaiting_names")
+  // whose "What can you do?" was read as a decline and punted with "I'll leave it
+  // with you…". The LLM classifier is also unreliable here once context exists,
+  // so we never rely on it for this.
+  if (isCapabilitiesQuery(message.body)) {
+    console.log('[router] deterministic capabilities short-circuit');
+    await reply(
+      contact,
+      message,
+      buildCapabilitiesReply(contact.role as CapabilityRole, contact.name)
+    );
+    return;
   }
 
   // Pre-classification: employee session checks

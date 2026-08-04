@@ -73,6 +73,12 @@ vi.mock('../time-off', () => ({
   createTimeOffRequestAndNotify: h.createTimeOffMock,
   resolvePartialWindow: () => null,
   formatDateRange: (a: string, b: string) => (a === b ? a : `${a} to ${b}`),
+  // Onboarding now reuses the normal flow's affirmation detector at the confirm
+  // step; mirror the real regex so the mocked module keeps the same behavior.
+  isTimeOffAffirmation: (body: string) =>
+    /^(yes|yeah|yea|yep|yup|y\b|correct|confirmed|confirm|that'?s right|right|ok|okay|sure|send(?: it| that| it over)?|go (?:ahead|for it)|do it|please do|please|sounds good|looks good|that works|perfect|great|👍)/.test(
+      body.trim().toLowerCase(),
+    ),
 }));
 
 import { handleOnboardingResponse, type OnboardingSession } from '../employee-onboarding';

@@ -87,6 +87,40 @@ export function buildCapabilitiesReply(role: CapabilityRole, name?: string | nul
   return `${intro}\n\n${blocks.join('\n\n')}\n\nJust tell me in your own words and I'll take care of it.`;
 }
 
+// Deterministic "what can you do?" detector. Used by the router to short-circuit
+// a capabilities question to buildCapabilitiesReply BEFORE any pending-state /
+// context handler can swallow it. Live bug: a manager mid-coverage-session asked
+// "What can you do?" and the open coverage session's manager-reply handler read
+// the empty name-extraction as "manager declining outreach" and punted with
+// "I'll leave it with you…" instead of the capabilities reply. The LLM intent
+// classifier is also unreliable here once there's prior conversational context,
+// so we detect the standalone question deterministically and route it directly.
+//
+// Deliberately tight: only fires on a SHORT, standalone capabilities question
+// ("what can you do", "how can you help", "what can you help me with") — never on
+// "what can you do about getting Saturday covered", which is a real request.
+export function isCapabilitiesQuery(body: string): boolean {
+  const t = (body || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!t) return false;
+  // Standalone only — a longer sentence is almost certainly a real task ("what
+  // can you do about my shift on Friday"), not a capabilities question.
+  if (t.split(' ').length > 8) return false;
+  const lead = '(?:hey |hi |hello |ok |okay |so |um |aegis )*';
+  const patterns: RegExp[] = [
+    new RegExp(`^${lead}what (?:can|could|do) you (?:do|help)(?: me)?(?: with| for me| here| out)?$`),
+    new RegExp(`^${lead}what (?:else|all) can you (?:do|help)(?: me)?(?: with)?$`),
+    new RegExp(`^${lead}what are you able to (?:do|help)(?: me)?(?: with)?$`),
+    new RegExp(`^${lead}what can you help me with$`),
+    new RegExp(`^${lead}how (?:can|do) you help(?: me)?(?: out)?$`),
+    new RegExp(`^${lead}what can i (?:ask|say to) you(?: about)?$`),
+  ];
+  return patterns.some((re) => re.test(t));
+}
+
 // Short sentence naming what the person CAN ask for — used by the out-of-scope
 // redirect so a "no" never dead-ends. Employees get the employee actions.
 export function allowedActionsLine(role: CapabilityRole): string {

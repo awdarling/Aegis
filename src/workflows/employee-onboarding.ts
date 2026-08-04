@@ -27,7 +27,7 @@ import { env } from '../config/env';
 import { withAnthropicRetry } from '../ai/claude';
 // D21 — reuse the real time-off flow's partial-window resolver so onboarding and
 // the normal flow cannot disagree about what "the afternoon" means.
-import { resolvePartialWindow, createTimeOffRequestAndNotify } from './time-off';
+import { resolvePartialWindow, createTimeOffRequestAndNotify, isTimeOffAffirmation } from './time-off';
 import { generateActionToken } from '../lib/aegis-actions/tokens';
 import { formatDateRange } from './time-off';
 import type { InboundMessage, VerifiedContact } from '../security/types';
@@ -1832,11 +1832,106 @@ async function handleTimeOffStep(
   // Dates parsed — DO NOT submit yet. Time off is high-stakes (a wrong date =
   // weeks of bad schedules), so stage it and read it back for the employee to
   // confirm or edit before anything reaches the manager (time_off_confirm step).
-  const pending = dates.map(buildPendingFromEntry);
+  // Coalesce first: a contiguous trip the extractor split into per-day rows
+  // ("UP weekend" → Sat + Sun) becomes ONE start..end request, not two.
+  const pending = coalesceDateEntries(dates).map(buildPendingFromEntry);
   session.collected.time_off_pending = pending;
   session.step = 'time_off_confirm';
   await saveOnboardingSession(session);
   await textEmployee(session, buildTimeOffConfirmPrompt(pending, false));
+}
+
+function addDaysLocal(date: string, days: number): string {
+  const d = new Date(`${date}T12:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+
+// Coalesce a contiguous / overlapping run of extracted date entries into ONE
+// entry, so a single trip that the extractor split into per-day rows ("UP
+// weekend" → Saturday + Sunday) becomes a single start..end request instead of
+// TWO separate time_off_requests. Two entries merge only when they are the SAME
+// kind of time off AND touch or overlap (next.start <= cur.end + 1 day):
+//   • two full-day rows for adjacent dates → one full-day range
+//   • two partial rows with the SAME window on adjacent dates → one partial range
+// Different types, or partials with different windows, are left as distinct
+// requests (they genuinely differ), so partial-day handling via
+// resolvePartialWindow downstream is preserved. Pure + exported for tests.
+export function coalesceDateEntries(entries: OnboardingDateEntry[]): OnboardingDateEntry[] {
+  const norm = entries
+    .filter(e => !!e && !!e.start_date)
+    .map(e => ({
+      ...e,
+      end_date: e.end_date ?? e.start_date,
+      time_off_type: e.time_off_type ?? 'full_day',
+    }))
+    .sort((a, b) => a.start_date.localeCompare(b.start_date) || a.end_date!.localeCompare(b.end_date!));
+
+  const sameWindow = (a: OnboardingDateEntry, b: OnboardingDateEntry): boolean =>
+    (a.time_off_type ?? 'full_day') === (b.time_off_type ?? 'full_day') &&
+    (a.time_off_type === 'partial'
+      ? (a.period_label ?? null) === (b.period_label ?? null) &&
+        (a.start_time ?? null) === (b.start_time ?? null) &&
+        (a.end_time ?? null) === (b.end_time ?? null)
+      : true);
+
+  const out: OnboardingDateEntry[] = [];
+  for (const e of norm) {
+    const last = out[out.length - 1];
+    if (
+      last &&
+      sameWindow(last, e) &&
+      e.start_date <= addDaysLocal(last.end_date!, 1) // touching or overlapping
+    ) {
+      // Extend the run; keep the later end date.
+      if ((e.end_date ?? e.start_date) > last.end_date!) last.end_date = e.end_date ?? e.start_date;
+    } else {
+      out.push({ ...e });
+    }
+  }
+  return out;
+}
+
+// Deterministically pull a short human reason out of a confirmation that adds
+// context — "yes, it's for a family wedding", "yep — going to a wedding",
+// "sounds good, it's because I'm traveling". Returns null when there's no reason
+// to capture (a bare "yes"), so the caller keeps its default. No LLM call.
+const NON_REASONS = new Set([
+  'me', 'you', 'us', 'it', 'that', 'this', 'now', 'then', 'today', 'tomorrow',
+  'sure', 'real', 'good', 'approval', 'sending', 'sure thing', 'him', 'her', 'them',
+]);
+export function extractOnboardingReason(body: string): string | null {
+  const t = (body || '').replace(/\s+/g, ' ').trim();
+  if (!t) return null;
+  const patterns: RegExp[] = [
+    /\bbecause\s+(?:of\s+)?(.+)$/i,
+    /\bto\s+attend\s+(.+)$/i,
+    /\bgoing\s+to\s+(?:a\s+|an\s+|my\s+|our\s+|the\s+)?(.+)$/i,
+    /\bfor\s+(.+)$/i,
+  ];
+  for (const re of patterns) {
+    const m = t.match(re);
+    if (!m || !m[1]) continue;
+    const reason = m[1].trim().replace(/[.!,;:]+$/g, '').trim();
+    if (reason.length < 2 || reason.length > 80) continue;
+    if (/^\d/.test(reason)) continue;               // "for 3 days" is not a reason
+    if (NON_REASONS.has(reason.toLowerCase())) continue;
+    return reason;
+  }
+  return null;
+}
+
+// Confirm-step YES detector. Reuses the MAIN time-off flow's affirmation logic
+// (isTimeOffAffirmation) so onboarding and the normal flow agree on what counts
+// as "send it" — "looks good, go ahead", "sounds good send it", "yep send it",
+// "that works" all confirm. classifyAffirmation alone was too strict (it dropped
+// "looks good, go ahead" once it ran past 3 words). A message carrying a
+// CORRECTION ("yeah but make it the 21st") is NOT a clean yes — it has a change
+// marker and must fall through to the edit branch, which re-parses the dates.
+export function isOnboardingTimeOffConfirm(body: string): boolean {
+  const norm = (body || '').toLowerCase();
+  if (/\b(but|except|instead|rather|actually|change|wrong|not)\b/.test(norm)) return false;
+  return classifyAffirmation(body) === 'yes' || isTimeOffAffirmation(body);
 }
 
 // Turn one extracted date entry into a stageable pending time-off item, resolving
@@ -1917,17 +2012,22 @@ async function handleTimeOffConfirmStep(
     return;
   }
 
-  // 1. Clean YES → submit exactly what we read back.
-  if (classifyAffirmation(body) === 'yes') {
-    await submitOnboardingTimeOff(session, pending, managerContact, managerMsg);
+  // 1. Clean YES (broad, natural confirmations) → submit exactly what we read
+  //    back. If the confirmation ADDS context ("yes, it's for a family wedding"),
+  //    capture it as the request reason so it reaches the manager email.
+  if (isOnboardingTimeOffConfirm(body)) {
+    const reason = extractOnboardingReason(body);
+    await submitOnboardingTimeOff(session, pending, managerContact, managerMsg, reason);
     return;
   }
 
   // 2. Named new dates → treat as an EDIT: re-parse and re-confirm. Checked before
   //    the skip/no branches so "actually make it the 21st" corrects, never submits.
+  //    A contiguous range the extractor split into per-day rows is coalesced into
+  //    ONE request (see coalesceDateEntries) so an edit can't fan out into two.
   const dates = await claudeExtractDates(body);
   if (dates.length > 0) {
-    const rebuilt = dates.map(buildPendingFromEntry);
+    const rebuilt = coalesceDateEntries(dates).map(buildPendingFromEntry);
     session.collected.time_off_pending = rebuilt;
     await saveOnboardingSession(session);
     await textEmployee(session, buildTimeOffConfirmPrompt(rebuilt, true));
@@ -1963,8 +2063,12 @@ async function submitOnboardingTimeOff(
   session: OnboardingSession & { _memory_id: string },
   pending: OnboardingPendingTimeOff[],
   managerContact: VerifiedContact,
-  managerMsg: InboundMessage
+  managerMsg: InboundMessage,
+  reason?: string | null
 ): Promise<void> {
+  // Reason the manager sees: whatever context the new hire added on confirmation
+  // ("it's for a family wedding"), else the generic onboarding marker.
+  const requestReason = reason?.trim() ? reason.trim() : 'submitted during onboarding';
   const { data: empData } = await supabase
     .from('employees')
     .select('*')
@@ -1988,7 +2092,7 @@ async function submitOnboardingTimeOff(
         employee_id: session.employee_id,
         start_date: p.start_date,
         end_date: p.end_date,
-        reason: 'submitted during onboarding',
+        reason: requestReason,
         channel: session.employee_channel,
         sender: employeeContact ?? '',
         recipient: session.aegis_sms_channel,
@@ -2012,7 +2116,7 @@ async function submitOnboardingTimeOff(
           company_id: session.company_id,
           start_date: p.start_date,
           end_date: p.end_date,
-          reason: 'submitted during onboarding',
+          reason: requestReason,
           status: 'pending',
           requested_at: new Date().toISOString(),
           time_off_type: p.time_off_type,

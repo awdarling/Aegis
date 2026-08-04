@@ -30,6 +30,11 @@ import { withAnthropicRetry } from '../ai/claude';
 import { resolvePartialWindow } from './time-off';
 import { generateActionToken } from '../lib/aegis-actions/tokens';
 import { formatDateRange } from './time-off';
+import {
+  insertPendingAvailabilityChange,
+  flipChangeRequestGuarded,
+  type AvailabilityApplyOutcome,
+} from './availability-change-requests';
 import type { InboundMessage, VerifiedContact } from '../security/types';
 import type { Employee } from '../db/types';
 
@@ -240,6 +245,10 @@ interface PendingManagerAvailApproval {
   raw_subject?: string | null;
   custom_end_date?: string | null;
   rotation?: RotationSpec | null;
+  // AVAIL-TAB-1: the durable availability_change_requests row this pending mirrors.
+  // Flows into the manager email token payload so every decision surface (tab,
+  // reply-YES, email button) flips the same ledger row.
+  change_request_id?: string;
   expires_at: string;
 }
 
@@ -2903,6 +2912,15 @@ export async function handleAvailabilityConfirmResponse(
     expires_at: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
   };
 
+  // AVAIL-TAB-1: mirror this pending change into the durable Homebase ledger so it's
+  // visible + approvable in the Availability tab (parity with Time Off / Swaps).
+  // Newest-wins for permanent is handled inside (older pending permanent withdrawn).
+  const changeRequestId = await insertPendingAvailabilityChange({
+    snapshot: approval,
+    sourceChannel: message.channel,
+  });
+  if (changeRequestId) approval.change_request_id = changeRequestId;
+
   await supabase
     .from('aegis_memory')
     .delete()
@@ -3182,6 +3200,8 @@ export interface AvailabilityDecisionInput {
   proposed_availability: AvailabilitySlot[];
   availability_raw: string;
   decided_by?: string;          // manager name/email — recorded in the activity log
+  decided_by_user_id?: string | null;   // manager users.id → availability_change_requests.decided_by
+  change_request_id?: string;            // AVAIL-TAB-1 durable ledger row to guard-flip
   // Employee notify context (rebuilds their channel/thread for the decision notice):
   employee_sender: string;
   employee_recipient: string;
@@ -3190,7 +3210,19 @@ export interface AvailabilityDecisionInput {
   raw_subject?: string | null;
 }
 
-export async function applyAvailabilityDecision(input: AvailabilityDecisionInput): Promise<void> {
+export async function applyAvailabilityDecision(input: AvailabilityDecisionInput): Promise<AvailabilityApplyOutcome> {
+  // AVAIL-TAB-1 universal idempotency guard: only the surface that flips the still-
+  // pending ledger row proceeds. A stale email button after a tab approval no-ops here.
+  if (input.change_request_id) {
+    const flipped = await flipChangeRequestGuarded(input.change_request_id, input.decision, input.decided_by_user_id ?? null);
+    if (!flipped) return { status: 'already_decided' };
+  }
+  // Parity with the custom path: clear the aegis_memory pending so a later manager
+  // email can't be read as a YES/NO to a decision that's already been made.
+  await supabase.from('aegis_memory').delete()
+    .eq('company_id', input.company_id)
+    .eq('source', availApprovalSource(input.company_id, input.employee_id));
+
   const notifyContext: PendingManagerAvailApproval = {
     employee_id: input.employee_id,
     employee_name: input.employee_name,
@@ -3253,6 +3285,7 @@ export async function applyAvailabilityDecision(input: AvailabilityDecisionInput
       `Your availability change wasn't approved this time — give your manager a shout if you'd like to talk it through.`
     );
   }
+  return { status: 'applied' };
 }
 
 // ── Shared CUSTOM-availability decision effect (date-limited override) ─────────
@@ -3273,6 +3306,8 @@ export interface CustomAvailabilityDecisionInput {
   current_availability: AvailabilitySlot[];
   availability_raw: string;
   decided_by?: string;
+  decided_by_user_id?: string | null;   // AVAIL-TAB-1
+  change_request_id?: string;            // AVAIL-TAB-1 durable ledger row to guard-flip
   employee_sender: string;
   employee_recipient: string;
   employee_channel: 'sms' | 'email';
@@ -3280,7 +3315,12 @@ export interface CustomAvailabilityDecisionInput {
   raw_subject?: string | null;
 }
 
-export async function applyCustomAvailabilityDecision(input: CustomAvailabilityDecisionInput): Promise<void> {
+export async function applyCustomAvailabilityDecision(input: CustomAvailabilityDecisionInput): Promise<AvailabilityApplyOutcome> {
+  // AVAIL-TAB-1 universal idempotency guard (see applyAvailabilityDecision).
+  if (input.change_request_id) {
+    const flipped = await flipChangeRequestGuarded(input.change_request_id, input.decision, input.decided_by_user_id ?? null);
+    if (!flipped) return { status: 'already_decided' };
+  }
   const notifyContext: PendingManagerAvailApproval = {
     employee_id: input.employee_id,
     employee_name: input.employee_name,
@@ -3358,7 +3398,7 @@ export async function applyCustomAvailabilityDecision(input: CustomAvailabilityD
         notifyContext,
         `Nice — your rotating availability is approved, set on a ${rot.cycle_weeks}-week cycle${rot.end_date ? ` through ${formatDateRange(rot.end_date, rot.end_date)}` : ''}. I'll work your schedule around it. Thanks!`
       );
-      return;
+      return { status: 'applied' };
     }
 
     // DATE-LIMITED override.
@@ -3412,6 +3452,7 @@ export async function applyCustomAvailabilityDecision(input: CustomAvailabilityD
       `That change wasn't approved this time — give your manager a shout if you'd like to talk it through.`
     );
   }
+  return { status: 'applied' };
 }
 
 export async function handleManagerAvailabilityApproval(
@@ -3445,6 +3486,8 @@ export async function handleManagerAvailabilityApproval(
     proposed_availability: pending.proposed_availability,
     availability_raw: pending.availability_raw,
     decided_by: contact.name,
+    decided_by_user_id: contact.user_id ?? null,
+    change_request_id: pending.change_request_id,
     employee_sender: pending.employee_sender,
     employee_recipient: pending.employee_recipient,
     employee_channel: pending.employee_channel,

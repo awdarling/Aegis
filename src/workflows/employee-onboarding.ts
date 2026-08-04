@@ -44,6 +44,18 @@ export interface AvailabilitySlot {
   end_time: string;    // HH:MM 24h
 }
 
+// Time off parsed during onboarding that is waiting on the employee's explicit
+// confirmation before it becomes a real, manager-facing request. Held on the
+// session across the time_off -> time_off_confirm turn so a misheard date can be
+// edited before anything is created (a wrong onboarding time-off = weeks of bad
+// schedules, so it must be confirmed, never auto-submitted).
+interface OnboardingPendingTimeOff {
+  start_date: string;
+  end_date: string;
+  time_off_type: 'full_day' | 'partial';
+  partial_days: PartialDayDetail[] | null;
+}
+
 export interface OnboardingSession {
   company_id: string;
   employee_id: string;
@@ -56,7 +68,7 @@ export interface OnboardingSession {
   manager_channel: 'sms' | 'email';
   manager_sender: string;
   manager_recipient: string;
-  step: 'opt_in' | 'name_confirm' | 'email' | 'role' | 'availability' | 'availability_confirm' | 'time_off' | 'complete';
+  step: 'opt_in' | 'name_confirm' | 'email' | 'role' | 'availability' | 'availability_confirm' | 'time_off' | 'time_off_confirm' | 'complete';
   collected: {
     name_confirmed: boolean;
     email: string | null;
@@ -65,6 +77,9 @@ export interface OnboardingSession {
     availability_parsed: AvailabilitySlot[];
     availability_confirmed: boolean;
     time_off_submitted: boolean;
+    // Parsed-but-unconfirmed time off, staged for the time_off_confirm step.
+    // Cleared once submitted, edited, or skipped. Absent on pre-confirm-step sessions.
+    time_off_pending?: OnboardingPendingTimeOff[] | null;
   };
   flagged_low_availability: boolean;
   invalid_email_attempts: number;
@@ -644,6 +659,14 @@ function clampTime(time: string, min: string, max: string): string {
   return time;
 }
 
+// A tiny close-of-onboarding nudge so a new hire thinks of Aegis as more than
+// scheduling reminders — and knows they can just ask. Appended to the completion
+// message (Alexander: "explain I have other capabilities... feel free to ask me
+// them if you want"). The "what can you do?" reply routes to the capabilities flow.
+const CAPABILITIES_ADDENDUM =
+  `One more thing: I can do more than send schedules — you can text me to request time off, ` +
+  `swap or pick up shifts, or check who's working. Want the full rundown? Just reply "what can you do?" anytime.`;
+
 // ── Messaging helpers ─────────────────────────────────────────────────────────
 
 // MULTI-TENANCY — the client's name comes from THEIR row in `companies`, never
@@ -672,6 +695,8 @@ function getStepSubject(step: string, companyName: string): string {
       return 'Does this look right?';
     case 'time_off':
       return 'Almost done';
+    case 'time_off_confirm':
+      return 'Confirm your time off';
     case 'complete':
       return "You're all set";
     default:
@@ -1458,8 +1483,8 @@ async function proceedAfterConsent(
   await saveOnboardingSession(session);
   await textEmployee(
     session,
-    `Great, you're confirmed, and it looks like I already have everything I need on file — welcome aboard! ` +
-      `One quick thing: any upcoming dates you know you won't be available (a vacation, appointments)? Reply NO if nothing comes to mind.`
+    `Great, you're confirmed! It looks like you're all set — I already have everything I need about you in my memory for scheduling. ` +
+      `One quick thing before I wrap up: do you have any time off coming up in the near future that you'd want your manager to know about? Reply NO if nothing comes to mind.`
   );
 }
 
@@ -1804,12 +1829,142 @@ async function handleTimeOffStep(
     return;
   }
 
-  // Load the employee record once so each request runs the SAME create+notify
-  // path the normal time-off flow uses — coverage simulation, the rich manager
-  // approve/deny email, and the manager SMS alert — instead of the old bare
-  // insert + one-line manager text that gave the new hire no confirmation and
-  // the manager no way to decide (Alexander: "flag and send emails with action
-  // items the exact same way all the other workflows do").
+  // Dates parsed — DO NOT submit yet. Time off is high-stakes (a wrong date =
+  // weeks of bad schedules), so stage it and read it back for the employee to
+  // confirm or edit before anything reaches the manager (time_off_confirm step).
+  const pending = dates.map(buildPendingFromEntry);
+  session.collected.time_off_pending = pending;
+  session.step = 'time_off_confirm';
+  await saveOnboardingSession(session);
+  await textEmployee(session, buildTimeOffConfirmPrompt(pending, false));
+}
+
+// Turn one extracted date entry into a stageable pending time-off item, resolving
+// a partial window through the SAME helper the real time-off flow uses (D21) so
+// onboarding and the normal flow can't disagree about what "the afternoon" means.
+// If an entry claims to be partial but no window pins, fall back to full_day
+// rather than dropping the request.
+function buildPendingFromEntry(entry: OnboardingDateEntry): OnboardingPendingTimeOff {
+  const start_date = entry.start_date;
+  const end_date = entry.end_date ?? entry.start_date;
+  let time_off_type: 'full_day' | 'partial' = 'full_day';
+  let partial_days: PartialDayDetail[] | null = null;
+
+  if (entry.time_off_type === 'partial') {
+    const window = resolvePartialWindow(entry);
+    if (window) {
+      time_off_type = 'partial';
+      partial_days = eachDateInRangeLocal(start_date, end_date).map(date => ({
+        date,
+        type: 'custom_hours' as const,
+        shift_id: null,
+        shift_name: null,
+        start_time: window.start_time,
+        end_time: window.end_time,
+      }));
+    }
+  }
+  return { start_date, end_date, time_off_type, partial_days };
+}
+
+// One human-readable line per staged item for the confirm prompt. Partial days
+// are marked so the employee sees it's not a whole day off.
+function describePendingTimeOff(p: OnboardingPendingTimeOff): string {
+  const range = formatDateRange(p.start_date, p.end_date);
+  const isPartial = p.time_off_type === 'partial' && !!p.partial_days && p.partial_days.length > 0;
+  return isPartial ? `• ${range} (partial day)` : `• ${range}`;
+}
+
+// The "does this look right?" read-back the employee confirms before we submit.
+function buildTimeOffConfirmPrompt(pending: OnboardingPendingTimeOff[], edited: boolean): string {
+  const lead = edited
+    ? `Updated — here's the time off I'll send to your manager to approve:`
+    : `Got it. Here's the time off I'll send to your manager to approve:`;
+  const list = pending.map(describePendingTimeOff).join('\n');
+  return `${lead}\n${list}\n\nDoes that look right? Reply YES to send it, or tell me what to change.`;
+}
+
+// Explicit "actually, I don't need time off after all" at the confirm step. Kept
+// distinct from a bare "no" (which more often means "the dates are wrong") so we
+// neither submit unconfirmed dates nor silently discard a real request.
+function isSkipTimeOff(body: string): boolean {
+  const t = body.trim().toLowerCase().replace(/[.!,?]+/g, ' ').replace(/\s+/g, ' ').trim();
+  const skips = new Set([
+    'skip', 'no time off', 'none', 'nothing', 'no dates', 'no time', 'cancel',
+    'never mind', 'nevermind', 'forget it', 'no thanks', 'nada',
+    "i don't need any", 'i dont need any', "don't need any", 'dont need any',
+    'no i dont need any', 'no time off after all', 'no dont send it', "no don't send it",
+  ]);
+  return skips.has(t);
+}
+
+// time_off_confirm: the employee has been shown the staged time off and must
+// confirm, edit, or skip before anything is created. Never auto-submits.
+async function handleTimeOffConfirmStep(
+  body: string,
+  session: OnboardingSession & { _memory_id: string },
+  managerContact: VerifiedContact,
+  managerMsg: InboundMessage
+): Promise<void> {
+  const pending = session.collected.time_off_pending ?? [];
+
+  // Defensive: nothing staged (e.g. a resumed/corrupted session) — drop back to
+  // the ask rather than confirming a phantom request.
+  if (pending.length === 0) {
+    session.step = 'time_off';
+    await saveOnboardingSession(session);
+    await sendTimeOffStep(session);
+    return;
+  }
+
+  // 1. Clean YES → submit exactly what we read back.
+  if (classifyAffirmation(body) === 'yes') {
+    await submitOnboardingTimeOff(session, pending, managerContact, managerMsg);
+    return;
+  }
+
+  // 2. Named new dates → treat as an EDIT: re-parse and re-confirm. Checked before
+  //    the skip/no branches so "actually make it the 21st" corrects, never submits.
+  const dates = await claudeExtractDates(body);
+  if (dates.length > 0) {
+    const rebuilt = dates.map(buildPendingFromEntry);
+    session.collected.time_off_pending = rebuilt;
+    await saveOnboardingSession(session);
+    await textEmployee(session, buildTimeOffConfirmPrompt(rebuilt, true));
+    return;
+  }
+
+  // 3. Explicit "skip / no time off after all" → drop it and finish WITHOUT
+  //    sending anything to the manager.
+  if (isSkipTimeOff(body)) {
+    session.collected.time_off_pending = null;
+    session.step = 'complete';
+    await saveOnboardingSession(session);
+    await textEmployee(session, `No problem — I won't send any time off to your manager.`);
+    await completeOnboarding(session, managerContact, managerMsg);
+    return;
+  }
+
+  // 4. Anything else (a bare "no", unclear) → clarify. Nothing submitted, nothing
+  //    dropped: re-show the staged time off with the explicit options.
+  await textEmployee(
+    session,
+    `I want to get this right before I send it. Here's what I have:\n` +
+      `${pending.map(describePendingTimeOff).join('\n')}\n\n` +
+      `Reply YES to send it to your manager, send me the corrected date(s), or reply "skip" if you don't need time off after all.`
+  );
+}
+
+// Create + notify for each confirmed item, then confirm to the employee and
+// complete. Runs each request through the SAME create+notify core the normal
+// time-off flow uses (coverage sim + rich manager approve/deny email + SMS
+// alert), so an onboarding request is indistinguishable downstream.
+async function submitOnboardingTimeOff(
+  session: OnboardingSession & { _memory_id: string },
+  pending: OnboardingPendingTimeOff[],
+  managerContact: VerifiedContact,
+  managerMsg: InboundMessage
+): Promise<void> {
   const { data: empData } = await supabase
     .from('employees')
     .select('*')
@@ -1819,46 +1974,20 @@ async function handleTimeOffStep(
   const employee = empData as Employee | null;
 
   // The channel/contact the new hire submitted on, so the manager's eventual
-  // approve/deny decision is delivered back to them the same way (the shared
-  // core stamps a to_thread row from pending.channel/sender).
+  // approve/deny decision is delivered back the same way (the shared core stamps
+  // a to_thread row from pending.channel/sender).
   const employeeContact =
     session.employee_channel === 'sms' ? session.employee_phone : session.employee_email;
 
   const submittedRanges: string[] = [];
 
-  for (const entry of dates) {
-    const start_date = entry.start_date;
-    const end_date = entry.end_date ?? entry.start_date;
-
-    // D21 — resolve a partial window through the SAME helper the real time-off
-    // flow uses, so "the afternoon of the 20th" means the same thing in both.
-    // If the entry claims to be partial but we can't pin a window, fall back to
-    // full_day rather than dropping the request — losing it entirely is worse
-    // than over-blocking, and the manager still sees it to approve.
-    let timeOffType: 'full_day' | 'partial' = 'full_day';
-    let partialDays: PartialDayDetail[] | null = null;
-
-    if (entry.time_off_type === 'partial') {
-      const window = resolvePartialWindow(entry);
-      if (window) {
-        timeOffType = 'partial';
-        partialDays = eachDateInRangeLocal(start_date, end_date).map(date => ({
-          date,
-          type: 'custom_hours' as const,
-          shift_id: null,
-          shift_name: null,
-          start_time: window.start_time,
-          end_time: window.end_time,
-        }));
-      }
-    }
-
+  for (const p of pending) {
     let requestId: string | null = null;
     if (employee) {
       requestId = await createTimeOffRequestAndNotify(session.company_id, employee, {
         employee_id: session.employee_id,
-        start_date,
-        end_date,
+        start_date: p.start_date,
+        end_date: p.end_date,
         reason: 'submitted during onboarding',
         channel: session.employee_channel,
         sender: employeeContact ?? '',
@@ -1866,8 +1995,8 @@ async function handleTimeOffStep(
         // Pending-confirmation TTL field; unused by the create/notify core (it
         // mints its own decision-token expiry). Set to a sane 24h to satisfy the type.
         expires_at: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
-        time_off_type: timeOffType,
-        partial_days: partialDays,
+        time_off_type: p.time_off_type,
+        partial_days: p.partial_days,
       });
     } else {
       // Defensive: no employee row (should never happen mid-onboarding). Save the
@@ -1881,13 +2010,13 @@ async function handleTimeOffStep(
         .insert({
           employee_id: session.employee_id,
           company_id: session.company_id,
-          start_date,
-          end_date,
+          start_date: p.start_date,
+          end_date: p.end_date,
           reason: 'submitted during onboarding',
           status: 'pending',
           requested_at: new Date().toISOString(),
-          time_off_type: timeOffType,
-          partial_days: partialDays,
+          time_off_type: p.time_off_type,
+          partial_days: p.partial_days,
         })
         .select('id')
         .single();
@@ -1895,19 +2024,20 @@ async function handleTimeOffStep(
     }
 
     if (requestId) {
-      submittedRanges.push(formatDateRange(start_date, end_date));
+      submittedRanges.push(formatDateRange(p.start_date, p.end_date));
     }
   }
+
+  session.collected.time_off_pending = null;
 
   if (submittedRanges.length > 0) {
     session.collected.time_off_submitted = true;
     // Employee confirmation — mirror the normal flow's "passed it to your manager"
-    // acknowledgement so onboarding time off is a real, confirmed request, not a
-    // silent "you're all set" (the exact gap Alexander flagged on his test run).
+    // acknowledgement so onboarding time off is a real, confirmed request.
     const list = submittedRanges.join(' and ');
     await textEmployee(
       session,
-      `Got it — I've sent your time off (${list}) to your manager to approve. ` +
+      `Perfect — I've sent your time off (${list}) to your manager to approve. ` +
         "I'll let you know as soon as they get back to me."
     );
   }
@@ -1932,10 +2062,11 @@ async function completeOnboarding(
     : false;
   await textEmployee(
     session,
-    completeRecord
-      ? `Thanks ${firstName}! Looks like I already have everything I need on file. ` +
-          `I'll send you your schedule each week — reach out any time if you need me or have any questions. Welcome aboard!`
-      : `You're all set ${firstName}! I'll send you your schedule each week. Welcome to the team!`
+    (completeRecord
+      ? `Thanks ${firstName}! You're all set — everything I need for scheduling is in my memory. ` +
+          `I'll send you your schedule each week. Welcome aboard! `
+      : `You're all set ${firstName}! I'll send you your schedule each week. Welcome to the team! `) +
+      CAPABILITIES_ADDENDUM
   );
 
   // Write to employees table
@@ -2198,6 +2329,9 @@ export async function handleOnboardingResponse(
       break;
     case 'time_off':
       await handleTimeOffStep(message.body, session, managerContact, managerMsg);
+      break;
+    case 'time_off_confirm':
+      await handleTimeOffConfirmStep(message.body, session, managerContact, managerMsg);
       break;
     case 'complete':
       await textEmployee(

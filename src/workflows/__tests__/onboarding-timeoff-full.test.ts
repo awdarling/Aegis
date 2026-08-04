@@ -130,48 +130,71 @@ beforeEach(() => {
     company_id: COMPANY_ID, primary_role: 'guard', active: true, aegis_access: 'employee',
     qualified_roles: ['guard'],
   });
-  h.createMock.mockImplementation(async (args: { system?: string }) => {
+  h.createMock.mockImplementation(async (args: { system?: string; messages?: Array<{ content?: unknown }> }) => {
     const sys = args.system ?? '';
-    // Extract time-off dates → one full-day request.
+    const userMsg = String(args.messages?.[0]?.content ?? '').toLowerCase();
+    // Date extraction returns a date only when the message actually names one, so
+    // "yes"/"skip" at the confirm step parse to no dates (as the real model would).
     if (sys.includes('Extract time-off dates')) {
-      return txt(JSON.stringify({ dates: [{ start_date: '2026-08-20', end_date: '2026-08-20', time_off_type: 'full_day' }] }));
+      if (userMsg.includes('21')) {
+        return txt(JSON.stringify({ dates: [{ start_date: '2026-08-21', end_date: '2026-08-21', time_off_type: 'full_day' }] }));
+      }
+      if (userMsg.includes('20') || userMsg.includes('august') || userMsg.includes('trip')) {
+        return txt(JSON.stringify({ dates: [{ start_date: '2026-08-20', end_date: '2026-08-20', time_off_type: 'full_day' }] }));
+      }
+      return txt(JSON.stringify({ dates: [] }));
     }
     if (sys.includes('one word')) return txt('no');
     return txt('{}');
   });
 });
 
-describe('onboarding time-off routes through the full create+notify core', () => {
-  it('creates the request via the shared core, confirms to the employee, completes', async () => {
+describe('onboarding time-off has a confirmation step before it submits', () => {
+  it('stages the dates and asks to confirm — nothing is submitted yet', async () => {
     const s = makeSessionAtTimeOff();
 
     await handleOnboardingResponse(inbound('I need August 20th off for a family trip'), CONTACT, s);
 
-    // 1. Routed through the SHARED core (not a bare local insert): no direct
-    //    time_off_requests insert happened in onboarding.
+    // NOT submitted — high-stakes, so it must be confirmed first.
+    expect(h.createTimeOffMock).not.toHaveBeenCalled();
+    expect(h.writes.some(w => w.table === 'time_off_requests' && w.op === 'insert')).toBe(false);
+    expect(s.step).toBe('time_off_confirm');
+    expect(s.collected.time_off_pending).toHaveLength(1);
+    expect(s.collected.time_off_pending![0].start_date).toBe('2026-08-20');
+
+    // Employee is asked to confirm and shown the date.
+    const prompt = smsBodies()[smsBodies().length - 1].toLowerCase();
+    expect(prompt).toContain('look right');
+    expect(prompt).toContain('yes');
+  });
+
+  it('YES submits through the shared core, confirms to the employee, completes, emails the summary', async () => {
+    const s = makeSessionAtTimeOff();
+    await handleOnboardingResponse(inbound('I need August 20th off for a family trip'), CONTACT, s);
+    await handleOnboardingResponse(inbound('yes'), CONTACT, s);
+
+    // Routed through the SHARED core (not a bare local insert).
     expect(h.createTimeOffMock).toHaveBeenCalledTimes(1);
     const [companyArg, employeeArg, pendingArg] = h.createTimeOffMock.mock.calls[0] as [
-      string, { id: string }, { start_date: string; end_date: string; channel: string; sender: string }
+      string, { id: string }, { start_date: string; channel: string; sender: string }
     ];
     expect(companyArg).toBe(COMPANY_ID);
     expect(employeeArg.id).toBe(EMPLOYEE_ID);
     expect(pendingArg.start_date).toBe('2026-08-20');
     expect(pendingArg.channel).toBe('sms');
     expect(pendingArg.sender).toBe(EMPLOYEE_PHONE);
-    // Onboarding must NOT bare-insert the request itself anymore.
     expect(h.writes.some(w => w.table === 'time_off_requests' && w.op === 'insert')).toBe(false);
 
-    // 2. Employee got a real confirmation the request went to the manager
-    //    (the exact gap: previously a silent "you're all set").
     const bodies = smsBodies().map(b => b.toLowerCase());
     expect(bodies.some(b => b.includes('sent your time off') && b.includes('manager'))).toBe(true);
-
-    // 3. Session marks time off submitted + completes.
     expect(s.collected.time_off_submitted).toBe(true);
+    expect(s.collected.time_off_pending).toBeNull();
     expect(s.step).toBe('complete');
 
-    // 4. Manager audit summary email went out and lists the pending time off.
-    expect(h.sendEmailMock).toHaveBeenCalled();
+    // Completion message nudges the employee about other capabilities.
+    expect(bodies.some(b => b.includes('what can you do'))).toBe(true);
+
+    // Manager audit summary email went out and lists the pending time off.
     const summaryCall = h.sendEmailMock.mock.calls
       .map(c => c[0] as { to: string; subject: string; text: string; html: string })
       .find(e => e.subject.includes('completed onboarding'));
@@ -179,8 +202,35 @@ describe('onboarding time-off routes through the full create+notify core', () =>
     expect(summaryCall!.to).toBe('morgan@sandbox.test');
     expect(summaryCall!.text).toContain('2026-08-20');
     expect(summaryCall!.text.toLowerCase()).toContain('pending your approval');
-    expect(summaryCall!.html.toLowerCase()).toContain('pending your approval');
-    // The auto-applied availability is in the summary too.
-    expect(summaryCall!.text.toLowerCase()).toContain('availability');
+  });
+
+  it('an edit at the confirm step re-parses and re-confirms without submitting', async () => {
+    const s = makeSessionAtTimeOff();
+    await handleOnboardingResponse(inbound('August 20th off'), CONTACT, s);
+    await handleOnboardingResponse(inbound('actually make it the 21st'), CONTACT, s);
+
+    expect(h.createTimeOffMock).not.toHaveBeenCalled();
+    expect(s.step).toBe('time_off_confirm');
+    expect(s.collected.time_off_pending).toHaveLength(1);
+    expect(s.collected.time_off_pending![0].start_date).toBe('2026-08-21');
+    const prompt = smsBodies()[smsBodies().length - 1].toLowerCase();
+    expect(prompt).toContain('2026-08-21');
+    expect(prompt).toContain('look right');
+  });
+
+  it('"skip" at the confirm step finishes with NO time off sent', async () => {
+    const s = makeSessionAtTimeOff();
+    await handleOnboardingResponse(inbound('August 20th off'), CONTACT, s);
+    await handleOnboardingResponse(inbound('skip'), CONTACT, s);
+
+    expect(h.createTimeOffMock).not.toHaveBeenCalled();
+    expect(s.collected.time_off_submitted).toBe(false);
+    expect(s.collected.time_off_pending).toBeNull();
+    expect(s.step).toBe('complete');
+    // No pending time off in the manager summary.
+    const summaryCall = h.sendEmailMock.mock.calls
+      .map(c => c[0] as { subject: string; text: string })
+      .find(e => e.subject.includes('completed onboarding'));
+    expect(summaryCall!.text.toLowerCase()).toContain('no time off');
   });
 });

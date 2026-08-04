@@ -205,12 +205,14 @@ describe('smart onboarding walk over SMS (B6)', () => {
     expect(s.step).toBe('time_off');
     const afterConsent = lastSms().toLowerCase();
     expect(afterConsent).toContain('already have everything');
-    expect(afterConsent).toContain('upcoming');
+    expect(afterConsent).toContain('coming up');
 
-    // Time-off "no" → warm complete-record close.
+    // Time-off "no" → warm complete-record close + capabilities nudge.
     await handleOnboardingResponse(inbound('no'), CONTACT, s);
     expect(s.step).toBe('complete');
-    expect(lastSms().toLowerCase()).toContain('already have everything');
+    const close = lastSms().toLowerCase();
+    expect(close).toContain('all set');
+    expect(close).toContain('what can you do');
 
     // No name / email / role / availability prompt was ever sent.
     const bodies = h.sendSmsMock.mock.calls.map(c => (c[0] as { body: string }).body.toLowerCase());

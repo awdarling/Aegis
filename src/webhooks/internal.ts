@@ -8,6 +8,7 @@ import {
   type AvailabilitySlot,
   type RotationSpec,
 } from '../workflows/employee-onboarding';
+import { loadAvailabilityChangeRow } from '../workflows/availability-change-requests';
 import { commitSwapPickup, proposeSwapTrade, resolveSwapProposal } from '../workflows/shift-swap';
 import { sendSwapDecisionNotification } from './decision';
 import { supabase } from '../db/client';
@@ -277,6 +278,8 @@ internalRouter.post('/apply-availability-decision', async (req: Request, res: Re
       proposed_availability: proposed as AvailabilitySlot[],
       availability_raw: typeof body.availability_raw === 'string' ? body.availability_raw : '',
       decided_by: typeof body.decided_by === 'string' ? body.decided_by : undefined,
+      decided_by_user_id: typeof body.decided_by_user_id === 'string' ? body.decided_by_user_id : null,
+      change_request_id: typeof body.change_request_id === 'string' ? body.change_request_id : undefined,
       employee_sender: employeeSender,
       employee_recipient: typeof body.employee_recipient === 'string' ? body.employee_recipient : '',
       employee_channel: employeeChannel,
@@ -362,6 +365,8 @@ internalRouter.post('/apply-custom-availability-decision', async (req: Request, 
         : [],
       availability_raw: typeof body.availability_raw === 'string' ? body.availability_raw : '',
       decided_by: typeof body.decided_by === 'string' ? body.decided_by : undefined,
+      decided_by_user_id: typeof body.decided_by_user_id === 'string' ? body.decided_by_user_id : null,
+      change_request_id: typeof body.change_request_id === 'string' ? body.change_request_id : undefined,
       employee_sender: employeeSender,
       employee_recipient: typeof body.employee_recipient === 'string' ? body.employee_recipient : '',
       employee_channel: employeeChannel,
@@ -372,6 +377,78 @@ internalRouter.post('/apply-custom-availability-decision', async (req: Request, 
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[internal] apply-custom-availability-decision failed:', msg);
+    serverError(res, msg);
+  }
+});
+
+// POST /internal/decide-availability-change
+// Homebase Availability tab calls this after a manager clicks Approve/Deny on a
+// pending availability_change_requests row. Aegis is authoritative (like swaps): it
+// applies the DB effect + notifies via the SAME shared apply functions the reply-YES
+// and email-button paths use, and the guarded flip inside them is the idempotency guard.
+internalRouter.post('/decide-availability-change', async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const id = body.availability_change_request_id;
+  const decision = body.decision;
+  const decidedByUserId = typeof body.decided_by_user_id === 'string' ? body.decided_by_user_id : null;
+  const decidedByName = typeof body.decided_by_name === 'string' ? body.decided_by_name : undefined;
+
+  if (typeof id !== 'string' || id.length === 0) {
+    badRequest(res, 'availability_change_request_id is required');
+    return;
+  }
+  if (decision !== 'approved' && decision !== 'denied') {
+    badRequest(res, 'decision must be "approved" or "denied"');
+    return;
+  }
+
+  try {
+    const row = await loadAvailabilityChangeRow(id);
+    if (!row) {
+      res.status(404).json({ ok: false, error: 'availability_change_request not found' });
+      return;
+    }
+    if (row.status !== 'pending') {
+      res.json({ ok: true, status: 'noop', reason: `already ${row.status}` });
+      return;
+    }
+
+    const snap = row.proposed_change;
+    const base = {
+      company_id: snap.company_id,
+      employee_id: snap.employee_id,
+      employee_name: snap.employee_name,
+      current_availability: snap.current_availability ?? [],
+      proposed_availability: snap.proposed_availability ?? [],
+      availability_raw: snap.availability_raw ?? '',
+      decided_by: decidedByName,
+      decided_by_user_id: decidedByUserId,
+      change_request_id: row.id,
+      employee_sender: snap.employee_sender,
+      employee_recipient: snap.employee_recipient,
+      employee_channel: snap.employee_channel,
+      thread_id: snap.thread_id ?? null,
+      raw_subject: snap.raw_subject ?? null,
+    };
+
+    const outcome =
+      row.change_kind === 'permanent'
+        ? await applyAvailabilityDecision({ ...base, decision })
+        : await applyCustomAvailabilityDecision({
+            ...base,
+            custom_end_date: snap.custom_end_date ?? null,
+            rotation: snap.rotation ?? null,
+            decision,
+          });
+
+    if (outcome.status === 'already_decided') {
+      res.json({ ok: true, status: 'noop', reason: 'already decided' });
+      return;
+    }
+    res.json({ ok: true, status: decision });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[internal] decide-availability-change failed:', msg);
     serverError(res, msg);
   }
 });

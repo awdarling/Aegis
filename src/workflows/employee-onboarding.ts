@@ -30,6 +30,11 @@ import { withAnthropicRetry } from '../ai/claude';
 import { resolvePartialWindow, createTimeOffRequestAndNotify, isTimeOffAffirmation } from './time-off';
 import { generateActionToken } from '../lib/aegis-actions/tokens';
 import { formatDateRange } from './time-off';
+import {
+  insertPendingAvailabilityChange,
+  flipChangeRequestGuarded,
+  type AvailabilityApplyOutcome,
+} from './availability-change-requests';
 import type { InboundMessage, VerifiedContact } from '../security/types';
 import type { Employee, PartialDayDetail } from '../db/types';
 
@@ -54,6 +59,9 @@ interface OnboardingPendingTimeOff {
   end_date: string;
   time_off_type: 'full_day' | 'partial';
   partial_days: PartialDayDetail[] | null;
+  // Reason stated in the request ("…off for a wedding") — captured at staging so
+  // it survives to the manager email even when the employee just confirms "yes".
+  reason?: string | null;
 }
 
 export interface OnboardingSession {
@@ -255,6 +263,10 @@ interface PendingManagerAvailApproval {
   raw_subject?: string | null;
   custom_end_date?: string | null;
   rotation?: RotationSpec | null;
+  // AVAIL-TAB-1: the durable availability_change_requests row this pending mirrors.
+  // Flows into the manager email token payload so every decision surface (tab,
+  // reply-YES, email button) flips the same ledger row.
+  change_request_id?: string;
   expires_at: string;
 }
 
@@ -1835,6 +1847,13 @@ async function handleTimeOffStep(
   // Coalesce first: a contiguous trip the extractor split into per-day rows
   // ("UP weekend" → Sat + Sun) becomes ONE start..end request, not two.
   const pending = coalesceDateEntries(dates).map(buildPendingFromEntry);
+  // Capture a reason stated in the request itself ("…off for a wedding") so it
+  // reaches the manager email even when the employee just confirms "yes" — the
+  // reason was previously only read from the confirmation reply.
+  const statedReason = extractOnboardingReason(body);
+  if (statedReason) {
+    for (const p of pending) p.reason = statedReason;
+  }
   session.collected.time_off_pending = pending;
   session.step = 'time_off_confirm';
   await saveOnboardingSession(session);
@@ -2016,8 +2035,12 @@ async function handleTimeOffConfirmStep(
   //    back. If the confirmation ADDS context ("yes, it's for a family wedding"),
   //    capture it as the request reason so it reaches the manager email.
   if (isOnboardingTimeOffConfirm(body)) {
-    const reason = extractOnboardingReason(body);
-    await submitOnboardingTimeOff(session, pending, managerContact, managerMsg, reason);
+    // Reason precedence: the one stated in the ORIGINAL request (staged on the
+    // pending) wins; a reason added only on confirmation ("yes, for a wedding")
+    // is the fallback; the generic marker is last (handled in submit).
+    const confirmReason = extractOnboardingReason(body);
+    const stagedReason = pending.find(p => p.reason)?.reason ?? null;
+    await submitOnboardingTimeOff(session, pending, managerContact, managerMsg, stagedReason ?? confirmReason);
     return;
   }
 
@@ -2028,6 +2051,13 @@ async function handleTimeOffConfirmStep(
   const dates = await claudeExtractDates(body);
   if (dates.length > 0) {
     const rebuilt = coalesceDateEntries(dates).map(buildPendingFromEntry);
+    // Preserve any reason: prefer one stated in this edit, else carry forward the
+    // reason already staged from the original request.
+    const priorReason = pending.find(p => p.reason)?.reason ?? null;
+    const editReason = extractOnboardingReason(body) ?? priorReason;
+    if (editReason) {
+      for (const p of rebuilt) p.reason = editReason;
+    }
     session.collected.time_off_pending = rebuilt;
     await saveOnboardingSession(session);
     await textEmployee(session, buildTimeOffConfirmPrompt(rebuilt, true));
@@ -2066,8 +2096,8 @@ async function submitOnboardingTimeOff(
   managerMsg: InboundMessage,
   reason?: string | null
 ): Promise<void> {
-  // Reason the manager sees: whatever context the new hire added on confirmation
-  // ("it's for a family wedding"), else the generic onboarding marker.
+  // Reason the manager sees: the reason the new hire gave — stated in the request
+  // ("…off for a wedding") or added on confirmation — else the generic marker.
   const requestReason = reason?.trim() ? reason.trim() : 'submitted during onboarding';
   const { data: empData } = await supabase
     .from('employees')
@@ -3299,6 +3329,15 @@ export async function handleAvailabilityConfirmResponse(
     expires_at: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
   };
 
+  // AVAIL-TAB-1: mirror this pending change into the durable Homebase ledger so it's
+  // visible + approvable in the Availability tab (parity with Time Off / Swaps).
+  // Newest-wins for permanent is handled inside (older pending permanent withdrawn).
+  const changeRequestId = await insertPendingAvailabilityChange({
+    snapshot: approval,
+    sourceChannel: message.channel,
+  });
+  if (changeRequestId) approval.change_request_id = changeRequestId;
+
   await supabase
     .from('aegis_memory')
     .delete()
@@ -3578,6 +3617,8 @@ export interface AvailabilityDecisionInput {
   proposed_availability: AvailabilitySlot[];
   availability_raw: string;
   decided_by?: string;          // manager name/email — recorded in the activity log
+  decided_by_user_id?: string | null;   // manager users.id → availability_change_requests.decided_by
+  change_request_id?: string;            // AVAIL-TAB-1 durable ledger row to guard-flip
   // Employee notify context (rebuilds their channel/thread for the decision notice):
   employee_sender: string;
   employee_recipient: string;
@@ -3586,7 +3627,19 @@ export interface AvailabilityDecisionInput {
   raw_subject?: string | null;
 }
 
-export async function applyAvailabilityDecision(input: AvailabilityDecisionInput): Promise<void> {
+export async function applyAvailabilityDecision(input: AvailabilityDecisionInput): Promise<AvailabilityApplyOutcome> {
+  // AVAIL-TAB-1 universal idempotency guard: only the surface that flips the still-
+  // pending ledger row proceeds. A stale email button after a tab approval no-ops here.
+  if (input.change_request_id) {
+    const flipped = await flipChangeRequestGuarded(input.change_request_id, input.decision, input.decided_by_user_id ?? null);
+    if (!flipped) return { status: 'already_decided' };
+  }
+  // Parity with the custom path: clear the aegis_memory pending so a later manager
+  // email can't be read as a YES/NO to a decision that's already been made.
+  await supabase.from('aegis_memory').delete()
+    .eq('company_id', input.company_id)
+    .eq('source', availApprovalSource(input.company_id, input.employee_id));
+
   const notifyContext: PendingManagerAvailApproval = {
     employee_id: input.employee_id,
     employee_name: input.employee_name,
@@ -3649,6 +3702,7 @@ export async function applyAvailabilityDecision(input: AvailabilityDecisionInput
       `Your availability change wasn't approved this time — give your manager a shout if you'd like to talk it through.`
     );
   }
+  return { status: 'applied' };
 }
 
 // ── Shared CUSTOM-availability decision effect (date-limited override) ─────────
@@ -3669,6 +3723,8 @@ export interface CustomAvailabilityDecisionInput {
   current_availability: AvailabilitySlot[];
   availability_raw: string;
   decided_by?: string;
+  decided_by_user_id?: string | null;   // AVAIL-TAB-1
+  change_request_id?: string;            // AVAIL-TAB-1 durable ledger row to guard-flip
   employee_sender: string;
   employee_recipient: string;
   employee_channel: 'sms' | 'email';
@@ -3676,7 +3732,12 @@ export interface CustomAvailabilityDecisionInput {
   raw_subject?: string | null;
 }
 
-export async function applyCustomAvailabilityDecision(input: CustomAvailabilityDecisionInput): Promise<void> {
+export async function applyCustomAvailabilityDecision(input: CustomAvailabilityDecisionInput): Promise<AvailabilityApplyOutcome> {
+  // AVAIL-TAB-1 universal idempotency guard (see applyAvailabilityDecision).
+  if (input.change_request_id) {
+    const flipped = await flipChangeRequestGuarded(input.change_request_id, input.decision, input.decided_by_user_id ?? null);
+    if (!flipped) return { status: 'already_decided' };
+  }
   const notifyContext: PendingManagerAvailApproval = {
     employee_id: input.employee_id,
     employee_name: input.employee_name,
@@ -3754,7 +3815,7 @@ export async function applyCustomAvailabilityDecision(input: CustomAvailabilityD
         notifyContext,
         `Nice — your rotating availability is approved, set on a ${rot.cycle_weeks}-week cycle${rot.end_date ? ` through ${formatDateRange(rot.end_date, rot.end_date)}` : ''}. I'll work your schedule around it. Thanks!`
       );
-      return;
+      return { status: 'applied' };
     }
 
     // DATE-LIMITED override.
@@ -3808,6 +3869,7 @@ export async function applyCustomAvailabilityDecision(input: CustomAvailabilityD
       `That change wasn't approved this time — give your manager a shout if you'd like to talk it through.`
     );
   }
+  return { status: 'applied' };
 }
 
 export async function handleManagerAvailabilityApproval(
@@ -3841,6 +3903,8 @@ export async function handleManagerAvailabilityApproval(
     proposed_availability: pending.proposed_availability,
     availability_raw: pending.availability_raw,
     decided_by: contact.name,
+    decided_by_user_id: contact.user_id ?? null,
+    change_request_id: pending.change_request_id,
     employee_sender: pending.employee_sender,
     employee_recipient: pending.employee_recipient,
     employee_channel: pending.employee_channel,

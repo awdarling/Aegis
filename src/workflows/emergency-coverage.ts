@@ -1847,6 +1847,38 @@ export async function routeManagerCoverageReply(
   return true;
 }
 
+// H7 — if a manager's mid-coverage reply is a clearly-different actionable
+// request (not a name / "all" / "more" / decline), abandon THIS coverage
+// session and let the router handle the new request instead. Returns true when
+// it re-routed (caller must then return). Clearing the session BEFORE
+// re-routing prevents routeIntent from re-entering the coverage handler.
+// `allowQueries` lets "who's free Saturday?"-style questions interrupt on the
+// decline / batch-decision branches, where the reply cannot be a name to contact.
+async function yieldCoverageToDifferentIntent(
+  message: InboundMessage,
+  contact: VerifiedContact,
+  session: CoverageSession,
+  opts: { allowQueries: boolean }
+): Promise<boolean> {
+  const { managerInterruptIntent } = await import('../router/interrupt');
+  const intent = await managerInterruptIntent(message, contact, opts);
+  if (!intent) return false;
+  await clearSession(session);
+  await logActivity({
+    company_id: contact.company_id,
+    action: 'emergency_coverage_yielded',
+    summary: `Manager sent a different request (${intent}) during coverage for ${session.callout_employee_name}'s shift — handling that instead`,
+    metadata: {
+      shift_date: session.shift_date,
+      shift_name: session.shift_info.shift_name,
+      yielded_to: intent,
+    },
+  });
+  const { routeIntent } = await import('../router/intent-router');
+  await routeIntent(message, contact);
+  return true;
+}
+
 export async function handleManagerCoverageReply(
   message: InboundMessage,
   contact: VerifiedContact,
@@ -1869,6 +1901,9 @@ export async function handleManagerCoverageReply(
     if (parseEmployeeResponse(message.body) === 'yes') {
       await blastNextBatch(message, contact, session);
     } else {
+      // H7 — yield to a clearly-different actionable request before treating this
+      // as "no more batches" (queries allowed — a batch reply is never a name).
+      if (await yieldCoverageToDifferentIntent(message, contact, session, { allowQueries: true })) return;
       await clearSession(session);
       await reply(
         contact,
@@ -1915,6 +1950,10 @@ export async function handleManagerCoverageReply(
   }
 
   if (names.length === 0) {
+    // H7 — a reply that is not a name / "all" / "more" but IS a clearly-different
+    // actionable request should be handled, not read as "manager declining"
+    // (queries allowed — there is no name to contact on this branch).
+    if (await yieldCoverageToDifferentIntent(message, contact, session, { allowQueries: true })) return;
     // Manager is declining Aegis outreach or just following up.
     await clearSession(session);
     await reply(
@@ -1930,6 +1969,12 @@ export async function handleManagerCoverageReply(
     });
     return;
   }
+
+  // H7 — the reply named someone, but it might be a command that merely CONTAINS
+  // a name ("approve Sam's swap"). If it classifies as an explicit manager ACTION,
+  // yield to it rather than contacting that person for coverage. Queries are NOT
+  // allowed here — a bare name can look like a query, and we still expect names.
+  if (await yieldCoverageToDifferentIntent(message, contact, session, { allowQueries: false })) return;
 
   // Specific names → contact just those (in parallel).
   const employees: Employee[] = [];

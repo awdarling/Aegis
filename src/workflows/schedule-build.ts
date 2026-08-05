@@ -7,7 +7,7 @@ import { BRAND, brandedEmailShell, brandDetailRow } from '../messaging/brand';
 import { isAlreadyDistributed, isInitiatingManagerContact } from '../lib/distribute-guard';
 import { computeChangedEmployeeIds } from '../lib/schedule-diff';
 import { buildTemplatedScheduleGridHtml, type EmailScheduleTemplate } from './templated-grid';
-import { sendSms } from '../messaging/sms';
+import { sendSms, getTenantSmsNumber } from '../messaging/sms';
 import { env } from '../config/env';
 import { computeWageEstimate } from '../lib/schedule-simulator';
 import { buildScheduleResultEmail } from './schedule-build-email';
@@ -2096,6 +2096,13 @@ export async function distributeScheduleCore(
   let emailed = 0;
   let texted = 0;
   let sent = 0;
+  // Robust SMS sender number (Bug 2): if the batched lookup missed, resolve via the
+  // canonical per-tenant resolver (separate query). Null = pointers can't send.
+  const smsFrom = env.EMAIL_ONLY ? null : (aegisSmsChannel ?? await getTenantSmsNumber(companyId));
+  if (!env.EMAIL_ONLY && !smsFrom) {
+    console.error(`[schedule-sms] no SMS number resolved for company ${companyId} — pointers skipped.`);
+    await logActivity({ company_id: companyId, action: 'schedule_sms_no_channel', summary: `No SMS channel resolved at distribution for ${companyId} — pointers skipped`, metadata: { companyId, aegis_sms_channel: aegisSmsChannel } });
+  }
   const no_contact: string[] = [];
   const errors: Array<{ employee_id: string; reason: string }> = [];
 
@@ -2178,23 +2185,25 @@ ${teamGridHtml}
       }
     }
 
-    if (!env.EMAIL_ONLY && emp.contact_phone && aegisSmsChannel) {
+    if (!env.EMAIL_ONLY && emp.contact_phone && smsFrom) {
       try {
-        const smsBody = emp.contact_email
-          ? `Your schedule for ${weekLabel} is posted — check your email for the details.`
-          : hasShifts
-            ? `Your shifts for ${weekLabel}: ${myShifts.slice(0, 3).map(s => `${new Date(s.date + 'T12:00:00Z').toLocaleDateString('en-US', { weekday: 'short' })} ${s.shift_name}`).join(', ')}${myShifts.length > 3 ? ` +${myShifts.length - 3} more` : ''}`
-            : `You're not on the schedule for ${weekLabel} — enjoy the week off.`;
+        // Bug 2 (spec): every phone-holder gets a text listing THEIR shifts for
+        // the week; email-holders also get a pointer that the full schedule +
+        // the whole team's is in their email. No-email → shifts-only. No-phone
+        // employees never reach here (email-only, handled above).
+        const smsBody = buildDistributionSmsBody({ weekLabel, shifts: myShifts, hasEmail: !!emp.contact_email });
 
-        const ok = await sendSms({ to: emp.contact_phone, from: aegisSmsChannel, body: smsBody, company_id: companyId });
+        const ok = await sendSms({ to: emp.contact_phone, from: smsFrom, body: smsBody, company_id: companyId });
         if (ok) {
           texted++;
           empTexted = true;
         } else {
           errors.push({ employee_id: emp.id, reason: 'sms send returned false' });
+          await logActivity({ company_id: companyId, action: 'schedule_sms_send_failed', summary: `SMS pointer to ${emp.name} (${emp.contact_phone}) returned false`, metadata: { employee_id: emp.id, from: smsFrom } });
         }
       } catch (err) {
         errors.push({ employee_id: emp.id, reason: `sms send failed: ${err instanceof Error ? err.message : String(err)}` });
+        await logActivity({ company_id: companyId, action: 'schedule_sms_send_failed', summary: `SMS pointer to ${emp.name} threw`, metadata: { employee_id: emp.id, error: err instanceof Error ? err.message : String(err) } });
       }
     }
 
@@ -2270,7 +2279,74 @@ ${teamGridHtml}
   };
 }
 
+// ── Distribution SMS body (Bug 2) ─────────────────────────────────────────────
+// Build the per-employee distribution/redistribution text. Spec: a phone-holder
+// always gets THEIR shifts for the week; an email-holder also gets a one-line
+// pointer that the full schedule + the whole team's grid is in their email. A
+// no-email employee gets shifts-only (this text is all they have). Times use a
+// plain hyphen (not an en-dash) to stay in the GSM-7 charset so the message
+// isn't forced to UCS-2 (halved segment length). Pure + exported for unit tests.
+export function buildDistributionSmsBody(opts: {
+  weekLabel: string;
+  shifts: Array<{ date: string; shift_name: string; start_time: string; end_time: string }>;
+  hasEmail: boolean;
+  updated?: boolean;
+}): string {
+  const { weekLabel, shifts, hasEmail, updated = false } = opts;
+  const hasShifts = shifts.length > 0;
+
+  if (!hasShifts) {
+    const base = updated
+      ? `Your schedule for ${weekLabel} changed — you're no longer on the schedule this week.`
+      : `You're not on the schedule for ${weekLabel} — enjoy the week off.`;
+    return hasEmail ? `${base} The team's full schedule is in your email.` : base;
+  }
+
+  const lines = shifts
+    .slice()
+    .sort((a, b) => a.date.localeCompare(b.date))
+    .map((s) => {
+      const day = new Date(s.date + 'T12:00:00Z').toLocaleDateString('en-US', {
+        weekday: 'short', month: 'short', day: 'numeric',
+      });
+      return `${day}: ${s.shift_name} ${formatTime(s.start_time)}-${formatTime(s.end_time)}`;
+    });
+
+  const header = updated ? `Your updated shifts for ${weekLabel}:` : `Your shifts for ${weekLabel}:`;
+  let body = `${header}\n${lines.join('\n')}`;
+  if (hasEmail) {
+    body += updated
+      ? `\n\nYour full updated schedule and the whole team's is in your email.`
+      : `\n\nYour full schedule and the whole team's is in your email.`;
+  }
+  return body;
+}
+
 // ── Distribute handler ────────────────────────────────────────────────────────
+
+// Pick which schedule row to distribute for a target week, given every non-
+// deleted published/draft row for that week_start. The NEWEST build (by
+// generated_at) wins, tie-broken to the published row.
+//
+// Why newest-wins and not published-first: when a manager rebuilds a week that
+// already has a published+distributed schedule, the fresh build lands as a NEW
+// `draft` alongside the OLD `published` row. Preferring published (the old code)
+// selected the STALE row, whose distributed_at was set on the prior send — so
+// "distribute it" right after an approved rebuild hit the re-distribution guard
+// and refused ("already sent on <old date>"), and the freshly built week never
+// went out. Distributing the newest build is the manager's intent; distribute-
+// Core then supersedes any older published row for the same week. Pure + tested.
+export function pickScheduleToDistribute<
+  T extends { id: string; status: string; generated_at: string }
+>(rows: T[]): T | null {
+  if (rows.length === 0) return null;
+  return [...rows].sort((a, b) => {
+    const byGenerated = Date.parse(b.generated_at) - Date.parse(a.generated_at);
+    if (byGenerated !== 0) return byGenerated;
+    if (a.status !== b.status) return a.status === 'published' ? -1 : 1;
+    return 0;
+  })[0];
+}
 
 export async function handleDistributeSchedule(
   message: InboundMessage,
@@ -2287,19 +2363,17 @@ export async function handleDistributeSchedule(
   const { weekStart, weekEnd } = parseTargetWeek(extracted, settings);
   const weekLabel = `${formatShortDate(weekStart)}–${formatShortDate(weekEnd)}`;
 
-  // Select the schedule for THAT week_start (not "latest"). Prefer a published
-  // one over a draft; newest generated_at within the week breaks any tie.
-  type ScheduleRow = { id: string };
-  let scheduleRow: ScheduleRow | null = null;
-  for (const status of ['published', 'draft'] as const) {
-    const { data } = await supabase
-      .from('schedules').select('id').is('deleted_at', null)
-      .eq('company_id', contact.company_id)
-      .eq('status', status)
-      .eq('week_start', weekStart)
-      .order('generated_at', { ascending: false }).limit(1).maybeSingle();
-    if (data) { scheduleRow = data as ScheduleRow; break; }
-  }
+  // Select the schedule for THAT week_start (not "latest"). Among the week's
+  // published/draft rows, distribute the NEWEST build (see pickScheduleToDistribute)
+  // — NOT published-first, which would grab a stale prior-distributed row and make
+  // "distribute it" refuse right after a rebuild.
+  type ScheduleRow = { id: string; status: string; generated_at: string };
+  const { data: weekRows } = await supabase
+    .from('schedules').select('id, status, generated_at').is('deleted_at', null)
+    .eq('company_id', contact.company_id)
+    .eq('week_start', weekStart)
+    .in('status', ['published', 'draft']);
+  const scheduleRow = pickScheduleToDistribute((weekRows ?? []) as ScheduleRow[]);
 
   if (!scheduleRow) {
     // Do NOT fall back to a different week — say so plainly.
@@ -2405,6 +2479,15 @@ export async function notifyScheduleChangesCore(
   const employees = (empRes.data ?? []) as Pick<Employee, 'id' | 'name' | 'contact_email' | 'contact_phone'>[];
   const scheduleTemplate = (templateRes.data as EmailScheduleTemplate | null) ?? null;
 
+  // Bug 2 (sibling): resolve the sender number robustly, same as distributeScheduleCore.
+  // Previously this path sent `from: aegisSmsChannel ?? ''` — an empty From when the
+  // batched lookup missed, which fails the send silently. Null = pointers can't send.
+  const smsFrom = env.EMAIL_ONLY ? null : (aegisSmsChannel ?? await getTenantSmsNumber(companyId));
+  if (!env.EMAIL_ONLY && !smsFrom) {
+    console.error(`[schedule-sms] no SMS number resolved for company ${companyId} — update pointers skipped.`);
+    await logActivity({ company_id: companyId, action: 'schedule_sms_no_channel', summary: `No SMS channel resolved at redistribution for ${companyId} — pointers skipped`, metadata: { companyId, aegis_sms_channel: aegisSmsChannel } });
+  }
+
   // Group the NEW schedule's assignments by employee (for rendering each
   // changed person's updated shifts), and compute the changed-employee set.
   const newByEmp = new Map<string, ScheduleAssignment[]>();
@@ -2509,19 +2592,18 @@ ${teamGridHtml}
       }
     }
 
-    if (!env.EMAIL_ONLY && emp.contact_phone && aegisSmsChannel) {
+    if (!env.EMAIL_ONLY && emp.contact_phone && smsFrom) {
       try {
-        const smsBody = emp.contact_email
-          ? `Your schedule for ${weekLabel} changed — check your email for the update.`
-          : hasShifts
-            ? `Your updated shifts for ${weekLabel}: ${myNew.slice(0, 3).map(s => `${new Date(s.date + 'T12:00:00Z').toLocaleDateString('en-US', { weekday: 'short' })} ${s.shift_name}`).join(', ')}${myNew.length > 3 ? ` +${myNew.length - 3} more` : ''}`
-            : `Your schedule for ${weekLabel} changed — you're not on the schedule this week.`;
-        const ok = await sendSms({ to: emp.contact_phone, from: aegisSmsChannel, body: smsBody, company_id: companyId });
+        // Bug 2 (spec): updated-schedule text lists the employee's CURRENT shifts;
+        // email-holders also get a pointer to their full updated schedule + team grid.
+        const smsBody = buildDistributionSmsBody({ weekLabel, shifts: myNew, hasEmail: !!emp.contact_email, updated: true });
+        const ok = await sendSms({ to: emp.contact_phone, from: smsFrom, body: smsBody, company_id: companyId });
         if (ok) {
           texted++;
           empTexted = true;
         } else {
           errors.push({ employee_id: emp.id, reason: 'sms send returned false' });
+          console.error(`[schedule-sms] pointer NOT sent to ${emp.name} (${emp.contact_phone}) — sendSms returned false; a phone-holder was skipped (check Telnyx / company_channels sms row).`);
         }
       } catch (err) {
         errors.push({ employee_id: emp.id, reason: `sms send failed: ${err instanceof Error ? err.message : String(err)}` });

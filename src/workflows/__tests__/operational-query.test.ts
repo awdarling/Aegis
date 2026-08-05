@@ -16,7 +16,7 @@ vi.mock('../../logger/activity-log', () => ({ logActivity: vi.fn() }));
 vi.mock('../../lib/schedule-simulator', () => ({ computeWageEstimate: vi.fn() }));
 vi.mock('../payroll', () => ({ handleWageRateSync: vi.fn() }));
 
-import { collectAssignments, summarizeStaffingByDate, buildDataContext, formatMyShiftsReply, type MyShift } from '../operational-query';
+import { collectAssignments, summarizeStaffingByDate, buildDataContext, formatMyShiftsReply, detectWeekScope, type MyShift } from '../operational-query';
 
 // One Watermark-shaped schedule row. Erin works two shifts on Jun 17 (a double),
 // so she must be counted ONCE in that day's headcount.
@@ -177,5 +177,40 @@ describe('formatMyShiftsReply', () => {
     const out = formatMyShiftsReply('Dana Reed', [shifts[0]], { kind: 'date', date: '2026-07-04' });
     expect(out).toMatch(/what you're on for Saturday, July 4/);
     expect(out).not.toMatch(/in all/);
+  });
+});
+
+
+// ── Bug 1: "this week" vs "next week" resolve to distinct windows ─────────────
+describe('detectWeekScope — this week vs next week', () => {
+  const today = '2026-08-04'; // Tuesday; schedule weeks run Sun 8/2 – Sat 8/8
+  it('this week → the Sun–Sat window containing today', () => {
+    expect(detectWeekScope('when am I working this week?', today)).toEqual({ label: 'this week', start: '2026-08-02', end: '2026-08-08' });
+  });
+  it('next week → the following Sun–Sat window', () => {
+    expect(detectWeekScope('what about next week?', today)).toEqual({ label: 'next week', start: '2026-08-09', end: '2026-08-15' });
+  });
+  it('no relative week → null (falls through to upcoming)', () => {
+    expect(detectWeekScope('when do I work?', today)).toBeNull();
+  });
+  it('does not treat "this weekend" as a week window', () => {
+    expect(detectWeekScope('anything this weekend?', today)).toBeNull();
+  });
+});
+
+describe('formatMyShiftsReply — week scope', () => {
+  const wk: MyShift[] = [
+    { date: '2026-06-15', role: 'Lifeguard', shift_name: 'AM', start_time: '09:00', end_time: '13:00', hours: 4 },
+    { date: '2026-06-17', role: 'Lifeguard', shift_name: 'PM', start_time: '13:00', end_time: '21:00', hours: 8 },
+  ];
+  it('labels the reply for the named week and totals hours', () => {
+    const out = formatMyShiftsReply('Dana Reed', wk, { kind: 'week', label: 'next week', start: '2026-06-14', end: '2026-06-20' });
+    expect(out).toMatch(/2 shifts next week/);
+    expect(out).toMatch(/12h in total/);
+    expect(out).toMatch(/That's 12h in all/);
+  });
+  it('empty week → "not on the schedule <label>"', () => {
+    const out = formatMyShiftsReply('Dana Reed', [], { kind: 'week', label: 'this week', start: '2026-06-14', end: '2026-06-20' });
+    expect(out).toMatch(/not on the schedule this week/);
   });
 });

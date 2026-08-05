@@ -2473,6 +2473,19 @@ export async function handleSwapConfirmation(
   const answer = parseYesNo(message.body);
 
   if (answer === 'unclear') {
+    // H7 — before re-asking, yield to a clearly-different actionable request so a
+    // pending (unsent) swap confirmation does not hold a schedule query / time-off
+    // / new swap hostage. The pending swap was never sent to anyone, so abandoning
+    // it to handle the new request is safe (mirrors the time-off-confirm MOVED_ON
+    // re-route). A genuine fumbled yes/no still falls through to the re-ask below.
+    const { employeeInterruptIntent } = await import('../router/interrupt');
+    const interrupt = await employeeInterruptIntent(message, contact);
+    if (interrupt) {
+      await clearPendingSwap(contact.company_id, contact.employee_id!);
+      const { routeIntent } = await import('../router/intent-router');
+      await routeIntent(message, contact);
+      return;
+    }
     await reply(contact, message,
       "Just let me know — should I set that swap up? Or tell me no and I'll drop it."
     );

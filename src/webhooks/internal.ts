@@ -10,6 +10,7 @@ import {
 } from '../workflows/employee-onboarding';
 import { loadAvailabilityChangeRow } from '../workflows/availability-change-requests';
 import { commitSwapPickup, proposeSwapTrade, resolveSwapProposal } from '../workflows/shift-swap';
+import { sendSwapDecisionNotification } from './decision';
 import { supabase } from '../db/client';
 import { sendEmail } from '../messaging/email';
 import { brandedEmailShell, BRAND } from '../messaging/brand';
@@ -53,6 +54,34 @@ internalRouter.post('/notify-to-decision', async (req: Request, res: Response) =
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[internal] notify-to-decision failed:', msg);
+    serverError(res, msg);
+  }
+});
+
+// POST /internal/notify-swap-decision
+// Homebase calls this after a manager approves/denies a swap in the UI (it only
+// updates swap_requests.status; Aegis executes the schedule change + notifies).
+// Giveaway/pickup only — trades stay on the manager email button (see decision.ts).
+internalRouter.post('/notify-swap-decision', async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const swapRequestId = body.swap_request_id;
+  const decision = body.decision;
+
+  if (typeof swapRequestId !== 'string' || swapRequestId.length === 0) {
+    badRequest(res, 'swap_request_id is required');
+    return;
+  }
+  if (decision !== 'approved' && decision !== 'denied') {
+    badRequest(res, 'decision must be "approved" or "denied"');
+    return;
+  }
+
+  try {
+    const result = await sendSwapDecisionNotification(swapRequestId, decision);
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[internal] notify-swap-decision failed:', msg);
     serverError(res, msg);
   }
 });

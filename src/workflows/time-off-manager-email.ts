@@ -110,7 +110,7 @@ function escapeHtml(s: string): string {
 
 // ── Request-details rendering ─────────────────────────────────────────────────
 
-function describePartialDay(d: PartialDayDetail): string {
+export function describePartialDay(d: PartialDayDetail): string {
   if (d.shift_name) {
     return `${formatWeekdayShort(d.date)} ${formatShortDate(d.date)} — ${d.shift_name} off`;
   }
@@ -120,7 +120,7 @@ function describePartialDay(d: PartialDayDetail): string {
   return `${formatWeekdayShort(d.date)} ${formatShortDate(d.date)} — partial`;
 }
 
-function buildPartialSummaryText(partialDays: PartialDayDetail[]): string {
+export function buildPartialSummaryText(partialDays: PartialDayDetail[]): string {
   // If every day shares the same window/shift, collapse to one line.
   const sample = partialDays[0];
   const allSame = partialDays.every(

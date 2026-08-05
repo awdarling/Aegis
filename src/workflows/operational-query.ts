@@ -1593,7 +1593,7 @@ export interface MyShift {
   end_time: string;
   hours: number;
 }
-type ShiftScope = { kind: 'upcoming' } | { kind: 'date'; date: string };
+type ShiftScope = { kind: 'upcoming' } | { kind: 'date'; date: string } | { kind: 'week'; label: string; start: string; end: string };
 
 function fmtShiftDate(d: string): string {
   return new Date(d + 'T12:00:00Z').toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
@@ -1609,19 +1609,45 @@ function fmtShiftTime(t: string): string {
 export function formatMyShiftsReply(employeeName: string, shifts: MyShift[], scope: ShiftScope): string {
   const hi = textOpener(employeeName);
   if (shifts.length === 0) {
-    return scope.kind === 'date'
-      ? `${hi}you're not scheduled on ${fmtShiftDate(scope.date)} — looks like you've got that day off. If you were expecting a shift, reply here or check with your manager and we'll sort it out.`
-      : `${hi}you don't have any upcoming shifts on the schedule right now. If that seems off, reply here or check with your manager and we'll take a look.`;
+    if (scope.kind === 'date')
+      return `${hi}you're not scheduled on ${fmtShiftDate(scope.date)} — looks like you've got that day off. If you were expecting a shift, reply here or check with your manager and we'll sort it out.`;
+    if (scope.kind === 'week')
+      return `${hi}you're not on the schedule ${scope.label} — looks like you've got ${scope.label} off. If that seems off, reply here or check with your manager and we'll take a look.`;
+    return `${hi}you don't have any upcoming shifts on the schedule right now. If that seems off, reply here or check with your manager and we'll take a look.`;
   }
   const totalHours = Math.round(shifts.reduce((s, a) => s + a.hours, 0) * 10) / 10;
   const lead = scope.kind === 'date'
     ? `Here's what you're on for ${fmtShiftDate(scope.date)}:`
-    : `You're on for ${shifts.length} shift${shifts.length === 1 ? '' : 's'} coming up — ${totalHours}h in total:`;
+    : scope.kind === 'week'
+      ? `You're on for ${shifts.length} shift${shifts.length === 1 ? '' : 's'} ${scope.label} — ${totalHours}h in total:`
+      : `You're on for ${shifts.length} shift${shifts.length === 1 ? '' : 's'} coming up — ${totalHours}h in total:`;
   const lines = shifts
     .map(s => `• ${fmtShiftDate(s.date)} — ${s.role} (${s.shift_name}), ${fmtShiftTime(s.start_time)}–${fmtShiftTime(s.end_time)}, ${s.hours}h`)
     .join('\n');
   const tail = scope.kind === 'date' ? '' : `\n\nThat's ${totalHours}h in all.`;
   return `${hi}${lead}\n\n${lines}${tail}\n\nIf anything looks off, just reply here or reach out to your manager.`;
+}
+
+// Sunday-anchored week window for "this week" / "next week", from the tenant's
+// local today (schedule weeks run Sun–Sat). Returns null when no relative week is
+// named, so a plain "my shifts" keeps the 'upcoming' behavior.
+function addDaysISO(date: string, days: number): string {
+  const d = new Date(date + 'T12:00:00Z');
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+export function detectWeekScope(body: string, todayLocal: string): { label: string; start: string; end: string } | null {
+  const t = (body || '').toLowerCase();
+  const dow = new Date(todayLocal + 'T12:00:00Z').getUTCDay(); // 0 = Sunday
+  const thisStart = addDaysISO(todayLocal, -dow);
+  if (/\bthis (?:coming )?week\b/.test(t)) {
+    return { label: 'this week', start: thisStart, end: addDaysISO(thisStart, 6) };
+  }
+  if (/\bnext week\b/.test(t)) {
+    const nextStart = addDaysISO(thisStart, 7);
+    return { label: 'next week', start: nextStart, end: addDaysISO(nextStart, 6) };
+  }
+  return null;
 }
 
 export async function handleMyShiftsQuery(
@@ -1634,22 +1660,39 @@ export async function handleMyShiftsQuery(
     return;
   }
 
-  const today = new Date().toISOString().slice(0, 10);
+  // Tenant-local today (never server UTC) so relative week windows land on the
+  // correct calendar days.
+  const { data: companyRow } = await supabase
+    .from('companies').select('timezone').eq('id', contact.company_id).single();
+  const tz = (companyRow as { timezone: string | null } | null)?.timezone ?? 'America/New_York';
+  const today = new Intl.DateTimeFormat('en-CA', { timeZone: tz }).format(new Date());
+
   const rawDate = typeof extracted.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(extracted.date)
     ? extracted.date
     : null;
-  const scope: ShiftScope = rawDate ? { kind: 'date', date: rawDate } : { kind: 'upcoming' };
+  // "this week" / "next week" resolve to an explicit [start,end] window so the two
+  // are distinct and each scoped to its own week — previously both fell through to
+  // 'upcoming' and returned every future shift identically.
+  const week = rawDate ? null : detectWeekScope(message.body, today);
+  const scope: ShiftScope = rawDate
+    ? { kind: 'date', date: rawDate }
+    : week
+      ? { kind: 'week', label: week.label, start: week.start, end: week.end }
+      : { kind: 'upcoming' };
 
   // Published, non-deleted schedules that could hold the relevant shifts.
-  const { data: schedRows } = await supabase
+  const lowerBound = scope.kind === 'week' ? scope.start : (rawDate ?? today);
+  let schedQuery = supabase
     .from('schedules')
     .select('data, week_start, week_end')
     .eq('company_id', contact.company_id)
     .eq('status', 'published')
     .is('deleted_at', null)
-    .gte('week_end', rawDate ?? today)
+    .gte('week_end', lowerBound)
     .order('week_start', { ascending: true })
     .limit(8);
+  if (scope.kind === 'week') schedQuery = schedQuery.lte('week_start', scope.end);
+  const { data: schedRows } = await schedQuery;
 
   const schedules = (schedRows ?? []) as Array<{ data: { assignments?: Array<Record<string, unknown>> } | null }>;
 
@@ -1659,7 +1702,9 @@ export async function handleMyShiftsQuery(
     for (const raw of (s.data?.assignments ?? [])) {
       const a = raw as { employee_id?: string; date?: string; role?: string; shift_name?: string; start_time?: string; end_time?: string; hours?: number };
       if (a.employee_id !== contact.employee_id || !a.date) continue;
-      if (rawDate ? a.date !== rawDate : a.date < today) continue;
+      if (scope.kind === 'date') { if (a.date !== rawDate) continue; }
+      else if (scope.kind === 'week') { if (a.date < scope.start || a.date > scope.end) continue; }
+      else if (a.date < today) continue;
       const key = `${a.date}|${a.shift_name ?? ''}|${a.start_time ?? ''}`;
       if (seen.has(key)) continue;
       seen.add(key);
@@ -1680,7 +1725,7 @@ export async function handleMyShiftsQuery(
   await logActivity({
     company_id: contact.company_id,
     action: 'employee_shift_query',
-    summary: `${contact.name} asked about their shifts (${scope.kind === 'date' ? scope.date : 'upcoming'}) — ${mine.length} found`,
+    summary: `${contact.name} asked about their shifts (${scope.kind === 'date' ? scope.date : scope.kind === 'week' ? scope.label : 'upcoming'}) — ${mine.length} found`,
     metadata: { employee_id: contact.employee_id, scope: scope.kind, date: rawDate, count: mine.length },
   });
 }

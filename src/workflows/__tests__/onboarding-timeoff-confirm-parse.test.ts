@@ -115,3 +115,18 @@ describe('extractOnboardingReason', () => {
     }
   });
 });
+
+
+// ── Bug 3: the reason stated in the ORIGINAL request must be captured ─────────
+describe('extractOnboardingReason — reason stated in the request', () => {
+  it('pulls a "for X" reason out of the request itself', () => {
+    expect(extractOnboardingReason('I need Aug 20-25 off for a wedding')).toBe('a wedding');
+  });
+  it('pulls a "because X" reason', () => {
+    expect(extractOnboardingReason("taking those days because I'm getting married")).toBe("I'm getting married");
+  });
+  it('returns null when no reason is given (so the caller can fall back)', () => {
+    expect(extractOnboardingReason('I need Friday off')).toBeNull();
+    expect(extractOnboardingReason('yes')).toBeNull();
+  });
+});

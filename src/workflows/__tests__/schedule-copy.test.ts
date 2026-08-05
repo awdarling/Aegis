@@ -20,9 +20,13 @@ describe('employee schedule SMS drops the awkward tenant "Name:" prefix (3b)', (
     expect(src).not.toContain('${companyName}:');
   });
   it('drops the tenant name from routine schedule SMS (identity is set at opt-in)', () => {
-    expect(src).toContain('Your schedule for ${weekLabel} is posted');
+    // Bug 2: the bare "…is posted — check your email" body was replaced by a
+    // shift-list body (buildDistributionSmsBody); the branding guard is that the
+    // tenant/company name never appears in the routine SMS.
     expect(src).toContain('Your shifts for ${weekLabel}:');
+    expect(src).toContain("Your full schedule and the whole team's is in your email.");
     expect(src).not.toContain('Your ${companyName} schedule for');
     expect(src).not.toContain('${companyName} shifts for');
+    expect(src).not.toContain('${companyName}:');
   });
 });

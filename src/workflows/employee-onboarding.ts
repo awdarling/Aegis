@@ -13,6 +13,7 @@ import { logActivity } from '../logger/activity-log';
 import { sendSms } from '../messaging/sms';
 import { sendEmail } from '../messaging/email';
 import { reply, sendInThreadAck } from '../messaging/reply';
+import { getAegisSmsChannel } from '../messaging/notify';
 import { greeting, firstName as firstNameOf, textOpener, managerAlertSms } from '../messaging/greeting';
 import {
   BRAND,
@@ -3947,11 +3948,31 @@ async function notifyEmployeeOfAvailabilityDecision(
   pending: PendingManagerAvailApproval,
   bodyText: string
 ): Promise<void> {
+  // SMS-FIRST for phone-holders, independent of pending.employee_channel. The
+  // Homebase availability tab passes employee_channel='email' (Batch-1 F1), so
+  // routing purely on that flag emailed phone-holders who should have been
+  // texted. Resolve the employee's REAL contacts + the tenant SMS number, decide
+  // the channel SMS-first, then let reply() send — reply()'s SMS path already
+  // falls back to email on send failure. (The tab now also passes the true
+  // channel — but this backstop never depends on it.)
+  const { data: empRow } = await supabase
+    .from('employees')
+    .select('contact_phone, contact_email')
+    .eq('id', pending.employee_id)
+    .eq('company_id', pending.company_id)
+    .maybeSingle();
+  const emp = empRow as { contact_phone: string | null; contact_email: string | null } | null;
+
+  const phone = emp?.contact_phone ?? (pending.employee_channel === 'sms' ? pending.employee_sender : null);
+  const email = emp?.contact_email ?? (pending.employee_channel === 'email' ? pending.employee_sender : null);
+  const smsChannel = await getAegisSmsChannel(pending.company_id);
+  const useSms = !env.EMAIL_ONLY && !!phone && !!smsChannel;
+
   const employeeMessage: InboundMessage = {
-    sender: pending.employee_sender,
-    recipient: pending.employee_recipient,
+    sender: useSms ? phone! : (email ?? pending.employee_sender),
+    recipient: useSms ? smsChannel! : pending.employee_recipient,
     body: '',
-    channel: pending.employee_channel,
+    channel: useSms ? 'sms' : 'email',
     raw_subject: pending.raw_subject ?? undefined,
     thread_id: pending.thread_id ?? undefined,
   };
@@ -3961,8 +3982,8 @@ async function notifyEmployeeOfAvailabilityDecision(
     employee_id: pending.employee_id,
     user_id: null,
     name: pending.employee_name,
-    matched_identifier: pending.employee_sender,
-    channel: pending.employee_channel,
+    matched_identifier: employeeMessage.sender,
+    channel: employeeMessage.channel,
   };
   await reply(employeeContact, employeeMessage, `${textOpener(pending.employee_name)}${bodyText}`);
 }

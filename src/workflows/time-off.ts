@@ -911,10 +911,15 @@ ${brandActionCard('Action needed · Time off', cardInner)}`;
 // Loads the TO + employee, picks the employee's best channel (email first,
 // then SMS), sends the decision notification, and logs activity. Throws on
 // hard failure so the calling endpoint can return 5xx with a clear error.
-// Pure channel router for the employee decision notification. Reply on the
-// channel the employee SUBMITTED on: an SMS request gets an SMS decision. Rules:
-//   'sms'         — submitted by SMS (or has no email) AND SMS is possible
-//   'email'       — has an email (email-origin, or SMS unavailable)
+// Pure channel router for the employee decision notification. SMS-FIRST for
+// phone-holders (Batch-1 design principle; SMS spec §3.3 "the employee gets the
+// outcome in text"): when EMAIL_ONLY=false, any employee with a phone is texted
+// and email is the fallback (the SMS path in sendDecisionNotification falls back
+// to email on send failure). originChannel is retained for threading context but
+// no longer gates SMS — previously a phone+email employee whose SMS origin
+// wasn't captured defaulted to email (Batch-1 F1). Rules:
+//   'sms'         — has a phone AND SMS is enabled (email fallback on failure)
+//   'email'       — no phone (or EMAIL_ONLY) but has an email
 //   'skip'        — EMAIL_ONLY + phone-only: unreachable right now; skip the notice
 //   'unreachable' — neither email nor phone on file
 export type DecisionRoute = 'sms' | 'email' | 'skip' | 'unreachable';
@@ -925,7 +930,7 @@ export function pickDecisionRoute(opts: {
   emailOnly: boolean;
 }): DecisionRoute {
   const canSms = !!opts.contactPhone && !opts.emailOnly;
-  if (canSms && (opts.originChannel === 'sms' || !opts.contactEmail)) return 'sms';
+  if (canSms) return 'sms';
   if (opts.contactEmail) return 'email';
   if (opts.emailOnly && opts.contactPhone) return 'skip';
   return 'unreachable';

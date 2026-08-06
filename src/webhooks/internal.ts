@@ -9,6 +9,7 @@ import {
   type RotationSpec,
 } from '../workflows/employee-onboarding';
 import { loadAvailabilityChangeRow } from '../workflows/availability-change-requests';
+import { notifyDayClosureCore } from '../workflows/day-closure';
 import { commitSwapPickup, proposeSwapTrade, resolveSwapProposal } from '../workflows/shift-swap';
 import { sendSwapDecisionNotification } from './decision';
 import { supabase } from '../db/client';
@@ -708,6 +709,38 @@ internalRouter.post('/distribute-schedule', async (req: Request, res: Response) 
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[internal] distribute-schedule failed:', msg);
+    serverError(res, msg);
+  }
+});
+
+// POST /internal/notify-day-closure
+// Homebase "Close day" (Batch-1 F8). Aegis owns the roster: given the schedule +
+// the closed date, it notifies EVERY scheduled employee SMS-first + email
+// fallback. Replaces the old approach where Homebase impersonated the manager
+// over the public /webhooks/sms|email and relied on the classifier to deliver —
+// which notified nobody. Body: { company_id, schedule_id, date }
+internalRouter.post('/notify-day-closure', async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const companyId = body.company_id;
+  const scheduleId = body.schedule_id;
+  const date = body.date;
+  if (typeof companyId !== 'string' || companyId.length === 0) { badRequest(res, 'company_id is required'); return; }
+  if (typeof scheduleId !== 'string' || scheduleId.length === 0) { badRequest(res, 'schedule_id is required'); return; }
+  if (typeof date !== 'string' || date.length === 0) { badRequest(res, 'date is required'); return; }
+
+  try {
+    const result = await notifyDayClosureCore(companyId, scheduleId, date);
+    res.json({
+      ok: true,
+      notified: result.notified,
+      total_scheduled: result.total_scheduled,
+      texted: result.texted,
+      emailed: result.emailed,
+      failures: result.failures,
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[internal] notify-day-closure failed:', msg);
     serverError(res, msg);
   }
 });

@@ -2434,9 +2434,11 @@ export async function handleInitiateSwap(
   }
 }
 
-// Reach an employee email-first (branded email) with an SMS fallback. Used for
-// swap outreach so the flow works for email-only employees — replies route back
-// via the same swap_outreach record keyed by the employee.
+// Reach a coworker for a directed swap offer — SMS-FIRST for phone-holders
+// (SMS spec §3.4: swaps are text-native employee↔employee), email as the fallback
+// on no-phone or SMS send failure. Replies route back via the same swap_outreach
+// record keyed by the employee, on either channel. (Batch-1 systemic sweep — this
+// was email-first, an email-era holdover.)
 async function sendOutreachMessage(params: {
   receiverEmail: string | null;
   receiverPhone: string | null;
@@ -2446,6 +2448,11 @@ async function sendOutreachMessage(params: {
   company_id: string;
 }): Promise<'email' | 'sms' | 'none'> {
   const { receiverEmail, receiverPhone, aegisSmsNumber, subject, text, company_id } = params;
+  if (!env.EMAIL_ONLY && receiverPhone && aegisSmsNumber) {
+    const ok = await sendSms({ to: receiverPhone, from: aegisSmsNumber, body: text, company_id });
+    if (ok) return 'sms';
+    console.warn(`[swap-outreach] SMS send failed for company ${company_id}; falling back to email`);
+  }
   if (receiverEmail) {
     const safe = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     const html = brandedEmailShell({
@@ -2456,10 +2463,6 @@ async function sendOutreachMessage(params: {
     // SendGrid failure must not make us tell the requester we reached the coworker.
     const ok = await sendEmail({ to: receiverEmail, subject, text, html, company_id });
     return ok ? 'email' : 'none';
-  }
-  if (!env.EMAIL_ONLY && receiverPhone && aegisSmsNumber) {
-    const ok = await sendSms({ to: receiverPhone, from: aegisSmsNumber, body: text, company_id });
-    return ok ? 'sms' : 'none';
   }
   return 'none';
 }

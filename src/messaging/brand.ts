@@ -125,7 +125,7 @@ export function brandedButton(btn: BrandButton): string {
     variant === 'primary'
       ? `${base}background:${BRAND.accent};color:#0d0d0d;border:1px solid ${BRAND.accent};`
       : `${base}background:transparent;color:${BRAND.textPrimary};border:1px solid ${BRAND.borderStrong};`;
-  return `<a href="${escapeAttr(btn.url)}" style="${style}">${btn.label}</a>`;
+  return `<a href="${escapeAttr(btn.url)}" class="btn-a" style="${style}">${btn.label}</a>`;
 }
 
 /**
@@ -140,12 +140,16 @@ export function brandedButtonRow(buttons: BrandButton[]): string {
         (b.variant ?? 'primary') === 'primary'
           ? `padding:4px;background:${BRAND.accentDim};border:1px solid ${BRAND.accentBorder};border-radius:11px;`
           : 'padding:4px;border:1px solid transparent;border-radius:11px;';
-      return `<td style="padding-right:${i === buttons.length - 1 ? '0' : '10px'};">
-        <span style="display:inline-block;${glow}">${brandedButton(b)}</span>
+      // .btn-cell / .btn-glow / .btn-a classes let the shell's mobile media query
+      // stack the buttons full-width instead of letting them crowd/wrap oddly on a
+      // narrow screen (Batch-1 F9). Inline styles keep the desktop look for clients
+      // that ignore <style>.
+      return `<td class="btn-cell" style="padding-right:${i === buttons.length - 1 ? '0' : '10px'};">
+        <span class="btn-glow" style="display:inline-block;${glow}">${brandedButton(b)}</span>
       </td>`;
     })
     .join('');
-  return `<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin:0 0 14px;"><tr>${cells}</tr></table>`;
+  return `<table class="btn-row" role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin:0 0 14px;"><tr>${cells}</tr></table>`;
 }
 
 // ── Reusable section pieces ───────────────────────────────────────────────────
@@ -269,6 +273,17 @@ export function brandedEmailShell(params: BrandedShellParams): string {
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="dark">
 <meta name="supported-color-schemes" content="dark">
+<style>
+  /* Batch-1 F9 — on a narrow screen, stack action buttons full-width and centered
+     instead of letting the side-by-side row crowd or wrap awkwardly. Clients that
+     strip <style> keep the inline desktop layout. */
+  @media only screen and (max-width:480px) {
+    .btn-row { width:100% !important; }
+    .btn-cell { display:block !important; width:100% !important; padding:0 0 10px 0 !important; }
+    .btn-glow { display:block !important; }
+    .btn-a { display:block !important; text-align:center !important; }
+  }
+</style>
 </head>
 <body style="margin:0;padding:0;background:${BRAND.bgBase};font-family:${FONT_STACK};color:${BRAND.textPrimary};">
 ${preheaderHtml}

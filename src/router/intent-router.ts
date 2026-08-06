@@ -94,8 +94,10 @@ const MANAGER_ONLY_INTENTS = new Set([
 ]);
 
 // Intents available only to quria_admin — managers attempting these are blocked.
+// broadcast_message is NOT here: managers may broadcast to their OWN company
+// (Batch-1 F4); handleBroadcast scopes targeting by role (managers-only targeting
+// stays a quria-admin action).
 const QURIA_ONLY_INTENTS = new Set([
-  'broadcast_message',
   'quria_diagnostic',
 ]);
 
@@ -326,17 +328,16 @@ async function routeIntentInner(
 
   // Pre-classification: manager and quria_admin session checks
   if (contact.role === 'manager' || contact.role === 'quria_admin') {
-    // Quria-specific: broadcast confirmation session
-    if (contact.role === 'quria_admin') {
-      const broadcastSession = await getActiveBroadcastSession(
-        contact.company_id,
-        contact.matched_identifier
-      );
-      if (broadcastSession) {
-        await handleBroadcastConfirmation(message, contact, broadcastSession);
-        console.log('[router] EARLY RETURN', { reason: 'broadcast_confirmation' });
-        return;
-      }
+    // Broadcast confirmation session — managers and quria admins both broadcast
+    // (Batch-1 F4), so both need their YES/NO confirmation caught here.
+    const broadcastSession = await getActiveBroadcastSession(
+      contact.company_id,
+      contact.matched_identifier
+    );
+    if (broadcastSession) {
+      await handleBroadcastConfirmation(message, contact, broadcastSession);
+      console.log('[router] EARLY RETURN', { reason: 'broadcast_confirmation' });
+      return;
     }
 
     const pendingEdit = await getPendingEdit(contact.company_id, contact.matched_identifier);

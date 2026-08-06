@@ -96,11 +96,14 @@ export const MANAGER_INTENTS = [
   'homebase_edit',
   'notify_day_closure',
   'recheck_time_off',
+  // Managers CAN broadcast to their OWN company (Batch-1 F4). Targeting is scoped
+  // to all / employees / a role / specific people; managers-only targeting stays a
+  // quria-admin action (enforced in handleBroadcast by role).
+  'broadcast_message',
 ] as const;
 
 export const QURIA_INTENTS = [
   ...MANAGER_INTENTS,
-  'broadcast_message',
   'quria_diagnostic',
 ] as const;
 
@@ -359,6 +362,22 @@ does NOT apply to an until/through boundary on a recurring pattern.
 - A recurring pattern with NO end boundary → update_availability with NO end_date
   (a permanent change).
 
+## Manager broadcasts — "message the team" is broadcast_message, NOT operational_query
+
+When a MANAGER or QURIA admin asks to SEND a message OUT to people — "message the
+whole team", "tell everyone …", "let the staff know …", "send a message to all the
+lifeguards", "text everybody that we're closed tomorrow", "blast the team" — that
+is broadcast_message. It is NOT operational_query (a question ABOUT the workforce)
+and NOT general_question. Extract the message_text, target_type
+(all|managers|employees|role|specific), target_role, target_names, and channel.
+- "tell the team the pool opens at 10 tomorrow" → broadcast_message, target_type=all.
+- "let the lifeguards know training moved to Friday" → broadcast_message,
+  target_type=role, target_role="Lifeguard".
+- "message Sam and Jordan that their shift changed" → broadcast_message,
+  target_type=specific, target_names=["Sam","Jordan"].
+A QUESTION about the workforce ("who's on Saturday?", "how many guards today?")
+stays operational_query — only an outbound message to people is broadcast_message.
+
 ## Reading vs changing availability — query_my_availability vs update_availability
 
 A message that ASKS what the employee's availability currently IS (a READ) is
@@ -576,6 +595,12 @@ User: "what did I set my hours to?"
 
 User: "am I available fridays?"
 {"intent":"query_my_availability","confidence":"high","extracted":{}}
+
+User: "message the whole team that the pool opens at 10 tomorrow"
+{"intent":"broadcast_message","confidence":"high","extracted":{"message_text":"The pool opens at 10 tomorrow.","target_type":"all","target_role":null,"target_names":null,"channel":"sms"}}
+
+User: "let the lifeguards know training moved to Friday"
+{"intent":"broadcast_message","confidence":"high","extracted":{"message_text":"Training moved to Friday.","target_type":"role","target_role":"Lifeguard","target_names":null,"channel":"sms"}}
 
 Respond with ONLY valid JSON in this exact shape — no markdown, no explanation:
 {

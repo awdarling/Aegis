@@ -26,6 +26,7 @@ const h = vi.hoisted(() => {
       eq(col: string, val: unknown) { state.filters[col] = val; return builder; },
       in() { return builder; },
       is() { return builder; },
+      limit() { return builder; },
       maybeSingle() { recorded.push({ table, op: state.op, filters: state.filters }); return Promise.resolve({ data: null, error: null }); },
       single() { recorded.push({ table, op: state.op, filters: state.filters }); return Promise.resolve({ data: null, error: null }); },
       then(onF: (v: { data: null; error: null }) => unknown, onR?: (e: unknown) => unknown) {

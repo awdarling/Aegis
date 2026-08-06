@@ -13,7 +13,7 @@ export type CapabilityRole = 'employee' | 'manager' | 'quria_admin';
 // too — they're also employees of the club.
 const EMPLOYEE_ACTIONS = [
   'Request time off, or check where a request stands',
-  'Change your availability — including just until a date, or on a repeating schedule',
+  'Check your current availability, or change it — including just until a date, or on a repeating schedule',
   'Ask about your own shifts',
   'Swap a shift with a coworker, or accept/decline a swap someone asks you about',
 ];

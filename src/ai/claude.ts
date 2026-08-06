@@ -72,6 +72,7 @@ export const EMPLOYEE_INTENTS = [
   'submit_time_off',
   'query_my_time_off',
   'query_my_shifts',
+  'query_my_availability',
   'update_availability',
   'initiate_swap',
   'respond_swap_accept',
@@ -358,6 +359,24 @@ does NOT apply to an until/through boundary on a recurring pattern.
 - A recurring pattern with NO end boundary → update_availability with NO end_date
   (a permanent change).
 
+## Reading vs changing availability — query_my_availability vs update_availability
+
+A message that ASKS what the employee's availability currently IS (a READ) is
+query_my_availability — NEVER update_availability (a CHANGE) and NEVER
+submit_time_off. A READ poses a QUESTION about the existing setting; a CHANGE
+STATES a new one.
+- READ → query_my_availability: "what's my availability?", "what days am I
+  available?", "what are my hours set to?", "what did I set my availability to?",
+  "what's my current availability?", "when am I marked available?", "remind me
+  what my availability is", "am I available Fridays?", "am I down as available
+  on weekends?".
+- CHANGE → update_availability: "take me off Thursdays", "I can work mornings
+  from now on", "drop Mondays", "I'm available Tuesdays now" (states a new value).
+- Distinct from query_my_shifts: "am I available Fridays?" reads the availability
+  PATTERN the employee set; "am I working Saturday?" reads their actual SCHEDULED
+  shifts (query_my_shifts). Availability = when they CAN work; shifts = when they
+  ARE scheduled.
+
 ## A bare intent with no specifics yet — route to the ACTION, never to a general question
 
 Someone may state they WANT to do something without giving the details yet. Classify by the
@@ -546,6 +565,18 @@ User: "when do I work?"
 User: "am I working saturday?"
 {"intent":"query_my_shifts","confidence":"high","extracted":{"date":"${currentYear}-06-27"}}
 
+User: "what's my availability?"
+{"intent":"query_my_availability","confidence":"high","extracted":{}}
+
+User: "what days am I available?"
+{"intent":"query_my_availability","confidence":"high","extracted":{}}
+
+User: "what did I set my hours to?"
+{"intent":"query_my_availability","confidence":"high","extracted":{}}
+
+User: "am I available fridays?"
+{"intent":"query_my_availability","confidence":"high","extracted":{}}
+
 Respond with ONLY valid JSON in this exact shape — no markdown, no explanation:
 {
   "intent": "<intent_name>",
@@ -597,6 +628,9 @@ Respond with ONLY valid JSON in this exact shape — no markdown, no explanation
     //     they appear in the company context, prefer those exact shift times.
     // For query_my_time_off: {} — used when the employee asks about their own approved
     //   upcoming time off ("what time off do I have approved?", "when is my next day off?").
+    // For query_my_availability: {} — the employee asking to READ their current
+    //   availability ("what's my availability?", "what days am I available?"). A READ,
+    //   never a change (update_availability) or a time-off request.
     // For query_my_shifts: { "date": "YYYY-MM-DD" } when they ask about a specific day
     //   ("am I working Saturday?"), else {} for the general "what are my shifts?" /
     //   "when do I work this week?" / "what's my schedule?". This is the employee asking

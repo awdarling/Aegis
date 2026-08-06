@@ -1150,11 +1150,17 @@ export async function dispatchOutreach(params: {
     `${si.shift_name} shift (${si.start_time}–${si.end_time}, ${si.role}) on ${dateStr}. ` +
     `Can you come in?\n\nReply YES to accept or NO to decline.`;
 
-  // Email-first during the email rollout; fall back to SMS. (When Aegis has a
-  // live phone number, flip this to prefer SMS for urgency.) Reply YES/NO works
-  // the same on both channels, which is what makes the SMS migration a drop-in.
+  // SMS-FIRST for phone-holders (Batch-1 F2; SMS spec §3.5 — emergency coverage
+  // is text-native end to end). Coverage is urgent and in-the-moment, so a
+  // phone-holder is texted (reply YES/NO) whenever EMAIL_ONLY=false and the
+  // tenant has an Aegis number. Email (with branded Accept/Decline buttons) is
+  // the fallback for a no-phone employee or while EMAIL_ONLY is on. Previously
+  // this was email-first — a phone+email employee got emailed, never texted.
   let channel: 'sms' | 'email';
-  if (employee.contact_email) {
+  if (!env.EMAIL_ONLY && employee.contact_phone && aegisSmsNumber) {
+    channel = 'sms';
+    await sendSms({ to: employee.contact_phone, from: aegisSmsNumber, body, company_id: session.company_id });
+  } else if (employee.contact_email) {
     channel = 'email';
     // Email gets branded Accept/Decline BUTTONS (matching time-off & availability),
     // routed through the shared /webhooks/decision handler (decision_type:
@@ -1204,9 +1210,6 @@ export async function dispatchOutreach(params: {
       html,
       company_id: session.company_id,
     });
-  } else if (!env.EMAIL_ONLY && employee.contact_phone && aegisSmsNumber) {
-    channel = 'sms';
-    await sendSms({ to: employee.contact_phone, from: aegisSmsNumber, body, company_id: session.company_id });
   } else {
     return { sent: false, reason: `${employee.name} has no email or phone on file` };
   }
@@ -1246,18 +1249,20 @@ async function notifyEmployeeShiftFilled(
   employee: Employee
 ): Promise<void> {
   const body = `${textOpener(employee.name)}the ${outreach.shift_info.shift_name} shift on ${formatShortDate(outreach.shift_date)} has been filled — no response needed. Thanks!`;
-  if (outreach.employee_channel === 'email' && (outreach.employee_email || employee.contact_email)) {
-    await sendEmail({
-      to: (outreach.employee_email ?? employee.contact_email)!,
-      subject: `Re: coverage for the ${outreach.shift_info.shift_name} shift`,
-      text: body,
-      company_id: outreach.company_id,
-    });
-  } else if (!env.EMAIL_ONLY && employee.contact_phone && outreach.aegis_sms_channel) {
+  // SMS-first for phone-holders (Batch-1 F2), mirroring dispatchOutreach; email
+  // is the fallback for a no-phone employee or while EMAIL_ONLY is on.
+  if (!env.EMAIL_ONLY && employee.contact_phone && outreach.aegis_sms_channel) {
     await sendSms({
       to: employee.contact_phone,
       from: outreach.aegis_sms_channel,
       body,
+      company_id: outreach.company_id,
+    });
+  } else if (outreach.employee_email || employee.contact_email) {
+    await sendEmail({
+      to: (outreach.employee_email ?? employee.contact_email)!,
+      subject: `Re: coverage for the ${outreach.shift_info.shift_name} shift`,
+      text: body,
       company_id: outreach.company_id,
     });
   }

@@ -2028,11 +2028,11 @@ export async function distributeScheduleCore(
   force = false,
   excludeContacts: string[] = []
 ): Promise<DistributeScheduleResult> {
-  type ScheduleRow = { id: string; week_start: string; week_end: string; data: ScheduleData; status: string; distributed_at: string | null };
+  type ScheduleRow = { id: string; week_start: string; week_end: string; data: ScheduleData; status: string; distributed_at: string | null; published_at: string | null };
 
   const { data: schedRowData, error: schedError } = await supabase
     .from('schedules')
-    .select('id, week_start, week_end, data, status, distributed_at')
+    .select('id, week_start, week_end, data, status, distributed_at, published_at')
     .eq('id', scheduleId)
     .eq('company_id', companyId)
     .is('deleted_at', null)
@@ -2233,18 +2233,31 @@ ${teamGridHtml}
   // land on a different row than a reader (the shift query), which is how an
   // approved swap can fail to show up on the schedule the employee sees. One
   // published schedule per week keeps writers and readers on the same row.
+  //
+  // Key the supersede on Homebase's source of truth — a live-published row is
+  // published_at NOT NULL AND archived_at NULL (Homebase publish/route.ts), NOT
+  // the ambiguous status enum — so Aegis and Homebase agree on which row is "the"
+  // published one for the week. (Batch-1 F3.)
   await supabase
     .from('schedules')
     .update({ status: 'archived', archived_at: new Date().toISOString(), superseded_by: scheduleRow.id })
     .eq('company_id', companyId)
     .eq('week_start', scheduleRow.week_start)
     .eq('week_end', scheduleRow.week_end)
-    .eq('status', 'published')
+    .not('published_at', 'is', null)
+    .is('archived_at', null)
     .is('deleted_at', null)
     .neq('id', scheduleRow.id);
 
+  // Mark THIS row published on BOTH the status enum AND published_at (Homebase's
+  // source of truth), plus distributed_at for the re-distribution guard. Preserve
+  // an existing published_at so a re-distribute doesn't reset the original publish
+  // time. Previously published_at was left null on the Aegis/SMS-distribute path,
+  // so a schedule distributed by text never showed as "published" in Homebase
+  // (Batch-1 F3a).
   await supabase.from('schedules').update({
     status: 'published',
+    published_at: scheduleRow.published_at ?? new Date().toISOString(),
     distributed_at: new Date().toISOString(),
   }).eq('id', scheduleRow.id);
 
@@ -2445,11 +2458,11 @@ export async function notifyScheduleChangesCore(
   oldScheduleId: string,
   companyId: string,
 ): Promise<NotifyScheduleChangesResult> {
-  type Row = { id: string; week_start: string; week_end: string; data: ScheduleData };
+  type Row = { id: string; week_start: string; week_end: string; data: ScheduleData; published_at?: string | null };
 
   const [{ data: newData, error: newErr }, { data: oldData, error: oldErr }] = await Promise.all([
     supabase.from('schedules')
-      .select('id, week_start, week_end, data')
+      .select('id, week_start, week_end, data, published_at')
       .eq('id', newScheduleId).eq('company_id', companyId).single(),
     supabase.from('schedules')
       .select('id, week_start, week_end, data')
@@ -2627,19 +2640,27 @@ ${teamGridHtml}
   // distribute path): archive the old row and any other published row for this
   // week before marking the new one published, so writers and readers can't land
   // on divergent rows.
+  // Key the supersede on Homebase's source of truth (published_at not null &
+  // archived_at null), same as distributeScheduleCore, so both writers agree on
+  // the single live-published row per week. (Batch-1 F3.)
   await supabase
     .from('schedules')
     .update({ status: 'archived', archived_at: new Date().toISOString(), superseded_by: newRow.id })
     .eq('company_id', companyId)
     .eq('week_start', newRow.week_start)
     .eq('week_end', newRow.week_end)
-    .eq('status', 'published')
+    .not('published_at', 'is', null)
+    .is('archived_at', null)
     .is('deleted_at', null)
     .neq('id', newRow.id);
 
-  // Mark the new schedule as sent so the re-distribution guard sees it.
+  // Mark the new schedule as sent so the re-distribution guard sees it. The
+  // Homebase publish swap normally sets published_at already; coalesce-set it here
+  // too so an Aegis-initiated redistribute-after-edit still shows as published in
+  // Homebase (Batch-1 F3a). Preserve an existing publish time.
   await supabase.from('schedules').update({
     status: 'published',
+    published_at: newRow.published_at ?? new Date().toISOString(),
     distributed_at: new Date().toISOString(),
   }).eq('id', newRow.id);
 

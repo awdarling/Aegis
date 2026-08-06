@@ -17,25 +17,29 @@ import { pickDecisionRoute } from '../time-off';
 
 // The bug: an employee who submitted a time-off request BY SMS got the
 // approve/deny decision by EMAIL (because they happened to have an email on file).
-// The decision must go back on the channel they used.
-describe('pickDecisionRoute — reply on the submission channel', () => {
-  it('SMS origin + phone available → SMS (the fix; even when an email exists)', () => {
+// Batch-1 F1: SMS-FIRST for phone-holders. Previously a phone+email employee
+// whose SMS origin wasn't captured (email origin, or unknown origin) got the
+// approve/deny decision by EMAIL. Per the design principle + SMS spec §3.3 ("the
+// employee gets the outcome in text"), any phone-holder is texted when
+// EMAIL_ONLY=false; email is the fallback (on SMS send failure, or no phone).
+describe('pickDecisionRoute — SMS-first for phone-holders (Batch-1 F1)', () => {
+  it('SMS origin + phone available → SMS (even when an email exists)', () => {
     expect(pickDecisionRoute({ originChannel: 'sms', contactEmail: 'sam@x.com', contactPhone: '+16165550123', emailOnly: false })).toBe('sms');
   });
 
-  it('email origin → email even when a phone exists', () => {
-    expect(pickDecisionRoute({ originChannel: 'email', contactEmail: 'sam@x.com', contactPhone: '+16165550123', emailOnly: false })).toBe('email');
+  it('email origin + phone available → SMS (the fix: no longer email-by-default)', () => {
+    expect(pickDecisionRoute({ originChannel: 'email', contactEmail: 'sam@x.com', contactPhone: '+16165550123', emailOnly: false })).toBe('sms');
   });
 
-  it('unknown origin (older request) falls back to email-first', () => {
-    expect(pickDecisionRoute({ originChannel: undefined, contactEmail: 'sam@x.com', contactPhone: '+16165550123', emailOnly: false })).toBe('email');
+  it('unknown origin (older request) + phone → SMS (the fix)', () => {
+    expect(pickDecisionRoute({ originChannel: undefined, contactEmail: 'sam@x.com', contactPhone: '+16165550123', emailOnly: false })).toBe('sms');
   });
 
-  it('no email on file → SMS regardless of origin', () => {
-    expect(pickDecisionRoute({ originChannel: undefined, contactEmail: null, contactPhone: '+16165550123', emailOnly: false })).toBe('sms');
+  it('no phone on file → email', () => {
+    expect(pickDecisionRoute({ originChannel: 'email', contactEmail: 'sam@x.com', contactPhone: null, emailOnly: false })).toBe('email');
   });
 
-  it('EMAIL_ONLY forces email even for an SMS-origin request', () => {
+  it('EMAIL_ONLY forces email even for a phone-holder', () => {
     expect(pickDecisionRoute({ originChannel: 'sms', contactEmail: 'sam@x.com', contactPhone: '+16165550123', emailOnly: true })).toBe('email');
   });
 

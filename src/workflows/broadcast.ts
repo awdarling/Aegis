@@ -16,6 +16,11 @@ export interface BroadcastSession {
   admin_channel: 'sms' | 'email';
   admin_sender: string;
   admin_recipient: string;
+  // Who is sending — the actual manager's or quria admin's name (employee-facing
+  // attribution: "<SenderName>: <message>", not the company name — Batch-1 F4) and
+  // their role (for the activity-log actor).
+  sender_name: string;
+  sender_role: 'manager' | 'quria_admin';
   message_text: string;
   target_type: 'all' | 'managers' | 'employees' | 'role' | 'specific';
   target_role: string | null;
@@ -211,9 +216,11 @@ export async function handleBroadcast(
   contact: VerifiedContact,
   _extracted: Record<string, unknown>
 ): Promise<void> {
+  const isQuria = contact.role === 'quria_admin';
+
   // Step 1: Extract broadcast parameters from the message
   const extractSystem =
-    'You are extracting parameters from a broadcast message request sent by a Quria administrator. ' +
+    `You are extracting parameters from a broadcast message request sent by a ${isQuria ? 'Quria administrator' : 'manager'}. ` +
     'Return ONLY valid JSON: ' +
     '{ "message_text": "exact message to send", "target_type": "all|managers|employees|role|specific", ' +
     '"target_role": "RoleName or null", "target_names": ["Name1"] or null, "channel": "sms|email|both" }. ' +
@@ -240,6 +247,18 @@ export async function handleBroadcast(
       contact,
       message,
       "I couldn't parse that broadcast request. Try: \"Send 'Message text here' to all staff via SMS.\""
+    );
+    return;
+  }
+
+  // A manager may broadcast to their OWN company — all staff, their employees, a
+  // role, or specific people — but targeting MANAGERS specifically stays a
+  // quria-admin action (Batch-1 F4). Redirect rather than silently widening scope.
+  if (!isQuria && params.target_type === 'managers') {
+    await reply(
+      contact,
+      message,
+      "Messaging the management team specifically is a Quria-admin action. You can message all staff, your employees, a specific role, or named people — tell me which and I'll set it up.",
     );
     return;
   }
@@ -276,6 +295,8 @@ export async function handleBroadcast(
     admin_channel: contact.channel,
     admin_sender: message.sender,
     admin_recipient: message.recipient,
+    sender_name: contact.name?.trim() || (isQuria ? 'Quria' : companyName),
+    sender_role: isQuria ? 'quria_admin' : 'manager',
     message_text: params.message_text,
     target_type: params.target_type,
     target_role: params.target_role ?? null,
@@ -339,6 +360,10 @@ export async function handleBroadcastConfirmation(
   const companyName = (companyRes.data as { name: string } | null)?.name ?? 'Your Company';
   const aegisSmsNumber =
     (channelRes.data as { channel_value: string } | null)?.channel_value ?? null;
+  // Employee-facing attribution is the SENDER's name (the manager or quria admin),
+  // not the company name (Batch-1 F4). Fall back to the company name only if a
+  // sender name somehow wasn't captured (older sessions).
+  const senderName = session.sender_name?.trim() || companyName;
 
   let sentSms = 0;
   let sentEmail = 0;
@@ -362,7 +387,7 @@ export async function handleBroadcastConfirmation(
       await sendSms({
         to: recipient.phone!,
         from: aegisSmsNumber!,
-        body: `${companyName}: ${session.message_text}`,
+        body: `${senderName}: ${session.message_text}`,
         company_id: session.company_id,
       });
       sentSms++;
@@ -371,8 +396,8 @@ export async function handleBroadcastConfirmation(
     if (canEmail) {
       await sendEmail({
         to: recipient.email!,
-        subject: `Message from ${companyName}`,
-        text: session.message_text,
+        subject: `Message from ${senderName}`,
+        text: `${senderName}: ${session.message_text}`,
         company_id: session.company_id,
       });
       sentEmail++;
@@ -384,12 +409,16 @@ export async function handleBroadcastConfirmation(
     ? `${session.message_text.slice(0, 50)}...`
     : session.message_text;
 
+  const actor = session.sender_role === 'quria_admin' ? 'quria_admin' : 'manager';
   await logActivity({
     company_id: session.company_id,
-    actor: 'quria_admin',
-    action: 'quria_broadcast_sent',
-    summary: `Quria broadcast sent to ${session.resolved_recipients.length} recipients at ${companyName}: "${preview}"`,
+    actor,
+    actor_name: senderName,
+    action: session.sender_role === 'quria_admin' ? 'quria_broadcast_sent' : 'manager_broadcast_sent',
+    summary: `${session.sender_role === 'quria_admin' ? 'Quria' : 'Manager'} broadcast by ${senderName} sent to ${session.resolved_recipients.length} recipients at ${companyName}: "${preview}"`,
     metadata: {
+      sender_name: senderName,
+      sender_role: session.sender_role,
       target_type: session.target_type,
       message_text: session.message_text,
       recipients_count: session.resolved_recipients.length,

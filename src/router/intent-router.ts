@@ -59,6 +59,10 @@ import {
   buildAvailChangeConfirmBody,
   classifyAffirmation,
   classifySwitchReply,
+  handleMyAvailabilityQuery,
+  getPendingAvailTargetDisambig,
+  clearPendingAvailTargetDisambig,
+  classifyAvailTarget,
 } from '../workflows/employee-onboarding';
 import {
   handleBroadcast,
@@ -285,6 +289,26 @@ async function routeIntentInner(
       await clearPendingIntentSwitch(contact.company_id, contact.employee_id);
     }
 
+    // F7 — a pending "normal or temporary?" disambiguation. A clear answer replays
+    // the original change against the chosen target; an unclear reply drops the
+    // offer and falls through (so a pivot to a different request isn't trapped).
+    const pendingAvailTarget = await getPendingAvailTargetDisambig(contact.company_id, contact.employee_id);
+    if (pendingAvailTarget) {
+      const choice = classifyAvailTarget(message.body);
+      if (choice === 'normal' || choice === 'temporary') {
+        await clearPendingAvailTargetDisambig(contact.company_id, contact.employee_id);
+        const replay: InboundMessage = { ...message, body: pendingAvailTarget.original_body };
+        const extractedTarget: Record<string, unknown> = choice === 'temporary'
+          ? { avail_target: 'temporary', end_date: pendingAvailTarget.override_end_date ?? '' }
+          : { avail_target: 'normal' };
+        await handleUpdateAvailability(replay, contact, extractedTarget);
+        console.log('[router] EARLY RETURN', { reason: `avail_target_resolved_${choice}` });
+        return;
+      }
+      // Unclear → drop the disambiguation and let this message route fresh.
+      await clearPendingAvailTargetDisambig(contact.company_id, contact.employee_id);
+    }
+
     const pendingAvailConfirm = await getPendingAvailConfirm(contact.company_id, contact.employee_id);
     if (pendingAvailConfirm) {
       await handleAvailabilityConfirmResponse(message, contact, pendingAvailConfirm);
@@ -420,6 +444,11 @@ async function routeIntentInner(
       case 'query_my_time_off':
         console.log('[router] dispatching to handleQueryMyTimeOff');
         await handleQueryMyTimeOff(message, contact, classification.extracted);
+        break;
+
+      case 'query_my_availability':
+        console.log('[router] dispatching to handleMyAvailabilityQuery');
+        await handleMyAvailabilityQuery(message, contact, classification.extracted);
         break;
 
       case 'approve_time_off':

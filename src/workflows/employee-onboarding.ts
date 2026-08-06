@@ -89,6 +89,10 @@ export interface OnboardingSession {
     // Parsed-but-unconfirmed time off, staged for the time_off_confirm step.
     // Cleared once submitted, edited, or skipped. Absent on pre-confirm-step sessions.
     time_off_pending?: OnboardingPendingTimeOff[] | null;
+    // F6: set when the "won't be available?" answer read like an AVAILABILITY
+    // WINDOW ("I'm open 3–9pm") rather than a day off. While true, the next reply
+    // is a clarifier answer (off vs availability), not a fresh parse.
+    time_off_avail_clarify?: boolean | null;
   };
   flagged_low_availability: boolean;
   invalid_email_attempts: number;
@@ -633,6 +637,84 @@ export function formatAvailabilityList(slots: AvailabilitySlot[]): string {
     lines.push(`${DAY_NAMES[d]}: ${times}`);
   }
   return lines.join('\n');
+}
+
+// ── Availability READ (Batch-1 F5) ─────────────────────────────────────────────
+//
+// Employees have no dashboard, so they must be able to text and READ their current
+// availability anytime (product decision). This mirrors handleMyShiftsQuery /
+// handleQueryMyTimeOff: read-only, replies on the asker's channel (SMS-first for a
+// texting employee via reply()), and NEVER opens a time-off request. When both a
+// normal availability and an ACTIVE custom override exist, it shows BOTH clearly
+// (the F7 read side; the change side asks which — see the availability-change flow).
+export async function handleMyAvailabilityQuery(
+  message: InboundMessage,
+  contact: VerifiedContact,
+  _extracted: Record<string, unknown>,
+): Promise<void> {
+  if (!contact.employee_id) {
+    await reply(contact, message, "I couldn't find your employee record, so I can't pull your availability. Please reach out to your manager and they can check it for you.");
+    return;
+  }
+
+  const [{ data: availRows }, { data: customRows }] = await Promise.all([
+    supabase.from('availability')
+      .select('day_of_week, start_time, end_time')
+      .eq('employee_id', contact.employee_id)
+      .eq('company_id', contact.company_id),
+    supabase.from('custom_availability')
+      .select('type, end_date, cycle_weeks, patterns, active')
+      .eq('employee_id', contact.employee_id)
+      .eq('company_id', contact.company_id)
+      .eq('active', true),
+  ]);
+
+  const normal = ((availRows ?? []) as AvailabilitySlot[])
+    .map(s => ({ day_of_week: s.day_of_week, start_time: s.start_time, end_time: s.end_time }));
+  const custom = ((customRows ?? []) as Array<{
+    type: 'date_limited' | 'rotating'; end_date: string | null; cycle_weeks: number | null; patterns: unknown; active: boolean;
+  }>)[0] ?? null;
+
+  const normalText = normal.length ? formatAvailabilityList(normal) : null;
+
+  let customText: string | null = null;
+  if (custom) {
+    if (custom.type === 'rotating') {
+      const weeks = Array.isArray(custom.patterns)
+        ? (custom.patterns as Array<{ week: number; days: AvailabilitySlot[] }>)
+        : [];
+      const weeksText = weeks
+        .map(w => `  Week ${w.week}: ${w.days?.length ? formatAvailabilityList(w.days).replace(/\n/g, '; ') : 'off'}`)
+        .join('\n');
+      customText = `a ${custom.cycle_weeks ?? weeks.length}-week rotation${custom.end_date ? `, through ${formatDateRange(custom.end_date, custom.end_date)}` : ''}:\n${weeksText}`;
+    } else {
+      const slots = Array.isArray(custom.patterns) ? (custom.patterns as AvailabilitySlot[]) : [];
+      customText = `${slots.length ? formatAvailabilityList(slots) : '(not available any day)'}${custom.end_date ? `\n(through ${formatDateRange(custom.end_date, custom.end_date)})` : ''}`;
+    }
+  }
+
+  const opener = textOpener(contact.name);
+  let body: string;
+  if (!normalText && !customText) {
+    body = `${opener}you don't have any availability set yet. Just text me the days and times you can work and I'll get it saved.`;
+  } else if (normalText && customText) {
+    body = `${opener}here's your availability.\n\nNormal:\n${normalText}\n\nTemporary override (this one takes priority right now):\n${customText}`;
+  } else if (customText) {
+    body = `${opener}you're on a temporary availability override right now:\n${customText}`;
+  } else {
+    body = `${opener}here's your availability:\n${normalText}`;
+  }
+
+  await reply(contact, message, body);
+
+  await logActivity({
+    company_id: contact.company_id,
+    action: 'employee_availability_query',
+    entity_type: 'employee',
+    entity_id: contact.employee_id,
+    summary: `${contact.name} asked to read their current availability`,
+    metadata: { has_normal: !!normalText, has_active_override: !!custom },
+  });
 }
 
 // HTML sibling of formatAvailabilityList: one accent detail row per day, so an
@@ -1807,12 +1889,60 @@ export function isClearNoTimeOff(body: string): boolean {
   return negatives.has(t);
 }
 
+// F6 — does the onboarding "won't be available?" answer read like an AVAILABILITY
+// WINDOW ("Friday I'm open 3–9pm") rather than a day OFF? A window states when the
+// person CAN work; a day off states when they CANNOT. Fires only when there IS
+// availability-window language and NO clear off-language, so a genuine "I'm off
+// Friday" / "I can't work the 5th" is still treated as time off.
+export function looksLikeAvailabilityWindow(body: string): boolean {
+  const t = (body || '').toLowerCase();
+  const windowish =
+    /\b(open|available|free)\b/.test(t) ||
+    /\bi can (work|do|make|come in)\b/.test(t) ||
+    /\bcan work\b/.test(t);
+  if (!windowish) return false;
+  const offish =
+    /\boff\b|\bcan['’]?t work\b|\bcannot work\b|\bcan ?not work\b|\bunavailable\b|\bnot available\b|\bout of town\b|\baway\b|\bon vacation\b|\bday off\b|\bdays off\b|\bneed[s]?\b[^.]*\boff\b|\btake\b[^.]*\boff\b/.test(t);
+  return !offish;
+}
+
+// Resolve the F6 clarifier reply: did they mean a day OFF, or an availability note?
+function clarifyMeansTimeOff(body: string): boolean {
+  const t = (body || '').toLowerCase();
+  if (/\b(available|availability|open|free|can work|just avail|only avail)\b/.test(t)) return false;
+  return /\boff\b|\bday off\b|\bneed it off\b|\btake it off\b|\btime off\b|\byes\b|\byeah\b|\byep\b|\bcorrect\b/.test(t);
+}
+
 async function handleTimeOffStep(
   body: string,
   session: OnboardingSession & { _memory_id: string },
   managerContact: VerifiedContact,
   managerMsg: InboundMessage
 ): Promise<void> {
+  // F6 — resolving a prior availability-vs-time-off clarifier. The next reply says
+  // whether they meant a day off (file it) or an availability note (don't file).
+  if (session.collected.time_off_avail_clarify) {
+    const meansOff = clarifyMeansTimeOff(body);
+    session.collected.time_off_avail_clarify = null;
+    const staged = session.collected.time_off_pending ?? [];
+    if (meansOff && staged.length > 0) {
+      session.step = 'time_off_confirm';
+      await saveOnboardingSession(session);
+      await textEmployee(session, buildTimeOffConfirmPrompt(staged, false));
+      return;
+    }
+    // It was an availability note, not a day off — never file spurious time off.
+    session.collected.time_off_pending = null;
+    session.step = 'complete';
+    await saveOnboardingSession(session);
+    await textEmployee(
+      session,
+      `Got it — that's your availability, not time off, so I won't put in a request. You can update your availability anytime by texting me.`,
+    );
+    await completeOnboarding(session, managerContact, managerMsg);
+    return;
+  }
+
   const dates = await claudeExtractDates(body);
 
   if (dates.length === 0) {
@@ -1848,6 +1978,21 @@ async function handleTimeOffStep(
   // Coalesce first: a contiguous trip the extractor split into per-day rows
   // ("UP weekend" → Sat + Sun) becomes ONE start..end request, not two.
   const pending = coalesceDateEntries(dates).map(buildPendingFromEntry);
+
+  // F6 — the message named a date but reads like an AVAILABILITY WINDOW ("Friday
+  // I'm open 3–9pm"), not a day off. Don't silently file a (partial) time-off;
+  // stage it and ask which they meant rather than assuming time-off.
+  if (looksLikeAvailabilityWindow(body)) {
+    session.collected.time_off_pending = pending;
+    session.collected.time_off_avail_clarify = true;
+    await saveOnboardingSession(session);
+    await textEmployee(
+      session,
+      `Quick check — did you mean you need that day off, or that you're only available those hours? ` +
+        `Reply "off" if you need the day off, or "available" if that's just your availability.`,
+    );
+    return;
+  }
   // Capture a reason stated in the request itself ("…off for a wedding") so it
   // reaches the manager email even when the employee just confirms "yes" — the
   // reason was previously only read from the confirmation reply.
@@ -2810,6 +2955,67 @@ export async function getPendingAvailConfirm(
   }
 }
 
+// ── F7: normal-vs-temporary availability disambiguation ────────────────────────
+//
+// When an employee has BOTH a normal availability AND an ACTIVE custom override,
+// an availability CHANGE is ambiguous — do they mean their normal availability or
+// the temporary one? Product decision: never auto-clobber (the normal-change path
+// used to leave an active override in place, so the two silently coexisted and
+// conflicted — Batch-1 F7). We ask which, remember the original request, and apply
+// it to the chosen target once they answer.
+function availTargetSource(employeeId: string): string {
+  return `avail_target_disambig:${employeeId}`;
+}
+
+export interface PendingAvailTargetDisambig {
+  employee_id: string;
+  company_id: string;
+  original_body: string;            // the change request, replayed once the target is chosen
+  override_end_date: string | null; // the active override's end_date (carried so a "temporary" answer stays date-limited)
+  expires_at: string;
+}
+
+export async function getPendingAvailTargetDisambig(
+  companyId: string,
+  employeeId: string,
+): Promise<PendingAvailTargetDisambig | null> {
+  const { data } = await supabase
+    .from('aegis_memory')
+    .select('id, content')
+    .eq('company_id', companyId)
+    .eq('source', availTargetSource(employeeId))
+    .maybeSingle();
+  if (!data) return null;
+  try {
+    const row = data as { id: string; content: string };
+    const p = JSON.parse(row.content) as PendingAvailTargetDisambig;
+    if (new Date(p.expires_at) < new Date()) {
+      await supabase.from('aegis_memory').delete().eq('id', row.id);
+      return null;
+    }
+    return p;
+  } catch {
+    return null;
+  }
+}
+
+export async function clearPendingAvailTargetDisambig(companyId: string, employeeId: string): Promise<void> {
+  await supabase.from('aegis_memory').delete()
+    .eq('company_id', companyId).eq('source', availTargetSource(employeeId));
+}
+
+// Deterministic read of a "which availability?" reply. Only 'normal' / 'temporary'
+// on a clear answer; everything else is 'unclear' so the caller can move on rather
+// than trap the employee.
+export function classifyAvailTarget(body: string): 'normal' | 'temporary' | 'unclear' {
+  const t = (body || '').toLowerCase();
+  const normal = /\b(normal|permanent|regular|usual|standard|default|forever|for good)\b/.test(t);
+  const temp = /\b(temp|temporary|temporarily|override|current one|short[-\s]?term)\b/.test(t);
+  if (normal && !temp) return 'normal';
+  if (temp && !normal) return 'temporary';
+  return 'unclear';
+}
+
 // ── Mid-availability "switch to a different request?" offer ────────────────────
 
 export interface PendingIntentSwitch {
@@ -2918,6 +3124,48 @@ export async function handleUpdateAvailability(
   contact: VerifiedContact,
   extracted: Record<string, unknown>
 ): Promise<void> {
+  const employeeIdForGate = contact.employee_id!;
+  const availTarget = typeof extracted.avail_target === 'string' ? extracted.avail_target : null;
+
+  // F7 — when BOTH a normal availability and an ACTIVE custom override exist, a
+  // change is ambiguous. Ask which the employee means and remember the request,
+  // UNLESS the target is already resolved (the disambiguation reply set
+  // extracted.avail_target). Never auto-clobber.
+  if (availTarget !== 'normal' && availTarget !== 'temporary') {
+    const [{ data: normalRows }, { data: overrideRows }] = await Promise.all([
+      supabase.from('availability').select('day_of_week')
+        .eq('employee_id', employeeIdForGate).eq('company_id', contact.company_id).limit(1),
+      supabase.from('custom_availability').select('end_date')
+        .eq('employee_id', employeeIdForGate).eq('company_id', contact.company_id).eq('active', true).limit(1),
+    ]);
+    const hasNormal = ((normalRows ?? []) as unknown[]).length > 0;
+    const override = ((overrideRows ?? []) as Array<{ end_date: string | null }>)[0] ?? null;
+    if (hasNormal && override) {
+      const endTail = override.end_date ? ` (through ${formatDateRange(override.end_date, override.end_date)})` : '';
+      await supabase.from('aegis_memory').delete()
+        .eq('company_id', contact.company_id).eq('source', availTargetSource(employeeIdForGate));
+      await supabase.from('aegis_memory').insert({
+        company_id: contact.company_id,
+        memory_type: 'observation',
+        source: availTargetSource(employeeIdForGate),
+        content: JSON.stringify({
+          employee_id: employeeIdForGate,
+          company_id: contact.company_id,
+          original_body: message.body,
+          override_end_date: override.end_date ?? null,
+          expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+        } as PendingAvailTargetDisambig),
+      });
+      await reply(
+        contact,
+        message,
+        `Quick check — do you want to change your normal availability, or your temporary one${endTail}? ` +
+          `Just say "normal" or "temporary" and I'll take it from there.`,
+      );
+      return;
+    }
+  }
+
   // Conversational ack on email so the employee sees an immediate in-thread
   // reply while the availability parse runs. The YES/NO confirmation follows
   // in the same thread; delay ensures the ack lands first.

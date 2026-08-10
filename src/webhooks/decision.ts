@@ -96,6 +96,12 @@ interface SwapDecisionToken {
   shift_date: string;
   shift_name: string;
   role: string;
+  // The manager who minted the approval email — persisted to swap_requests.decided_by
+  // on approve/deny (Batch-1.5 #9), mirroring time-off. A single manager id is
+  // resolved when the email is built, so the old "shared across managers → null"
+  // note no longer holds.
+  manager_user_id?: string | null;
+  manager_name?: string | null;
   // Two-way trade (item 18): the target's shift the requester takes in return.
   // Present → execute a true trade; absent → legacy one-way reassignment.
   target_shift_date?: string | null;
@@ -360,15 +366,13 @@ async function handleSwapDecision(
     }
 
     // The schedule changed. NOW the approval is real — record it with the
-    // receipt (schedule_id) in the same write.
-    // NOTE: decided_by is a UUID column. The manager is identified by the
-    // magic-link email (shared across managers), so we don't have a single
-    // user UUID here — write null rather than a string.
+    // receipt (schedule_id) in the same write. decided_by is the approving
+    // manager's user id, carried on the token (Batch-1.5 #9).
     const { error: statusErr } = await supabase.from('swap_requests').update({
       status: 'approved',
       schedule_id: applied.schedule_id,
       decided_at: new Date().toISOString(),
-      decided_by: null,
+      decided_by: token.manager_user_id ?? null,
     }).eq('id', requestId);
     if (statusErr) {
       // The schedule IS updated but the row didn't close. Say so loudly rather
@@ -396,7 +400,7 @@ async function handleSwapDecision(
     await supabase.from('swap_requests').update({
       status: 'denied',
       decided_at: new Date().toISOString(),
-      decided_by: null,
+      decided_by: token.manager_user_id ?? null,
     }).eq('id', requestId);
 
     await consumeSwapTokens(token.company_id, requestId);

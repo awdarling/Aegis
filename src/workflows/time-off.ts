@@ -1020,27 +1020,32 @@ export async function sendDecisionNotification(
       .eq('channel_type', 'sms')
       .maybeSingle();
     const aegisSmsChannel = (channelRow as { channel_value: string } | null)?.channel_value ?? null;
-    if (!aegisSmsChannel) {
-      throw new Error(
-        `employee ${employee.id} submitted by SMS but company ${tor.company_id} has no Aegis SMS channel configured`
-      );
-    }
-    const sent = await sendSms({
-      to: employee.contact_phone!,
-      from: aegisSmsChannel,
-      body: text,
-      company_id: tor.company_id,
-    });
+    // Attempt SMS only if a channel is actually configured. If it isn't, treat
+    // it exactly like a send failure below and fall back to email — the decision
+    // notice is the single highest-stakes message and SMS-first means email is
+    // the fallback, so a missing channel must NOT drop it (DRIFT_REGISTER H20).
+    const sent = aegisSmsChannel
+      ? await sendSms({
+          to: employee.contact_phone!,
+          from: aegisSmsChannel,
+          body: text,
+          company_id: tor.company_id,
+        })
+      : false;
     if (sent) {
       channel = 'sms';
       sent_to = employee.contact_phone!;
     } else if (employee.contact_email) {
-      // SMS send failed (transient Telnyx error or unreachable number). The
-      // decision notice is the single highest-stakes message, so fall back to
-      // email rather than dropping it — mirrors notifyEmployeeDecision (H2).
-      // Previously this path threw, silently losing the notice (DRIFT_REGISTER H3).
+      // SMS unavailable — either no Aegis SMS channel is configured for this
+      // company yet, or the send failed (transient Telnyx error / unreachable
+      // number). The decision notice is the single highest-stakes message, so
+      // fall back to email rather than dropping it — mirrors notifyEmployeeDecision
+      // (H2). Previously the no-channel case threw and 500'd the internal
+      // endpoint, and the send-failure case once silently lost the notice
+      // (DRIFT_REGISTER H3, extended by H20).
       console.warn(
-        `[time-off] decision SMS failed for employee ${employee.id}; falling back to email`
+        `[time-off] decision SMS unavailable for employee ${employee.id} ` +
+          `(${aegisSmsChannel ? 'send failed' : 'no SMS channel configured'}); falling back to email`
       );
       const subject = rawSubject
         ? normalizeReSubject(rawSubject)
@@ -1055,9 +1060,9 @@ export async function sendDecisionNotification(
       channel = 'email';
       sent_to = employee.contact_email;
     } else {
-      // SMS failed and no email on file — genuinely unreachable right now.
+      // SMS unavailable and no email on file — genuinely unreachable right now.
       throw new Error(
-        `SMS send failed for employee ${employee.id} and no email address on file to fall back to`
+        `SMS unavailable for employee ${employee.id} and no email address on file to fall back to`
       );
     }
   } else if (route === 'email') {

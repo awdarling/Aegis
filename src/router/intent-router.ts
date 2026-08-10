@@ -46,6 +46,7 @@ import {
   getOnboardingSessionByEmail,
   handleOnboardingResponse,
   handleInitiateOnboarding,
+  handleAddEmployee,
   getPendingAvailConfirm,
   handleAvailabilityConfirmResponse,
   handleUpdateAvailability,
@@ -87,6 +88,7 @@ const MANAGER_ONLY_INTENTS = new Set([
   'deny_swap',
   'request_emergency_coverage',
   'initiate_onboarding',
+  'add_employee',
   'homebase_edit',
   'run_payroll_check',
   'notify_day_closure',
@@ -505,6 +507,11 @@ async function routeIntentInner(
       case 'initiate_onboarding':
         console.log('[router] dispatching to handleInitiateOnboarding');
         await handleInitiateOnboarding(message, contact, classification.extracted);
+        break;
+
+      case 'add_employee':
+        console.log('[router] dispatching to handleAddEmployee');
+        await handleAddEmployee(message, contact, classification.extracted);
         break;
 
       case 'update_availability':

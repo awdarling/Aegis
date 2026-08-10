@@ -2634,6 +2634,36 @@ export async function handleOnboardingResponse(
 
 // ── Public: manager initiates onboarding ─────────────────────────────────────
 
+// Finding #17 — "add a new employee" over SMS. Creating an employee RECORD is a
+// Homebase-owned action (Data Contract Rule 0: Homebase is the system of record
+// for the roster; RLS + required fields + dedupe all live there). Aegis does not
+// insert the row from the SMS lane — instead it points the manager to Homebase to
+// add the hire, then offers to run onboarding (the intro + opt-in walk) once the
+// record exists. This keeps "create NEW" distinct from "onboard EXISTING"
+// (initiate_onboarding) and stops the capability contract from advertising an
+// action with no backing handler.
+export async function handleAddEmployee(
+  message: InboundMessage,
+  contact: VerifiedContact,
+  _extracted: Record<string, unknown>
+): Promise<void> {
+  await logActivity({
+    company_id: contact.company_id,
+    actor: contact.role === 'quria_admin' ? 'quria_admin' : 'manager',
+    actor_name: contact.name ?? null,
+    action: 'add_employee_redirect',
+    summary: `${contact.name ?? 'A manager'} asked to add a new employee — pointed to Homebase to create the record`,
+  });
+
+  const opener = textOpener(contact.name);
+  await reply(
+    contact,
+    message,
+    `${opener}To add a new hire, create their profile in Homebase (Employees → Add employee) — that's where names, roles, and contact info live. ` +
+      `Once they're in, just tell me "onboard <their name>" and I'll send the intro and opt-in so they can start using Aegis.`
+  );
+}
+
 export async function handleInitiateOnboarding(
   message: InboundMessage,
   contact: VerifiedContact,

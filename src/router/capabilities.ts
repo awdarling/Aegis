@@ -25,7 +25,7 @@ const MANAGER_ACTIONS = [
   "Arrange emergency coverage when someone can't make a shift",
   'Ask about staffing and coverage — like "who\'s free Saturday?"',
   'Set staffing rules, like requiring veterans on a shift',
-  'Add a new employee to the team',
+  'Add a new hire in Homebase, then have me onboard them',
 ];
 
 // Quria-admin-only extras, on top of the manager actions.

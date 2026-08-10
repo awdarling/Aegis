@@ -1415,15 +1415,23 @@ function eachDateInRangeLocal(start: string, end: string): string[] {
 
 // ── Step senders ──────────────────────────────────────────────────────────────
 
+// The A2P 10DLC opt-in/consent message — VERBATIM from the registered campaign
+// (Telnyx "Aegis SMS Scheduling — Quria Solutions") and the public consent page
+// quriasolutions.com/sms-consent. This is the compliance call-to-action, so its
+// wording is the legal source of truth: if you change it, change the campaign
+// registration AND the consent page to match. Exported + pure so a test pins it.
+export function buildOptInMessage(firstName: string, companyName: string): string {
+  return (
+    `Hi ${firstName}! This is Aegis, scheduling assistant for ${companyName}. ` +
+    `We'll send shift notifications via SMS. Reply YES to confirm. ` +
+    `Msg & data rates may apply. Reply STOP to opt out. ` +
+    `Info: quriasolutions.com/sms-consent`
+  );
+}
+
 async function sendOptInStep(session: OnboardingSession, companyName: string): Promise<void> {
   const firstName = session.employee_name.split(' ')[0];
-  await textEmployeeRaw(
-    session,
-    `Hi ${firstName}! This is Aegis, scheduling assistant for ${companyName}. ` +
-      `We'll send shift notifications via SMS. Reply YES to confirm. ` +
-      `Msg & data rates may apply. Reply STOP to opt out. ` +
-      `Info: quriasolutions.com/sms-consent`
-  );
+  await textEmployeeRaw(session, buildOptInMessage(firstName, companyName));
 }
 
 async function sendEmailStep(session: OnboardingSession): Promise<void> {

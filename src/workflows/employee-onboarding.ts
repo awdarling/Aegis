@@ -2396,7 +2396,23 @@ async function completeOnboarding(
     );
   }
 
-  const weeklyHours = totalWeeklyHours(session.collected.availability_parsed);
+  // Availability for the completion summary + manager email. Smart-onboarding
+  // SKIPS the availability step when the employee already has it on file, leaving
+  // session.collected.availability_parsed empty — computing hours from that empty
+  // array misreported "0.0h/week / No availability provided" though the data is
+  // intact (Batch-1.5 #1). Fall back to the employee's existing DB availability so
+  // the summary reflects the truth (Data Contract Rule 0).
+  let summarySlots = session.collected.availability_parsed;
+  if (summarySlots.length === 0) {
+    const { data: existingAvail } = await supabase
+      .from('availability')
+      .select('day_of_week, start_time, end_time')
+      .eq('company_id', session.company_id)
+      .eq('employee_id', session.employee_id);
+    summarySlots = ((existingAvail ?? []) as AvailabilitySlot[])
+      .filter(s => !!s && typeof s.start_time === 'string' && typeof s.end_time === 'string');
+  }
+  const weeklyHours = totalWeeklyHours(summarySlots);
 
   await logActivity({
     company_id: session.company_id,
@@ -2433,7 +2449,7 @@ async function completeOnboarding(
   // copies of all of their answers for easy auditing"). Best-effort — a summary
   // failure must never fail the onboarding completion.
   try {
-    await sendOnboardingSummaryEmail(session, weeklyHours, timeOffRanges);
+    await sendOnboardingSummaryEmail(session, weeklyHours, timeOffRanges, summarySlots);
   } catch (err) {
     console.error('[onboarding] manager summary email failed (non-fatal):', err);
   }
@@ -2450,7 +2466,8 @@ async function completeOnboarding(
 async function sendOnboardingSummaryEmail(
   session: OnboardingSession & { _memory_id: string },
   weeklyHours: number,
-  timeOffRanges: string[]
+  timeOffRanges: string[],
+  availabilitySlots: AvailabilitySlot[]
 ): Promise<void> {
   const { data: managerData } = await supabase
     .from('users')
@@ -2470,7 +2487,7 @@ async function sendOnboardingSummaryEmail(
   }
 
   const companyName = await loadCompanyName(session.company_id);
-  const slots = session.collected.availability_parsed;
+  const slots = availabilitySlots;
   const role = session.collected.role ?? '—';
   const contactEmail = session.collected.email ?? session.employee_email ?? '—';
   const contactPhone = session.employee_phone ?? '—';

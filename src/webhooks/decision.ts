@@ -9,7 +9,7 @@ import { normalizeReSubject } from '../messaging/reply';
 import { executeScheduleSwap, executeScheduleTrade } from '../workflows/shift-swap';
 import { processCoverageButtonDecision, processCoverageBatchButton } from '../workflows/emergency-coverage';
 import { computeWageEstimate } from '../lib/schedule-simulator';
-import { BRAND, logoUrl } from '../messaging/brand';
+import { BRAND, quriaLogoDataUri } from '../messaging/brand';
 import type { Employee } from '../db/types';
 
 // Escape user-supplied text before it lands in an HTML page.
@@ -42,7 +42,7 @@ function brandedPage(opts: { title: string; heading: string; headingColor: strin
 </head>
 <body>
   <div class="card">
-    <div class="hdr"><img src="${logoUrl()}" alt="Aegis"><span>Aegis</span></div>
+    <div class="hdr"><img src="${quriaLogoDataUri()}" alt="Aegis"><span>Aegis</span></div>
     <div class="body">
       <div class="icon">${opts.icon}</div>
       <h1>${escapeHtml(opts.heading)}</h1>

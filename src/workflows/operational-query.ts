@@ -663,7 +663,7 @@ export function buildOperationalAnswerSystem(
   const noLeakGuard =
     `Answer plainly, in your own voice, and NEVER mention how you got the information — ` +
     `no talk of data, payloads, records, JSON, schedules being "loaded"/"truncated"/"provided", or "pulling from Homebase". ` +
-    `If you genuinely don't have what's needed, say so in one short, natural sentence and offer to pull it up (e.g. "I don't have that week's schedule in front of me — want me to pull it up?") — never explain the internals or apologize for the system.`;
+    `If you genuinely don't have what's needed, say so in one short, natural sentence, NAME the date you assumed, and offer the RIGHT next step — never explain the internals or apologize for the system. When a schedule for that date does NOT exist yet, offer to BUILD one (e.g. "There's no schedule up for Saturday Aug 16 yet — want me to build it?"); only when a schedule likely exists but you don't have it in front of you should you offer to pull it up (e.g. "I don't have next week's schedule in front of me — want me to pull it up?"). Do not say "pull it up" for a date that has no schedule — that reads as retrieving something that isn't there.`;
 
   const roleScope =
     role === 'employee'

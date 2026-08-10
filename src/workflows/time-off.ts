@@ -1940,12 +1940,15 @@ export async function handleQueryMyTimeOff(
 
   const today = new Date().toISOString().slice(0, 10);
 
+  // Surface EVERY current/upcoming request with its status, not just approved
+  // (Batch-1.5 #5): "where does my request stand?" for a PENDING request used to
+  // read "no approved time off." Pending + approved + denied all answer "where it
+  // stands"; still windowed to end_date >= today so old history doesn't pile up.
   const { data } = await supabase
     .from('time_off_requests')
-    .select('start_date, end_date, time_off_type, partial_days')
+    .select('start_date, end_date, time_off_type, partial_days, status')
     .eq('employee_id', contact.employee_id)
     .eq('company_id', contact.company_id)
-    .eq('status', 'approved')
     .gte('end_date', today)
     .order('start_date', { ascending: true });
 
@@ -1954,19 +1957,26 @@ export async function handleQueryMyTimeOff(
     end_date: string;
     time_off_type: 'full_day' | 'partial' | null;
     partial_days: PartialDayDetail[] | null;
+    status: 'pending' | 'approved' | 'denied' | null;
   }>;
 
   if (rows.length === 0) {
     await reply(
       contact,
       message,
-      `${textOpener(contact.name)}You don't have any approved time off coming up. You can request time off by texting me the dates you need.`
+      `${textOpener(contact.name)}You don't have any time off on file coming up. You can request time off by texting me the dates you need.`
     );
     return;
   }
 
+  const statusLabel = (s: string | null): string =>
+    s === 'approved' ? 'Approved'
+      : s === 'denied' ? 'Not approved'
+        : 'Pending — awaiting your manager';
+
   const lines = rows.map(row => {
     const dateRange = formatDateRange(row.start_date, row.end_date);
+    const stat = statusLabel(row.status);
     const parsed: ParsedRequest = {
       start_date: row.start_date,
       end_date: row.end_date,
@@ -1975,7 +1985,7 @@ export async function handleQueryMyTimeOff(
     };
 
     if (parsed.time_off_type === 'full_day' || !parsed.partial_days || parsed.partial_days.length === 0) {
-      return `• ${dateRange}: Full day`;
+      return `• ${dateRange}: Full day — ${stat}`;
     }
 
     const sample = parsed.partial_days[0];
@@ -1989,7 +1999,7 @@ export async function handleQueryMyTimeOff(
         : sample.start_time && sample.end_time
           ? formatTimeRange(sample.start_time, sample.end_time)
           : 'partial';
-      return `• ${dateRange}: Partial — ${detail}`;
+      return `• ${dateRange}: Partial (${detail}) — ${stat}`;
     }
 
     const perDay = parsed.partial_days
@@ -2002,13 +2012,13 @@ export async function handleQueryMyTimeOff(
         return `${formatShortDate(d.date)} ${label}`;
       })
       .join(', ');
-    return `• ${dateRange}: Partial — ${perDay}`;
+    return `• ${dateRange}: Partial (${perDay}) — ${stat}`;
   });
 
   const header =
     rows.length === 1
-      ? 'You have 1 approved time off period coming up:'
-      : `You have ${rows.length} approved time off periods coming up:`;
+      ? "Here's where your time off stands:"
+      : `Here's where your ${rows.length} time-off requests stand:`;
 
   await reply(contact, message, `${textOpener(contact.name)}${header}\n\n${lines.join('\n')}`);
 }

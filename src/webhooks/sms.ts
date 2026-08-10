@@ -27,13 +27,16 @@ const STOP_KEYWORDS = new Set([
 ]);
 const HELP_KEYWORDS = new Set(['HELP', 'INFO']);
 
-// Reference copy of the HELP/compliance text. The live responder is configured
-// on the Telnyx messaging profile (carrier level); this constant documents the
-// wording so the two stay in sync.
+// Reference copy of the HELP/compliance text — VERBATIM from the registered A2P
+// 10DLC campaign HELP message (Telnyx "Aegis SMS Scheduling — Quria Solutions").
+// The live responder is configured on the Telnyx messaging profile (carrier
+// level); this constant documents the registered wording so the two stay in sync.
+// If you change this, change the Telnyx profile HELP reply AND the campaign
+// registration to match — an auditor compares all three.
 export const HELP_RESPONSE =
-  'Aegis by Quria Solutions: scheduling assistant for your employer. ' +
+  'Aegis by Quria Solutions: Scheduling assistant for your employer. ' +
   'Msg freq varies. Msg & data rates may apply. Reply STOP to opt out. ' +
-  'Support: support@quriasolutions.com';
+  'Support: awdarling@quriasolutions.com';
 
 export function isStopKeyword(body: string): boolean {
   return STOP_KEYWORDS.has(body.trim().toUpperCase());

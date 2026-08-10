@@ -2927,6 +2927,27 @@ export async function handleOnboardingFanoutConfirm(
   const isNo = /^(no|nope|n\b|cancel|stop|nah|don'?t|never\s?mind)/i.test(lower);
 
   if (!isYes && !isNo) {
+    // H7 interruptibility (Batch-1.5 #18): this pending confirm runs BEFORE
+    // classification, so a manager sending a clearly-different actionable request
+    // mid-fanout (e.g. "I need emergency coverage for Saturday") would otherwise be
+    // swallowed as an invalid YES/NO and the row would linger, re-swallowing every
+    // subsequent non-YES/NO message. Yield: clear the pending row and re-route the
+    // new request. allowQueries:true — this is a bare YES/NO batch prompt, so the
+    // reply can never be a name to contact.
+    const { managerInterruptIntent } = await import('../router/interrupt');
+    const intent = await managerInterruptIntent(message, contact, { allowQueries: true });
+    if (intent) {
+      await supabase.from('aegis_memory').delete().eq('id', pending._memory_id);
+      await logActivity({
+        company_id: contact.company_id,
+        action: 'onboarding_fanout_yielded',
+        summary: `Manager sent a different request (${intent}) during the onboarding confirm — handling that instead`,
+        metadata: { yielded_to: intent },
+      });
+      const { routeIntent } = await import('../router/intent-router');
+      await routeIntent(message, contact);
+      return;
+    }
     await reply(contact, message, `Reply YES to start onboarding or NO to cancel.`);
     return;
   }

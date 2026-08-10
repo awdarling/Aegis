@@ -88,4 +88,26 @@ describe('sendDecisionNotification — Homebase-path email fallback (DRIFT_REGIS
     await expect(sendDecisionNotification('r1', 'approved')).rejects.toThrow(/no email address on file/);
     expect(mockEmail).not.toHaveBeenCalled();
   });
+
+  it('falls back to email when the tenant has NO SMS channel configured (H20)', async () => {
+    // SMS route (submitted by SMS, phone on file) but the company has no
+    // company_channels sms row yet. Must NOT throw — must email-fall-back.
+    mockSms.mockResolvedValue(true); // irrelevant: sendSms must not even be called
+    rows.company_channels = null as unknown as Record<string, unknown>;
+    const result = await sendDecisionNotification('r1', 'approved');
+    expect(mockSms).not.toHaveBeenCalled();
+    expect(mockEmail).toHaveBeenCalledTimes(1);
+    expect(result.channel).toBe('email');
+    expect(result.sent_to).toBe('sam@example.com');
+    rows.company_channels = { channel_value: '+16160000000' }; // restore for other tests
+  });
+
+  it('throws when there is no SMS channel AND no email to fall back to (H20)', async () => {
+    rows.company_channels = null as unknown as Record<string, unknown>;
+    rows.employees = { id: 'e1', name: 'Sam Rivera', contact_email: null, contact_phone: '+16165551234' };
+    await expect(sendDecisionNotification('r1', 'approved')).rejects.toThrow(/no email address on file/);
+    expect(mockSms).not.toHaveBeenCalled();
+    expect(mockEmail).not.toHaveBeenCalled();
+    rows.company_channels = { channel_value: '+16160000000' };
+  });
 });

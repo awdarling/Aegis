@@ -116,6 +116,18 @@ export function resolveAvailabilityForWeek(
     return normalAvailability;
   }
 
+  // Symmetric with the end gate (Finding 3 / DRIFT_REGISTER §I): don't apply a
+  // future-effective override before it starts. A week is in-window iff
+  //   effective_start_date <= weekStart <= end_date.
+  // NULL/undefined effective_start_date = in effect immediately (rows created
+  // before migration 019, and Aegis's generated db/types Row may not carry the
+  // column yet — read it defensively). Whole-week granularity mirrors the end
+  // gate and the Homebase resolver (resolveEffectiveAvailability) exactly.
+  const effectiveStart = (customAvailability as { effective_start_date?: string | null }).effective_start_date;
+  if (effectiveStart && effectiveStart > weekStart) {
+    return normalAvailability;
+  }
+
   if (customAvailability.type === 'date_limited') {
     const patterns = patternsAsList(customAvailability.patterns);
     if (!patterns) return normalAvailability;

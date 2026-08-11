@@ -475,13 +475,36 @@ export async function proposeSwapTrade(params: {
     metadata: { requester_id: params.requester_id, receiver_id: params.receiver_id, shift_date: b.shift_date, target_shift_date: sel.date, mode: 'swap' },
   });
 
-  // Ask the requester to Agree/Decline the trade (email-first magic-link). Their
-  // email comes from their record; fall back to the channel sender if needed.
-  const { data: reqData } = await supabase.from('employees').select('id, name, contact_email')
+  // Ask the requester to Agree/Decline the trade. The actionable Agree/Decline
+  // magic-link buttons live in the EMAIL; for a phone-holding requester we also
+  // send an SMS-first heads-up pointing to it (Batch-1.5 #10 — the trade branch
+  // used to notify the requester by email only, unlike the pickup branch).
+  const { data: reqData } = await supabase.from('employees').select('id, name, contact_email, contact_phone')
     .eq('id', params.requester_id).single();
-  const requesterRec = reqData as { id: string; name: string; contact_email: string | null } | null;
+  const requesterRec = reqData as { id: string; name: string; contact_email: string | null; contact_phone: string | null } | null;
   const requesterEmail = requesterRec?.contact_email
     ?? (b.requester_channel === 'email' ? b.requester_sender : null);
+
+  // SMS-first heads-up (the buttons are in the email that follows). Mirrors the
+  // pickup path's reply() on the requester's submission channel; gated off under
+  // EMAIL_ONLY so it doesn't double up with the email fallback.
+  if (!env.EMAIL_ONLY && b.requester_channel === 'sms') {
+    const requesterMsgOut: InboundMessage = {
+      sender: b.requester_sender, recipient: b.requester_recipient, body: '',
+      channel: b.requester_channel, raw_subject: b.requester_raw_subject, thread_id: b.requester_thread_id,
+    };
+    const requesterContactOut: VerifiedContact = {
+      role: 'employee', company_id: params.company_id, employee_id: params.requester_id,
+      user_id: null, name: b.requester_name, matched_identifier: b.requester_sender, channel: b.requester_channel,
+    };
+    const emailPointer = requesterEmail
+      ? ` I've emailed you the details — open it to Agree or Decline and I'll finish it up.`
+      : ` Your manager can help you confirm it.`;
+    await reply(requesterContactOut, requesterMsgOut,
+      `${firstName(receiver.name)} offered to trade their ${sel.shift_name} shift on ${formatDisplayDate(sel.date)} for your ${b.shift_name} shift on ${formatDisplayDate(b.shift_date)}.${emailPointer}`
+    );
+  }
+
   if (requesterEmail) {
     const { subject, text, html } = await buildSwapProposalEmail({
       company_id: params.company_id,
@@ -1908,6 +1931,9 @@ export async function sendManagerSwapApprovalRequest(params: {
     aegis_sms_channel: params.aegis_sms_channel,
     receiver_id: receiver.id,
     receiver_name: receiver.name,
+    // The approving manager — persisted to swap_requests.decided_by (Batch-1.5 #9).
+    manager_user_id: manager.id,
+    manager_name: manager.name,
     shift_date,
     shift_name,
     role,
@@ -2429,9 +2455,30 @@ export async function handleInitiateSwap(
       : `Since you didn't mention days you could work instead, I'll send it as a straight pickup (no trade). If you'd like to allow trades, tell me which days you can work. `;
 
     await reply(contact, message,
-      `You want someone to take your ${shift.shift_name} shift (${shift.role}, ${shift.start_time}–${shift.end_time}) on ${formatDisplayDate(shiftDate)}. ${candidateNote}${tradeNote}Want me to ask the team?`
+      buildFacilitatedSwapConfirm({
+        shiftLabel: `${shift.shift_name} shift (${shift.role}, ${shift.start_time}–${shift.end_time})`,
+        dateLabel: formatDisplayDate(shiftDate),
+        candidateNote,
+        tradeNote,
+      })
     );
   }
+}
+
+// Facilitated (no coworker named) swap confirmation. Surfaces the option to name
+// a specific coworker for a DIRECTED swap before defaulting to a full-pool ask
+// (Batch-1.5 #8 — the flow used to drop silently into a broadcast). Pure so the
+// directed hint can be asserted in a test.
+export function buildFacilitatedSwapConfirm(p: {
+  shiftLabel: string;
+  dateLabel: string;
+  candidateNote: string;
+  tradeNote: string;
+}): string {
+  return (
+    `You want someone to take your ${p.shiftLabel} on ${p.dateLabel}. ${p.candidateNote}${p.tradeNote}` +
+    `If you'd rather ask one person, just tell me their name and I'll set it up with them directly — otherwise, want me to ask the team?`
+  );
 }
 
 // Reach a coworker for a directed swap offer — SMS-FIRST for phone-holders

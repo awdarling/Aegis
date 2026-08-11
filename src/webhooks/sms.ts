@@ -12,9 +12,11 @@ export const smsWebhook = Router();
 // handled at the CARRIER level by the Telnyx messaging profile — Telnyx auto-
 // suppresses future sends on STOP and can auto-respond to HELP. We recognize
 // them here only to make sure a bare keyword is NEVER routed as a workflow
-// intent (spec §2.2 / §3.7). The opt-in keywords (YES/START) are deliberately
-// NOT in this set — the onboarding opt-in is the one place a literal reply is a
-// real workflow answer, so it must route normally.
+// intent (spec §2.2 / §3.7). YES is deliberately NOT a carrier keyword — the
+// onboarding opt-in is the one place a literal reply is a real workflow answer,
+// so YES must route normally. START/UNSTOP ARE carrier resubscribe keywords
+// (handled by Telnyx); the app must NOT re-answer them with the capabilities menu
+// on top of the carrier's resubscribe confirmation (Batch-1.5 #19).
 const STOP_KEYWORDS = new Set([
   'STOP',
   'STOPALL',
@@ -26,6 +28,10 @@ const STOP_KEYWORDS = new Set([
   'OPTOUT',
 ]);
 const HELP_KEYWORDS = new Set(['HELP', 'INFO']);
+// Carrier resubscribe keywords — Telnyx re-enables the number and sends the
+// registered resubscribe confirmation. The app must not route or re-answer these
+// (Batch-1.5 #19). YES is intentionally excluded (it's the opt-in workflow answer).
+const RESUBSCRIBE_KEYWORDS = new Set(['START', 'UNSTOP']);
 
 // Reference copy of the HELP/compliance text — VERBATIM from the registered A2P
 // 10DLC campaign HELP message (Telnyx "Aegis SMS Scheduling — Quria Solutions").
@@ -43,6 +49,9 @@ export function isStopKeyword(body: string): boolean {
 }
 export function isHelpKeyword(body: string): boolean {
   return HELP_KEYWORDS.has(body.trim().toUpperCase());
+}
+export function isResubscribeKeyword(body: string): boolean {
+  return RESUBSCRIBE_KEYWORDS.has(body.trim().toUpperCase());
 }
 
 // Minimal shape of a Telnyx inbound-message webhook.
@@ -125,6 +134,10 @@ smsWebhook.post('/', verifyTelnyxRequest, async (req, res) => {
     }
     if (isHelpKeyword(message.body)) {
       console.log(`[sms] HELP keyword from ${message.sender} — carrier handles the HELP reply; not routing.`);
+      return;
+    }
+    if (isResubscribeKeyword(message.body)) {
+      console.log(`[sms] START/UNSTOP keyword from ${message.sender} — carrier handles resubscribe; not routing.`);
       return;
     }
 

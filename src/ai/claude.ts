@@ -89,6 +89,7 @@ export const MANAGER_INTENTS = [
   'approve_swap',
   'deny_swap',
   'initiate_onboarding',
+  'add_employee',
   'request_emergency_coverage',
   'build_schedule',
   'distribute_schedule',
@@ -138,7 +139,67 @@ export async function classifyIntent(
   const parsed = coerceJsonObject<ClassifyResult>(text) ??
     { intent: 'unknown', confidence: 'low', extracted: {} };
 
-  return applyBareTimeOffBackstop(applyAvailabilityBackstop(parsed, message), message);
+  return applyManagerCoverageBackstop(
+    applyBareTimeOffBackstop(applyAvailabilityBackstop(parsed, message), message),
+    message,
+    role
+  );
+}
+
+// A MANAGER reporting that a THIRD PARTY can't work is an emergency-coverage
+// call-out, not a swap (a coworker's own trade) and not the manager's own time
+// off. The classifier had zero few-shots for request_emergency_coverage and the
+// informal rules steered "<name> can't work" to initiate_swap / submit_time_off
+// (live 2026-08-10, finding #11). This deterministic seam upgrades those to
+// coverage when a manager reports someone ELSE out. Deliberately narrow: it never
+// fires on first-person ("I can't work") or on "my shift" (the sender's own),
+// so a manager's own time-off / swap is left to the model.
+export function looksLikeManagerCoverageCallout(body: string): boolean {
+  const b = body.trim().toLowerCase();
+  if (!b) return false;
+  // The sender's OWN shift is a swap, never coverage.
+  if (/\bmy\s+(shift|shifts)\b/.test(b)) return false;
+  // A manager's direct ask to fill a hole — coverage regardless of a named person.
+  // Checked BEFORE the first-person guard so "I need someone to cover …" counts
+  // (the guard only excludes the sender's OWN absence, e.g. "I need Friday off").
+  if (/\b(emergency\s+coverage|need\s+coverage|coverage\s+(for|needed)|need\s+(someone|somebody|a\s+(sub|replacement|fill[-\s]?in|guard|lifeguard))\s+(to\s+)?(cover|fill|work|come\s+in)|find\s+(a\s+)?(sub|replacement|cover)|fill\s+(the|a)\s+\w+\s+shift)\b/.test(b)) {
+    return true;
+  }
+  // First-person = the sender's OWN absence — that's their time off / swap, not
+  // a coverage call-out for someone else.
+  if (/^(i|i'?m|im|we|we'?re)\b/.test(b)) return false;
+  if (/\bi\s+(can'?t|cannot|can\s?not|need|won'?t)\b/.test(b)) return false;
+  // Third-party call-out: <someone other than the sender> + can't-work language.
+  // The subject clause must NOT be the sender ("I"/"we") — guarded above.
+  const callout = /(can'?t|cannot|can\s?not)\s+(work|make\s+it|come\s+in|be\s+(here|in))|call(ed)?\s+(in|out)(\s+sick)?|is\s+(out|sick)\b|out\s+sick\b|won'?t\s+(make\s+it|be\s+(in|here))|phoned\s+in\s+sick/;
+  if (callout.test(b)) {
+    // Require a plausible third-party subject before the call-out verb: a proper
+    // name, a pronoun (he/she/they), or a role/"someone". "off tuesday" etc. with
+    // no subject stays with the model.
+    const subject = /\b([a-z]+|he|she|they|someone|somebody|nobody)\b\s+(can'?t|cannot|can\s?not|call(ed)?|is\s+(out|sick)|out\s+sick|won'?t|phoned)/;
+    return subject.test(b);
+  }
+  return false;
+}
+
+// Deterministic backstop for finding #11. When the sender is a MANAGER/QURIA and
+// the model landed on initiate_swap or submit_time_off but the message is clearly
+// a third-party coverage call-out, reclassify to request_emergency_coverage. The
+// coverage handler re-extracts the absent person + shift from the body, so an
+// empty extracted is fine here. Never touches employee senders.
+export function applyManagerCoverageBackstop(
+  result: ClassifyResult,
+  message: string,
+  role: 'employee' | 'manager' | 'quria_admin'
+): ClassifyResult {
+  if (role === 'employee') return result;
+  if (result.intent !== 'initiate_swap' && result.intent !== 'submit_time_off') return result;
+  if (!looksLikeManagerCoverageCallout(message)) return result;
+  return {
+    intent: 'request_emergency_coverage',
+    confidence: result.confidence === 'low' ? 'medium' : result.confidence,
+    extracted: {},
+  };
 }
 
 // A purely-positive availability statement ("I can work …", "I'm available …")
@@ -378,6 +439,43 @@ and NOT general_question. Extract the message_text, target_type
 A QUESTION about the workforce ("who's on Saturday?", "how many guards today?")
 stays operational_query — only an outbound message to people is broadcast_message.
 
+## A MANAGER reporting that SOMEONE ELSE can't work → request_emergency_coverage
+
+When a MANAGER or QURIA admin reports that a NAMED THIRD PARTY (not the sender
+themselves) can't work / called in / is out sick / won't make a shift, that is
+request_emergency_coverage — Aegis needs to fill the hole. This is NOT
+initiate_swap (a coworker arranging their OWN trade) and NOT submit_time_off (the
+person themselves asking off). Distinguish by WHO can't work:
+- SOMEONE ELSE can't work (third party, named or "someone") + the sender is a
+  manager → request_emergency_coverage. Extract employee_name (the absent person)
+  and shift_date / shift_name when present.
+- The SENDER can't work ("I can't work Saturday", "I need Friday off") → their own
+  time off (submit_time_off).
+- A coworker arranging a trade of THEIR OWN shift → initiate_swap.
+Also route a manager's direct ask to fill a hole — "I need someone to cover the
+morning shift", "need coverage for Saturday", "find a sub for the 9am" — to
+request_emergency_coverage.
+- Manager: "Marcus can't work Saturday" → request_emergency_coverage,
+  extracted {"employee_name":"Marcus", shift_date for the upcoming Saturday}.
+- Manager: "Sarah called in sick, I need someone for the morning shift" →
+  request_emergency_coverage, extracted {"employee_name":"Sarah"}.
+- Manager: "Jordan is out today, cover the 9am" → request_emergency_coverage.
+- Contrast (employee, first person): "I can't work Saturday" → submit_time_off.
+- Contrast (employee): "Marcus is taking my Saturday shift" → initiate_swap.
+
+## Adding a NEW hire vs onboarding the EXISTING team — add_employee vs initiate_onboarding
+
+A MANAGER asking to CREATE a brand-new employee record — "add a new employee",
+"I just hired someone", "add a new hire named Alex", "set up a new person",
+"onboard a new hire" — is add_employee (the record does not exist yet). This is
+DISTINCT from initiate_onboarding, which starts the intro/opt-in walk for people
+who are ALREADY on the roster ("onboard the team", "get everyone set up", "start
+onboarding for Sam" where Sam already exists).
+- "add a new employee", "I just hired someone", "we have a new lifeguard starting"
+  → add_employee.
+- "onboard the team", "get everyone set up on Aegis", "send Sam the intro" (Sam
+  already on roster) → initiate_onboarding.
+
 ## Reading vs changing availability — query_my_availability vs update_availability
 
 A message that ASKS what the employee's availability currently IS (a READ) is
@@ -475,6 +573,18 @@ User: "i need june 30 off until 2pm"
 
 User: "Time off: June 18-21. Availability: 6/22 morning, 6/23 morning, 6/24 all day, 6/25 all day, 6/26 morning"
 {"intent":"submit_time_off","confidence":"high","extracted":{"dates":[{"start_date":"${currentYear}-06-18","end_date":"${currentYear}-06-21","time_off_type":"full_day","period_label":null,"start_time":null,"end_time":null}],"reason":null,"also_mentions_availability":true}}
+
+User (manager): "Marcus can't work Saturday"
+{"intent":"request_emergency_coverage","confidence":"high","extracted":{"employee_name":"Marcus","shift_date":"${currentYear}-06-06","shift_name":null}}
+
+User (manager): "Sarah called in sick, need someone to cover the morning shift"
+{"intent":"request_emergency_coverage","confidence":"high","extracted":{"employee_name":"Sarah","shift_name":"morning"}}
+
+User (manager): "add a new employee"
+{"intent":"add_employee","confidence":"high","extracted":{}}
+
+User (manager): "I just hired someone, need to add them"
+{"intent":"add_employee","confidence":"high","extracted":{}}
 
 ## Manager edits and staffing rules → homebase_edit
 

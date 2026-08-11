@@ -510,6 +510,66 @@ export function summarizeStaffingByDate(assignments: AssignmentLite[]): string {
   return lines.join('\n');
 }
 
+// Per-date "available but NOT scheduled" summary (Batch-1.5 #16): the deterministic
+// answer to "who's free [date]", mirroring summarizeStaffingByDate for "who's
+// working". availability is a recurring pattern keyed by day_of_week (0=Sun), so
+// for each date we take its weekday's available employees and subtract anyone
+// already assigned that date. The model just reads back the line for the day asked.
+export function summarizeAvailableByDate(
+  employees: Array<Record<string, unknown>>,
+  availability: Array<Record<string, unknown>>,
+  assignments: AssignmentLite[],
+  dates: string[],
+): string {
+  if (dates.length === 0) return '';
+  const nameById = new Map<string, string>();
+  const roleById = new Map<string, string>();
+  for (const e of employees) {
+    const id = String(e.id ?? '');
+    if (!id) continue;
+    nameById.set(id, String(e.name ?? 'Someone'));
+    roleById.set(id, String(e.primary_role ?? ''));
+  }
+  const availByDow = new Map<number, Set<string>>();
+  for (const a of availability) {
+    const dow = Number(a.day_of_week);
+    const eid = String(a.employee_id ?? '');
+    if (Number.isNaN(dow) || !eid) continue;
+    const set = availByDow.get(dow) ?? new Set<string>();
+    set.add(eid);
+    availByDow.set(dow, set);
+  }
+  const assignedByDate = new Map<string, Set<string>>();
+  for (const a of assignments) {
+    const set = assignedByDate.get(a.date) ?? new Set<string>();
+    if (a.employee_id) set.add(a.employee_id);
+    assignedByDate.set(a.date, set);
+  }
+  const lines: string[] = [];
+  for (const date of [...new Set(dates)].sort()) {
+    const dow = new Date(date + 'T12:00:00Z').getUTCDay();
+    const avail = availByDow.get(dow) ?? new Set<string>();
+    const assigned = assignedByDate.get(date) ?? new Set<string>();
+    const freeIds = [...avail].filter(id => !assigned.has(id) && nameById.has(id));
+    if (freeIds.length === 0) {
+      lines.push(`${prettyDate(date)}: nobody available who isn't already scheduled`);
+      continue;
+    }
+    const names = freeIds
+      .map(id => { const r = roleById.get(id); return r ? `${nameById.get(id)} (${r})` : nameById.get(id)!; })
+      .sort();
+    lines.push(`${prettyDate(date)}: ${names.join(', ')}`);
+  }
+  return lines.join('\n');
+}
+
+// Detects a "who's free / available" staffing question (as opposed to "who's
+// working"). The two share the operational_query intent; this routes the free-set
+// computation on top of the same fetched schedule + availability.
+export function isFreeStaffQuery(body: string): boolean {
+  return /\bwho'?s\s+(free|available|open|around|not\s+(working|scheduled|on))\b|\bwho\s+(can|could)\s+work\b|\bwho\s+is\s+(free|available)\b|\banyone\s+(free|available|around)\b/i.test(body || '');
+}
+
 // Unfilled coverage across the fetched schedules, as plain text.
 function summarizeGaps(scheduleRows: unknown[]): string {
   const lines: string[] = [];
@@ -603,7 +663,7 @@ export function buildOperationalAnswerSystem(
   const noLeakGuard =
     `Answer plainly, in your own voice, and NEVER mention how you got the information — ` +
     `no talk of data, payloads, records, JSON, schedules being "loaded"/"truncated"/"provided", or "pulling from Homebase". ` +
-    `If you genuinely don't have what's needed, say so in one short, natural sentence and offer to pull it up (e.g. "I don't have that week's schedule in front of me — want me to pull it up?") — never explain the internals or apologize for the system.`;
+    `If you genuinely don't have what's needed, say so in one short, natural sentence, NAME the date you assumed, and offer the RIGHT next step — never explain the internals or apologize for the system. When a schedule for that date does NOT exist yet, offer to BUILD one (e.g. "There's no schedule up for Saturday Aug 16 yet — want me to build it?"); only when a schedule likely exists but you don't have it in front of you should you offer to pull it up (e.g. "I don't have next week's schedule in front of me — want me to pull it up?"). Do not say "pull it up" for a date that has no schedule — that reads as retrieving something that isn't there.`;
 
   const roleScope =
     role === 'employee'
@@ -676,6 +736,21 @@ Available Homebase tables (all scoped to this company):
     };
   }
 
+  // "Who's free [date]" needs employees + availability + the published schedule to
+  // compute available-but-not-scheduled (Batch-1.5 #16). The LLM plan reads "free"
+  // as availability-only and skips schedules, so the answer model has nothing to
+  // subtract the scheduled set from and hedges ("I don't have the schedule…").
+  // Force the three inputs so the deterministic free-set block below can be built.
+  const freeStaff = isFreeStaffQuery(message.body);
+  if (freeStaff) {
+    const ensure = (table: string, item: FetchPlanItem) => {
+      if (!plan.fetches.some(f => f.table === table)) plan.fetches.push(item);
+    };
+    ensure('employees', { table: 'employees', filters: [{ field: 'active', op: 'eq', value: true }] });
+    ensure('availability', { table: 'availability' });
+    ensure('schedules', { table: 'schedules', limit: 4, order: { field: 'generated_at', ascending: false } });
+  }
+
   // Step 2: Execute the fetch plan. Pass the asker's employee_id so an employee's
   // self-queries (availability, time off) are scoped to their own rows.
   const fetchedData = await executeFetchPlan(
@@ -689,7 +764,32 @@ Available Homebase tables (all scoped to this company):
   // Step 3: Ask Claude to answer with the data. The context is pre-summarized
   // into clean facts (esp. schedules → per-date headcount + names) so the model
   // never has to parse — or hedge about — a truncated raw JSON blob.
-  const dataContext = buildDataContext(fetchedData, contact.role as CapabilityRole);
+  let dataContext = buildDataContext(fetchedData, contact.role as CapabilityRole);
+
+  // Append the deterministic "available but not scheduled" block for a who's-free
+  // question, computed over the same fetched tables (Batch-1.5 #16).
+  if (freeStaff) {
+    const schedRows = (fetchedData.schedules ?? []) as Array<Record<string, unknown>>;
+    const assignments = collectAssignments(schedRows);
+    const dates = new Set<string>();
+    for (const a of assignments) dates.add(a.date);
+    for (const row of schedRows) {
+      const ws = typeof row.week_start === 'string' ? row.week_start : null;
+      const we = typeof row.week_end === 'string' ? row.week_end : null;
+      if (ws && we) {
+        for (let d = ws; d <= we; d = addDaysISO(d, 1)) dates.add(d);
+      }
+    }
+    const freeBlock = summarizeAvailableByDate(
+      (fetchedData.employees ?? []) as Array<Record<string, unknown>>,
+      (fetchedData.availability ?? []) as Array<Record<string, unknown>>,
+      assignments,
+      [...dates],
+    );
+    if (freeBlock) {
+      dataContext += `${dataContext ? '\n\n' : ''}Available but NOT scheduled each day (these people can work but aren't on the schedule):\n${freeBlock}`;
+    }
+  }
 
   const answerSystem = buildOperationalAnswerSystem(
     contact.role as CapabilityRole,
@@ -1650,6 +1750,19 @@ export function detectWeekScope(body: string, todayLocal: string): { label: stri
   return null;
 }
 
+// Resolve the shift-query window. An EXPLICIT week phrase wins over a stray
+// extracted date (Batch-1.5 #3): a vague follow-up like "what about next week?"
+// classifies with medium confidence and the model sometimes emits a spurious
+// single date (next week's Monday). If the body literally says "next week" /
+// "this week", honor the full Sun–Sat window rather than narrowing to that one
+// day. Only a specific date with NO week phrase resolves to a single day.
+export function resolveShiftScope(body: string, rawDate: string | null, todayLocal: string): ShiftScope {
+  const week = detectWeekScope(body, todayLocal);
+  if (week) return { kind: 'week', label: week.label, start: week.start, end: week.end };
+  if (rawDate) return { kind: 'date', date: rawDate };
+  return { kind: 'upcoming' };
+}
+
 export async function handleMyShiftsQuery(
   message: InboundMessage,
   contact: VerifiedContact,
@@ -1670,15 +1783,7 @@ export async function handleMyShiftsQuery(
   const rawDate = typeof extracted.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(extracted.date)
     ? extracted.date
     : null;
-  // "this week" / "next week" resolve to an explicit [start,end] window so the two
-  // are distinct and each scoped to its own week — previously both fell through to
-  // 'upcoming' and returned every future shift identically.
-  const week = rawDate ? null : detectWeekScope(message.body, today);
-  const scope: ShiftScope = rawDate
-    ? { kind: 'date', date: rawDate }
-    : week
-      ? { kind: 'week', label: week.label, start: week.start, end: week.end }
-      : { kind: 'upcoming' };
+  const scope = resolveShiftScope(message.body, rawDate, today);
 
   // Published, non-deleted schedules that could hold the relevant shifts.
   const lowerBound = scope.kind === 'week' ? scope.start : (rawDate ?? today);

@@ -2396,7 +2396,23 @@ async function completeOnboarding(
     );
   }
 
-  const weeklyHours = totalWeeklyHours(session.collected.availability_parsed);
+  // Availability for the completion summary + manager email. Smart-onboarding
+  // SKIPS the availability step when the employee already has it on file, leaving
+  // session.collected.availability_parsed empty — computing hours from that empty
+  // array misreported "0.0h/week / No availability provided" though the data is
+  // intact (Batch-1.5 #1). Fall back to the employee's existing DB availability so
+  // the summary reflects the truth (Data Contract Rule 0).
+  let summarySlots = session.collected.availability_parsed;
+  if (summarySlots.length === 0) {
+    const { data: existingAvail } = await supabase
+      .from('availability')
+      .select('day_of_week, start_time, end_time')
+      .eq('company_id', session.company_id)
+      .eq('employee_id', session.employee_id);
+    summarySlots = ((existingAvail ?? []) as AvailabilitySlot[])
+      .filter(s => !!s && typeof s.start_time === 'string' && typeof s.end_time === 'string');
+  }
+  const weeklyHours = totalWeeklyHours(summarySlots);
 
   await logActivity({
     company_id: session.company_id,
@@ -2433,7 +2449,7 @@ async function completeOnboarding(
   // copies of all of their answers for easy auditing"). Best-effort — a summary
   // failure must never fail the onboarding completion.
   try {
-    await sendOnboardingSummaryEmail(session, weeklyHours, timeOffRanges);
+    await sendOnboardingSummaryEmail(session, weeklyHours, timeOffRanges, summarySlots);
   } catch (err) {
     console.error('[onboarding] manager summary email failed (non-fatal):', err);
   }
@@ -2450,7 +2466,8 @@ async function completeOnboarding(
 async function sendOnboardingSummaryEmail(
   session: OnboardingSession & { _memory_id: string },
   weeklyHours: number,
-  timeOffRanges: string[]
+  timeOffRanges: string[],
+  availabilitySlots: AvailabilitySlot[]
 ): Promise<void> {
   const { data: managerData } = await supabase
     .from('users')
@@ -2470,7 +2487,7 @@ async function sendOnboardingSummaryEmail(
   }
 
   const companyName = await loadCompanyName(session.company_id);
-  const slots = session.collected.availability_parsed;
+  const slots = availabilitySlots;
   const role = session.collected.role ?? '—';
   const contactEmail = session.collected.email ?? session.employee_email ?? '—';
   const contactPhone = session.employee_phone ?? '—';
@@ -2633,6 +2650,36 @@ export async function handleOnboardingResponse(
 }
 
 // ── Public: manager initiates onboarding ─────────────────────────────────────
+
+// Finding #17 — "add a new employee" over SMS. Creating an employee RECORD is a
+// Homebase-owned action (Data Contract Rule 0: Homebase is the system of record
+// for the roster; RLS + required fields + dedupe all live there). Aegis does not
+// insert the row from the SMS lane — instead it points the manager to Homebase to
+// add the hire, then offers to run onboarding (the intro + opt-in walk) once the
+// record exists. This keeps "create NEW" distinct from "onboard EXISTING"
+// (initiate_onboarding) and stops the capability contract from advertising an
+// action with no backing handler.
+export async function handleAddEmployee(
+  message: InboundMessage,
+  contact: VerifiedContact,
+  _extracted: Record<string, unknown>
+): Promise<void> {
+  await logActivity({
+    company_id: contact.company_id,
+    actor: contact.role === 'quria_admin' ? 'quria_admin' : 'manager',
+    actor_name: contact.name ?? null,
+    action: 'add_employee_redirect',
+    summary: `${contact.name ?? 'A manager'} asked to add a new employee — pointed to Homebase to create the record`,
+  });
+
+  const opener = textOpener(contact.name);
+  await reply(
+    contact,
+    message,
+    `${opener}To add a new hire, create their profile in Homebase (Employees → Add employee) — that's where names, roles, and contact info live. ` +
+      `Once they're in, just tell me "onboard <their name>" and I'll send the intro and opt-in so they can start using Aegis.`
+  );
+}
 
 export async function handleInitiateOnboarding(
   message: InboundMessage,
@@ -2897,6 +2944,27 @@ export async function handleOnboardingFanoutConfirm(
   const isNo = /^(no|nope|n\b|cancel|stop|nah|don'?t|never\s?mind)/i.test(lower);
 
   if (!isYes && !isNo) {
+    // H7 interruptibility (Batch-1.5 #18): this pending confirm runs BEFORE
+    // classification, so a manager sending a clearly-different actionable request
+    // mid-fanout (e.g. "I need emergency coverage for Saturday") would otherwise be
+    // swallowed as an invalid YES/NO and the row would linger, re-swallowing every
+    // subsequent non-YES/NO message. Yield: clear the pending row and re-route the
+    // new request. allowQueries:true — this is a bare YES/NO batch prompt, so the
+    // reply can never be a name to contact.
+    const { managerInterruptIntent } = await import('../router/interrupt');
+    const intent = await managerInterruptIntent(message, contact, { allowQueries: true });
+    if (intent) {
+      await supabase.from('aegis_memory').delete().eq('id', pending._memory_id);
+      await logActivity({
+        company_id: contact.company_id,
+        action: 'onboarding_fanout_yielded',
+        summary: `Manager sent a different request (${intent}) during the onboarding confirm — handling that instead`,
+        metadata: { yielded_to: intent },
+      });
+      const { routeIntent } = await import('../router/intent-router');
+      await routeIntent(message, contact);
+      return;
+    }
     await reply(contact, message, `Reply YES to start onboarding or NO to cancel.`);
     return;
   }

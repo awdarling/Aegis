@@ -4,6 +4,7 @@ import { coerceJsonObject } from '../utils/coerce-json';
 import { reply } from '../messaging/reply';
 import { sendEmail } from '../messaging/email';
 import { sendSms } from '../messaging/sms';
+import { notifyEmployeeSmsFirst } from '../messaging/notify';
 import { env } from '../config/env';
 import { generateReply } from '../ai/claude';
 import type { InboundMessage, VerifiedContact } from '../security/types';
@@ -311,17 +312,18 @@ export async function handleBroadcast(
   const previewNames = recipients.slice(0, 5).map(r => r.name).join(', ');
   const overflow = recipients.length > 5 ? `, and ${recipients.length - 5} more` : '';
   const channelLabel =
-    session.channel === 'both' ? 'SMS + Email' :
-    session.channel === 'email' ? 'Email' : 'SMS';
+    session.channel === 'both' ? 'Text + email' :
+    session.channel === 'email' ? 'Email' : 'Text (email if no mobile on file)';
 
+  const recipientCount = `${recipients.length} ${recipients.length === 1 ? 'teammate' : 'teammates'}`;
   await reply(
     contact,
     message,
-    `Sending to ${recipients.length} recipient${recipients.length !== 1 ? 's' : ''} at ${companyName}:\n\n` +
-    `'${session.message_text}'\n\n` +
-    `Recipients: ${previewNames}${overflow}\n` +
-    `Channel: ${channelLabel}\n\n` +
-    `Reply YES to send or NO to cancel.`
+    `Here's what I'll send to ${recipientCount} at ${companyName}:\n\n` +
+    `"${session.message_text}"\n\n` +
+    `To: ${previewNames}${overflow}\n` +
+    `How: ${channelLabel}\n\n` +
+    `Reply YES to send it, or NO to call it off.`
   );
 }
 
@@ -367,42 +369,58 @@ export async function handleBroadcastConfirmation(
 
   let sentSms = 0;
   let sentEmail = 0;
-  const failed: string[] = [];
+  // Two distinct failure buckets so the manager gets an honest report (Batch-1.5
+  // #13): "noContact" = nobody to reach (no phone AND no email on file); "failed"
+  // = had a contact method but the send didn't go through.
+  const noContact: string[] = [];
+  const deliveryFailed: string[] = [];
+
+  const outBody = `${senderName}: ${session.message_text}`;
+  const outSubject = `Message from ${senderName}`;
 
   for (const recipient of session.resolved_recipients) {
-    const wantSms = session.channel !== 'email';
-    // Email-only mode: always allow email (so an "sms"/"both" broadcast still
-    // reaches people) and never SMS.
-    const wantEmail = session.channel !== 'sms' || env.EMAIL_ONLY;
-
-    const canSms = wantSms && !env.EMAIL_ONLY && !!recipient.phone && !!aegisSmsNumber;
-    const canEmail = wantEmail && !!recipient.email;
-
-    if (!canSms && !canEmail) {
-      failed.push(recipient.name);
+    // Explicit "email" broadcast → email only. Explicit "both" → text AND email.
+    // Everything else (the default / "sms") → SMS-first with email fallback, so an
+    // email-only teammate is reached by email instead of being dropped as "no
+    // contact info" (Batch-1.5 #13 root cause).
+    if (session.channel === 'email') {
+      if (!recipient.email) { noContact.push(recipient.name); continue; }
+      const ok = await sendEmail({ to: recipient.email, subject: outSubject, text: outBody, company_id: session.company_id });
+      if (ok) sentEmail++; else deliveryFailed.push(recipient.name);
       continue;
     }
 
-    if (canSms) {
-      await sendSms({
-        to: recipient.phone!,
-        from: aegisSmsNumber!,
-        body: `${senderName}: ${session.message_text}`,
-        company_id: session.company_id,
-      });
-      sentSms++;
+    if (session.channel === 'both') {
+      let any = false;
+      if (!env.EMAIL_ONLY && recipient.phone && aegisSmsNumber) {
+        const ok = await sendSms({ to: recipient.phone, from: aegisSmsNumber, body: outBody, company_id: session.company_id });
+        if (ok) { sentSms++; any = true; }
+      }
+      if (recipient.email) {
+        const ok = await sendEmail({ to: recipient.email, subject: outSubject, text: outBody, company_id: session.company_id });
+        if (ok) { sentEmail++; any = true; }
+      }
+      if (!any) {
+        (recipient.phone || recipient.email ? deliveryFailed : noContact).push(recipient.name);
+      }
+      continue;
     }
 
-    if (canEmail) {
-      await sendEmail({
-        to: recipient.email!,
-        subject: `Message from ${senderName}`,
-        text: `${senderName}: ${session.message_text}`,
-        company_id: session.company_id,
-      });
-      sentEmail++;
-    }
+    // Default / "sms": one message per recipient, SMS-first + email fallback.
+    const used = await notifyEmployeeSmsFirst({
+      company_id: session.company_id,
+      smsChannel: aegisSmsNumber,
+      phone: recipient.phone,
+      email: recipient.email,
+      body: outBody,
+      subject: outSubject,
+    });
+    if (used === 'sms') sentSms++;
+    else if (used === 'email') sentEmail++;
+    else (recipient.phone || recipient.email ? deliveryFailed : noContact).push(recipient.name);
   }
+
+  const failed = [...noContact, ...deliveryFailed];
 
   // Log to activity_log
   const preview = session.message_text.length > 50
@@ -426,18 +444,30 @@ export async function handleBroadcastConfirmation(
       sent_email: sentEmail,
       failed_count: failed.length,
       failed_names: failed,
+      no_contact_names: noContact,
+      delivery_failed_names: deliveryFailed,
     },
   });
 
-  // Reply to admin
+  // Reply to admin — warm, and honest about who (if anyone) didn't get it.
+  const reached = sentSms + sentEmail;
+  const parts: string[] = [];
+  if (sentSms > 0) parts.push(`${sentSms} by text`);
+  if (sentEmail > 0) parts.push(`${sentEmail} by email`);
+  const breakdown = parts.length > 0 ? ` (${parts.join(', ')})` : '';
+  const headline =
+    reached > 0
+      ? `Done — your message went out to ${reached} ${reached === 1 ? 'teammate' : 'teammates'}${breakdown}.`
+      : `I couldn't reach anyone with that broadcast.`;
+
+  const noContactLine =
+    noContact.length > 0
+      ? `\n${noContact.length} ${noContact.length === 1 ? 'has' : 'have'} no phone or email on file: ${noContact.join(', ')}.`
+      : '';
   const failedLine =
-    failed.length > 0
-      ? `\n${failed.length} could not be reached (no contact info): ${failed.join(', ')}`
+    deliveryFailed.length > 0
+      ? `\n${deliveryFailed.length} couldn't be reached just now (delivery failed): ${deliveryFailed.join(', ')}.`
       : '';
 
-  await reply(
-    contact,
-    message,
-    `Sent. ${sentSms} SMS delivered, ${sentEmail} emails sent.${failedLine}`
-  );
+  await reply(contact, message, `${headline}${noContactLine}${failedLine}`);
 }

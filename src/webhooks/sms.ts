@@ -1,8 +1,10 @@
 import { Router } from 'express';
 import { verifyTelnyxRequest } from '../middleware/verify-signature';
-import { verifySender } from '../security/sender-verification';
+import { verifySender, resolveCompanyId } from '../security/sender-verification';
 import { routeIntent } from '../router/intent-router';
 import { saveConversation } from '../logger/conversation';
+import { logActivity } from '../logger/activity-log';
+import { supabase } from '../db/client';
 import { env } from '../config/env';
 import type { InboundMessage } from '../security/types';
 
@@ -52,6 +54,53 @@ export function isHelpKeyword(body: string): boolean {
 }
 export function isResubscribeKeyword(body: string): boolean {
   return RESUBSCRIBE_KEYWORDS.has(body.trim().toUpperCase());
+}
+
+// Record a carrier opt-out (STOP) or resubscribe (START) in the activity log so a
+// manager can always see who has opted out — and why they've stopped receiving
+// texts — regardless of WHEN it happened (not just during onboarding). The
+// carrier (Telnyx) still owns the actual suppression/resubscribe; this only
+// creates the visible, timestamped record. Best-effort: a logging failure must
+// never change the carrier-keyword short-circuit. Resolves the employee from the
+// destination tenant number + sender phone; if the number isn't recognized, we
+// still log a company-scoped event with the raw phone so nothing is silently lost.
+export async function recordCarrierKeywordEvent(
+  message: InboundMessage,
+  kind: 'opted_out' | 'resubscribed'
+): Promise<void> {
+  try {
+    const companyId = await resolveCompanyId('sms', message.recipient);
+    if (!companyId) return; // destination number not mapped to a tenant — nothing to attribute
+    const { data } = await supabase
+      .from('employees')
+      .select('id, name')
+      .eq('company_id', companyId)
+      .eq('contact_phone', message.sender)
+      .maybeSingle();
+    const emp = data as { id: string; name: string } | null;
+    const keyword = message.body.trim().toUpperCase();
+    const action = kind === 'opted_out' ? 'employee_opted_out' : 'employee_resubscribed';
+    const verb = kind === 'opted_out' ? 'opted out of' : 'resubscribed to';
+    await logActivity({
+      company_id: companyId,
+      actor: 'aegis',
+      action,
+      entity_type: 'employee',
+      entity_id: emp?.id,
+      summary: emp
+        ? `${emp.name} ${verb} SMS (texted ${keyword})`
+        : `An unrecognized number ${verb} SMS: ${message.sender} (${keyword})`,
+      metadata: {
+        keyword,
+        phone: message.sender,
+        ...(kind === 'opted_out'
+          ? { opted_out_at: new Date().toISOString() }
+          : { resubscribed_at: new Date().toISOString() }),
+      },
+    });
+  } catch (err) {
+    console.error('[sms] carrier-keyword logging failed (non-fatal):', err);
+  }
 }
 
 // Minimal shape of a Telnyx inbound-message webhook.
@@ -130,6 +179,7 @@ smsWebhook.post('/', verifyTelnyxRequest, async (req, res) => {
     // the HELP reply are owned by the Telnyx messaging profile (carrier level).
     if (isStopKeyword(message.body)) {
       console.log(`[sms] STOP keyword from ${message.sender} — carrier handles opt-out; not routing.`);
+      await recordCarrierKeywordEvent(message, 'opted_out');
       return;
     }
     if (isHelpKeyword(message.body)) {
@@ -138,6 +188,7 @@ smsWebhook.post('/', verifyTelnyxRequest, async (req, res) => {
     }
     if (isResubscribeKeyword(message.body)) {
       console.log(`[sms] START/UNSTOP keyword from ${message.sender} — carrier handles resubscribe; not routing.`);
+      await recordCarrierKeywordEvent(message, 'resubscribed');
       return;
     }
 

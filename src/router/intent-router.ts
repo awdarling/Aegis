@@ -251,7 +251,7 @@ async function routeIntentInner(
           await reply(
             contact,
             message,
-            `No problem — keeping your availability update. ${buildAvailChangeConfirmBody(avail.proposed_availability, { customEndDate: avail.custom_end_date ?? null })}`
+            `No problem — keeping your availability update. ${buildAvailChangeConfirmBody(avail.proposed_availability, { customEndDate: avail.custom_end_date ?? null, effectiveStartDate: avail.effective_start_date ?? null })}`
           );
         } else {
           await reply(contact, message, `No problem. What would you like to do?`);
@@ -279,7 +279,7 @@ async function routeIntentInner(
           await reply(
             contact,
             message,
-            `No problem — keeping your availability update. ${buildAvailChangeConfirmBody(availKeep.proposed_availability, { customEndDate: availKeep.custom_end_date ?? null })}`
+            `No problem — keeping your availability update. ${buildAvailChangeConfirmBody(availKeep.proposed_availability, { customEndDate: availKeep.custom_end_date ?? null, effectiveStartDate: availKeep.effective_start_date ?? null })}`
           );
         } else {
           await reply(contact, message, `No problem. What would you like to do?`);

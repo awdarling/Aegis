@@ -315,6 +315,8 @@ internalRouter.post('/apply-custom-availability-decision', async (req: Request, 
   const employeeChannel = body.employee_channel;
   const proposed = body.proposed_availability;
   const customEndDate = body.custom_end_date;
+  const effectiveStartDate = body.effective_start_date;
+  const hasValidStart = typeof effectiveStartDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(effectiveStartDate);
   const rotationRaw = body.rotation && typeof body.rotation === 'object'
     ? (body.rotation as { cycle_weeks?: unknown; cycle_start_date?: unknown; weeks?: unknown })
     : null;
@@ -331,11 +333,14 @@ internalRouter.post('/apply-custom-availability-decision', async (req: Request, 
     badRequest(res, 'employee_id is required');
     return;
   }
-  // A date-limited override needs custom_end_date + a proposed list. A rotating
-  // override carries its pattern in `rotation` instead, so neither is required.
+  // A date-limited override needs a proposed list plus at least one date bound:
+  // custom_end_date (temporary "until X") and/or effective_start_date (future-start
+  // "from X"). A rotating override carries its pattern in `rotation` instead, so
+  // neither is required for it.
+  const hasValidEnd = typeof customEndDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(customEndDate);
   if (!isRotating) {
-    if (typeof customEndDate !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(customEndDate)) {
-      badRequest(res, 'custom_end_date is required (YYYY-MM-DD) unless a rotation is provided');
+    if (!hasValidEnd && !hasValidStart) {
+      badRequest(res, 'custom_end_date or effective_start_date is required (YYYY-MM-DD) unless a rotation is provided');
       return;
     }
     if (!Array.isArray(proposed)) {
@@ -359,7 +364,8 @@ internalRouter.post('/apply-custom-availability-decision', async (req: Request, 
       employee_id: employeeId,
       employee_name: typeof body.employee_name === 'string' ? body.employee_name : 'there',
       proposed_availability: Array.isArray(proposed) ? (proposed as AvailabilitySlot[]) : [],
-      custom_end_date: typeof customEndDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(customEndDate) ? customEndDate : null,
+      custom_end_date: hasValidEnd ? (customEndDate as string) : null,
+      effective_start_date: hasValidStart ? (effectiveStartDate as string) : null,
       rotation: isRotating ? (rotationRaw as unknown as RotationSpec) : null,
       current_availability: Array.isArray(body.current_availability)
         ? (body.current_availability as AvailabilitySlot[])
@@ -438,6 +444,7 @@ internalRouter.post('/decide-availability-change', async (req: Request, res: Res
         : await applyCustomAvailabilityDecision({
             ...base,
             custom_end_date: snap.custom_end_date ?? null,
+            effective_start_date: snap.effective_start_date ?? null,
             rotation: snap.rotation ?? null,
             decision,
           });

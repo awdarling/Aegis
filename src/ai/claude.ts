@@ -423,6 +423,26 @@ does NOT apply to an until/through boundary on a recurring pattern.
 - A recurring pattern with NO end boundary → update_availability with NO end_date
   (a permanent change).
 
+## Future-START availability changes — surface effective_start_date
+
+An availability change can be stated to BEGIN on a future date: "weekends-only
+starting Aug 31", "no Mondays effective September 1", "afternoons only from the
+15th onward", "starting next month I can only work weekends". This is still
+update_availability (a recurring PATTERN change, not time-off), but it does not
+take effect until that date, so surface the start date in
+extracted.effective_start_date (YYYY-MM-DD), resolved to a concrete date using
+today's date given above.
+- START-date trigger phrases: "starting <date>", "effective <date>", "from
+  <date> (onward)", "beginning <date>", "as of <date>", "starting next
+  week/month" (resolve to the concrete date).
+- effective_start_date and end_date are INDEPENDENT: a change can start in the
+  future AND end later ("weekends-only from Aug 31 until Oct 1" → both set), start
+  in the future open-ended ("weekends-only starting Aug 31" → effective_start_date
+  only), or start now and end later ("no mornings until Sept 1" → end_date only).
+- Do NOT confuse a future START date with a specific single day off: a START date
+  attaches to a recurring PATTERN ("weekends-only starting Aug 31"), whereas a
+  one-day event ("Aug 31 off") is still submit_time_off.
+
 ## Manager broadcasts — "message the team" is broadcast_message, NOT operational_query
 
 When a MANAGER or QURIA admin asks to SEND a message OUT to people — "message the
@@ -555,6 +575,9 @@ User: "i cant do tuesday mornings anymore"
 
 User: "no mornings until september 1"
 {"intent":"update_availability","confidence":"high","extracted":{"end_date":"${currentYear}-09-01"}}
+
+User: "make me weekends-only starting aug 31"
+{"intent":"update_availability","confidence":"high","extracted":{"effective_start_date":"${currentYear}-08-31"}}
 
 User: "gimme june 20 off"
 {"intent":"submit_time_off","confidence":"high","extracted":{"dates":[{"start_date":"${currentYear}-06-20","end_date":"${currentYear}-06-20","time_off_type":"full_day","period_label":null,"start_time":null,"end_time":null}],"reason":null}}
@@ -806,10 +829,13 @@ Respond with ONLY valid JSON in this exact shape — no markdown, no explanation
     //   unspecified. Never emit a calendar date — you do not know today's date.
     // For homebase_edit: { "entity_type": "employee|event|policy|wage_rate|shift_type", "entity_name": "...", "field": "...", "new_value": "..." }
     // For initiate_onboarding: { "employee_name": "..." } if targeting one employee, or {} for all
-    // For update_availability: {} for a permanent change, OR { "end_date": "YYYY-MM-DD" }
-    //   when the change is TEMPORARY (bounded by "until/through <date>"). The
-    //   availability times themselves are parsed downstream from the message text;
-    //   you only need to surface end_date here when a boundary is stated.
+    // For update_availability: {} for a permanent change effective now, OR
+    //   { "end_date": "YYYY-MM-DD" } when the change is TEMPORARY (bounded by
+    //   "until/through <date>"), OR { "effective_start_date": "YYYY-MM-DD" } when the
+    //   change BEGINS on a future date ("starting/effective/from <date>"), OR both
+    //   (a future window). The availability times themselves are parsed downstream
+    //   from the message text; you only surface end_date / effective_start_date here
+    //   when a boundary or start date is stated.
     // For operational_query: {}
     // For run_payroll_check: { "period_start": "YYYY-MM-DD", "period_end": "YYYY-MM-DD" }
     // For broadcast_message: { "message_text": "exact message to send", "target_type": "all|managers|employees|role|specific", "target_role": "Lifeguard|null", "target_names": ["Name1"]|null, "channel": "sms|email|both" }

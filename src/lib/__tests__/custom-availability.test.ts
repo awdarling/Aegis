@@ -85,3 +85,37 @@ describe('resolveAvailabilityForWeek — unchanged behaviors still hold', () => 
     expect(dows(slots)).toEqual([2]);
   });
 });
+
+// Finding 3 / DRIFT_REGISTER §I: symmetric effective_start_date gate. A future-
+// effective override must NOT apply before it starts. Mirrors the Homebase
+// resolver (validateScheduleEdit.resolveEffectiveAvailability) vector exactly —
+// keep the two in lockstep (Rule 0). effective_start_date is read defensively
+// because Aegis's generated db/types Row may not carry the column yet.
+describe('resolveAvailabilityForWeek — future-effective start gate (Finding 3)', () => {
+  const dateLimited = (effectiveStart: string | null) => rotating({
+    type: 'date_limited', end_date: null, cycle_weeks: null, cycle_start_date: null,
+    patterns: [{ day_of_week: 2, start_time: '09:00', end_time: '17:00' }],
+    effective_start_date: effectiveStart,
+  } as unknown as Partial<CustomAvailabilityRow>);
+
+  it('effective_start_date AFTER the week → falls back to normal (does not apply early)', () => {
+    const normal: [] = [];
+    // week of Mon 2026-07-27; override starts 2026-08-10 → not yet effective.
+    expect(resolveAvailabilityForWeek(emp, '2026-07-27', '2026-08-02', normal, dateLimited('2026-08-10'))).toBe(normal);
+  });
+
+  it('effective_start_date on/before the week → applies its patterns', () => {
+    const slots = resolveAvailabilityForWeek(emp, '2026-07-27', '2026-08-02', [], dateLimited('2026-07-20'));
+    expect(dows(slots)).toEqual([2]);
+  });
+
+  it('effective_start_date == week_start → applies (inclusive boundary)', () => {
+    const slots = resolveAvailabilityForWeek(emp, '2026-07-27', '2026-08-02', [], dateLimited('2026-07-27'));
+    expect(dows(slots)).toEqual([2]);
+  });
+
+  it('null effective_start_date → applies immediately (back-compat)', () => {
+    const slots = resolveAvailabilityForWeek(emp, '2026-07-27', '2026-08-02', [], dateLimited(null));
+    expect(dows(slots)).toEqual([2]);
+  });
+});

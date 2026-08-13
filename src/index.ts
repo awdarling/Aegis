@@ -4,9 +4,11 @@ import { env } from './config/env';
 import { emailWebhook } from './webhooks/email';
 import { smsWebhook } from './webhooks/sms';
 import { decisionWebhook } from './webhooks/decision';
+import { departureDecisionWebhook } from './webhooks/departure-decision';
 import { internalRouter } from './webhooks/internal';
 import { startCoverageTimeoutScheduler } from './scheduler/coverage-timeout';
 import { startPayrollScheduler } from './scheduler/payroll-scheduler';
+import { startEmployeeOffboardingScheduler } from './scheduler/employee-offboarding';
 
 process.on('unhandledRejection', (reason, promise) => {
   console.error('[unhandledRejection] Unhandled rejection at:', promise, 'reason:', reason);
@@ -47,6 +49,9 @@ app.use('/webhooks/email', emailWebhook);
 // Manager approve/deny clicks from time-off notification emails
 app.use('/webhooks/decision', decisionWebhook);
 
+// Manager Acknowledge / follow-up clicks from departure alert emails (Feature B)
+app.use('/webhooks/departure', departureDecisionWebhook);
+
 // Internal endpoints called by Homebase /api/aegis-action dispatcher after
 // magic-link consumption. Bearer-token auth via AEGIS_INTERNAL_SECRET.
 app.use('/internal', internalRouter);
@@ -67,6 +72,7 @@ app.listen(env.PORT, () => {
   if (env.RUN_SCHEDULERS) {
     startCoverageTimeoutScheduler();
     startPayrollScheduler();
+    startEmployeeOffboardingScheduler();
   } else {
     console.log('[schedulers] DISABLED (RUN_SCHEDULERS=false) — webhooks-only mode; no cross-tenant background jobs.');
   }

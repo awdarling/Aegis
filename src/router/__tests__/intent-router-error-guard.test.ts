@@ -43,6 +43,7 @@ vi.mock('../../workflows/employee-onboarding', () => ({
 }));
 vi.mock('../../workflows/broadcast', () => ({ handleBroadcast: vi.fn(), handleBroadcastConfirmation: vi.fn(), getActiveBroadcastSession: vi.fn() }));
 vi.mock('../../workflows/day-closure', () => ({ handleNotifyDayClosure: vi.fn() }));
+vi.mock('../../workflows/departure', () => ({ handleReportDeparture: vi.fn() }));
 vi.mock('../capabilities', () => ({ buildCapabilitiesReply: vi.fn(() => 'help'), allowedActionsLine: vi.fn(() => 'stuff') }));
 
 import { routeIntent } from '../intent-router';

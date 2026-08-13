@@ -21,7 +21,7 @@ function escapeHtml(s: string): string {
 // Shared Aegis-branded landing page (dark surface + orange accent + logo header)
 // so the /webhooks/decision pages match the branded emails and the Homebase
 // aegis-action pages, instead of the old plain-white card.
-function brandedPage(opts: { title: string; heading: string; headingColor: string; icon: string; iconColor: string; body: string }): string {
+export function brandedPage(opts: { title: string; heading: string; headingColor: string; icon: string; iconColor: string; body: string }): string {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>

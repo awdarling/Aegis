@@ -71,6 +71,7 @@ import {
   getActiveBroadcastSession,
 } from '../workflows/broadcast';
 import { handleNotifyDayClosure } from '../workflows/day-closure';
+import { handleReportDeparture } from '../workflows/departure';
 import { buildCapabilitiesReply, allowedActionsLine, isCapabilitiesQuery, type CapabilityRole } from './capabilities';
 
 // ── Permission sets ───────────────────────────────────────────────────────────
@@ -442,6 +443,11 @@ async function routeIntentInner(
       case 'query_my_shifts':
         console.log('[router] dispatching to handleMyShiftsQuery');
         await handleMyShiftsQuery(message, contact, classification.extracted);
+        break;
+
+      case 'report_departure':
+        console.log('[router] dispatching to handleReportDeparture');
+        await handleReportDeparture(message, contact, classification.extracted);
         break;
 
       case 'query_my_time_off':

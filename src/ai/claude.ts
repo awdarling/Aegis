@@ -74,6 +74,7 @@ export const EMPLOYEE_INTENTS = [
   'query_my_shifts',
   'query_my_availability',
   'update_availability',
+  'report_departure',
   'initiate_swap',
   'respond_swap_accept',
   'respond_swap_decline',
@@ -140,7 +141,10 @@ export async function classifyIntent(
     { intent: 'unknown', confidence: 'low', extracted: {} };
 
   return applyManagerCoverageBackstop(
-    applyBareTimeOffBackstop(applyAvailabilityBackstop(parsed, message), message),
+    applyDepartureBackstop(
+      applyBareTimeOffBackstop(applyAvailabilityBackstop(parsed, message), message),
+      message
+    ),
     message,
     role
   );
@@ -283,6 +287,47 @@ export function applyBareTimeOffBackstop(result: ClassifyResult, message: string
     intent: 'submit_time_off',
     confidence: result.confidence === 'low' ? 'medium' : result.confidence,
     extracted: {},
+  };
+}
+
+// True for a clear employee DEPARTURE signal (quitting / resigning / naming a last
+// day). Deliberately narrow, mirroring looksLikeBareTimeOffRequest: it fires only on
+// unambiguous leaving-the-job phrasing so it never swallows time-off or a schedule
+// question. Excludes retractions ("never mind, not quitting").
+export function looksLikeDeparture(body: string): boolean {
+  const b = body.toLowerCase();
+  if (/\b(don'?t|do not|never ?mind|not (quitting|leaving|resigning)|change[d]? my mind|cancel|nvm|scratch that|kidding|jk)\b/.test(b)) return false;
+  // "last day" as employment, "two weeks(' notice)", quit/resign/leaving-the-job.
+  const departure =
+    /\bmy last day\b/.test(b) ||
+    /\b(two|2)[-\s]?weeks?('?s)?( notice)?\b/.test(b) ||
+    /\b(put(ting)?|giving|hand(ing)?) in (my )?(two|2)[-\s]?weeks?\b/.test(b) ||
+    /\bgiving (my )?notice\b/.test(b) ||
+    /\b(i['’ ]?a?m )?(quitting|resigning)\b/.test(b) ||
+    /\bi (quit|resign)\b/.test(b) ||
+    /\b(i['’ ]?a?m )?(leaving|done) (the job|for good|the company|after)\b/.test(b) ||
+    /\bwon['’]?t be (coming )?back\b/.test(b) ||
+    /\bthis (is )?my (last|final) (week|shift)\b.*\b(leav|quit|done|notice)/.test(b);
+  return departure;
+}
+
+// Deterministic backstop for the departure signal. ONLY upgrades from the "general"
+// buckets (general_question / operational_query / unknown) so it can never override a
+// confident, more specific action the model already found. Leaves date extraction to
+// the model / the manager acknowledgment — the handler alerts the manager either way.
+export function applyDepartureBackstop(result: ClassifyResult, message: string): ClassifyResult {
+  if (
+    result.intent !== 'general_question' &&
+    result.intent !== 'operational_query' &&
+    result.intent !== 'unknown'
+  ) {
+    return result;
+  }
+  if (!looksLikeDeparture(message)) return result;
+  return {
+    intent: 'report_departure',
+    confidence: result.confidence === 'low' ? 'medium' : result.confidence,
+    extracted: { last_day_date: null, note: null },
   };
 }
 
@@ -443,6 +488,30 @@ today's date given above.
   attaches to a recurring PATTERN ("weekends-only starting Aug 31"), whereas a
   one-day event ("Aug 31 off") is still submit_time_off.
 
+## Employee departures / last day — report_departure
+
+When an EMPLOYEE signals they are LEAVING the job — quitting, resigning, giving
+notice, or naming their last working day — classify it as report_departure. This is
+NOT time off (they are not asking for a day off) and NOT an availability change (they
+are not changing which days they work). Aegis does not act on it; it flags the
+MANAGER, who acknowledges by setting the last day. Triggers:
+- "my last day is <date>", "my last day will be Friday", "I'm leaving on the 30th"
+- "I'm putting in my two weeks", "consider this my two weeks' notice", "I'm giving notice"
+- "I quit", "I'm quitting", "I'm resigning", "I'm done after this week", "I won't be
+  coming back after <date>"
+Extract { "last_day_date": "YYYY-MM-DD" | null, "note": string | null }:
+- last_day_date: the stated last working day resolved to a concrete date, or null if
+  they gave notice without a specific date ("putting in my two weeks", "I quit").
+  Resolve relative dates ("Friday", "the 30th", "end of the month") using today's date.
+- note: a short verbatim-ish reason if they gave one (e.g. "moving out of state"), else null.
+Boundaries:
+- A manager saying "set <someone>'s last day" is NOT this — that is a manager
+  homebase_edit / Soteria action, not an employee self-report.
+- "I need <date> off" / "I'm on vacation until <date>" is submit_time_off, not a
+  departure — they are coming back.
+- Do NOT confuse "my last shift this week is Friday" (a schedule question) with "my
+  last DAY is Friday" (leaving). If they are asking WHICH shift, it's query_my_shifts.
+
 ## Manager broadcasts — "message the team" is broadcast_message, NOT operational_query
 
 When a MANAGER or QURIA admin asks to SEND a message OUT to people — "message the
@@ -578,6 +647,15 @@ User: "no mornings until september 1"
 
 User: "make me weekends-only starting aug 31"
 {"intent":"update_availability","confidence":"high","extracted":{"effective_start_date":"${currentYear}-08-31"}}
+
+User: "my last day is august 30"
+{"intent":"report_departure","confidence":"high","extracted":{"last_day_date":"${currentYear}-08-30","note":null}}
+
+User: "putting in my two weeks"
+{"intent":"report_departure","confidence":"high","extracted":{"last_day_date":null,"note":null}}
+
+User: "I'm quitting, moving out of state after friday"
+{"intent":"report_departure","confidence":"high","extracted":{"last_day_date":null,"note":"moving out of state"}}
 
 User: "gimme june 20 off"
 {"intent":"submit_time_off","confidence":"high","extracted":{"dates":[{"start_date":"${currentYear}-06-20","end_date":"${currentYear}-06-20","time_off_type":"full_day","period_label":null,"start_time":null,"end_time":null}],"reason":null}}
@@ -836,6 +914,11 @@ Respond with ONLY valid JSON in this exact shape — no markdown, no explanation
     //   (a future window). The availability times themselves are parsed downstream
     //   from the message text; you only surface end_date / effective_start_date here
     //   when a boundary or start date is stated.
+    // For report_departure: { "last_day_date": "YYYY-MM-DD" | null, "note": string | null }
+    //   — last_day_date is the stated final working day (null if notice was given with
+    //   no date); note is a short reason if offered, else null. Aegis never writes
+    //   employment status from this — it alerts the manager, who acknowledges by
+    //   setting the last day.
     // For operational_query: {}
     // For run_payroll_check: { "period_start": "YYYY-MM-DD", "period_end": "YYYY-MM-DD" }
     // For broadcast_message: { "message_text": "exact message to send", "target_type": "all|managers|employees|role|specific", "target_role": "Lifeguard|null", "target_names": ["Name1"]|null, "channel": "sms|email|both" }

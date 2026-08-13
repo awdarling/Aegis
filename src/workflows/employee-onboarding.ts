@@ -575,21 +575,41 @@ async function loadCompanyName(companyId: string): Promise<string> {
 }
 
 // B6 smart onboarding — per-employee "what's still missing?" resolver.
-// Completeness = a reachable contact (phone OR email) + a role (primary_role or
-// qualified_roles) + availability on file. Corrects the old getIncompleteEmployees
-// quirks: it required BOTH phone AND email (so an email-only or phone-only hire
-// always read "incomplete"), and checked primary_role which is NOT NULL (dead).
+// Reachability = a phone OR an email (a hire with neither can't be onboarded and
+// is filtered out upstream). Role = primary_role OR qualified_roles. Availability
+// = a row on file.
+//
+// H5 (2026-08-13): `needsEmail` gates on `!contact_email` specifically, NOT on
+// "has no contact at all". The old rule (`!hasContact`) meant a phone-only hire —
+// reachable, so "has contact" — was never asked for an email, so Aegis had no way
+// to send them the full weekly schedule (the SMS carries only their own shifts;
+// the whole-team schedule goes by email). A phone-only hire is now routed to the
+// email step so they can add one. It stays OPTIONAL — they're already SMS-
+// reachable — so the email step accepts a SKIP (see handleEmailStep / isEmailSkip);
+// nothing forces an email onto a phone-reachable hire.
 export function resolveOnboardingNeeds(
   employee: { contact_phone?: string | null; contact_email?: string | null; primary_role?: string | null; qualified_roles?: string[] | null },
   hasAvailability: boolean,
 ): { needsEmail: boolean; needsRole: boolean; needsAvailability: boolean } {
-  const hasContact = !!(employee.contact_phone || employee.contact_email);
   const hasRole = !!employee.primary_role || (Array.isArray(employee.qualified_roles) && employee.qualified_roles.length > 0);
   return {
-    needsEmail: !hasContact,
+    needsEmail: !employee.contact_email,
     needsRole: !hasRole,
     needsAvailability: !hasAvailability,
   };
+}
+
+// H5: tokens that let a phone-only hire decline the (optional) email step. A real
+// email always contains "@" and passes the email regex, so these plain words never
+// collide with a valid address. Only honoured on an SMS-channel session — where the
+// hire is reachable by text — never on an email-channel session.
+const EMAIL_SKIP_TOKENS = new Set([
+  'skip', 'no', 'nope', 'none', 'n/a', 'na', 'no email', 'no thanks', 'skip email',
+  'pass', "don't have one", 'dont have one', 'no thank you',
+]);
+export function isEmailSkip(body: string): boolean {
+  const norm = (body || '').toLowerCase().replace(/[.!,;:]+$/g, '').trim();
+  return EMAIL_SKIP_TOKENS.has(norm);
 }
 
 async function hasAvailabilityOnFile(companyId: string, employeeId: string): Promise<boolean> {
@@ -1559,7 +1579,7 @@ async function proceedAfterConsent(
     await saveOnboardingSession(session);
     await textEmployee(
       session,
-      `Great, you're confirmed! You're mostly set up already — I just need an email address so I can send you your schedule each week. What's the best one?`
+      `Great, you're confirmed! You're mostly set up already. What's a good email address? I'll text you your shifts, and email is where I send the full team schedule each week. If you'd rather not add one, just reply SKIP — you'll still get your shifts by text.`
     );
     return;
   }
@@ -1644,6 +1664,32 @@ async function handleEmailStep(
   // this guard rescues any session that landed here anyway.
   if (session.employee_channel === 'email') {
     session.collected.email = session.employee_email ?? '';
+    const needsRole = !employee.primary_role && !session.collected.role;
+    if (needsRole) {
+      session.step = 'role';
+      const roles = await loadRoles(session.company_id);
+      await saveOnboardingSession(session);
+      await sendRoleStep(session, roles);
+    } else {
+      await goToAvailabilityOrTimeOff(session);
+    }
+    return;
+  }
+
+  // H5: a phone-only hire is reached at the email step (needsEmail gates on
+  // !contact_email now). Email is a nice-to-have for them — they already get
+  // their shifts by text — so honour an explicit SKIP and move on without
+  // collecting or writing an email. SMS-channel only; an email-channel session
+  // never lands here (handled above), so this can't drop a known address.
+  if (session.employee_channel === 'sms' && isEmailSkip(body)) {
+    session.invalid_email_attempts = 0;
+    await logActivity({
+      company_id: session.company_id,
+      action: 'onboarding_email_skipped',
+      entity_type: 'employee',
+      entity_id: session.employee_id,
+      summary: `${session.employee_name} skipped adding an email during onboarding (SMS-reachable)`,
+    });
     const needsRole = !employee.primary_role && !session.collected.role;
     if (needsRole) {
       session.step = 'role';

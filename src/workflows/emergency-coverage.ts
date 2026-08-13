@@ -126,6 +126,12 @@ export interface CoverageSession {
   // manager can ask for "more" (additional batch) without recomputing.
   candidate_pool?: PoolCandidate[];
   shown_count?: number;
+  // H7 — set true only for the brief span while a mid-coverage interrupt is being
+  // re-routed. A paused session is skipped by routeManagerCoverageReply so the
+  // re-route can't re-enter coverage and recurse; it is resumed (paused=false)
+  // immediately after, leaving the call-out open for the manager to finish. Absent
+  // on every at-rest session.
+  paused?: boolean;
   expires_at: string;
 }
 
@@ -1817,7 +1823,7 @@ export async function routeManagerCoverageReply(
   contact: VerifiedContact
 ): Promise<boolean> {
   const open = (await listActiveCoverageSessions(contact.company_id, contact.matched_identifier))
-    .filter(s => REPLYABLE_STATES.has(s.state));
+    .filter(s => REPLYABLE_STATES.has(s.state) && !s.paused);
 
   if (open.length === 0) return false;
   if (open.length === 1) {
@@ -1852,13 +1858,29 @@ export async function routeManagerCoverageReply(
   return true;
 }
 
+// A short, state-aware nudge telling the manager the paused call-out is still open
+// and how to pick it back up. Exported pure so it can be unit-tested.
+export function resumeCoveragePrompt(session: CoverageSession): string {
+  const shiftLabel = `${session.callout_employee_name}'s ${session.shift_info.shift_name} shift on ${formatShortDate(session.shift_date)}`;
+  if (session.state === 'awaiting_next_batch_decision') {
+    return `One more thing — I've still got the coverage request for ${shiftLabel} open. Reply YES whenever you'd like me to reach out to more people, or ignore this to leave it.`;
+  }
+  return `One more thing — I've still got the coverage request for ${shiftLabel} open. Reply with a name (or "all") whenever you're ready and I'll reach out, or ignore this to leave it with you.`;
+}
+
 // H7 — if a manager's mid-coverage reply is a clearly-different actionable
-// request (not a name / "all" / "more" / decline), abandon THIS coverage
-// session and let the router handle the new request instead. Returns true when
-// it re-routed (caller must then return). Clearing the session BEFORE
-// re-routing prevents routeIntent from re-entering the coverage handler.
-// `allowQueries` lets "who's free Saturday?"-style questions interrupt on the
-// decline / batch-decision branches, where the reply cannot be a name to contact.
+// request (not a name / "all" / "more" / decline), PAUSE this coverage session,
+// let the router handle the new request, then RESUME the call-out so it isn't
+// lost — the manager can finish it with a later name / "yes" reply. Returns true
+// when it re-routed (caller must then return).
+//
+// The session is marked `paused` and persisted BEFORE re-routing: while paused it
+// is skipped by routeManagerCoverageReply, so routeIntent can't re-enter the
+// coverage handler and recurse on the same message. After the interrupt is
+// handled it is un-paused (resumed) and a short nudge reminds the manager the
+// call-out is still open. `allowQueries` lets "who's free Saturday?"-style
+// questions interrupt on the decline / batch-decision branches, where the reply
+// cannot be a name to contact.
 async function yieldCoverageToDifferentIntent(
   message: InboundMessage,
   contact: VerifiedContact,
@@ -1868,19 +1890,37 @@ async function yieldCoverageToDifferentIntent(
   const { managerInterruptIntent } = await import('../router/interrupt');
   const intent = await managerInterruptIntent(message, contact, opts);
   if (!intent) return false;
-  await clearSession(session);
+
+  // Pause (do NOT abandon) — persist paused=true so the re-route below can't
+  // re-enter this session.
+  await updateSession({ ...session, paused: true });
   await logActivity({
     company_id: contact.company_id,
-    action: 'emergency_coverage_yielded',
-    summary: `Manager sent a different request (${intent}) during coverage for ${session.callout_employee_name}'s shift — handling that instead`,
+    action: 'emergency_coverage_paused',
+    summary: `Manager sent a different request (${intent}) during coverage for ${session.callout_employee_name}'s shift — handling that, coverage paused`,
     metadata: {
       shift_date: session.shift_date,
       shift_name: session.shift_info.shift_name,
-      yielded_to: intent,
+      paused_for: intent,
     },
   });
+
   const { routeIntent } = await import('../router/intent-router');
   await routeIntent(message, contact);
+
+  // Resume — clear the pause so the manager's next name / "yes" reply lands back
+  // on this call-out, and nudge them that it's still open.
+  await updateSession({ ...session, paused: false });
+  await logActivity({
+    company_id: contact.company_id,
+    action: 'emergency_coverage_resumed',
+    summary: `Coverage for ${session.callout_employee_name}'s shift resumed after handling the manager's ${intent} request`,
+    metadata: {
+      shift_date: session.shift_date,
+      shift_name: session.shift_info.shift_name,
+    },
+  });
+  await reply(contact, message, resumeCoveragePrompt(session));
   return true;
 }
 

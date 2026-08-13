@@ -635,6 +635,81 @@ async function getActiveEmployees(companyId: string): Promise<Employee[]> {
   return (data ?? []) as Employee[];
 }
 
+// ── N4: onboard a SUBSET, not all-or-one ──────────────────────────────────────
+// The manager can target (a) specific people by name (multi-select), (b) the
+// "unfinished" status group (everyone who hasn't completed onboarding — the
+// stragglers), or (c) the whole active team (default, unchanged).
+// "a" → a; "a", "b" → a and b; "a", "b", "c" → a, b, and c.
+export function humanJoin(items: string[]): string {
+  if (items.length === 0) return '';
+  if (items.length === 1) return items[0];
+  if (items.length === 2) return `${items[0]} and ${items[1]}`;
+  return `${items.slice(0, -1).join(', ')}, and ${items[items.length - 1]}`;
+}
+
+export type OnboardingSubset = 'all' | 'unfinished';
+
+// An employee has NOT finished onboarding when they haven't confirmed the opt-in
+// and haven't explicitly declined. The onboarding flow's completion marker is the
+// opt-in confirmation, mirrored on `employees.sms_consent_state` (N3): 'confirmed'
+// / 'resubscribed' = done; 'declined'/'opted_out' = deliberately out (never
+// re-onboard automatically — that would re-pester someone who said no); anything
+// else (none/null — never started, mid-flow, or timed out) = unfinished.
+// NOTE: for an email-only onboarding (no SMS opt-in event) a completed employee
+// can still read as unfinished; the manager reviews the list at the fan-out
+// confirmation gate before anything sends, so a false positive is caught there.
+export function isUnfinishedOnboarding(e: Employee): boolean {
+  const state = (e as { sms_consent_state?: string | null }).sms_consent_state ?? null;
+  if (state === 'confirmed' || state === 'resubscribed') return false;
+  if (state === 'declined' || state === 'opted_out') return false;
+  return true;
+}
+
+export interface OnboardingSelection {
+  candidates: Employee[];
+  unmatchedNames: string[];
+  mode: 'names' | 'subset' | 'all';
+}
+
+// Pure candidate selection — no DB. Explicit names win; then a status subset;
+// then the whole active team. Names are matched case-insensitively (substring),
+// deduped by id, and any name with no active match is reported back so the
+// manager hears about it.
+export function selectOnboardingCandidates(input: {
+  active: Employee[];
+  requestedNames?: string[] | null;
+  subset?: OnboardingSubset | null;
+}): OnboardingSelection {
+  const names = (input.requestedNames ?? []).map((n) => n.trim()).filter(Boolean);
+
+  if (names.length > 0) {
+    const seen = new Set<string>();
+    const candidates: Employee[] = [];
+    const unmatchedNames: string[] = [];
+    for (const name of names) {
+      const lower = name.toLowerCase();
+      const hits = input.active.filter((e) => e.name.toLowerCase().includes(lower));
+      if (hits.length === 0) {
+        unmatchedNames.push(name);
+        continue;
+      }
+      for (const e of hits) {
+        if (!seen.has(e.id)) {
+          seen.add(e.id);
+          candidates.push(e);
+        }
+      }
+    }
+    return { candidates, unmatchedNames, mode: 'names' };
+  }
+
+  if (input.subset === 'unfinished') {
+    return { candidates: input.active.filter(isUnfinishedOnboarding), unmatchedNames: [], mode: 'subset' };
+  }
+
+  return { candidates: input.active, unmatchedNames: [], mode: 'all' };
+}
+
 // ── Formatting ────────────────────────────────────────────────────────────────
 
 function formatTime12h(time: string): string {
@@ -2765,41 +2840,50 @@ export async function handleInitiateOnboarding(
 
   const companyName = await loadCompanyName(contact.company_id);
   const roles = await loadRoles(contact.company_id);
-  const targetName = extracted['employee_name'] as string | undefined;
+  // N4 — target selection: specific people (multi-select), a status subset
+  // ("unfinished" = the stragglers), or the whole active team (default).
+  const rawNames = extracted['employee_names'];
+  const singleName = extracted['employee_name'] as string | undefined;
+  const requestedNames: string[] = Array.isArray(rawNames)
+    ? (rawNames as unknown[]).filter((n): n is string => typeof n === 'string')
+    : singleName
+      ? [singleName]
+      : [];
+  const rawSubset = extracted['subset'];
+  const subset: OnboardingSubset | null =
+    rawSubset === 'unfinished' ? 'unfinished' : rawSubset === 'all' ? 'all' : null;
 
-  let candidates: Employee[];
+  const active = await getActiveEmployees(contact.company_id);
+  const selection = selectOnboardingCandidates({ active, requestedNames, subset });
 
-  if (targetName) {
-    const all = await getActiveEmployees(contact.company_id);
-    const lower = targetName.toLowerCase();
-    candidates = all.filter(e => e.name.toLowerCase().includes(lower));
-
-    if (candidates.length === 0) {
-      await reply(contact, message, `I couldn't find an employee matching "${targetName}". Please check the name and try again.`);
-      return;
-    }
-
-    // Named target — proceed immediately (B6: onboard even a fully-complete
-    // record; consent + intro still go out, and the smart flow skips any
-    // questions whose answers are already on file).
-    await executeOnboardingForCandidates(
-      candidates,
-      companyName,
-      roles,
-      aegisSmsChannel,
+  // Names that matched nobody — if NOTHING matched, stop and say so.
+  if (selection.candidates.length === 0 && selection.unmatchedNames.length > 0) {
+    const list = humanJoin(selection.unmatchedNames.map((n) => `"${n}"`));
+    await reply(
       contact,
-      message
+      message,
+      `I couldn't find ${selection.unmatchedNames.length === 1 ? 'an employee' : 'employees'} matching ${list}. Please check the name${selection.unmatchedNames.length === 1 ? '' : 's'} and try again.`
     );
     return;
   }
 
-  // No name specified — onboard the whole active team (B6: consent + intro go to
-  // everyone; the per-employee smart flow asks only for what's missing).
-  candidates = await getActiveEmployees(contact.company_id);
+  const candidates: Employee[] = selection.candidates;
   if (candidates.length === 0) {
-    await reply(contact, message, `There are no active employees to onboard.`);
+    await reply(
+      contact,
+      message,
+      selection.mode === 'subset'
+        ? `Good news — everyone on your active team has already finished onboarding, so there's no one left to re-onboard.`
+        : `There are no active employees to onboard.`
+    );
     return;
   }
+
+  // If SOME names matched and some didn't, note the misses in the reply/confirmation.
+  const unmatchedNote =
+    selection.unmatchedNames.length > 0
+      ? `\n\n(I couldn't find ${humanJoin(selection.unmatchedNames.map((n) => `"${n}"`))} — skipping ${selection.unmatchedNames.length === 1 ? 'that one' : 'those'}.)`
+      : '';
 
   // Fan-out confirmation gate: if 2+ reachable employees would be contacted at once,
   // ask the manager to confirm first so they don't accidentally spam staff.
@@ -2831,6 +2915,7 @@ export async function handleInitiateOnboarding(
         previewNames.join('\n') +
         overflow +
         skipNote +
+        unmatchedNote +
         `\n\nReply YES to begin or NO to cancel.`
     );
     return;

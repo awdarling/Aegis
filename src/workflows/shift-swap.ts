@@ -706,9 +706,9 @@ export function parseYesNo(body: string): 'yes' | 'no' | 'unclear' {
 }
 
 // Can we reach this candidate for facilitated (undirected) swap outreach?
-// EMAIL-FIRST: an email address is enough on its own — SMS is only usable once
-// the company has an active SMS channel (post-A2P). Without this, the broadcast
-// was SMS-only and silently did nothing on the live email channel.
+// Reachable = has an email, OR has a phone AND the tenant has an active SMS
+// channel. The broadcast fan-out is SMS-first for phone-holders (H19) with email
+// as the fallback; either contact method on its own is enough to include them.
 export function isReachableForOutreach(
   emp: { contact_email?: string | null; contact_phone?: string | null },
   hasSmsChannel: boolean,
@@ -813,7 +813,7 @@ export interface TradeableShiftOption {
 
 export async function buildSwapBroadcastEmail(params: {
   company_id: string;
-  candidate: { id: string; name: string; email: string };
+  candidate: { id: string; name: string; email?: string | null };  // email optional — SMS-only candidates carry the same links (H19)
   requester_name: string;
   shift_name: string;
   shift_role: string;
@@ -825,7 +825,7 @@ export async function buildSwapBroadcastEmail(params: {
   tradeableShifts?: TradeableShiftOption[];  // the candidate's shifts shown on the swap page
   token_payload: Record<string, unknown>;   // shared broadcast snapshot
   ttl_minutes?: number;
-}): Promise<{ subject: string; text: string; html: string }> {
+}): Promise<{ subject: string; text: string; html: string; sms: string; pickupUrl: string; swapUrl: string | null }> {
   const ttl = params.ttl_minutes ?? 72 * 60;
   const dateLong = formatDisplayDate(params.shift_date);
   // Enrich both token payloads so the Homebase landing pages are self-contained
@@ -845,7 +845,7 @@ export async function buildSwapBroadcastEmail(params: {
     action_type: 'swap_pickup',
     payload: { ...sharedSnapshot, mode: 'pickup' },
     company_id: params.company_id,
-    issued_to_email: params.candidate.email,
+    issued_to_email: params.candidate.email ?? '',
     issued_to_employee_id: params.candidate.id,
     ttl_minutes: ttl,
   });
@@ -855,7 +855,7 @@ export async function buildSwapBroadcastEmail(params: {
       action_type: 'swap_trade_select',
       payload: { ...sharedSnapshot, mode: 'swap', tradeable_shifts: params.tradeableShifts ?? [] },
       company_id: params.company_id,
-      issued_to_email: params.candidate.email,
+      issued_to_email: params.candidate.email ?? '',
       issued_to_employee_id: params.candidate.id,
       ttl_minutes: ttl,
     });
@@ -878,6 +878,19 @@ export async function buildSwapBroadcastEmail(params: {
     (willingList ? ` In return, ${firstName(params.requester_name)} can work: ${willingList}.` : '') +
     ` You can pick the shift up and add it to your schedule.${swapLineText} ` +
     `Just tap the button in this email to let me know.`;
+
+  // SMS body (H19): unlike the directed swap outreach (a yes/no reply), a broadcast
+  // is first-commit-wins across many candidates, so the SMS must carry the SAME
+  // per-candidate magic-links the email buttons use — one to pick the shift up, one
+  // (when eligible) to offer a trade. Same tokens, minted once above.
+  const smsSwapLine = swapUrl ? `\nOr offer a swap instead: ${swapUrl}` : '';
+  const sms =
+    `${textOpener(params.candidate.name)}this is Aegis. ` +
+    `${params.requester_name} can't work their ${shiftDesc} and is hoping a teammate can cover it.` +
+    (willingList ? ` In return, ${firstName(params.requester_name)} can work: ${willingList}.` : '') +
+    `\nPick it up: ${pickupTok.url}` +
+    smsSwapLine +
+    `\nFirst to tap it gets it — your manager gives the final OK.`;
 
   const buttons = [
     { url: pickupTok.url, label: 'Pick up this shift', variant: 'primary' as const },
@@ -917,7 +930,37 @@ export async function buildSwapBroadcastEmail(params: {
     `<p style="margin:0 0 0;font-size:14px;color:${BRAND.silver};line-height:1.6;">First person to lock it in gets it, and your manager gives the final okay before anything changes. Thanks for being flexible.</p>`;
 
   const html = brandedEmailShell({ bodyHtml, preheader: subject });
-  return { subject, text, html };
+  return { subject, text, html, sms, pickupUrl: pickupTok.url, swapUrl };
+}
+
+// Deliver ONE candidate's broadcast message — SMS-FIRST for a phone-holder (the
+// SMS carries the SAME magic-links as the email buttons), email as the fallback on
+// no-phone or SMS send failure, and email-first when SMS isn't available at all
+// (EMAIL_ONLY set, or the tenant has no Aegis SMS number → smsCapable=false).
+// Extracted so the routing is unit-testable, exactly like the directed path's
+// sendOutreachMessage. Returns the channel ACTUALLY used ('none' = unreachable, so
+// the caller never over-counts). (H19 — DRIFT_REGISTER §H.)
+export async function deliverSwapBroadcast(params: {
+  smsCapable: boolean;
+  aegisSmsNumber: string | null;
+  candidatePhone: string | null;
+  candidateEmail: string | null;
+  sms: string;
+  subject: string;
+  text: string;
+  html: string;
+  company_id: string;
+}): Promise<'sms' | 'email' | 'none'> {
+  if (params.smsCapable && params.candidatePhone && params.aegisSmsNumber) {
+    const ok = await sendSms({ to: params.candidatePhone, from: params.aegisSmsNumber, body: params.sms, company_id: params.company_id });
+    if (ok) return 'sms';
+    console.warn(`[swap-broadcast] SMS send failed for company ${params.company_id}; falling back to email`);
+  }
+  if (params.candidateEmail) {
+    const ok = await sendEmail({ to: params.candidateEmail, subject: params.subject, text: params.text, html: params.html, company_id: params.company_id });
+    if (ok) return 'email';
+  }
+  return 'none';
 }
 
 // Build the REQUESTER's "do you agree to this trade?" email after a candidate
@@ -2712,12 +2755,17 @@ export async function handleSwapConfirmation(
     const partition = partitionSwapCandidates(reachable, assignmentsByEmployee, willingDates, requesterRoles);
     const tradeableById = new Map(partition.swap.map(s => [s.employee.id, s.tradeableShifts]));
 
-    // Fan out the two-button email to every reachable candidate (email-first).
+    // Fan out the two-button broadcast to every reachable candidate — SMS-FIRST
+    // for phone-holders (H19; SMS spec §3.4 swaps are text-native), email as the
+    // fallback on no-phone or SMS send failure, and email-first when EMAIL_ONLY is
+    // set or the tenant has no SMS number. SMS-only candidates (previously skipped)
+    // now get the pool blast — the qualified-pool text IS the feature.
+    const smsCapable = !env.EMAIL_ONLY && !!aegisSmsNumber;
     const contactedIds: string[] = [];
+    let smsReached = 0;
     for (const cand of partition.pickup) {
-      if (!cand.contact_email) continue;  // SMS-only candidates skipped (email-first; revisit post-A2P)
       const tradeable = tradeableById.get(cand.id);
-      const { subject, text, html } = await buildSwapBroadcastEmail({
+      const { subject, text, html, sms } = await buildSwapBroadcastEmail({
         company_id: contact.company_id,
         candidate: { id: cand.id, name: cand.name, email: cand.contact_email },
         requester_name: contact.name,
@@ -2733,16 +2781,26 @@ export async function handleSwapConfirmation(
         })),
         token_payload: { requester_id: contact.employee_id! },
       });
-      // Honest count: only tally a teammate we ACTUALLY reached. A swallowed
-      // SendGrid failure must not make us tell the requester we emailed them
-      // (mirrors the directed path). If none go through, the fallback below fires.
-      const ok = await sendEmail({ to: cand.contact_email, subject, text, html, company_id: contact.company_id });
-      if (ok) contactedIds.push(cand.id);
+      // Honest count: only tally a teammate we ACTUALLY reached. A swallowed send
+      // failure must not make us tell the requester we reached them (mirrors the
+      // directed path's sendOutreachMessage). SMS-first, then email fallback.
+      const delivered = await deliverSwapBroadcast({
+        smsCapable,
+        aegisSmsNumber,
+        candidatePhone: cand.contact_phone ?? null,
+        candidateEmail: cand.contact_email ?? null,
+        sms, subject, text, html,
+        company_id: contact.company_id,
+      });
+      if (delivered !== 'none') {
+        contactedIds.push(cand.id);
+        if (delivered === 'sms') smsReached++;
+      }
     }
 
     if (contactedIds.length === 0) {
       await reply(contact, message,
-        `I found teammates but couldn't email any of them right now. Please contact your manager for help covering this shift.`
+        `I found teammates but couldn't reach any of them right now. Please contact your manager for help covering this shift.`
       );
       return;
     }
@@ -2773,7 +2831,7 @@ export async function handleSwapConfirmation(
     const swapCount = partition.swap.filter(s => contactedIds.includes(s.employee.id)).length;
     const willingDatesLabel = [...willingDates].sort().map(formatShortDate).join(', ');
     await reply(contact, message,
-      `Done — I've emailed ${contactedIds.length} teammate${contactedIds.length !== 1 ? 's' : ''} about your ${pending.shift_name} shift on ${formatDisplayDate(pending.shift_date)}` +
+      `Done — I've reached out to ${contactedIds.length} teammate${contactedIds.length !== 1 ? 's' : ''} about your ${pending.shift_name} shift on ${formatDisplayDate(pending.shift_date)}` +
       (swapCount > 0 ? ` (${swapCount} of them can also trade you a shift on ${willingDatesLabel})` : '') +
       `. The first to accept gets it, and I'll loop in your manager for the final OK. I'll let you know as soon as someone takes it.`
     );
@@ -2781,8 +2839,8 @@ export async function handleSwapConfirmation(
     await logActivity({
       company_id: contact.company_id,
       action: 'swap_broadcast_sent',
-      summary: `Broadcast swap request for ${contact.name}'s ${pending.shift_name} on ${pending.shift_date} — emailed ${contactedIds.length} teammate(s)`,
-      metadata: { requester_id: contact.employee_id, shift_date: pending.shift_date, contacted: contactedIds.length, swap_eligible: swapCount },
+      summary: `Broadcast swap request for ${contact.name}'s ${pending.shift_name} on ${pending.shift_date} — messaged ${contactedIds.length} teammate(s)${smsReached > 0 ? ` (${smsReached} by text)` : ''}`,
+      metadata: { requester_id: contact.employee_id, shift_date: pending.shift_date, contacted: contactedIds.length, sms_reached: smsReached, swap_eligible: swapCount },
     });
   }
 }

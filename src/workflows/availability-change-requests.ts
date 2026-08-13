@@ -35,6 +35,7 @@ export interface AvailabilityChangeSnapshot {
   thread_id?: string | null;
   raw_subject?: string | null;
   custom_end_date?: string | null;
+  effective_start_date?: string | null;
   rotation?: RotationSpec | null;
 }
 
@@ -52,10 +53,14 @@ export interface AvailabilityChangeRow {
 }
 
 export function resolveChangeKind(
-  s: Pick<AvailabilityChangeSnapshot, 'custom_end_date' | 'rotation'>,
+  s: Pick<AvailabilityChangeSnapshot, 'custom_end_date' | 'effective_start_date' | 'rotation'>,
 ): AvailabilityChangeKind {
   if (s.rotation) return 'rotating';
-  if (s.custom_end_date) return 'date_limited';
+  // A future-start override (with or without an end_date) is a custom_availability
+  // override, not a permanent availability edit — classify it as date_limited so it
+  // routes through applyCustomAvailabilityDecision and is ADDITIVE in the ledger
+  // (it must not withdraw the employee's current permanent availability).
+  if (s.custom_end_date || s.effective_start_date) return 'date_limited';
   return 'permanent';
 }
 
@@ -63,8 +68,16 @@ function buildSummary(s: AvailabilityChangeSnapshot, kind: AvailabilityChangeKin
   if (kind === 'rotating' && s.rotation) {
     return `${s.employee_name} wants a rotating availability change (${s.rotation.cycle_weeks}-week cycle)`;
   }
-  if (kind === 'date_limited' && s.custom_end_date) {
-    return `${s.employee_name} wants a temporary availability change through ${s.custom_end_date}`;
+  if (kind === 'date_limited') {
+    if (s.effective_start_date && s.custom_end_date) {
+      return `${s.employee_name} wants an availability change from ${s.effective_start_date} through ${s.custom_end_date}`;
+    }
+    if (s.effective_start_date) {
+      return `${s.employee_name} wants an availability change starting ${s.effective_start_date}`;
+    }
+    if (s.custom_end_date) {
+      return `${s.employee_name} wants a temporary availability change through ${s.custom_end_date}`;
+    }
   }
   return `${s.employee_name} wants to update their weekly availability`;
 }

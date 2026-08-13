@@ -245,6 +245,11 @@ interface PendingAvailUpdate {
   // Set (YYYY-MM-DD) when this is a TEMPORARY, date-limited custom-availability
   // change ("until <date>"); absent/null for a normal permanent availability change.
   custom_end_date?: string | null;
+  // Set (YYYY-MM-DD) when the change BEGINS on a future date ("starting <date>").
+  // Forces the change onto the custom_availability override path (dormant until the
+  // date, then applied) even when there is no end_date — a plain availability edit
+  // has no date columns and would take effect immediately.
+  effective_start_date?: string | null;
   // Set when this is a ROTATING custom-availability change ("every other week").
   rotation?: RotationSpec | null;
   expires_at: string;
@@ -267,6 +272,7 @@ interface PendingManagerAvailApproval {
   thread_id?: string | null;
   raw_subject?: string | null;
   custom_end_date?: string | null;
+  effective_start_date?: string | null;
   rotation?: RotationSpec | null;
   // AVAIL-TAB-1: the durable availability_change_requests row this pending mirrors.
   // Flows into the manager email token payload so every decision surface (tab,
@@ -3340,6 +3346,17 @@ export async function handleUpdateAvailability(
   const endRaw = typeof extracted.end_date === 'string' ? extracted.end_date.trim() : '';
   const customEndDate = /^\d{4}-\d{2}-\d{2}$/.test(endRaw) ? endRaw : null;
 
+  // A future-START change ("weekends-only starting Aug 31") is a custom_availability
+  // override that stays dormant until effective_start_date, then applies — with or
+  // without an end_date. It must NOT be written as a plain availability edit (that
+  // table has no date columns and would take effect immediately), so like a
+  // customEndDate it takes the override/replace path below and carries onto the
+  // pending. Ignore a start date that is today or in the past (treat as immediate).
+  const startRaw = typeof extracted.effective_start_date === 'string' ? extracted.effective_start_date.trim() : '';
+  const startCandidate = /^\d{4}-\d{2}-\d{2}$/.test(startRaw) ? startRaw : null;
+  const todayStr = new Date().toISOString().slice(0, 10);
+  const effectiveStartDate = startCandidate && startCandidate > todayStr ? startCandidate : null;
+
   let proposed: AvailabilitySlot[];
   let assumedFullWeek = false;
   let merged = false;
@@ -3380,10 +3397,10 @@ export async function handleUpdateAvailability(
       );
       return;
     }
-    if (customEndDate || currentAvail.length === 0 || intent.scope === 'exclusive') {
-      // Temporary (until-date) override, nothing on file yet, OR an EXCLUSIVE
-      // restatement ("I can only work Saturdays") → the named days ARE the whole
-      // picture; replace, don't merge.
+    if (customEndDate || effectiveStartDate || currentAvail.length === 0 || intent.scope === 'exclusive') {
+      // Temporary (until-date) override, a future-START override, nothing on file
+      // yet, OR an EXCLUSIVE restatement ("I can only work Saturdays") → the named
+      // days ARE the whole picture for the override window; replace, don't merge.
       proposed = changed;
       exclusive = intent.scope === 'exclusive' && currentAvail.length > 0;
     } else {
@@ -3406,6 +3423,7 @@ export async function handleUpdateAvailability(
     employee_sender: message.sender,
     employee_recipient: message.recipient,
     custom_end_date: customEndDate,
+    effective_start_date: effectiveStartDate,
     expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
   };
 
@@ -3422,15 +3440,17 @@ export async function handleUpdateAvailability(
     content: JSON.stringify(pending),
   });
 
-  const confirmBody = buildAvailChangeConfirmBody(proposed, { customEndDate, assumedFullWeek, merged, exclusive });
+  const confirmBody = buildAvailChangeConfirmBody(proposed, { customEndDate, effectiveStartDate, assumedFullWeek, merged, exclusive });
 
   // Rich HTML sibling of the plain confirmBody: reflect the employee's own words
   // back, then the proposed availability as accent detail rows, then the reply-YES
   // ask. The plain text (confirmBody) still rides SMS and the text part. Purely
   // visual — the decision path (YES/NO) is unchanged.
   const introHtml = assumedFullWeek
-    ? `You don't have any availability on file yet, so I'm reading this as: you can work your usual hours every day <strong>except</strong> what you mentioned.${customEndDate ? ` This would run through <strong>${formatDateRange(customEndDate, customEndDate)}</strong>, then back to normal.` : ''} Here's what I'd set:`
-    : customEndDate
+    ? `You don't have any availability on file yet, so I'm reading this as: you can work your usual hours every day <strong>except</strong> what you mentioned.${effectiveStartDate ? ` This would start on <strong>${formatDateRange(effectiveStartDate, effectiveStartDate)}</strong>${customEndDate ? ` and run through <strong>${formatDateRange(customEndDate, customEndDate)}</strong>, then back to normal` : ''}.` : customEndDate ? ` This would run through <strong>${formatDateRange(customEndDate, customEndDate)}</strong>, then back to normal.` : ''} Here's what I'd set:`
+    : effectiveStartDate
+      ? `Got it — ${customEndDate ? `from <strong>${formatDateRange(effectiveStartDate, effectiveStartDate)}</strong> through <strong>${formatDateRange(customEndDate, customEndDate)}</strong>` : `starting <strong>${formatDateRange(effectiveStartDate, effectiveStartDate)}</strong>`}, here's the availability I have for you.${customEndDate ? ' After that you\'re back to your normal hours.' : ''} Until then nothing changes.`
+      : customEndDate
       ? `Got it — through <strong>${formatDateRange(customEndDate, customEndDate)}</strong>, here's the availability I have for you. After that you're back to your normal hours.`
       : exclusive
         ? `Got it — going forward you'll be available ONLY on the day(s) you named (this replaces your other days). Here's your full availability after that:`
@@ -3470,22 +3490,40 @@ export function mergeDayScopedAvailability(
 // partial correction, which handleAvailabilityConfirmResponse applies in place.
 export function buildAvailChangeConfirmBody(
   proposed: AvailabilitySlot[],
-  opts: { customEndDate?: string | null; assumedFullWeek?: boolean; merged?: boolean; exclusive?: boolean } = {}
+  opts: { customEndDate?: string | null; effectiveStartDate?: string | null; assumedFullWeek?: boolean; merged?: boolean; exclusive?: boolean } = {}
 ): string {
   const proposedDisplay = formatAvailabilityList(proposed);
+  const startDisp = opts.effectiveStartDate ? formatDateRange(opts.effectiveStartDate, opts.effectiveStartDate) : '';
+  const endDisp = opts.customEndDate ? formatDateRange(opts.customEndDate, opts.customEndDate) : '';
   if (opts.assumedFullWeek) {
-    const tail = opts.customEndDate
-      ? ` This would run through ${formatDateRange(opts.customEndDate, opts.customEndDate)}, then back to normal.`
-      : '';
+    const tail = opts.effectiveStartDate && opts.customEndDate
+      ? ` This would run from ${startDisp} through ${endDisp}, then back to normal.`
+      : opts.effectiveStartDate
+        ? ` This would start on ${startDisp}.`
+        : opts.customEndDate
+          ? ` This would run through ${endDisp}, then back to normal.`
+          : '';
     return (
       `You don't have any availability on file yet, so I'm reading that as: you can work your usual hours every day EXCEPT what you mentioned.${tail}\n\n` +
       `Here's what I'd set:\n${proposedDisplay}\n\n` +
       `Does that look right? If so, just say the word and I'll pass it to your manager — otherwise tell me what to change.`
     );
   }
+  // Future-START change: applies from a date onward (and only reverts if it also
+  // carries an end date). Checked before the plain "until X" branch.
+  if (opts.effectiveStartDate) {
+    const window = endDisp
+      ? `from ${startDisp} through ${endDisp}`
+      : `starting ${startDisp}`;
+    const tail = endDisp ? ` After that you're back to your normal hours.` : ``;
+    return (
+      `Got it — ${window} you'd be available:\n${proposedDisplay}\n` +
+      `${tail} Until ${startDisp} nothing changes. Does that look right? If so I'll pass it to your manager — otherwise tell me what to change.`
+    );
+  }
   if (opts.customEndDate) {
     return (
-      `Got it — through ${formatDateRange(opts.customEndDate, opts.customEndDate)} you'd be available:\n${proposedDisplay}\n` +
+      `Got it — through ${endDisp} you'd be available:\n${proposedDisplay}\n` +
       `Then you're back to your normal hours. Does that look right? If so I'll pass it to your manager — otherwise tell me what to change.`
     );
   }
@@ -3565,7 +3603,7 @@ export async function handleAvailabilityConfirmResponse(
       availability_raw: `${pending.availability_raw ?? ''}\n[edit] ${body}`.trim(),
     };
     await supabase.from('aegis_memory').update({ content: JSON.stringify(updated) }).eq('id', _memory_id);
-    await reply(contact, message, buildAvailChangeConfirmBody(revised, { customEndDate: updated.custom_end_date ?? null }));
+    await reply(contact, message, buildAvailChangeConfirmBody(revised, { customEndDate: updated.custom_end_date ?? null, effectiveStartDate: updated.effective_start_date ?? null }));
     return;
   }
 
@@ -3604,7 +3642,7 @@ export async function handleAvailabilityConfirmResponse(
   }
 
   if (action === 'unclear') {
-    await reply(contact, message, `Sorry, I want to get this right. ${buildAvailChangeConfirmBody(pending.proposed_availability, { customEndDate: pending.custom_end_date ?? null })}`);
+    await reply(contact, message, `Sorry, I want to get this right. ${buildAvailChangeConfirmBody(pending.proposed_availability, { customEndDate: pending.custom_end_date ?? null, effectiveStartDate: pending.effective_start_date ?? null })}`);
     return;
   }
 
@@ -3685,11 +3723,18 @@ export async function handleAvailabilityConfirmResponse(
   // A date-limited request reads as a TEMPORARY override through a date, then
   // back to normal; a permanent change reads as a plain availability update.
   const customEndDate = approval.custom_end_date ?? null;
+  const effectiveStartDate = approval.effective_start_date ?? null;
   const rotation = approval.rotation ?? null;
+  const startDisp = effectiveStartDate ? formatDateRange(effectiveStartDate, effectiveStartDate) : '';
+  const endDisp = customEndDate ? formatDateRange(customEndDate, customEndDate) : '';
   const headline = rotation
     ? `${pending.employee_name} wants a rotating availability change (a ${rotation.cycle_weeks}-week cycle, starting the week of ${formatDateRange(rotation.cycle_start_date, rotation.cycle_start_date)}).`
+    : effectiveStartDate && customEndDate
+    ? `${pending.employee_name} wants an availability change from ${startDisp} through ${endDisp} (then back to normal).`
+    : effectiveStartDate
+    ? `${pending.employee_name} wants an availability change starting ${startDisp} (applies from that date onward).`
     : customEndDate
-    ? `${pending.employee_name} wants a temporary availability change through ${formatDateRange(customEndDate, customEndDate)} (then back to normal).`
+    ? `${pending.employee_name} wants a temporary availability change through ${endDisp} (then back to normal).`
     : `${pending.employee_name} wants to update their availability.`;
   const proposedBlock = rotation
     ? `PROPOSED ROTATION:\n${formatRotationWeeks(rotation)}`
@@ -4044,6 +4089,7 @@ export interface CustomAvailabilityDecisionInput {
   employee_name: string;
   proposed_availability: AvailabilitySlot[];  // days/times available DURING the override
   custom_end_date: string | null;             // YYYY-MM-DD when a date_limited override expires; null for an open-ended rotation
+  effective_start_date?: string | null;       // YYYY-MM-DD when the override BEGINS; null = in effect immediately
   rotation?: RotationSpec | null;              // set for a ROTATING override
   current_availability: AvailabilitySlot[];
   availability_raw: string;
@@ -4076,12 +4122,25 @@ export async function applyCustomAvailabilityDecision(input: CustomAvailabilityD
     thread_id: input.thread_id ?? null,
     raw_subject: input.raw_subject ?? null,
     custom_end_date: input.custom_end_date,
+    effective_start_date: input.effective_start_date ?? null,
     rotation: input.rotation ?? null,
     expires_at: '',
   };
   const throughLabel = input.custom_end_date
     ? formatDateRange(input.custom_end_date, input.custom_end_date)
     : '';
+  const startLabel = input.effective_start_date
+    ? formatDateRange(input.effective_start_date, input.effective_start_date)
+    : '';
+  // Human phrase for the override window: "starting X", "through Y", "from X through Y",
+  // or "" (immediate, no end — falls back to the caller's own wording).
+  const windowLabel = startLabel && throughLabel
+    ? `from ${startLabel} through ${throughLabel}`
+    : startLabel
+      ? `starting ${startLabel}`
+      : throughLabel
+        ? `through ${throughLabel}`
+        : '';
 
   // Clear the pending manager-approval record for this employee. The reply-"YES"
   // path already deletes it by _memory_id before calling us, but the magic-link
@@ -4116,6 +4175,7 @@ export async function applyCustomAvailabilityDecision(input: CustomAvailabilityD
         employee_id: input.employee_id,
         type: 'rotating',
         end_date: rot.end_date ?? null,
+        effective_start_date: input.effective_start_date ?? null,
         cycle_weeks: rot.cycle_weeks,
         cycle_start_date: rot.cycle_start_date,
         patterns,
@@ -4155,6 +4215,7 @@ export async function applyCustomAvailabilityDecision(input: CustomAvailabilityD
       employee_id: input.employee_id,
       type: 'date_limited',
       end_date: input.custom_end_date,
+      effective_start_date: input.effective_start_date ?? null,
       cycle_weeks: null,
       cycle_start_date: null,
       patterns,
@@ -4166,19 +4227,25 @@ export async function applyCustomAvailabilityDecision(input: CustomAvailabilityD
       action: 'custom_availability_set',
       entity_type: 'custom_availability',
       entity_id: input.employee_id,
-      summary: `${input.decided_by ?? 'A manager'} approved ${input.employee_name}'s temporary availability through ${throughLabel}`,
+      summary: `${input.decided_by ?? 'A manager'} approved ${input.employee_name}'s availability change ${windowLabel || 'effective now'}`,
       metadata: {
         approved_by: input.decided_by ?? 'manager',
         end_date: input.custom_end_date,
+        effective_start_date: input.effective_start_date ?? null,
         patterns,
         raw_request: input.availability_raw,
       },
     });
 
-    await notifyEmployeeOfAvailabilityDecision(
-      notifyContext,
-      `Good news — your temporary availability is approved, set through ${throughLabel}. After that you're back to your normal hours. Thanks!`
-    );
+    // Wording depends on the window shape: a future-start override applies FROM a
+    // date (and only reverts if it also has an end); a plain "until X" override
+    // reverts after X.
+    const employeeMsg = input.effective_start_date
+      ? (input.custom_end_date
+          ? `Good news — your availability change is approved, set ${windowLabel}. After that you're back to your normal hours. Thanks!`
+          : `Good news — your availability change is approved, ${windowLabel}. Thanks!`)
+      : `Good news — your temporary availability is approved, set through ${throughLabel}. After that you're back to your normal hours. Thanks!`;
+    await notifyEmployeeOfAvailabilityDecision(notifyContext, employeeMsg);
   } else {
     await logActivity({
       company_id: input.company_id,
@@ -4238,25 +4305,33 @@ export async function handleManagerAvailabilityApproval(
   };
 
   const customEndDate = pending.custom_end_date ?? null;
+  const effectiveStartDate = pending.effective_start_date ?? null;
   const rotation = pending.rotation ?? null;
+  // A future-START change is a custom_availability override (even with no end_date):
+  // it must route to applyCustomAvailabilityDecision, NOT applyAvailabilityDecision
+  // (a plain availability edit has no date columns and would take effect immediately).
+  const isCustomOverride = !!rotation || !!customEndDate || !!effectiveStartDate;
+  const startLbl = effectiveStartDate ? formatDateRange(effectiveStartDate, effectiveStartDate) : '';
+  const endLbl = customEndDate ? formatDateRange(customEndDate, customEndDate) : '';
   if (isYes) {
     if (rotation) {
-      await applyCustomAvailabilityDecision({ ...decisionInput, custom_end_date: customEndDate, rotation, decision: 'approved' });
+      await applyCustomAvailabilityDecision({ ...decisionInput, custom_end_date: customEndDate, effective_start_date: effectiveStartDate, rotation, decision: 'approved' });
       await reply(contact, message, `${pending.employee_name}'s rotating availability is set (${rotation.cycle_weeks}-week cycle).`);
-    } else if (customEndDate) {
-      await applyCustomAvailabilityDecision({ ...decisionInput, custom_end_date: customEndDate, decision: 'approved' });
-      await reply(contact, message, `${pending.employee_name}'s temporary availability is set through ${formatDateRange(customEndDate, customEndDate)}.`);
+    } else if (isCustomOverride) {
+      await applyCustomAvailabilityDecision({ ...decisionInput, custom_end_date: customEndDate, effective_start_date: effectiveStartDate, decision: 'approved' });
+      const when = startLbl && endLbl ? `from ${startLbl} through ${endLbl}` : startLbl ? `starting ${startLbl}` : `through ${endLbl}`;
+      await reply(contact, message, `${pending.employee_name}'s availability is set ${when}.`);
     } else {
       await applyAvailabilityDecision({ ...decisionInput, decision: 'approved' });
       await reply(contact, message, `${pending.employee_name}'s availability has been updated.`);
     }
   } else {
     if (rotation) {
-      await applyCustomAvailabilityDecision({ ...decisionInput, custom_end_date: customEndDate, rotation, decision: 'denied' });
+      await applyCustomAvailabilityDecision({ ...decisionInput, custom_end_date: customEndDate, effective_start_date: effectiveStartDate, rotation, decision: 'denied' });
       await reply(contact, message, `${pending.employee_name}'s rotating availability change has been denied.`);
-    } else if (customEndDate) {
-      await applyCustomAvailabilityDecision({ ...decisionInput, custom_end_date: customEndDate, decision: 'denied' });
-      await reply(contact, message, `${pending.employee_name}'s temporary availability change has been denied.`);
+    } else if (isCustomOverride) {
+      await applyCustomAvailabilityDecision({ ...decisionInput, custom_end_date: customEndDate, effective_start_date: effectiveStartDate, decision: 'denied' });
+      await reply(contact, message, `${pending.employee_name}'s availability change has been denied.`);
     } else {
       await applyAvailabilityDecision({ ...decisionInput, decision: 'denied' });
       await reply(contact, message, `${pending.employee_name}'s availability update has been denied.`);

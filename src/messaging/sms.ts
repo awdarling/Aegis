@@ -2,12 +2,29 @@ import { env } from '../config/env';
 import { supabase } from '../db/client';
 import { saveConversation } from '../logger/conversation';
 import { sendTelnyxMessage } from './telnyx';
+import { canSmsEmployee } from './consent';
 
 interface SmsOptions {
   to: string;
   from: string; // the tenant's own Telnyx number (the company's dedicated line)
   body: string;
   company_id: string;
+  // ── Consent (N3) ───────────────────────────────────────────────────────────
+  // The recipient employee whose consent gates this send. REQUIRED for any SMS
+  // to a team member, unless allowPreConsent is set. When present, the send is
+  // blocked (returns false → email fallback) unless the employee's durable
+  // consent state permits it (see messaging/consent.ts).
+  employee_id?: string;
+  // Bypass the employee consent gate. Set ONLY when the caller has already
+  // established the send is legitimately outside the employee opt-in regime:
+  //   (a) the onboarding opt-in INVITATION itself + onboarding's own guarded
+  //       flow (onboarding is the consent authority for its own session and
+  //       already gates on opt_in_confirmed), and
+  //   (b) sends to a MANAGER / quria-admin recipient (client staff operating the
+  //       system — covered by the owner's subscription agreement, not the
+  //       employee opt-in regime; a STOP'd number is carrier-suppressed anyway).
+  // Never set this for an automated employee notification.
+  allowPreConsent?: boolean;
 }
 
 // Resolve a tenant's own SMS sending number from config (company_channels).
@@ -41,6 +58,32 @@ export async function sendSms(options: SmsOptions): Promise<boolean> {
   if (!env.TELNYX_API_KEY) {
     console.warn('[sms] Telnyx not configured — SMS disabled (email-first mode). Skipping send.');
     return false;
+  }
+
+  // ── Consent gate (N3) — the single chokepoint. ────────────────────────────
+  // Every automated SMS to an employee must clear this. Exactly one class of
+  // send bypasses it: allowPreConsent (the onboarding opt-in invitation + its
+  // own guarded flow, and manager/quria-admin recipients — see SmsOptions).
+  // A send that identifies no employee and is not marked allowPreConsent cannot
+  // have its consent verified, so it is REFUSED (fail closed) rather than
+  // silently delivered — this is the guarantee that closes the hole for every
+  // present and future caller.
+  if (!options.allowPreConsent) {
+    if (!options.employee_id) {
+      console.error(
+        `[sms] refusing to send for company ${options.company_id}: no employee_id and ` +
+          `allowPreConsent not set — cannot verify consent (fail closed).`
+      );
+      return false;
+    }
+    const consented = await canSmsEmployee(options.company_id, options.employee_id);
+    if (!consented) {
+      console.warn(
+        `[sms] blocked: employee ${options.employee_id} (company ${options.company_id}) ` +
+          `has not consented to SMS — falling back to email path.`
+      );
+      return false;
+    }
   }
 
   // The tenant's own number: prefer the caller-supplied `from` (a reply always

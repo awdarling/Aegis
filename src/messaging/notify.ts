@@ -45,9 +45,20 @@ export async function notifyEmployeeSmsFirst(opts: {
   body: string;
   subject: string;
   thread_id?: string | null;
+  // The recipient employee — REQUIRED for the SMS leg (N3 consent gate). When
+  // absent (or the employee hasn't consented), the SMS is blocked at the send
+  // layer and this notifier falls back to email — exactly the desired legal
+  // behavior. Every current caller is notifying a real employee, so thread it.
+  employee_id?: string | null;
 }): Promise<NotifyChannel> {
   if (!env.EMAIL_ONLY && opts.phone && opts.smsChannel) {
-    const ok = await sendSms({ to: opts.phone, from: opts.smsChannel, body: opts.body, company_id: opts.company_id });
+    const ok = await sendSms({
+      to: opts.phone,
+      from: opts.smsChannel,
+      body: opts.body,
+      company_id: opts.company_id,
+      employee_id: opts.employee_id ?? undefined,
+    });
     if (ok) return 'sms';
     console.warn(`[notify] SMS send failed for company ${opts.company_id}; falling back to email`);
   }

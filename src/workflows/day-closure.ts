@@ -40,6 +40,21 @@ export async function handleNotifyDayClosure(
     `${textOpener(employeeName)}${companyName} will be closed on ${formattedDate}. ` +
     `Your ${shiftPhrase} has been cancelled. We'll see you for your next scheduled shift. — Aegis`;
 
+  // Resolve the employee behind this closure notice so the SMS can be consent-
+  // gated (N3). The trigger payload carries name/phone/email but no id; look the
+  // employee up by phone within the tenant. No match → SMS is blocked at the send
+  // layer and we fall back to email, which is the correct behavior.
+  let employeeId: string | undefined;
+  if (employeePhone) {
+    const { data: empRow } = await supabase
+      .from('employees')
+      .select('id')
+      .eq('company_id', contact.company_id)
+      .eq('contact_phone', employeePhone)
+      .maybeSingle();
+    employeeId = (empRow as { id: string } | null)?.id;
+  }
+
   // SMS-first for phone-holders, email fallback (Batch-1 F8) — via the shared
   // notifier, which also falls back to email if the SMS send fails.
   const smsChannel = await getAegisSmsChannel(contact.company_id);
@@ -50,6 +65,7 @@ export async function handleNotifyDayClosure(
     email: employeeEmail,
     body,
     subject: `${companyName} — Closed ${formattedDate}`,
+    employee_id: employeeId,
   });
 
   if (used === 'none') {
@@ -155,6 +171,7 @@ export async function notifyDayClosureCore(
       email: emp.contact_email,
       body,
       subject: `${companyName} — Closed ${formattedDate}`,
+      employee_id: emp.id,
     });
 
     if (used === 'sms') { notified++; texted++; }

@@ -1030,6 +1030,7 @@ export async function sendDecisionNotification(
           from: aegisSmsChannel,
           body: text,
           company_id: tor.company_id,
+          employee_id: employee.id,
         })
       : false;
     if (sent) {
@@ -1337,6 +1338,8 @@ async function notifyManager(
   if (!env.EMAIL_ONLY && managerPhone && aegisSmsNumber) {
     const dateDisplay = formatDateRange(pending.start_date, pending.end_date);
     await sendSms({
+      // Recipient is the MANAGER (not under the employee opt-in regime).
+      allowPreConsent: true,
       to: managerPhone,
       from: aegisSmsNumber,
       body: managerAlertSms({

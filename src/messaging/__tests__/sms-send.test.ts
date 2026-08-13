@@ -32,20 +32,20 @@ describe('sendSms — email-only guard, provider guard, per-tenant number', () =
 
   it('sends nothing while EMAIL_ONLY is on', async () => {
     h.env.EMAIL_ONLY = true;
-    const sent = await sendSms({ to: '+1', from: '+16166164898', body: 'hi', company_id: 'c1' });
+    const sent = await sendSms({ to: '+1', from: '+16166164898', body: 'hi', company_id: 'c1', allowPreConsent: true });
     expect(sent).toBe(false);
     expect(h.sendTelnyxMessage).not.toHaveBeenCalled();
   });
 
   it('sends nothing when Telnyx is not configured', async () => {
     h.env.TELNYX_API_KEY = undefined;
-    const sent = await sendSms({ to: '+1', from: '+16166164898', body: 'hi', company_id: 'c1' });
+    const sent = await sendSms({ to: '+1', from: '+16166164898', body: 'hi', company_id: 'c1', allowPreConsent: true });
     expect(sent).toBe(false);
     expect(h.sendTelnyxMessage).not.toHaveBeenCalled();
   });
 
   it('uses the caller-supplied from number when present (a reply carries it)', async () => {
-    const sent = await sendSms({ to: '+16165550123', from: '+16166164898', body: 'hi', company_id: 'c1' });
+    const sent = await sendSms({ to: '+16165550123', from: '+16166164898', body: 'hi', company_id: 'c1', allowPreConsent: true });
     expect(sent).toBe(true);
     expect(h.sendTelnyxMessage).toHaveBeenCalledWith({ from: '+16166164898', to: '+16165550123', text: 'hi' });
     // no per-tenant lookup needed when from is supplied
@@ -55,21 +55,21 @@ describe('sendSms — email-only guard, provider guard, per-tenant number', () =
 
   it('resolves the tenant number from company_channels when from is empty', async () => {
     h.maybeSingle.mockResolvedValue({ data: { channel_value: '+16166164898' }, error: null });
-    const sent = await sendSms({ to: '+16165550123', from: '', body: 'hi', company_id: 'c1' });
+    const sent = await sendSms({ to: '+16165550123', from: '', body: 'hi', company_id: 'c1', allowPreConsent: true });
     expect(sent).toBe(true);
     expect(h.sendTelnyxMessage).toHaveBeenCalledWith({ from: '+16166164898', to: '+16165550123', text: 'hi' });
   });
 
   it('refuses to send when the tenant has no configured SMS number', async () => {
     h.maybeSingle.mockResolvedValue({ data: null, error: null });
-    const sent = await sendSms({ to: '+16165550123', from: '', body: 'hi', company_id: 'c1' });
+    const sent = await sendSms({ to: '+16165550123', from: '', body: 'hi', company_id: 'c1', allowPreConsent: true });
     expect(sent).toBe(false);
     expect(h.sendTelnyxMessage).not.toHaveBeenCalled();
   });
 
   it('returns false when the provider send fails, and logs the failure to the DB', async () => {
     h.sendTelnyxMessage.mockResolvedValue({ ok: false, error: 'boom' });
-    const sent = await sendSms({ to: '+1', from: '+16166164898', body: 'hi', company_id: 'c1' });
+    const sent = await sendSms({ to: '+1', from: '+16166164898', body: 'hi', company_id: 'c1', allowPreConsent: true });
     expect(sent).toBe(false);
     // A failed send is no longer invisible: it's written to the conversation,
     // distinctly marked so it can't be mistaken for a delivered message.

@@ -1165,7 +1165,7 @@ export async function dispatchOutreach(params: {
   let channel: 'sms' | 'email';
   if (!env.EMAIL_ONLY && employee.contact_phone && aegisSmsNumber) {
     channel = 'sms';
-    await sendSms({ to: employee.contact_phone, from: aegisSmsNumber, body, company_id: session.company_id });
+    await sendSms({ to: employee.contact_phone, from: aegisSmsNumber, body, company_id: session.company_id, employee_id: employee.id });
   } else if (employee.contact_email) {
     channel = 'email';
     // Email gets branded Accept/Decline BUTTONS (matching time-off & availability),
@@ -1263,6 +1263,7 @@ async function notifyEmployeeShiftFilled(
       from: outreach.aegis_sms_channel,
       body,
       company_id: outreach.company_id,
+      employee_id: employee.id,
     });
   } else if (outreach.employee_email || employee.contact_email) {
     await sendEmail({

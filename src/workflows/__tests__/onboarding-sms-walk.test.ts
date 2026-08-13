@@ -142,45 +142,59 @@ beforeEach(() => {
 });
 
 describe('smart onboarding walk over SMS (B6)', () => {
-  it('phone-only hire: opt-in skips name + email, collects role + availability, completes', async () => {
+  // H5: a phone-only hire IS now asked for an (optional) email. They can SKIP it —
+  // they're SMS-reachable — and no contact_email is written.
+  it('phone-only hire: opt-in skips name, ASKS for email, honours SKIP, collects role + availability, completes', async () => {
     const s = makeSession();
 
-    // 1. Opt-in → B6 smart routing skips the redundant name question and (phone on
-    //    file, so contact is complete) the email step, going to the first missing
-    //    field: role.
+    // 1. Opt-in → B6 smart routing skips the redundant name question but now stops
+    //    at the email step (phone-only hire has no email on file — H5).
     await handleOnboardingResponse(inbound('YES'), CONTACT, s);
     expect(s.opt_in_confirmed).toBe(true);
-    expect(s.step).toBe('role');
-    expect(lastSms()).toContain('guard');
+    expect(s.step).toBe('email');
+    expect(lastSms().toLowerCase()).toContain('email');
+    expect(lastSms().toLowerCase()).toContain('skip');
     expect(lastSms().toLowerCase()).toContain('confirmed');
 
-    // 2. Role (reply "2" → sorted ['Lifeguard','guard'] → 'guard')
+    // 2. Email → SKIP (reachable by text, so email is optional) → role
+    await handleOnboardingResponse(inbound('skip'), CONTACT, s);
+    expect(s.collected.email).toBeNull();
+    expect(s.step).toBe('role');
+    expect(lastSms().toLowerCase()).toContain('role');
+
+    // 3. Role (reply "2" → sorted ['Lifeguard','guard'] → 'guard')
     await handleOnboardingResponse(inbound('2'), CONTACT, s);
     expect(s.collected.role).toBe('guard');
     expect(s.step).toBe('availability');
     expect(lastSms().toLowerCase()).toContain('availability');
 
-    // 3. Availability → parsed to 3 slots
+    // 4. Availability → parsed to 3 slots
     await handleOnboardingResponse(inbound('Mon and Tue 9-5, Thursday 1-9'), CONTACT, s);
     expect(s.collected.availability_parsed).toHaveLength(3);
     expect(s.step).toBe('availability_confirm');
     expect(lastSms()).toContain('Does that look right?');
 
-    // 4. Confirm availability
+    // 5. Confirm availability
     await handleOnboardingResponse(inbound('looks good'), CONTACT, s);
     expect(s.collected.availability_confirmed).toBe(true);
     expect(s.step).toBe('time_off');
     expect(lastSms().toLowerCase()).toContain('upcoming dates');
 
-    // 5. Time off (none) → completion
+    // 6. Time off (none) → completion
     await handleOnboardingResponse(inbound('nothing coming up'), CONTACT, s);
     expect(s.step).toBe('complete');
     expect(lastSms().toLowerCase()).toContain('all set');
 
-    // Name + email were NEVER asked (phone on file); role + availability written.
+    // Name was never asked; email WAS asked but skipped, so no contact_email write;
+    // role + availability written.
     const bodies = h.sendSmsMock.mock.calls.map(c => (c[0] as { body: string }).body.toLowerCase());
     expect(bodies.some(b => b.includes('full name'))).toBe(false);
-    expect(bodies.some(b => b.includes('email address'))).toBe(false);
+    expect(bodies.some(b => b.includes('email'))).toBe(true);
+    const wroteEmail = h.writes.some(
+      w => w.table === 'employees' && w.op === 'update' &&
+        Object.prototype.hasOwnProperty.call(w.rows as Record<string, unknown>, 'contact_email')
+    );
+    expect(wroteEmail).toBe(false);
     const empUpdate = h.writes.find(
       w => w.table === 'employees' && w.op === 'update' &&
         (w.rows as Record<string, unknown>).primary_role === 'guard'
@@ -188,6 +202,34 @@ describe('smart onboarding walk over SMS (B6)', () => {
     expect(empUpdate).toBeTruthy();
     expect(h.writes.some(w => w.table === 'availability' && w.op === 'insert')).toBe(true);
     expect(h.writes.some(w => w.table === 'aegis_memory' && w.op === 'delete')).toBe(true);
+  });
+
+  // H5: same hire, but this time they PROVIDE an email — it is collected and
+  // written to contact_email at completion.
+  it('phone-only hire: provides an email at the email step → contact_email is written', async () => {
+    const s = makeSession();
+
+    await handleOnboardingResponse(inbound('YES'), CONTACT, s);
+    expect(s.step).toBe('email');
+
+    await handleOnboardingResponse(inbound('sam@example.com'), CONTACT, s);
+    expect(s.collected.email).toBe('sam@example.com');
+    expect(s.step).toBe('role');
+
+    await handleOnboardingResponse(inbound('2'), CONTACT, s);
+    expect(s.collected.role).toBe('guard');
+    expect(s.step).toBe('availability');
+
+    await handleOnboardingResponse(inbound('Mon and Tue 9-5, Thursday 1-9'), CONTACT, s);
+    await handleOnboardingResponse(inbound('looks good'), CONTACT, s);
+    await handleOnboardingResponse(inbound('nothing coming up'), CONTACT, s);
+    expect(s.step).toBe('complete');
+
+    const wroteEmail = h.writes.some(
+      w => w.table === 'employees' && w.op === 'update' &&
+        (w.rows as Record<string, unknown>).contact_email === 'sam@example.com'
+    );
+    expect(wroteEmail).toBe(true);
   });
 
   it('fully-complete employee: consent + warm close, with NO field prompts', async () => {

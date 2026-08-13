@@ -15,9 +15,19 @@ describe('resolveOnboardingNeeds (B6 completeness — phone OR email + role + av
     expect(resolveOnboardingNeeds({ contact_phone: '+1', contact_email: 'e@x.com', primary_role: 'Guard', qualified_roles: ['Guard'] }, true))
       .toEqual({ needsEmail: false, needsRole: false, needsAvailability: false });
   });
-  it('contact is satisfied by phone OR email — a phone-only or email-only hire is NOT incomplete', () => {
-    expect(resolveOnboardingNeeds({ contact_phone: '+1', contact_email: null, primary_role: 'Guard' }, true).needsEmail).toBe(false);
+  // H5 (2026-08-13): needsEmail gates on `!contact_email` specifically, not on
+  // "has no contact at all". A phone-only hire is reachable but has no email, so
+  // Aegis can't send them the full weekly team schedule — they should be ASKED
+  // for one (the step is optional; they can SKIP). An email-only hire already has
+  // an email, so needsEmail is false.
+  it('needsEmail gates on the absence of an email, not the absence of any contact', () => {
+    // phone-only hire: reachable, but no email -> ask for one (H5 fix)
+    expect(resolveOnboardingNeeds({ contact_phone: '+1', contact_email: null, primary_role: 'Guard' }, true).needsEmail).toBe(true);
+    // email-only hire: already has an email -> don't ask
     expect(resolveOnboardingNeeds({ contact_phone: null, contact_email: 'e@x.com', primary_role: 'Guard' }, true).needsEmail).toBe(false);
+    // phone + email: don't ask
+    expect(resolveOnboardingNeeds({ contact_phone: '+1', contact_email: 'e@x.com', primary_role: 'Guard' }, true).needsEmail).toBe(false);
+    // neither (defensive; filtered upstream): still reads as needing an email
     expect(resolveOnboardingNeeds({ contact_phone: null, contact_email: null, primary_role: 'Guard' }, true).needsEmail).toBe(true);
   });
   it('role is satisfied by primary_role OR qualified_roles', () => {

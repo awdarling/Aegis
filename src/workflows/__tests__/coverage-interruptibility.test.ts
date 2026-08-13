@@ -3,8 +3,10 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // H7 (DRIFT_REGISTER) — the emergency-coverage manager handler must YIELD a
 // clearly-different actionable request instead of swallowing it as "manager
 // declining". These tests prove the wiring: when the interrupt classifier flags
-// a different intent, the session is abandoned and the router re-handles the
-// message; a genuine decline still ends the session with the usual reply.
+// a different intent, the coverage session is PAUSED (not abandoned), the router
+// re-handles the message, and the call-out is then RESUMED with a short nudge so
+// the manager can finish it later; a genuine decline still ends the session with
+// the usual reply.
 
 vi.mock('../../config/env', () => ({
   env: {
@@ -49,7 +51,7 @@ vi.mock('../../router/interrupt', () => ({
 const routeIntent = vi.fn(async () => {});
 vi.mock('../../router/intent-router', () => ({ routeIntent: (...a: unknown[]) => routeIntent(...a) }));
 
-import { handleManagerCoverageReply, type CoverageSession } from '../emergency-coverage';
+import { handleManagerCoverageReply, resumeCoveragePrompt, type CoverageSession } from '../emergency-coverage';
 import type { InboundMessage, VerifiedContact } from '../../security/types';
 
 const mgr: VerifiedContact = {
@@ -78,12 +80,17 @@ beforeEach(() => {
 });
 
 describe('H7 — coverage yields to a different actionable intent', () => {
-  it('a mid-coverage query ("who\'s free saturday?") yields to the router, not a decline', async () => {
+  it('a mid-coverage query ("who\'s free saturday?") yields to the router, then resumes with a nudge', async () => {
     generateReply.mockResolvedValue('{"names":[]}');            // extractOutreachNames → no names
     managerInterruptIntent.mockResolvedValue('operational_query');
     await handleManagerCoverageReply(msg("who's free saturday?"), mgr, session());
     expect(routeIntent).toHaveBeenCalledTimes(1);
-    expect(reply).not.toHaveBeenCalled();                       // NOT "I'll leave it with you"
+    // The ONE reply is the resume nudge (the call-out is still open), NOT the
+    // "I'll leave it with you" decline.
+    expect(reply).toHaveBeenCalledTimes(1);
+    const body = reply.mock.calls[0][2] as string;
+    expect(body.toLowerCase()).toContain('still got the coverage request');
+    expect(body).not.toContain("I'll leave it with you");
   });
 
   it('"approve Sam\'s swap" mid-coverage yields even when the name-extractor grabbed a name', async () => {
@@ -93,6 +100,9 @@ describe('H7 — coverage yields to a different actionable intent', () => {
     expect(routeIntent).toHaveBeenCalledTimes(1);
     // did not fall through to contacting anyone
     expect(managerInterruptIntent).toHaveBeenCalledWith(expect.anything(), expect.anything(), { allowQueries: false });
+    // and the call-out is resumed with a nudge rather than abandoned
+    expect(reply).toHaveBeenCalledTimes(1);
+    expect((reply.mock.calls[0][2] as string).toLowerCase()).toContain('coverage request');
   });
 
   it('a genuine decline still ends the session and does NOT re-route', async () => {
@@ -109,5 +119,27 @@ describe('H7 — coverage yields to a different actionable intent', () => {
     await handleManagerCoverageReply(msg('Kori'), mgr, session());
     expect(routeIntent).not.toHaveBeenCalled();
     expect(reply).toHaveBeenCalled();                          // "couldn't find employees named Kori" (no such row in mock)
+  });
+
+  it('a batch-decision reply that yields also resumes (state-aware nudge)', async () => {
+    // On the awaiting_next_batch_decision branch, a query interrupt yields with
+    // allowQueries:true, then resumes with the YES-for-more-people nudge.
+    managerInterruptIntent.mockResolvedValue('operational_query');
+    await handleManagerCoverageReply(msg("who's on saturday?"), mgr, session({ state: 'awaiting_next_batch_decision' }));
+    expect(routeIntent).toHaveBeenCalledTimes(1);
+    expect(managerInterruptIntent).toHaveBeenCalledWith(expect.anything(), expect.anything(), { allowQueries: true });
+    expect((reply.mock.calls.at(-1)?.[2] as string).toLowerCase()).toContain('reply yes');
+  });
+});
+
+describe('H7 — resumeCoveragePrompt (state-aware resume nudge)', () => {
+  it('awaiting_names → asks for a name / "all"', () => {
+    const p = resumeCoveragePrompt(session({ state: 'awaiting_names' }));
+    expect(p).toContain("Jamie's Morning shift");
+    expect(p.toLowerCase()).toContain('reply with a name');
+  });
+  it('awaiting_next_batch_decision → asks for YES to reach more people', () => {
+    const p = resumeCoveragePrompt(session({ state: 'awaiting_next_batch_decision' }));
+    expect(p.toLowerCase()).toContain('reply yes');
   });
 });

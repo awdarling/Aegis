@@ -25,6 +25,20 @@ import type { Employee, PartialDayDetail, Policy, TimeOffRequest } from '../db/t
 import type { SimulationResult } from '../lib/schedule-simulator';
 import type { TimeOffViolations } from '../lib/time-off-policies';
 
+// ── N1: self-notification guard ───────────────────────────────────────────────
+// Exclude the actor who TOOK a decision from that decision's notification
+// recipients, so the deciding manager isn't told about their own action. Keyed
+// by `users.id`. A null actorId (unattributed — e.g. the shared magic-link path
+// where `decided_by` is NULL, Data Contract D17) excludes nobody, so everyone is
+// still notified. Pure + exported so the exclusion is unit-testable without the
+// supabase-heavy fan-out around it.
+export function excludeActor<T extends { id: string }>(
+  recipients: T[],
+  actorId: string | null | undefined
+): T[] {
+  return actorId ? recipients.filter((r) => r.id !== actorId) : recipients;
+}
+
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 interface PendingTimeOff {
@@ -1160,7 +1174,11 @@ async function sendManagerResolutionReplies(args: {
   const managers = ((managersData ?? []) as { id: string; email: string | null; name: string | null }[])
     .filter(m => !!m.email);
 
-  for (const m of managers) {
+  // N1 — never notify the manager who TOOK this decision about their own action
+  // ("Jack approved … " → Jack). See excludeActor: when decided_by is NULL (the
+  // shared magic-link path where we can't attribute — Data Contract D17) nobody
+  // is excluded, so an unattributed decision still notifies everyone.
+  for (const m of excludeActor(managers, decidedById)) {
     try {
       const { subject, html, text } = buildTimeOffResolutionEmail({
         employeeName: args.employeeName,

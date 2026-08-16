@@ -906,7 +906,15 @@ Respond with ONLY valid JSON in this exact shape — no markdown, no explanation
     //   "next week"/"upcoming week"/"the week after" → "next". Default "next" if
     //   unspecified. Never emit a calendar date — you do not know today's date.
     // For homebase_edit: { "entity_type": "employee|event|policy|wage_rate|shift_type", "entity_name": "...", "field": "...", "new_value": "..." }
-    // For initiate_onboarding: { "employee_name": "..." } if targeting one employee, or {} for all
+    // For initiate_onboarding: onboard the EXISTING team — target one of:
+    //   • specific people: { "employee_names": ["Jack", "Dana"] } (one or more names).
+    //     ("employee_name": "..." singular is still accepted for a single person.)
+    //   • a status group: { "subset": "unfinished" } for everyone who hasn't finished
+    //     onboarding yet (never started / didn't respond / timed out — i.e. "the
+    //     stragglers", "the ones who haven't finished", "whoever didn't respond",
+    //     "the rest"). { "subset": "all" } or {} for the whole active team.
+    //   Prefer employee_names when specific people are named; prefer subset:"unfinished"
+    //   when the manager describes the not-yet-onboarded group; else {} (all).
     // For update_availability: {} for a permanent change effective now, OR
     //   { "end_date": "YYYY-MM-DD" } when the change is TEMPORARY (bounded by
     //   "until/through <date>"), OR { "effective_start_date": "YYYY-MM-DD" } when the

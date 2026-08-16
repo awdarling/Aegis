@@ -70,6 +70,10 @@ export interface ClassifyResult {
 
 export const EMPLOYEE_INTENTS = [
   'submit_time_off',
+  // L3 — withdrawing time off the manager has ALREADY APPROVED. Distinct from
+  // backing out of an unsent request mid-confirmation, which stays
+  // general_question and is handled by the pending-time-off gate.
+  'cancel_time_off',
   'query_my_time_off',
   'query_my_shifts',
   'query_my_availability',
@@ -598,10 +602,23 @@ general_question or operational_query.
 A bare intent is the ACTION itself. A question ABOUT the action ("how do I request time off?",
 "how does time off work here?") is capabilities (see below) — do not confuse the two.
 
-NEVER treat a CANCELLATION or WITHDRAWAL as one of these actions. "I changed my mind, I don't
-need time off anymore", "never mind", "cancel that", "forget the time off", "I'm all set" are
-NOT submit_time_off (or any action) — the person is backing out. Classify them general_question;
-a brief, friendly acknowledgement is given downstream.
+NEVER treat a CANCELLATION or WITHDRAWAL as submit_time_off. The person is backing out, not
+requesting. There are TWO backing-out cases and they are NOT the same:
+
+  (a) BACKING OUT OF SOMETHING NOT YET SUBMITTED — a bare "never mind", "cancel that",
+      "forget it", "I changed my mind", "I'm all set", with NO date and NO reference to
+      time off that already exists. Classify general_question; a brief, friendly
+      acknowledgement is given downstream, and the pending-request gate clears itself.
+
+  (b) CANCELLING TIME OFF THAT ALREADY EXISTS — the message refers to time off that has
+      been REQUESTED OR APPROVED, usually by naming a date: "cancel my time off on Aug 1",
+      "I don't need Friday off anymore", "can I cancel my vacation next week", "I'm coming
+      in on the 3rd after all", "scratch my day off Tuesday". Classify cancel_time_off and
+      extract the date.
+
+The tell is whether the message points at a SPECIFIC existing day off. A date, a named day,
+"my vacation", "my day off" → (b) cancel_time_off. A bare retraction with nothing to point
+at → (a) general_question.
 
 ## Off-topic / unrelated messages → general_question
 
@@ -777,6 +794,18 @@ User: "I changed my mind, I don't need time off anymore"
 User: "never mind, cancel that"
 {"intent":"general_question","confidence":"high","extracted":{}}
 
+User: "cancel my time off on August 1"
+{"intent":"cancel_time_off","confidence":"high","extracted":{"date":"${currentYear}-08-01"}}
+
+User: "I don't need Friday off anymore"
+{"intent":"cancel_time_off","confidence":"high","extracted":{"date":null}}
+
+User: "can I cancel my vacation next week?"
+{"intent":"cancel_time_off","confidence":"medium","extracted":{"date":null}}
+
+User: "actually I'm coming in on the 3rd, scratch my day off"
+{"intent":"cancel_time_off","confidence":"high","extracted":{"date":"${currentYear}-08-03"}}
+
 User: "For the week of June 29 to July 5 I can work Monday 11am to 3:30pm, Wednesday 11am to 3:30pm, and Thursday."
 {"intent":"update_availability","confidence":"high","extracted":{"end_date":"${currentYear}-07-05"}}
 
@@ -864,6 +893,12 @@ Respond with ONLY valid JSON in this exact shape — no markdown, no explanation
     //     they appear in the company context, prefer those exact shift times.
     // For query_my_time_off: {} — used when the employee asks about their own approved
     //   upcoming time off ("what time off do I have approved?", "when is my next day off?").
+    // For cancel_time_off: { "date": "YYYY-MM-DD" | null } — the employee WITHDRAWING time
+    //   off that already exists. "date" is ANY day the time off covers, resolved from the
+    //   weekday table above; a single day inside an approved range is enough to identify it.
+    //   Use null when they clearly mean an existing day off but name no date ("cancel my
+    //   time off", "I don't need my day off anymore") — Aegis then lists what they have and
+    //   asks which one. NEVER guess a date; a wrong guess here cancels the wrong days.
     // For query_my_availability: {} — the employee asking to READ their current
     //   availability ("what's my availability?", "what days am I available?"). A READ,
     //   never a change (update_availability) or a time-off request.

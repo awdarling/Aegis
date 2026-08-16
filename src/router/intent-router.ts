@@ -14,6 +14,10 @@ import {
   handleQueryMyTimeOff,
   handleRecheckTimeOff,
   getPendingTimeOff,
+  // L3 — cancel already-approved time off, behind an explicit confirmation.
+  handleCancelTimeOff,
+  handleTimeOffCancelConfirmation,
+  getPendingTimeOffCancel,
 } from '../workflows/time-off';
 import { handleBuildSchedule, handleDistributeSchedule } from '../workflows/schedule-build';
 import {
@@ -201,6 +205,22 @@ async function routeIntentInner(
 
   // Pre-classification: employee session checks
   if (contact.role === 'employee' && contact.employee_id) {
+    // L3 — the CANCEL confirmation is checked FIRST, ahead of the pending-request
+    // gate, because both react to the word "cancel" and only one of them is right.
+    //
+    // If an employee has an unsent request pending AND a cancel-of-an-approved-
+    // request in flight, "yes, cancel it" hitting handlePendingTimeOffConfirmation
+    // would match isTimeOffCancellation and reply "I've scrapped that time-off
+    // request" — about the WRONG request, while the approved one they actually
+    // meant stays booked. The cancel confirmation is the more specific state (it
+    // names a concrete approved request and expires in an hour), so it wins.
+    const pendingCancel = await getPendingTimeOffCancel(contact.company_id, contact.employee_id);
+    if (pendingCancel) {
+      await handleTimeOffCancelConfirmation(message, contact, pendingCancel);
+      console.log('[router] EARLY RETURN', { reason: 'pending_time_off_cancel_confirmation' });
+      return;
+    }
+
     const pendingTO = await getPendingTimeOff(contact.company_id, contact.employee_id);
     if (pendingTO) {
       await handlePendingTimeOffConfirmation(message, contact, pendingTO);

@@ -286,3 +286,181 @@ describe('L4 · executeScheduleTrade refuses a half-applied trade', () => {
     expect(written).toHaveLength(3);
   });
 });
+
+// ── [SWAP-SHIFT-RESOLVE] — the requester's OWN shift, and only theirs ────────
+//
+// Alexander's mandate for L4 is that swaps be FULLY FUNCTIONAL, not merely safe.
+// The executor fix above makes a bad trade fail closed instead of half-applying;
+// this is the other half — stopping the bad side A from being constructed at
+// all, so a legitimate trade actually WORKS.
+//
+// The old code, when the requester had no assignment on the named date, fell
+// back to a search with NO employee_id filter and could return a COWORKER's row
+// as side A. Short hints like "AM"/"PM" (exactly what the router prompt asks
+// for) substring-match real shift names, so the match was usually the trade
+// counterparty's own shift — an unmatchable leg by construction.
+
+import { resolveRequesterShiftOnDate, narrowByShiftDescriptor, findRequesterShift } from '../shift-swap';
+import type { ScheduleData } from '../schedule-build';
+
+const ME = 'emp-me';
+const COWORKER = 'emp-coworker';
+const DAY = '2026-07-18';
+
+function asg(employee_id: string, date: string, shift_name: string, start: string, end: string): ScheduleAssignment {
+  return {
+    employee_id, employee_name: employee_id, date, shift_name,
+    role: 'Lifeguard', start_time: start, end_time: end, hours: 6,
+  } as ScheduleAssignment;
+}
+const sched = (assignments: ScheduleAssignment[]): ScheduleData =>
+  ({ assignments, gaps: [] } as unknown as ScheduleData);
+
+describe('L4 · resolveRequesterShiftOnDate never returns someone else\'s shift', () => {
+  it('THE BUG: a coworker\'s matching shift is NOT returned when I have none that day', () => {
+    // Exactly the live shape: I'm not working Saturday, my coworker is on "AM
+    // Weekend", and I said "AM". The old fallback returned THEIR row as side A.
+    const data = sched([asg(COWORKER, DAY, 'AM Weekend', '09:00', '15:30')]);
+    const r = resolveRequesterShiftOnDate(data, ME, DAY, 'AM');
+    expect(r.kind).toBe('none');
+  });
+
+  it('and the same is true with no hint at all', () => {
+    const data = sched([asg(COWORKER, DAY, 'AM Weekend', '09:00', '15:30')]);
+    expect(resolveRequesterShiftOnDate(data, ME, DAY, null).kind).toBe('none');
+  });
+
+  it('returns MY shift when I have exactly one that day', () => {
+    const data = sched([
+      asg(ME, DAY, 'Afternoon', '15:00', '21:15'),
+      asg(COWORKER, DAY, 'AM Weekend', '09:00', '15:30'),
+    ]);
+    const r = resolveRequesterShiftOnDate(data, ME, DAY, null);
+    expect(r.kind).toBe('one');
+    if (r.kind === 'one') expect(r.shift.employee_id).toBe(ME);
+  });
+
+  it('DOUBLE-SHIFT DAY: the hint picks the right one instead of a coin flip', () => {
+    // findRequesterShift ignores the name entirely and returns the FIRST match,
+    // so pre-fix this silently gave away whichever happened to be first.
+    const data = sched([
+      asg(ME, DAY, 'AM Weekday', '11:00', '15:30'),
+      asg(ME, DAY, 'Afternoon', '15:00', '21:15'),
+    ]);
+    const pm = resolveRequesterShiftOnDate(data, ME, DAY, 'my PM shift');
+    expect(pm.kind).toBe('one');
+    if (pm.kind === 'one') expect(pm.shift.shift_name).toBe('Afternoon');
+
+    const am = resolveRequesterShiftOnDate(data, ME, DAY, 'the AM one');
+    expect(am.kind).toBe('one');
+    if (am.kind === 'one') expect(am.shift.shift_name).toBe('AM Weekday');
+  });
+
+  it('DOUBLE-SHIFT DAY with no usable hint: ASKS rather than guessing', () => {
+    const data = sched([
+      asg(ME, DAY, 'AM Weekday', '11:00', '15:30'),
+      asg(ME, DAY, 'Afternoon', '15:00', '21:15'),
+    ]);
+    const r = resolveRequesterShiftOnDate(data, ME, DAY, null);
+    expect(r.kind).toBe('ambiguous');
+    if (r.kind === 'ambiguous') expect(r.shifts).toHaveLength(2);
+  });
+
+  it('soft narrowing never empties the set (no false "you have no shift")', () => {
+    const data = sched([
+      asg(ME, DAY, 'AM Weekday', '11:00', '15:30'),
+      asg(ME, DAY, 'Afternoon', '15:00', '21:15'),
+    ]);
+    // A descriptor matching neither must leave BOTH to ask about.
+    const r = resolveRequesterShiftOnDate(data, ME, DAY, 'the purple one');
+    expect(r.kind).toBe('ambiguous');
+    expect(narrowByShiftDescriptor(data.assignments, 'the purple one')).toHaveLength(2);
+  });
+
+  it('findRequesterShift keeps its old contract (existing callers/tests)', () => {
+    const data = sched([asg(ME, DAY, 'Afternoon', '15:00', '21:15')]);
+    expect(findRequesterShift(data, ME, DAY)?.shift_name).toBe('Afternoon');
+    expect(findRequesterShift(data, COWORKER, DAY)).toBe(null);
+  });
+});
+
+// ── END-TO-END: a real trade lands BOTH legs after the resolver fix ──────────
+
+describe('L4 · END-TO-END — a correctly-resolved trade applies both legs', () => {
+  it('resolver → token sides → executor: both people switch places', async () => {
+    // The full chain the live bug ran through, with the two ends now joined:
+    // (1) resolve the requester's own shift from a real schedule, using the same
+    //     kind of loose descriptor an employee actually texts, then
+    // (2) build the trade sides exactly as the decision token does, and
+    // (3) execute — asserting on what was WRITTEN, both legs.
+    const REQ = 'emp-a';
+    const CO = 'emp-b';
+    const MY_DAY = '2026-07-18';
+    const THEIR_DAY = '2026-07-19';
+
+    const liveAssignments = [
+      asg(REQ, MY_DAY, 'AM Weekday', '11:00', '15:30'),
+      asg(REQ, MY_DAY, 'Afternoon', '15:00', '21:15'),   // I work a double that day
+      asg(CO, THEIR_DAY, 'Flex', '13:00', '21:00'),
+      asg('emp-bystander', MY_DAY, 'Weekday Greeter', '12:00', '19:30'),
+    ];
+
+    // (1) "swap my afternoon shift on the 18th" — must pick MY Afternoon, not my
+    // AM, and never the bystander's.
+    const mine = resolveRequesterShiftOnDate(
+      sched(liveAssignments), REQ, MY_DAY, 'my afternoon shift',
+    );
+    expect(mine.kind).toBe('one');
+    if (mine.kind !== 'one') return;
+    expect(mine.shift.employee_id).toBe(REQ);
+    expect(mine.shift.shift_name).toBe('Afternoon');
+
+    // (2) the coworker's return leg, resolved by the sibling function
+    const theirs = chooseTradeShiftForTest(liveAssignments, CO);
+
+    // (3) execute
+    state.scheduleRow = { id: SCHEDULE_ID, data: { assignments: liveAssignments }, staffing_report: {} };
+    const r = await executeScheduleTrade(
+      COMPANY, SCHEDULE_ID,
+      { date: mine.shift.date, shift_name: mine.shift.shift_name, employee_id: REQ, employee_name: 'A' },
+      { date: theirs.date, shift_name: theirs.shift_name, employee_id: CO, employee_name: 'B' },
+    );
+
+    expect(r.ok).toBe(true);
+    const written = (state.updates[0].data as { assignments: ScheduleAssignment[] }).assignments;
+
+    // BOTH legs landed.
+    const myOldShift = written.find(x => x.date === MY_DAY && x.shift_name === 'Afternoon')!;
+    const theirOldShift = written.find(x => x.date === THEIR_DAY && x.shift_name === 'Flex')!;
+    expect(myOldShift.employee_id).toBe(CO);    // B took my Afternoon
+    expect(theirOldShift.employee_id).toBe(REQ); // I took their Flex
+
+    // My OTHER shift that day is untouched — the double-shift day didn't cost me
+    // the wrong shift.
+    expect(written.find(x => x.date === MY_DAY && x.shift_name === 'AM Weekday')!.employee_id).toBe(REQ);
+    // And the bystander is untouched.
+    expect(written.find(x => x.shift_name === 'Weekday Greeter')!.employee_id).toBe('emp-bystander');
+  });
+
+  it('REGRESSION: the pre-fix side A (a coworker\'s row) is now refused, not half-applied', async () => {
+    // Belt and braces — if a bad side A ever reaches the executor again from any
+    // other path, it must refuse rather than write one leg.
+    const bad = { date: DAY, shift_name: 'AM Weekend', employee_id: 'emp-a', employee_name: 'A' };
+    const good = { date: '2026-07-19', shift_name: 'Morning', employee_id: 'emp-b', employee_name: 'B' };
+    state.scheduleRow = {
+      id: SCHEDULE_ID,
+      data: { assignments: [asg('emp-coworker', DAY, 'AM Weekend', '09:00', '15:30'), assignment('emp-b', '2026-07-19', 'Morning')] },
+      staffing_report: {},
+    };
+    const r = await executeScheduleTrade(COMPANY, SCHEDULE_ID, bad, good);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.code).toBe('partial_trade');
+    expect(state.updates).toHaveLength(0);
+  });
+});
+
+// Small local helper so the E2E test doesn't depend on chooseTradeShift's own
+// hint semantics — it just needs the coworker's single shift.
+function chooseTradeShiftForTest(assignments: ScheduleAssignment[], coworkerId: string): ScheduleAssignment {
+  return assignments.find(a => a.employee_id === coworkerId)!;
+}

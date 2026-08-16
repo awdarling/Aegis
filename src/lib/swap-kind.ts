@@ -41,6 +41,23 @@
 // nobody (managers read the prose part), and is trivially replaced by a real
 // column later — parseSwapKind is the only reader.
 
+/**
+ * The manager-facing instruction appended to every refusal.
+ *
+ * A refusal is only acceptable if the manager is left knowing exactly how to
+ * complete the approval — otherwise "fail closed" just reads as "broken". The
+ * Aegis approval EMAIL for this same request carries a decision token holding
+ * BOTH shifts, so that path applies a trade correctly; this one cannot.
+ *
+ * Homebase surfaces this string verbatim on a `noop` result (see
+ * `src/lib/swaps/decide.ts` — it renders `Couldn't approve that swap: <reason>`),
+ * so it must be plain manager English with a concrete next step, not an error code.
+ */
+export const APPROVE_BY_EMAIL_INSTRUCTION =
+  'To approve it, use the Approve button in the Aegis approval EMAIL for this ' +
+  'request — that link carries both shifts and will update the schedule correctly. ' +
+  'Nothing has been changed here.';
+
 export type SwapKind =
   /** One-way: the receiving employee TAKES the requester's shift; the requester
    *  is off and gives nothing back. Exactly one assignment moves. */
@@ -115,9 +132,8 @@ export function canExecuteFromRowAlone(note: string | null | undefined): {
       kind: null,
       reason:
         'This request predates swap-kind tracking, so we cannot tell whether it is a one-way ' +
-        'giveaway or a two-way trade. Approving it here could change only half the schedule. ' +
-        'Use the Approve button in the manager email for this request instead — that path carries ' +
-        'the full shift details.',
+        'giveaway or a two-way trade, and approving the wrong one would change only half the ' +
+        'schedule. ' + APPROVE_BY_EMAIL_INSTRUCTION,
     };
   }
   if (kind === 'trade') {
@@ -125,9 +141,9 @@ export function canExecuteFromRowAlone(note: string | null | undefined): {
       ok: false,
       kind,
       reason:
-        'This is a two-way trade, and the swap record does not store the shift being given back — ' +
-        'approving it here would move only one of the two shifts. Use the Approve button in the ' +
-        'manager email for this request instead; it carries both shifts.',
+        'This is a two-way TRADE (both people give up a shift), and this swap record does not ' +
+        'store the shift being given back — approving it here would move only one of the two ' +
+        'shifts. ' + APPROVE_BY_EMAIL_INSTRUCTION,
     };
   }
   return { ok: true, kind, reason: null };

@@ -1100,6 +1100,67 @@ export function findRequesterShift(schedData: ScheduleData, requesterId: string,
   return schedData.assignments.find(a => a.employee_id === requesterId && a.date === shiftDate) ?? null;
 }
 
+// L4 [SWAP-SHIFT-RESOLVE] — resolve WHICH OF THE REQUESTER'S OWN shifts they mean
+// on a named date.
+//
+// THE BUG THIS REPLACES. handleInitiateSwap did:
+//
+//     shift = findRequesterShift(schedule.data, contact.employee_id!, shiftDate);
+//     if (!shift && shiftNameHint) {
+//       shift = schedule.data.assignments.find(a =>
+//         a.date === shiftDate && a.shift_name.toLowerCase().includes(shiftNameHint.toLowerCase())
+//       ) ?? null;                      // <-- NO employee_id filter
+//     }
+//
+// When the requester had NO assignment on the named date — a mis-parsed date, or
+// a pickup message where the model put the COWORKER's date in shift_date — the
+// fallback returned **whoever else's** assignment matched the name. Short hints
+// like "AM"/"PM" (exactly what the router prompt asks for) substring-match real
+// shift names, so the match was usually the trade counterparty's own shift.
+//
+// That value then propagated unfiltered — pending → outreach → manager approval
+// email → decision token → side A of executeScheduleTrade — where its triple
+// (date, shift_name, employee_id) could never match, because the requester was
+// never on it. Before this batch that produced a SILENT HALF-APPLIED TRADE.
+// After the executor fix it produces a `partial_trade` refusal, which is safe
+// but still means a legitimate swap DOESN'T WORK. This closes it at the source
+// so the swap actually succeeds.
+//
+// The second, quieter half: `findRequesterShift` matches on employee+date ONLY
+// and ignores the name, so on a DOUBLE-SHIFT DAY it silently returned the first
+// one — a coin flip on which of the employee's two shifts got given away, with
+// no question asked. That is why the resolver is name-aware and can answer
+// 'ambiguous'.
+//
+// Mirrors chooseTradeShift's shape and shares its soft-narrowing
+// (narrowByShiftDescriptor) so BOTH legs of a trade are resolved by identical
+// rules — RULE 0b.
+export type RequesterShiftChoice =
+  | { kind: 'one'; shift: ScheduleAssignment }
+  | { kind: 'ambiguous'; shifts: ScheduleAssignment[] }
+  | { kind: 'none' };
+
+export function resolveRequesterShiftOnDate(
+  schedData: ScheduleData,
+  requesterId: string,
+  shiftDate: string,
+  nameHint?: string | null,
+): RequesterShiftChoice {
+  // ALWAYS scoped to the requester. There is no fallback that widens beyond
+  // them — someone else's shift is never an answer to "which of MY shifts".
+  const mine = schedData.assignments.filter(
+    a => a.employee_id === requesterId && a.date === shiftDate,
+  );
+  if (mine.length === 0) return { kind: 'none' };
+  if (mine.length === 1) return { kind: 'one', shift: mine[0] };
+
+  const narrowed = narrowByShiftDescriptor(mine, nameHint);
+  if (narrowed.length === 1) return { kind: 'one', shift: narrowed[0] };
+  // Two shifts that day and the descriptor didn't settle it: ASK. Guessing here
+  // gives away a shift the employee never named.
+  return { kind: 'ambiguous', shifts: narrowed };
+}
+
 // When a swap message names no date, don't assume "today" — resolve the requester's
 // UPCOMING shifts (date >= today, current schedule) so the caller can use the single
 // obvious one or ask which. Pure, so it is unit-tested without a database.
@@ -1347,6 +1408,37 @@ export function descriptorAmPm(desc: string): 'day' | 'pm' | null {
 // start_time (tenant data), so it works for any client's shift structure.
 const shiftStartsPm = (a: ScheduleAssignment): boolean => (a.start_time ?? '00:00').slice(0, 5) >= '13:00';
 
+// SOFT-narrow a set of same-day candidates using the employee's loose descriptor
+// ("her 9-3 PM shift", "the AM one"). First by a genuine shift_name token that
+// appears in the descriptor, then by AM/PM sense against the shift's REAL
+// start_time (tenant data, so it works for any client's shift structure).
+//
+// "Soft" is load-bearing: narrowing may REDUCE the set but must never empty it.
+// A descriptor that matches nothing leaves the caller with the full set to ask
+// about, rather than a false "you have no such shift".
+//
+// L4 — extracted from chooseTradeShift so the requester's OWN shift is resolved
+// by exactly the same rules as the coworker's (RULE 0b). It used to be applied
+// only to the coworker's side, which is part of why the requester's leg was the
+// unreliable one.
+export function narrowByShiftDescriptor(
+  candidates: ScheduleAssignment[],
+  descriptor: string | null | undefined,
+): ScheduleAssignment[] {
+  if (!descriptor || candidates.length <= 1) return candidates;
+  const h = descriptor.toLowerCase();
+  let narrowed = candidates.filter(a =>
+    a.shift_name.toLowerCase().split(/\s+/).some(tok => tok.length > 2 && h.includes(tok)));
+  if (narrowed.length !== 1) {
+    const sense = descriptorAmPm(descriptor);
+    if (sense) {
+      const bySense = candidates.filter(a => (sense === 'pm') === shiftStartsPm(a));
+      if (bySense.length > 0) narrowed = bySense;
+    }
+  }
+  return narrowed.length > 0 ? narrowed : candidates;
+}
+
 // Resolve which of the target's shifts the requester trades FOR. Employees name
 // a coworker's shift by DAY + a loose time ("her 9-3 PM shift on Friday"), which
 // never matches a tenant's internal shift NAME ("AM Weekday", "Afternoon"...).
@@ -1376,16 +1468,7 @@ export function chooseTradeShift(
   // by AM/PM sense vs the shift's real start_time. Soft narrowing may reduce the
   // set but MUST NOT eliminate the last candidate.
   if (hint?.shift_name && candidates.length > 1) {
-    const h = hint.shift_name.toLowerCase();
-    let narrowed = candidates.filter(a =>
-      a.shift_name.toLowerCase().split(/\s+/).some(tok => tok.length > 2 && h.includes(tok)));
-    if (narrowed.length !== 1) {
-      const sense = descriptorAmPm(hint.shift_name);
-      if (sense) {
-        const bySense = candidates.filter(a => (sense === 'pm') === shiftStartsPm(a));
-        if (bySense.length > 0) narrowed = bySense;
-      }
-    }
+    const narrowed = narrowByShiftDescriptor(candidates, hint.shift_name);
     if (narrowed.length === 1) return { kind: 'one', shift: narrowed[0] };
     if (narrowed.length > 1) candidates = narrowed;
   }
@@ -2350,13 +2433,31 @@ export async function handleInitiateSwap(
   if (raw.shift_date) {
     shiftDate = raw.shift_date;
     schedule = await findSchedule(contact.company_id, shiftDate);
+    // L4 [SWAP-SHIFT-RESOLVE] — resolve strictly within the REQUESTER's own
+    // assignments. The old employee-agnostic fallback could hand back a
+    // coworker's shift as side A; see resolveRequesterShiftOnDate.
     if (schedule) {
-      shift = findRequesterShift(schedule.data, contact.employee_id!, shiftDate);
-      if (!shift && shiftNameHint) {
-        shift = schedule.data.assignments.find(a =>
-          a.date === shiftDate && a.shift_name.toLowerCase().includes(shiftNameHint.toLowerCase())
-        ) ?? null;
+      const own = resolveRequesterShiftOnDate(
+        schedule.data, contact.employee_id!, shiftDate, shiftNameHint,
+      );
+      if (own.kind === 'ambiguous') {
+        // They work more than one shift that day and didn't say which. Ask —
+        // picking one silently gives away a shift they never named.
+        const list = own.shifts
+          .map(a => `${a.shift_name} (${(a.start_time ?? '').slice(0, 5)}–${(a.end_time ?? '').slice(0, 5)})`)
+          .join(', or ');
+        await reply(contact, message,
+          `You're on more than one shift on ${formatDisplayDate(shiftDate)} — which one did you mean: ${list}? ` +
+          `Tell me which and I'll set it up.`);
+        await logActivity({
+          company_id: contact.company_id,
+          action: 'swap_shift_ambiguous',
+          summary: `${contact.name} asked to swap on ${shiftDate} but works ${own.shifts.length} shifts that day — asked which.`,
+          metadata: { requester_id: contact.employee_id, shift_date: shiftDate, shift_name_hint: shiftNameHint },
+        });
+        return;
       }
+      if (own.kind === 'one') shift = own.shift;
     }
     if (!shift) {
       await reply(contact, message,

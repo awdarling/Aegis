@@ -103,8 +103,9 @@ describe('L4 · sendSwapDecisionNotification refuses anything it cannot prove is
     h.swapRow = pending('Two-way trade agreed by both via the broadcast. [quria:kind=trade]');
     const r = await sendSwapDecisionNotification('s1', 'approved');
     expect(r.status).toBe('noop');
-    expect(r.reason).toMatch(/two-way trade/i);
-    expect(r.reason).toMatch(/manager email/i);
+    expect(r.reason).toMatch(/two-way TRADE/i);
+    // The manager must be routed to the path that DOES work, not just blocked.
+    expect(r.reason).toMatch(/Approve button in the Aegis approval EMAIL/i);
     // The whole point — the one-way executor must never see a trade.
     expect(mockExec).not.toHaveBeenCalled();
     expect(mockSms).not.toHaveBeenCalled();

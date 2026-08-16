@@ -107,8 +107,10 @@ describe('L4 · canExecuteFromRowAlone FAILS CLOSED', () => {
     expect(r.ok).toBe(false);
     expect(r.kind).toBe('trade');
     expect(r.reason).toMatch(/two-way trade/i);
-    // The manager needs to be told what to do instead, not just refused.
-    expect(r.reason).toMatch(/manager email/i);
+    // A refusal is only acceptable if the manager is told exactly how to finish
+    // the job — otherwise "fail closed" just reads as "broken".
+    expect(r.reason).toMatch(/Approve button in the Aegis approval EMAIL/i);
+    expect(r.reason).toMatch(/Nothing has been changed/i);
   });
 
   it('refuses an UNMARKED legacy row — unknown is unsafe, not assumed one-way', () => {
@@ -121,7 +123,7 @@ describe('L4 · canExecuteFromRowAlone FAILS CLOSED', () => {
     expect(r.ok).toBe(false);
     expect(r.kind).toBe(null);
     expect(r.reason).toMatch(/predates|cannot tell/i);
-    expect(r.reason).toMatch(/manager email/i);
+    expect(r.reason).toMatch(/Approve button in the Aegis approval EMAIL/i);
   });
 
   it('refuses a null note', () => {

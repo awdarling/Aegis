@@ -345,7 +345,30 @@ async function handleSwapDecision(
     }
 
     // Find the schedule covering this shift date.
-    const { data: schedRow } = await supabase.from('schedules').select('id, data').is('deleted_at', null)
+    //
+    // L4 [SWAP-SCHEDULE-SELECT] — `.is('archived_at', null)` added so this agrees
+    // with the PUBLISHER's own definition of "the live row for this week".
+    //
+    // Both publish paths (schedule-build.ts distributeScheduleCore + the
+    // redistribute path, and Homebase's publish_schedule_swap RPC) supersede a
+    // prior row with `{ status: 'archived', archived_at, superseded_by }`, keyed
+    // on `published_at NOT NULL AND archived_at IS NULL`. So "live" is defined by
+    // archived_at, while this query defined it by the status enum plus newest
+    // generated_at — TWO definitions of one fact, which is precisely what lets a
+    // writer and a reader land on different rows (SCHEMA_DRIFT_LOG 2026-07-01 s2,
+    // where multiple published rows per week caused approved swaps not to appear
+    // on the schedule the employee sees).
+    //
+    // Verified read-only 2026-08-16: NOT currently reachable. Live Watermark has
+    // 12 published rows, ZERO with archived_at set and ZERO with status
+    // 'archived' — no republish has fired in production yet — and because the
+    // archive path sets BOTH status and archived_at, the status filter alone
+    // still excludes superseded rows. This is defence in depth: it removes the
+    // dependency on those two columns never disagreeing (a legacy row archived
+    // by an older code path, a manual DB edit, or a republish from an OLDER
+    // build whose generated_at outranks the live row).
+    const { data: schedRow } = await supabase.from('schedules').select('id, data')
+      .is('deleted_at', null).is('archived_at', null)
       .eq('company_id', token.company_id).eq('status', 'published')
       .lte('week_start', token.shift_date).gte('week_end', token.shift_date)
       .order('generated_at', { ascending: false }).limit(1).maybeSingle();
@@ -838,7 +861,10 @@ export async function sendSwapDecisionNotification(
 
   // Approve. The schedule write is authoritative (D2): apply first, and only mark
   // approved + notify if it actually lands — otherwise leave it pending and say why.
-  const { data: schedRow } = await supabase.from('schedules').select('id, data').is('deleted_at', null)
+  // L4 [SWAP-SCHEDULE-SELECT] — same `archived_at` guard as the email-button
+  // path above; see the long note there for why.
+  const { data: schedRow } = await supabase.from('schedules').select('id, data')
+    .is('deleted_at', null).is('archived_at', null)
     .eq('company_id', swap.company_id).eq('status', 'published')
     .lte('week_start', swap.shift_date).gte('week_end', swap.shift_date)
     .order('generated_at', { ascending: false }).limit(1).maybeSingle();

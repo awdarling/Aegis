@@ -2193,7 +2193,7 @@ ${teamGridHtml}
         // employees never reach here (email-only, handled above).
         const smsBody = buildDistributionSmsBody({ weekLabel, shifts: myShifts, hasEmail: !!emp.contact_email });
 
-        const ok = await sendSms({ to: emp.contact_phone, from: smsFrom, body: smsBody, company_id: companyId });
+        const ok = await sendSms({ to: emp.contact_phone, from: smsFrom, body: smsBody, company_id: companyId, employee_id: emp.id });
         if (ok) {
           texted++;
           empTexted = true;
@@ -2610,7 +2610,7 @@ ${teamGridHtml}
         // Bug 2 (spec): updated-schedule text lists the employee's CURRENT shifts;
         // email-holders also get a pointer to their full updated schedule + team grid.
         const smsBody = buildDistributionSmsBody({ weekLabel, shifts: myNew, hasEmail: !!emp.contact_email, updated: true });
-        const ok = await sendSms({ to: emp.contact_phone, from: smsFrom, body: smsBody, company_id: companyId });
+        const ok = await sendSms({ to: emp.contact_phone, from: smsFrom, body: smsBody, company_id: companyId, employee_id: emp.id });
         if (ok) {
           texted++;
           empTexted = true;

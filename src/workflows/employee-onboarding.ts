@@ -11,6 +11,7 @@ import { supabase } from '../db/client';
 import { coerceJsonObject } from '../utils/coerce-json';
 import { logActivity } from '../logger/activity-log';
 import { sendSms } from '../messaging/sms';
+import { setEmployeeConsentState } from '../messaging/consent';
 import { sendEmail } from '../messaging/email';
 import { reply, sendInThreadAck } from '../messaging/reply';
 import { getAegisSmsChannel } from '../messaging/notify';
@@ -851,6 +852,11 @@ async function textEmployeeRaw(session: OnboardingSession, body: string): Promis
     return;
   }
   await sendSms({
+    // Onboarding is the consent authority for its own flow: this raw send is the
+    // opt-in INVITATION itself (the one legally-cleared pre-consent SMS) and, via
+    // textEmployee, the post-consent steps that are already gated on
+    // session.opt_in_confirmed. So it legitimately bypasses the send-layer gate.
+    allowPreConsent: true,
     to: session.employee_phone,
     from: session.aegis_sms_channel,
     body,
@@ -1526,6 +1532,9 @@ async function handleOptInStep(
         company_name: companyName,
       },
     });
+    // Keep the durable consent cache in lockstep with the event just logged, so
+    // the send-layer gate (canSmsEmployee) now permits SMS to this employee (N3).
+    await setEmployeeConsentState(session.company_id, session.employee_id, 'confirmed');
     // B6 smart onboarding: skip the redundant name question and any step whose
     // data is already on file — ask only what's genuinely missing (plus upcoming
     // time off), or close warmly when the record is already complete.
@@ -1546,6 +1555,9 @@ async function handleOptInStep(
         reply_body: body.slice(0, 200),
       },
     });
+    // Persist the decline to the durable consent cache — a hard block at the
+    // send layer even though a phone exists (N3).
+    await setEmployeeConsentState(session.company_id, session.employee_id, 'declined');
     await textEmployeeRaw(
       session,
       `No problem. You won't receive any further messages. Contact your manager if you change your mind.`
@@ -3831,6 +3843,8 @@ export async function handleAvailabilityConfirmResponse(
       // relying on noticing the email. Same principle as the time-off / swap alerts.
       if (smsAvailable) {
         await sendSms({
+          // Recipient is the MANAGER (not under the employee opt-in regime).
+          allowPreConsent: true,
           to: managerPhone!,
           from: aegisSmsChannel!,
           body: managerAlertSms({ managerName: mgr.name, summary: headline, inbox: 'approve' }),

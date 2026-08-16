@@ -6,6 +6,7 @@ import { saveConversation } from '../logger/conversation';
 import { logActivity } from '../logger/activity-log';
 import { supabase } from '../db/client';
 import { env } from '../config/env';
+import { setEmployeeConsentState } from '../messaging/consent';
 import type { InboundMessage } from '../security/types';
 
 export const smsWebhook = Router();
@@ -98,6 +99,13 @@ export async function recordCarrierKeywordEvent(
           : { resubscribed_at: new Date().toISOString() }),
       },
     });
+    // Keep the durable consent cache in lockstep with the STOP/START event so the
+    // send-layer gate (canSmsEmployee) reflects it immediately (N3). Only when we
+    // resolved the sender to a known employee; an unrecognized number has no row
+    // to update (the carrier still owns the actual suppression regardless).
+    if (emp?.id) {
+      await setEmployeeConsentState(companyId, emp.id, kind === 'opted_out' ? 'opted_out' : 'resubscribed');
+    }
   } catch (err) {
     console.error('[sms] carrier-keyword logging failed (non-fatal):', err);
   }

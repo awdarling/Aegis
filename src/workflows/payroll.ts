@@ -193,6 +193,8 @@ export async function handleWageRateSync(params: {
       const aegisChannel = await getAegisSmsChannel(companyId);
       if (aegisChannel) {
         await sendSms({
+          // Recipient is the MANAGER (not under the employee opt-in regime).
+          allowPreConsent: true,
           to: managerPhone,
           from: aegisChannel,
           body: managerAlertSms({ summary: `${employeeName}'s pay rate is now $${newRate}/hr — I synced it to Engage for you.` }),
@@ -216,6 +218,8 @@ export async function handleWageRateSync(params: {
       const aegisChannel = await getAegisSmsChannel(companyId);
       if (aegisChannel) {
         await sendSms({
+          // Recipient is the MANAGER (not under the employee opt-in regime).
+          allowPreConsent: true,
           to: managerPhone,
           from: aegisChannel,
           body: managerAlertSms({ summary: `Heads up — I couldn't sync ${employeeName}'s pay rate ($${newRate}/hr) to Engage (${result.message}); you'll need to update it manually.` }),

@@ -188,6 +188,8 @@ export async function handleReportDeparture(
   if (!env.EMAIL_ONLY && managerPhone && aegisSmsNumber) {
     const summary = `${employeeName} says they're leaving${lastDayDisplay ? ` — last day ${lastDayDisplay}` : ` (no date yet)`}.`;
     await sendSms({
+      // Recipient is the MANAGER (not under the employee opt-in regime).
+      allowPreConsent: true,
       to: managerPhone,
       from: aegisSmsNumber,
       body: managerAlertSms({ managerName: manager.name, summary, inbox: 'action' }),

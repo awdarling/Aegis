@@ -393,7 +393,7 @@ export async function handleBroadcastConfirmation(
     if (session.channel === 'both') {
       let any = false;
       if (!env.EMAIL_ONLY && recipient.phone && aegisSmsNumber) {
-        const ok = await sendSms({ to: recipient.phone, from: aegisSmsNumber, body: outBody, company_id: session.company_id });
+        const ok = await sendSms({ to: recipient.phone, from: aegisSmsNumber, body: outBody, company_id: session.company_id, employee_id: recipient.employee_id });
         if (ok) { sentSms++; any = true; }
       }
       if (recipient.email) {
@@ -414,6 +414,7 @@ export async function handleBroadcastConfirmation(
       email: recipient.email,
       body: outBody,
       subject: outSubject,
+      employee_id: recipient.employee_id,
     });
     if (used === 'sms') sentSms++;
     else if (used === 'email') sentEmail++;

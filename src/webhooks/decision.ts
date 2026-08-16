@@ -182,9 +182,18 @@ export async function notifyEmployeeDecision(opts: {
   body: string;
   subject: string;
   thread_id?: string | null;
+  // The recipient employee — REQUIRED for the SMS leg (N3 consent gate). Blocked
+  // → email fallback, which is the correct legal behavior for a decision notice.
+  employee_id?: string | null;
 }): Promise<boolean> {
   if (!env.EMAIL_ONLY && opts.phone && opts.smsChannel) {
-    const ok = await sendSms({ to: opts.phone, from: opts.smsChannel, body: opts.body, company_id: opts.company_id });
+    const ok = await sendSms({
+      to: opts.phone,
+      from: opts.smsChannel,
+      body: opts.body,
+      company_id: opts.company_id,
+      employee_id: opts.employee_id ?? undefined,
+    });
     if (ok) return true;
     console.warn(`[decision-notify] SMS send failed for company ${opts.company_id}; falling back to email`);
   }
@@ -231,6 +240,7 @@ async function notifyEmployee(
     body: messageText,
     subject,
     thread_id: token.thread_id,
+    employee_id: employee.id,
   });
 }
 
@@ -391,8 +401,8 @@ async function handleSwapDecision(
     const { requesterMsg, receiverMsg } = buildSwapDecisionMessages(token, isTrade, dateLong, targetDateLong);
     const subj = isTrade ? 'Shift trade approved' : 'Swap approved';
 
-    await notifyEmployeeDecision({ company_id: token.company_id, smsChannel: token.aegis_sms_channel, phone: requester?.contact_phone ?? null, email: requester?.contact_email ?? null, body: requesterMsg, subject: subj });
-    await notifyEmployeeDecision({ company_id: token.company_id, smsChannel: token.aegis_sms_channel, phone: receiver?.contact_phone ?? null, email: receiver?.contact_email ?? null, body: receiverMsg, subject: subj });
+    await notifyEmployeeDecision({ company_id: token.company_id, smsChannel: token.aegis_sms_channel, phone: requester?.contact_phone ?? null, email: requester?.contact_email ?? null, body: requesterMsg, subject: subj, employee_id: token.requester_id });
+    await notifyEmployeeDecision({ company_id: token.company_id, smsChannel: token.aegis_sms_channel, phone: receiver?.contact_phone ?? null, email: receiver?.contact_email ?? null, body: receiverMsg, subject: subj, employee_id: token.receiver_id });
   } else {
     // Denied — no schedule change is involved, so the status write is safe to
     // do first. (D2 only reorders the APPROVE path, where a status of
@@ -408,8 +418,8 @@ async function handleSwapDecision(
     // Notify both
     const deniedMsg = `Your shift ${isTrade ? 'trade' : 'swap'} request for the ${token.shift_name} shift on ${new Date(token.shift_date + 'T12:00:00Z').toLocaleDateString('en-US', { month: 'long', day: 'numeric' })} has been denied by your manager. Please contact them if you have questions.`;
     const subj = isTrade ? 'Shift trade denied' : 'Swap denied';
-    await notifyEmployeeDecision({ company_id: token.company_id, smsChannel: token.aegis_sms_channel, phone: requester?.contact_phone ?? null, email: requester?.contact_email ?? null, body: deniedMsg, subject: subj });
-    await notifyEmployeeDecision({ company_id: token.company_id, smsChannel: token.aegis_sms_channel, phone: receiver?.contact_phone ?? null, email: receiver?.contact_email ?? null, body: deniedMsg, subject: subj });
+    await notifyEmployeeDecision({ company_id: token.company_id, smsChannel: token.aegis_sms_channel, phone: requester?.contact_phone ?? null, email: requester?.contact_email ?? null, body: deniedMsg, subject: subj, employee_id: token.requester_id });
+    await notifyEmployeeDecision({ company_id: token.company_id, smsChannel: token.aegis_sms_channel, phone: receiver?.contact_phone ?? null, email: receiver?.contact_email ?? null, body: deniedMsg, subject: subj, employee_id: token.receiver_id });
   }
 
   const decisionPast = action === 'approve' ? 'approved' : 'denied';
@@ -736,12 +746,13 @@ async function loadSwapEmployee(companyId: string, employeeId: string) {
 // the person has a phone + the tenant has an Aegis number, else email. Returns
 // whether a channel was used (email honesty flows through sendEmail's boolean).
 async function sendSwapNotice(
-  to: { contact_email: string | null; contact_phone: string | null },
+  to: { id: string; contact_email: string | null; contact_phone: string | null },
   body: string, subject: string, aegisSmsChannel: string | null, companyId: string,
 ): Promise<boolean> {
   if (!env.EMAIL_ONLY && to.contact_phone && aegisSmsChannel) {
-    await sendSms({ to: to.contact_phone, from: aegisSmsChannel, body, company_id: companyId });
-    return true;
+    const ok = await sendSms({ to: to.contact_phone, from: aegisSmsChannel, body, company_id: companyId, employee_id: to.id });
+    if (ok) return true;
+    // Consent-blocked or send failure → fall through to the email leg below.
   }
   if (to.contact_email) {
     return sendEmail({ to: to.contact_email, subject, text: body, company_id: companyId });

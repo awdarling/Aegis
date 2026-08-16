@@ -574,6 +574,7 @@ export async function resolveSwapProposal(params: {
     await clearSwapProposal(params.company_id, params.requester_id);
 
     await sendOutreachMessage({
+      receiverId: receiver.id,
       receiverEmail: receiver.contact_email ?? null,
       receiverPhone: receiver.contact_phone ?? null,
       aegisSmsNumber,
@@ -627,6 +628,7 @@ export async function resolveSwapProposal(params: {
   });
 
   await sendOutreachMessage({
+    receiverId: receiver.id,
     receiverEmail: receiver.contact_email ?? null,
     receiverPhone: receiver.contact_phone ?? null,
     aegisSmsNumber,
@@ -943,6 +945,7 @@ export async function buildSwapBroadcastEmail(params: {
 export async function deliverSwapBroadcast(params: {
   smsCapable: boolean;
   aegisSmsNumber: string | null;
+  candidateId: string | null; // the candidate EMPLOYEE — gates the SMS (N3)
   candidatePhone: string | null;
   candidateEmail: string | null;
   sms: string;
@@ -952,7 +955,7 @@ export async function deliverSwapBroadcast(params: {
   company_id: string;
 }): Promise<'sms' | 'email' | 'none'> {
   if (params.smsCapable && params.candidatePhone && params.aegisSmsNumber) {
-    const ok = await sendSms({ to: params.candidatePhone, from: params.aegisSmsNumber, body: params.sms, company_id: params.company_id });
+    const ok = await sendSms({ to: params.candidatePhone, from: params.aegisSmsNumber, body: params.sms, company_id: params.company_id, employee_id: params.candidateId ?? undefined });
     if (ok) return 'sms';
     console.warn(`[swap-broadcast] SMS send failed for company ${params.company_id}; falling back to email`);
   }
@@ -2079,6 +2082,8 @@ ${brandActionCard(`Action needed · Shift ${isTrade ? 'trade' : 'swap'}`, `${det
 
   if (!env.EMAIL_ONLY && managerPhone && params.aegis_sms_channel) {
     await sendSms({
+      // Recipient is the MANAGER (not under the employee opt-in regime).
+      allowPreConsent: true,
       to: managerPhone,
       from: params.aegis_sms_channel,
       body: managerAlertSms({
@@ -2156,6 +2161,7 @@ async function executeSwapNow(params: {
       `${textOpener(requester.name)}${receiver.name} has agreed to cover your ${shiftDesc} — but I couldn't put it on the schedule yet because that week isn't published. Your manager will confirm it. Plan on working the shift until you hear it's locked in.`,
     );
     await sendOutreachMessage({
+      receiverId: receiver.id,
       receiverEmail: receiver.contact_email ?? null,
       receiverPhone: receiver.contact_phone ?? null,
       aegisSmsNumber: params.aegis_sms_channel,
@@ -2198,6 +2204,7 @@ async function executeSwapNow(params: {
 
   // Notify receiver — EMAIL-FIRST (SMS only once A2P clears).
   await sendOutreachMessage({
+    receiverId: receiver.id,
     receiverEmail: receiver.contact_email ?? null,
     receiverPhone: receiver.contact_phone ?? null,
     aegisSmsNumber: params.aegis_sms_channel,
@@ -2530,6 +2537,7 @@ export function buildFacilitatedSwapConfirm(p: {
 // record keyed by the employee, on either channel. (Batch-1 systemic sweep — this
 // was email-first, an email-era holdover.)
 async function sendOutreachMessage(params: {
+  receiverId: string | null; // the coworker EMPLOYEE being asked — gates the SMS (N3)
   receiverEmail: string | null;
   receiverPhone: string | null;
   aegisSmsNumber: string | null;
@@ -2537,9 +2545,9 @@ async function sendOutreachMessage(params: {
   text: string;
   company_id: string;
 }): Promise<'email' | 'sms' | 'none'> {
-  const { receiverEmail, receiverPhone, aegisSmsNumber, subject, text, company_id } = params;
+  const { receiverId, receiverEmail, receiverPhone, aegisSmsNumber, subject, text, company_id } = params;
   if (!env.EMAIL_ONLY && receiverPhone && aegisSmsNumber) {
-    const ok = await sendSms({ to: receiverPhone, from: aegisSmsNumber, body: text, company_id });
+    const ok = await sendSms({ to: receiverPhone, from: aegisSmsNumber, body: text, company_id, employee_id: receiverId ?? undefined });
     if (ok) return 'sms';
     console.warn(`[swap-outreach] SMS send failed for company ${company_id}; falling back to email`);
   }
@@ -2667,6 +2675,7 @@ export async function handleSwapConfirmation(
     const isGiveaway = ask.isGiveaway;
 
     const delivered = await sendOutreachMessage({
+      receiverId: receiver.id,
       receiverEmail, receiverPhone, aegisSmsNumber,
       subject: ask.subject,
       text: ask.text, company_id: contact.company_id,
@@ -2787,6 +2796,7 @@ export async function handleSwapConfirmation(
       const delivered = await deliverSwapBroadcast({
         smsCapable,
         aegisSmsNumber,
+        candidateId: cand.id,
         candidatePhone: cand.contact_phone ?? null,
         candidateEmail: cand.contact_email ?? null,
         sms, subject, text, html,
@@ -2923,6 +2933,7 @@ export async function handleSwapOutreachResponse(
     await storeSwapOutreach(nextOutreach);
 
     await sendOutreachMessage({
+      receiverId: nextEmp.id,
       receiverEmail: nextEmp.contact_email ?? null,
       receiverPhone: nextEmp.contact_phone ?? null,
       aegisSmsNumber: smsChannel,

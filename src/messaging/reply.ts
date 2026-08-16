@@ -45,6 +45,12 @@ export async function reply(
       from: originalMessage.recipient,
       body: text,
       company_id: contact.company_id,
+      // Replying to an inbound SMS. An employee is consent-gated (if they haven't
+      // consented, the reply falls back to email below); a manager / quria-admin
+      // is not under the employee opt-in regime (see SmsOptions).
+      ...(contact.role === 'employee'
+        ? { employee_id: contact.employee_id ?? undefined }
+        : { allowPreConsent: true }),
     });
     if (sent) return;
 

@@ -131,6 +131,7 @@ export async function processDepartureDecision(params: {
           ? `Hi ${firstName(employeeName)} — ${payload.manager_name} saw your note and has your last day (${lastDayDisplay}) recorded. They may reach out with a few questions, but you're all set on our end. Thanks for the heads-up!`
           : `Hi ${firstName(employeeName)} — ${payload.manager_name} saw your note about leaving and has it noted. They may reach out to nail down your exact last day. Thanks for the heads-up!`,
         thread_id: payload.thread_id,
+        employee_id: payload.employee_id ?? undefined,
       });
 
       await supabase.from('aegis_memory').delete().eq('source', `departure_token:${token}`);
@@ -169,6 +170,7 @@ export async function processDepartureDecision(params: {
       subject: 'About your note',
       body: `Hi ${firstName(employeeName)} — ${payload.manager_name} saw your note and would like to talk it through with you directly, so expect them to reach out soon. Thanks!`,
       thread_id: payload.thread_id,
+      employee_id: payload.employee_id ?? undefined,
     });
 
     await supabase.from('aegis_memory').delete().eq('source', `departure_token:${token}`);

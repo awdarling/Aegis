@@ -124,6 +124,7 @@ describe('buildSwapBroadcastEmail — sms body', () => {
 // ── 2) deliverSwapBroadcast — the SMS-first routing matrix ─────────────────────
 const deliverBase = {
   aegisSmsNumber: '+15550001111',
+  candidateId: 'emp-candidate-1',
   sms: 'sms body', subject: 'subj', text: 'text', html: '<p>html</p>',
   company_id: base.company_id,
 };

@@ -21,6 +21,8 @@ import {
 } from '../messaging/brand';
 import { generateActionToken } from '../lib/aegis-actions/tokens';
 import { resolveAvailabilityForWeek } from '../lib/custom-availability';
+// L4 — RULE 0b: one question ("what kind of swap is this?"), one function.
+import { withSwapKind } from '../lib/swap-kind';
 import type { InboundMessage, VerifiedContact } from '../security/types';
 import type { Employee, Policy, Availability, CustomAvailability } from '../db/types';
 import type { ScheduleAssignment } from './schedule-build';
@@ -292,7 +294,9 @@ export async function commitSwapPickup(params: {
     role: b.role,
     status: 'pending_manager',
     initiated_by: 'aegis',
-    notes: `${receiver.name} offered to pick up the shift via the broadcast — one-way pickup (no trade).`,
+    // L4 — kind is now PERSISTED so the Homebase UI approval path can prove
+    // this row is one-way instead of assuming it (see lib/swap-kind.ts).
+    notes: withSwapKind(`${receiver.name} offered to pick up the shift via the broadcast — one-way pickup (no trade).`, 'pickup'),
   }).select('id').single();
   const swapId = (swapRow as { id: string } | null)?.id ?? 'unknown';
 
@@ -603,7 +607,9 @@ export async function resolveSwapProposal(params: {
     role: p.role,
     status: 'pending_manager',
     initiated_by: 'aegis',
-    notes: `Two-way trade agreed by both via the broadcast: ${p.requester_name} gives ${p.shift_name} (${p.shift_date}) and takes ${p.target_shift_name} (${p.target_shift_date}).`,
+    // L4 — marked as a TRADE so the Homebase UI approval path refuses it
+    // rather than running it as a one-way giveaway and dropping the return leg.
+    notes: withSwapKind(`Two-way trade agreed by both via the broadcast: ${p.requester_name} gives ${p.shift_name} (${p.shift_date}) and takes ${p.target_shift_name} (${p.target_shift_date}).`, 'trade'),
   }).select('id').single();
   const swapId = (swapRow as { id: string } | null)?.id ?? 'unknown';
 
@@ -1157,15 +1163,63 @@ export function applyTradeToAssignments(
   a: TradeSide,
   b: TradeSide
 ): ScheduleAssignment[] {
-  return assignments.map(asg => {
+  return applyTradeToAssignmentsDetailed(assignments, a, b).assignments;
+}
+
+// L4 — the same transform, but REPORTING what each leg actually did.
+//
+// THE BUG this closes (live at Watermark, a manager reproduced it 2026-08-16):
+// a two-way trade half-applied. The requester correctly landed on the
+// coworker's shift; the coworker was never taken off it and never received the
+// requester's shift in return.
+//
+// The mechanism was not in the transform — it was that the transform threw the
+// per-leg result away. The two legs are INDEPENDENT `if` branches: when side
+// A's triple (date, shift_name, employee_id) matches nothing but side B's does,
+// leg B still fires and the array still "changed". executeScheduleTrade then
+// asked `updatedAssignments.some(row changed)` — ANY one row. That is a correct
+// guard for the ONE-leg executeScheduleSwap and a silently wrong one here. It
+// passed; the write went through; the request was marked approved; the magic
+// tokens were consumed so the manager could not retry; and BOTH employees were
+// emailed "your shift trade has been approved". One of them was wrong about
+// which shift they were working.
+//
+// So the invariant a trade must satisfy is not "something moved" but "EXACTLY
+// ONE row moved on EACH side". Counting is the fix; executeScheduleTrade
+// enforces it.
+//
+// Exactly one, not at-least-one: two rows sharing a
+// (date, shift_name, employee_id) triple means the same person is on the same
+// shift twice — corrupt data — and moving both would put the counterparty on
+// that shift twice. Better to refuse and tell the manager than to write a
+// schedule nobody can work.
+export interface TradeApplyOutcome {
+  assignments: ScheduleAssignment[];
+  /** Rows leg A moved — the requester's shift going to the coworker. */
+  aMatched: number;
+  /** Rows leg B moved — the coworker's shift coming back to the requester. */
+  bMatched: number;
+}
+
+export function applyTradeToAssignmentsDetailed(
+  assignments: ScheduleAssignment[],
+  a: TradeSide,
+  b: TradeSide
+): TradeApplyOutcome {
+  let aMatched = 0;
+  let bMatched = 0;
+  const next = assignments.map(asg => {
     if (asg.date === a.date && asg.shift_name === a.shift_name && asg.employee_id === a.employee_id) {
+      aMatched++;
       return { ...asg, employee_id: b.employee_id, employee_name: b.employee_name };
     }
     if (asg.date === b.date && asg.shift_name === b.shift_name && asg.employee_id === b.employee_id) {
+      bMatched++;
       return { ...asg, employee_id: a.employee_id, employee_name: a.employee_name };
     }
     return asg;
   });
+  return { assignments: next, aMatched, bMatched };
 }
 
 // Executes an approved swap: updates the schedule data and recalculates wages.
@@ -1183,7 +1237,22 @@ export function applyTradeToAssignments(
 // swap actually landed on — schedule first, status second.
 export type SwapApplyResult =
   | { ok: true; schedule_id: string }
-  | { ok: false; code: 'schedule_not_found' | 'no_matching_assignment' | 'write_failed'; reason: string };
+  | {
+      ok: false;
+      code:
+        | 'schedule_not_found'
+        | 'no_matching_assignment'
+        // L4 — a TRADE where one leg matched the schedule and the other did
+        // not. Distinct from 'no_matching_assignment' (neither leg matched)
+        // because it is the dangerous case: it used to be reported as SUCCESS.
+        | 'partial_trade'
+        // L4 — the Homebase UI approval path was handed a request it cannot
+        // prove is one-way. It has no target-shift columns to work from, so it
+        // refuses rather than running a trade as a giveaway.
+        | 'trade_not_supported_here'
+        | 'write_failed';
+      reason: string;
+    };
 
 export async function executeScheduleSwap(
   companyId: string,
@@ -1348,9 +1417,17 @@ export async function executeScheduleTrade(
   }
 
   const row = schedRow as { id: string; data: ScheduleData; staffing_report: Record<string, unknown> | null };
-  const updatedAssignments = applyTradeToAssignments(row.data.assignments, sideA, sideB);
-  if (!updatedAssignments.some((a, i) => a.employee_id !== row.data.assignments[i]?.employee_id)) {
-    console.warn(`[executeScheduleTrade] no matching assignments for trade (${sideA.employee_id} ${sideA.date} ${sideA.shift_name} ↔ ${sideB.employee_id} ${sideB.date} ${sideB.shift_name}) in schedule ${scheduleId} — nothing updated`);
+
+  // L4 — BOTH legs must land, or nothing is written.
+  //
+  // The old guard was `updatedAssignments.some(row changed)` — ANY one row —
+  // copied from the one-leg executeScheduleSwap. On a two-leg operation that
+  // reports a HALF-APPLIED trade as success. See applyTradeToAssignmentsDetailed.
+  const outcome = applyTradeToAssignmentsDetailed(row.data.assignments, sideA, sideB);
+  const legDesc = `${sideA.employee_id} ${sideA.date} ${sideA.shift_name} ↔ ${sideB.employee_id} ${sideB.date} ${sideB.shift_name}`;
+
+  if (outcome.aMatched === 0 && outcome.bMatched === 0) {
+    console.warn(`[executeScheduleTrade] no matching assignments for trade (${legDesc}) in schedule ${scheduleId} — nothing updated`);
     return {
       ok: false,
       code: 'no_matching_assignment',
@@ -1358,6 +1435,26 @@ export async function executeScheduleTrade(
     };
   }
 
+  if (outcome.aMatched !== 1 || outcome.bMatched !== 1) {
+    // THE reported bug. Loud, because until now this wrote a half-trade,
+    // marked it approved, and told both employees it worked.
+    console.error(
+      `[executeScheduleTrade] REFUSING partial trade in schedule ${scheduleId} (${legDesc}): ` +
+      `leg A matched ${outcome.aMatched} assignment(s), leg B matched ${outcome.bMatched}. ` +
+      `A trade requires exactly one on each side. Nothing was written.`
+    );
+    const missing = outcome.aMatched !== 1 ? sideA : sideB;
+    return {
+      ok: false,
+      code: 'partial_trade',
+      reason:
+        `Only one side of that trade matches the published schedule — the ${missing.shift_name} shift on ` +
+        `${missing.date} isn't there as expected, so applying it would have left the schedule half-changed. ` +
+        `Nothing was changed. The schedule most likely moved after the trade was requested; ask them to set it up again.`,
+    };
+  }
+
+  const updatedAssignments = outcome.assignments;
   const updatedData: ScheduleData = { ...row.data, assignments: updatedAssignments };
   const wages = await computeWageEstimate(companyId, updatedAssignments);
 
@@ -2153,7 +2250,10 @@ async function executeSwapNow(params: {
       role,
       status: 'pending_manager',
       initiated_by: 'aegis',
-      notes: `Auto-approval could not be applied to the schedule (${applied.code}): ${applied.reason} Needs a manager to publish the week and approve.`,
+      // L4 — facilitated auto-approval is one-way by construction: a request
+      // carrying a return shift is forced down the manager-approval path by
+      // swapRequiresManagerApproval, so it never reaches here.
+      notes: withSwapKind(`Auto-approval could not be applied to the schedule (${applied.code}): ${applied.reason} Needs a manager to publish the week and approve.`, 'pickup'),
     }).select('id').single();
 
     await reply(
@@ -2194,7 +2294,7 @@ async function executeSwapNow(params: {
     initiated_by: 'aegis',
     decided_at: new Date().toISOString(),
     decided_by: null, // UUID column — system auto-approval has no manager user; null (decided_at + notes record it). Writing a string here threw invalid-uuid and failed the insert.
-    notes: 'Auto-approved — no manager approval required per company policy.',
+    notes: withSwapKind('Auto-approved — no manager approval required per company policy.', 'pickup'),
   }).select('id').single();
 
   const swapId = (swapRow as { id: string } | null)?.id ?? 'unknown';
@@ -2359,6 +2459,48 @@ export async function handleInitiateSwap(
       await reply(contact, message,
         `Got it — ${firstName(targetEmployee.name)} would take your ${shift.shift_name} shift on ${formatDisplayDate(shiftDate)} (${shift.start_time}–${shift.end_time}) and you'd be off, no shift back. Want me to check with ${firstName(targetEmployee.name)} and line it up with your manager?`
       );
+      return;
+    }
+
+    // L4 — DIRECTION 'pickup' HAD NO BRANCH, so it fell through to the TRADE
+    // path below.
+    //
+    // The classifier (extractSwapDetails) defines three directions:
+    //   giveaway — a coworker takes the SENDER's shift, sender gets nothing back
+    //   pickup   — the SENDER takes a COWORKER's shift ("I'll take Joe's Friday")
+    //   trade    — two-way; both give up a shift
+    // and normalizeSwapExtraction faithfully passes 'pickup' through (there is
+    // even a test pinning that it does). But handleInitiateSwap branched only on
+    // 'giveaway', so a pickup silently became a two-way trade: the sender's own
+    // shift — resolved earlier, and on a pickup message frequently resolved from
+    // an upcoming-shift guess rather than anything the sender named — was given
+    // away as the return leg. The employee never asked to give up a shift, and
+    // the leg most likely to be wrong is exactly the leg that produced the
+    // half-applied trades this batch is fixing.
+    //
+    // A pickup is also the DIRECTIONAL INVERSE of a giveaway (sender takes,
+    // rather than sender gives), so it cannot be routed to the giveaway branch
+    // either — that would move the wrong shift.
+    //
+    // Until a genuine one-way pickup flow exists, ASK. Guessing is what caused
+    // the bug; an extra question costs one message.
+    if (raw.direction === 'pickup') {
+      await reply(contact, message,
+        `Just so I get this right — do you want to TRADE with ${firstName(targetEmployee.name)} ` +
+        `(you take one of their shifts and they take your ${shift.shift_name} shift on ${formatDisplayDate(shiftDate)}), ` +
+        `or are you offering to COVER one of their shifts without giving up any of your own? ` +
+        `Tell me which and I'll set it up.`
+      );
+      await logActivity({
+        company_id: contact.company_id,
+        action: 'swap_direction_ambiguous',
+        summary: `${contact.name} sent a one-way PICKUP for ${targetEmployee.name} — asked to disambiguate rather than assuming a trade.`,
+        metadata: {
+          requester_id: contact.employee_id, receiver_id: targetEmployee.id,
+          shift_date: shiftDate, shift_name: shift.shift_name,
+          mode: 'directed', direction: 'pickup',
+        },
+      });
       return;
     }
 
@@ -3030,7 +3172,16 @@ export async function handleSwapOutreachResponse(
       role: outreach.role,
       status: 'pending_manager',
       initiated_by: 'aegis',
-      notes: `Both employees agreed via Aegis. ${outreach.mode === 'facilitated' ? 'Facilitated swap.' : 'Directed swap.'}`,
+      // L4 — THE ROOT DATA DEFECT. This note was byte-identical for a one-way
+      // giveaway and a two-way trade, and `outreach.target_shift_name` — the
+      // only field that tells them apart — was in scope right here and thrown
+      // away. The Homebase UI approval path then had no way to know which it
+      // was, so it ran every row as a giveaway and silently dropped trades'
+      // return legs. Persist the kind.
+      notes: withSwapKind(
+        `Both employees agreed via Aegis. ${outreach.mode === 'facilitated' ? 'Facilitated swap.' : 'Directed swap.'}`,
+        outreach.target_shift_name ? 'trade' : 'giveaway',
+      ),
     }).select('id').single();
 
     const swapId = (swapRow as { id: string } | null)?.id ?? 'unknown';

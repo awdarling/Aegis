@@ -7,6 +7,8 @@ import { sendSms } from '../messaging/sms';
 import { env } from '../config/env';
 import { normalizeReSubject } from '../messaging/reply';
 import { executeScheduleSwap, executeScheduleTrade } from '../workflows/shift-swap';
+// L4 — RULE 0b: the single answer to "may this row be executed one-way?".
+import { canExecuteFromRowAlone } from '../lib/swap-kind';
 import { processCoverageButtonDecision, processCoverageBatchButton } from '../workflows/emergency-coverage';
 import { computeWageEstimate } from '../lib/schedule-simulator';
 import { BRAND, quriaLogoDataUri } from '../messaging/brand';
@@ -297,6 +299,8 @@ async function handleSwapDecision(
   const swap = swapRow as {
     id: string; status: string; requesting_employee_id: string; receiving_employee_id: string | null;
     shift_date: string; shift_name: string; role: string;
+    // L4 — carries the persisted swap-kind marker (lib/swap-kind.ts).
+    notes: string | null;
   };
 
   if (swap.status !== 'pending_manager') {
@@ -727,12 +731,30 @@ decisionWebhook.get('/', async (req, res) => {
 // the row (Homebase sends only the id), then run the SAME execute + confirm the
 // email path does, reusing buildSwapDecisionMessages so both speak identically.
 //
-// GIVEAWAY / PICKUP ONLY: swap_requests has NO target-shift columns (verified
-// against the live DB 2026-07-31), so a two-way trade's return shift cannot be
-// reconstructed from the row alone. Trades keep going through the manager email
-// button, whose decision token carries the target shift. A Homebase-UI approval
-// is a one-way pickup, so this covers the real path. (To approve trades in the
-// UI too, add target_shift_date/name/role columns to swap_requests first.)
+// GIVEAWAY / PICKUP ONLY — and as of L4 that is ENFORCED, not just asserted.
+//
+// swap_requests has NO target-shift columns (verified against the live DB
+// 2026-07-31), so a two-way trade's return shift cannot be reconstructed from
+// the row alone. Trades are supposed to go through the manager email button,
+// whose decision token carries the target shift.
+//
+// That restriction was documented in THREE files (here, webhooks/internal.ts,
+// and Homebase src/lib/swaps/decide.ts) and implemented in NONE. This function
+// called the one-way executeScheduleSwap unconditionally, so a manager who
+// approved a TRADE from the Homebase Swaps tab moved exactly one shift, silently
+// dropped the return leg, wrote status='approved', and told the requester they
+// were "off" when they had agreed to work the coworker's shift. Trades do reach
+// this path: both the broadcast trade and the directed trade create
+// status='pending_manager' rows with a receiver, and the tab renders live
+// Approve/Deny buttons for any such row.
+//
+// The guard is now real: canExecuteFromRowAlone (lib/swap-kind.ts) reads the
+// persisted kind marker and this function refuses anything it cannot PROVE is
+// one-way — including legacy rows with no marker, because the pre-L4 directed
+// note was byte-identical for giveaways and trades and guessing is exactly the
+// mistake that caused the bug. Refusals are returned as a noop with a manager-
+// readable reason, so Homebase can tell the manager to use the email button
+// instead of claiming the schedule was updated.
 type SwapNotifyResult = { status: 'approved' | 'denied' | 'noop'; notified: number; reason?: string };
 
 async function loadSwapEmployee(companyId: string, employeeId: string) {
@@ -770,10 +792,25 @@ export async function sendSwapDecisionNotification(
     id: string; company_id: string; status: string;
     requesting_employee_id: string; receiving_employee_id: string | null;
     shift_date: string; shift_name: string; role: string;
+    // L4 — carries the persisted swap-kind marker (lib/swap-kind.ts).
+    notes: string | null;
   };
   // Idempotent + safe: only a still-pending swap with a known coverer can execute.
   if (swap.status !== 'pending_manager') return { status: 'noop', notified: 0, reason: `swap already ${swap.status}` };
   if (!swap.receiving_employee_id) return { status: 'noop', notified: 0, reason: 'no coworker has taken this shift yet' };
+
+  // L4 — FAIL CLOSED. Only execute what we can prove is a one-way reassignment.
+  // Checked before ANY write and before either branch: a trade must not be
+  // denied-and-notified from here either, because the email button carrying the
+  // real shift details is the path that should decide it.
+  const executable = canExecuteFromRowAlone(swap.notes);
+  if (!executable.ok) {
+    console.warn(
+      `[sendSwapDecisionNotification] REFUSING ${decision} for swap ${swap.id} — ` +
+      `kind=${executable.kind ?? 'unknown'}. ${executable.reason}`
+    );
+    return { status: 'noop', notified: 0, reason: executable.reason! };
+  }
 
   const [requester, receiver] = await Promise.all([
     loadSwapEmployee(swap.company_id, swap.requesting_employee_id),

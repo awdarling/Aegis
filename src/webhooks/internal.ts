@@ -62,7 +62,13 @@ internalRouter.post('/notify-to-decision', async (req: Request, res: Response) =
 // POST /internal/notify-swap-decision
 // Homebase calls this after a manager approves/denies a swap in the UI (it only
 // updates swap_requests.status; Aegis executes the schedule change + notifies).
-// Giveaway/pickup only — trades stay on the manager email button (see decision.ts).
+// Giveaway/pickup only — and as of L4 that is ENFORCED in
+// sendSwapDecisionNotification via canExecuteFromRowAlone, not merely asserted
+// in a comment (it was asserted here, in decision.ts, and in Homebase
+// src/lib/swaps/decide.ts, and implemented in none of them). A trade — or any
+// row whose kind can't be proven — comes back as status:'noop' with a
+// manager-readable reason, which Homebase surfaces instead of claiming the
+// schedule was updated.
 internalRouter.post('/notify-swap-decision', async (req: Request, res: Response) => {
   const body = (req.body ?? {}) as Record<string, unknown>;
   const swapRequestId = body.swap_request_id;

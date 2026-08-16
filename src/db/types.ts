@@ -58,6 +58,23 @@ export interface Database {
           individual_wage: number | null;
           is_veteran: boolean | null;
           aegis_access?: 'manager' | 'employee' | 'blocked' | null;
+          /**
+           * Acknowledged FINAL WORKING DAY (migration 020, live since 2026-08-13).
+           * Postgres `date`, so Supabase returns 'YYYY-MM-DD'. NULL = no departure
+           * on record.
+           *
+           * The employee WORKS this day. Every reader must treat the boundary as
+           * `date > last_day`, never `>=`: the daily offboarding sweep flips
+           * `active=false` only once last_day is strictly past, and the build
+           * engine gates per-date on the same rule (engine/eligibility.ts
+           * `isPastLastDay`).
+           *
+           * Declared OPTIONAL because this file is a hand-maintained PARTIAL
+           * mirror of the live schema (see SCHEMA_DRIFT_LOG 2026-06-08) — optional
+           * keeps the ~15 engine smoke fixtures compiling. Mirrors Homebase's
+           * `Employee.last_day?: string | null`.
+           */
+          last_day?: string | null;
         };
       };
       availability: {

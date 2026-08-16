@@ -362,3 +362,99 @@ describe('L3 · askToCancelTimeOff is the single confirmation voice (Rule 0b)', 
     expect(timeOffUpdates()).toHaveLength(0);
   });
 });
+
+// ── MULTI-DAY: naming one date cancels the WHOLE approved range ──────────────
+//
+// Approved time off is a RANGE. An employee who texts "cancel my time off Aug 1"
+// while holding an approved Aug 1–5 is cancelling all five days — there is no
+// partial cancellation (see the scope decision in time-off.ts: shrinking an
+// approved range would mean silently editing, or splitting, a decision the
+// manager made).
+//
+// So the one thing that must never happen is a single-date mention wiping a
+// multi-day approval without the employee SEEING the full span before they say
+// yes. These pin that.
+
+import { countDaysInclusive } from '../time-off';
+
+const MULTI_DAY_ROW = { id: 'to-multi', status: 'approved', start_date: '2026-08-01', end_date: '2026-08-05' };
+
+describe('L3 · a multi-day approval shows its FULL range before it is cancelled', () => {
+  it('naming ONE date inside the range confirms the WHOLE range, not that date', async () => {
+    h.reads['time_off_requests'] = [MULTI_DAY_ROW];
+    // The employee only said "Aug 1".
+    await handleCancelTimeOff(msg('cancel my time off Aug 1'), contact, { date: '2026-08-01' });
+
+    // The confirmation must show the END of the range too, or they'd say yes to
+    // five days having read one. (The renderer spells both ends out in full:
+    // "Saturday, August 1 through Wednesday, August 5".)
+    expect(lastReply()).toMatch(/August 1/);
+    expect(lastReply()).toMatch(/through .*August 5/);
+    expect(lastReply()).toMatch(/are you sure/i);
+  });
+
+  it('and says the span out loud — "all 5 days ... not just the one day"', async () => {
+    h.reads['time_off_requests'] = [MULTI_DAY_ROW];
+    await handleCancelTimeOff(msg('cancel my time off Aug 1'), contact, { date: '2026-08-01' });
+
+    expect(lastReply()).toMatch(/all 5 days/i);
+    expect(lastReply()).toMatch(/not just the one day/i);
+  });
+
+  it('the parked pending row targets the whole request, with the full range', async () => {
+    h.reads['time_off_requests'] = [MULTI_DAY_ROW];
+    await handleCancelTimeOff(msg('cancel my time off Aug 3'), contact, { date: '2026-08-03' });
+
+    const ins = h.writes.find(w => w.table === 'aegis_memory' && w.op === 'insert')!;
+    const parked = JSON.parse(ins.payload!.content as string) as {
+      request_id: string; start_date: string; end_date: string; display_range: string;
+    };
+    expect(parked.request_id).toBe('to-multi');
+    expect(parked.start_date).toBe('2026-08-01');   // NOT the Aug 3 they named
+    expect(parked.end_date).toBe('2026-08-05');
+    expect(parked.display_range).toMatch(/August 1/);
+    expect(parked.display_range).toMatch(/through .*August 5/);
+  });
+
+  it('YES cancels the ONE request — no range rewriting, no row splitting', async () => {
+    h.reads['time_off_requests'] = [MULTI_DAY_ROW];
+    await handleTimeOffCancelConfirmation(
+      msg('yes'), contact,
+      pendingCancel({ request_id: 'to-multi', start_date: '2026-08-01', end_date: '2026-08-05', display_range: 'Aug 1–5, 2026' }),
+    );
+
+    const upd = timeOffUpdates();
+    expect(upd).toHaveLength(1);
+    expect(upd[0].payload!.status).toBe('cancelled');
+    // Partial cancellation is explicitly NOT supported: the dates must be left
+    // exactly as the manager approved them.
+    expect(upd[0].payload).not.toHaveProperty('start_date');
+    expect(upd[0].payload).not.toHaveProperty('end_date');
+    // And exactly one row is touched — no second "remainder" request invented.
+    expect(h.writes.filter(w => w.table === 'time_off_requests' && w.op === 'insert')).toHaveLength(0);
+  });
+
+  it('a SINGLE-day request is unchanged — no span clause, no noise', async () => {
+    h.reads['time_off_requests'] = [APPROVED_ROW];
+    await handleCancelTimeOff(msg('cancel my time off Aug 1'), contact, { date: '2026-08-01' });
+    expect(lastReply()).not.toMatch(/all \d+ days/i);
+    expect(lastReply()).toMatch(/are you sure/i);
+  });
+});
+
+describe('L3 · countDaysInclusive', () => {
+  it('counts both ends', () => {
+    expect(countDaysInclusive('2026-08-01', '2026-08-01')).toBe(1);
+    expect(countDaysInclusive('2026-08-01', '2026-08-05')).toBe(5);
+  });
+
+  it('is DST-proof across a spring-forward boundary', () => {
+    // Anchored at noon UTC; a naive local-midnight diff undercounts here.
+    expect(countDaysInclusive('2026-03-07', '2026-03-09')).toBe(3);
+  });
+
+  it('degrades to 1 on garbage rather than throwing mid-confirmation', () => {
+    expect(countDaysInclusive('2026-08-05', '2026-08-01')).toBe(1);
+    expect(countDaysInclusive('nonsense', '2026-08-01')).toBe(1);
+  });
+});

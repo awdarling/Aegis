@@ -2200,6 +2200,27 @@ export async function handleRecheckTimeOff(
 //      because "you have approved time off on that date", and they can cancel it
 //      right there (see shift-swap.ts, the youTakeTheirs refusal).
 //
+// ── SCOPE DECISION: whole-request cancellation, never partial ────────────────
+//
+// Approved time off is a RANGE (start_date/end_date). An employee naming ONE
+// date inside a multi-day approval cancels the WHOLE request — there is no
+// partial cancellation, and deliberately so:
+//
+//   • `time_off_requests` has no mechanism to shrink an approved range. Doing it
+//     would mean rewriting start_date/end_date (silently editing a decision the
+//     manager made) or splitting the row into two (inventing an approval the
+//     manager never granted). Both are Rule 0 violations.
+//   • `partial_days` models WITHIN-day windows, not a subset of days, so it
+//     can't express "cancel Wednesday out of Mon–Fri" either.
+//
+// So the confirmation must show the FULL RANGE, not the date they typed, and
+// when it spans more than a day it says so in as many words. An employee who
+// texts "cancel my time off Aug 1" while holding an approved Aug 1–5 must not be
+// able to answer YES without having seen that all five days are going.
+//
+// If partial cancellation is ever wanted, it is a schema change plus a manager
+// re-approval flow — not a tweak here.
+//
 // A CONFIRMATION IS MANDATORY, and that is a product requirement, not a nicety.
 // Everything else Aegis does for an employee is additive or reversible; this is
 // the one employee-triggered action that destroys something a MANAGER already
@@ -2226,6 +2247,18 @@ export async function handleRecheckTimeOff(
 // their time off would stay booked. Confirmation copy asks for YES / NO only.
 // ("cancel my time off" is a phrase, not the bare keyword, so inbound requests
 // are unaffected.)
+
+/**
+ * Inclusive day count for an approved range. Both ends are `date` columns, so
+ * this is anchored at noon UTC to stay DST-proof (same convention as
+ * eachDateInRange above). Exported for testing.
+ */
+export function countDaysInclusive(startDate: string, endDate: string): number {
+  const s = new Date(`${startDate}T12:00:00Z`).getTime();
+  const e = new Date(`${endDate}T12:00:00Z`).getTime();
+  if (Number.isNaN(s) || Number.isNaN(e) || e < s) return 1;
+  return Math.round((e - s) / (24 * 60 * 60 * 1000)) + 1;
+}
 
 /** aegis_memory source key for a cancellation awaiting a yes/no. */
 function timeOffCancelSource(employeeId: string): string {
@@ -2342,7 +2375,15 @@ export async function askToCancelTimeOff(opts: {
   lead?: string;
 }): Promise<void> {
   const { message, contact, request, lead } = opts;
+  // The FULL approved range — never the single date the employee happened to
+  // name. formatDateRange renders a multi-day request as e.g. "Aug 1-5, 2026".
   const displayRange = formatDateRange(request.start_date, request.end_date);
+  const dayCount = countDaysInclusive(request.start_date, request.end_date);
+  // Spell the span out. A range buried in a date string is easy to skim past,
+  // and this is a destructive, whole-request action.
+  const spanNote = dayCount > 1
+    ? ` That's all ${dayCount} days — ${displayRange} — not just the one day.`
+    : '';
 
   await storePendingTimeOffCancel(contact.company_id, {
     employee_id: contact.employee_id!,
@@ -2363,7 +2404,7 @@ export async function askToCancelTimeOff(opts: {
     contact,
     message,
     `${lead ? `${lead} ` : `${textOpener(contact.name)}`}` +
-      `I hear you want to cancel your approved time off on ${displayRange} — are you sure? ` +
+      `I hear you want to cancel your approved time off on ${displayRange} — are you sure?${spanNote} ` +
       `Reply YES to cancel it, or NO to leave it as it is.`
   );
 }

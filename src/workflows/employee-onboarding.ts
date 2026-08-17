@@ -350,25 +350,10 @@ export async function getOnboardingSession(
     const session = JSON.parse(row.content) as OnboardingSession;
 
     if (new Date(session.expires_at) < new Date()) {
-      await supabase.from('aegis_memory').delete().eq('id', row.id);
-      await logActivity({
-        company_id: companyId,
-        action: 'onboarding_timeout',
-        entity_type: 'employee',
-        entity_id: employeeId,
-        summary: `Onboarding session expired for ${session.employee_name}`,
-        metadata: {
-          step_reached: session.step,
-          started_at: session.started_at,
-        },
-      });
-      const managerContact = buildManagerContact(session);
-      const managerMsg = buildManagerMsg(session);
-      await reply(
-        managerContact,
-        managerMsg,
-        `${session.employee_name}'s onboarding window (48h) expired without completion. Their session has been cleared.`
-      );
+      // L5 — ONE reaper (see reapExpiredSession). This used to be ~20 lines
+      // duplicated here and in the two by-phone/by-email lookups, all of which
+      // fired `onboarding_timeout` + texted the manager unconditionally.
+      await reapExpiredSession(row.id, session, 'lazy_read');
       return null;
     }
 
@@ -403,25 +388,10 @@ export async function getOnboardingSessionByPhone(
     if (session.employee_phone !== phone) continue;
 
     if (new Date(session.expires_at) < new Date()) {
-      await supabase.from('aegis_memory').delete().eq('id', row.id);
-      await logActivity({
-        company_id: session.company_id,
-        action: 'onboarding_timeout',
-        entity_type: 'employee',
-        entity_id: session.employee_id,
-        summary: `Onboarding session expired for ${session.employee_name}`,
-        metadata: {
-          step_reached: session.step,
-          started_at: session.started_at,
-        },
-      });
-      const managerContact = buildManagerContact(session);
-      const managerMsg = buildManagerMsg(session);
-      await reply(
-        managerContact,
-        managerMsg,
-        `${session.employee_name}'s onboarding window (48h) expired without completion. Their session has been cleared.`
-      );
+      // L5 — ONE reaper (see reapExpiredSession). This used to be ~20 lines
+      // duplicated here and in the two by-phone/by-email lookups, all of which
+      // fired `onboarding_timeout` + texted the manager unconditionally.
+      await reapExpiredSession(row.id, session, 'lazy_read');
       return null;
     }
 
@@ -457,25 +427,10 @@ export async function getOnboardingSessionByEmail(
     if (session.employee_email?.toLowerCase() !== target) continue;
 
     if (new Date(session.expires_at) < new Date()) {
-      await supabase.from('aegis_memory').delete().eq('id', row.id);
-      await logActivity({
-        company_id: session.company_id,
-        action: 'onboarding_timeout',
-        entity_type: 'employee',
-        entity_id: session.employee_id,
-        summary: `Onboarding session expired for ${session.employee_name}`,
-        metadata: {
-          step_reached: session.step,
-          started_at: session.started_at,
-        },
-      });
-      const managerContact = buildManagerContact(session);
-      const managerMsg = buildManagerMsg(session);
-      await reply(
-        managerContact,
-        managerMsg,
-        `${session.employee_name}'s onboarding window (48h) expired without completion. Their session has been cleared.`
-      );
+      // L5 — ONE reaper (see reapExpiredSession). This used to be ~20 lines
+      // duplicated here and in the two by-phone/by-email lookups, all of which
+      // fired `onboarding_timeout` + texted the manager unconditionally.
+      await reapExpiredSession(row.id, session, 'lazy_read');
       return null;
     }
 
@@ -485,9 +440,21 @@ export async function getOnboardingSessionByEmail(
   return null;
 }
 
+// L5 — SLIDING EXPIRY. The 48h window used to be stamped once at creation and
+// never moved, so an employee actively replying at hour 47 was still reaped at
+// hour 48 — mid-conversation, with the manager told they "expired without
+// completion".
+//
+// Every save happens because the employee just did something, so each save
+// pushes the window out another 48h from now. An abandoned session still dies on
+// schedule (nothing saves it); an engaged one can no longer be killed for being
+// slow.
+const ONBOARDING_TTL_MS = 48 * 60 * 60 * 1000;
+
 async function saveOnboardingSession(
   session: OnboardingSession & { _memory_id?: string }
 ): Promise<void> {
+  session.expires_at = new Date(Date.now() + ONBOARDING_TTL_MS).toISOString();
   const { _memory_id, ...data } = session;
   const content = JSON.stringify(data);
 
@@ -4597,6 +4564,61 @@ async function notifyEmployeeOfAvailabilityDecision(
 // check inside getOnboardingSession only fires if the employee sends another
 // message — fully-silent sessions would otherwise linger indefinitely.
 
+// L5 — THE ONE PLACE an expired onboarding session is closed.
+//
+// This logic existed FOUR times: in getOnboardingSession, getOnboardingSessionByPhone,
+// getOnboardingSessionByEmail (all three reap lazily on read) and in the daily
+// reaper. Every copy deleted the row, logged `onboarding_timeout`, and texted the
+// manager "expired without completion" — unconditionally.
+//
+// That duplication is why the first pass of this fix was incomplete: guarding
+// only the two sweepers left the three READ paths still firing false alerts. In
+// particular `executeOnboardingForCandidates` calls getOnboardingSession to check
+// "is one already in progress?", so a MANAGER RESTARTING ONBOARDING would itself
+// emit a spurious timeout event and get texted about it — and an employee simply
+// replying after their window lapsed would do the same.
+//
+// One writer, one guard. If the employee is already onboarded, the leftover row
+// is stale bookkeeping: delete it QUIETLY. Nothing is wrong, so nothing is
+// reported to anyone.
+async function reapExpiredSession(
+  memoryRowId: string,
+  session: OnboardingSession,
+  reapedBy: 'lazy_read' | 'proactive_expiry',
+): Promise<void> {
+  // Delete first either way, so a transient notify failure can't leave the row
+  // stuck and re-reaping forever.
+  await supabase.from('aegis_memory').delete().eq('id', memoryRowId);
+
+  if (await isSessionSubjectOnboarded(session)) {
+    console.log(
+      `[onboarding-expire] ${session.employee_name} is already onboarded — ` +
+      `closed a stale session row (${reapedBy}) with no timeout event and no manager alert`
+    );
+    return;
+  }
+
+  await logActivity({
+    company_id: session.company_id,
+    action: 'onboarding_timeout',
+    entity_type: 'employee',
+    entity_id: session.employee_id,
+    summary: `Onboarding session expired for ${session.employee_name}`,
+    metadata: {
+      step_reached: session.step,
+      started_at: session.started_at,
+      reaped_by: reapedBy,
+    },
+  });
+
+  await reply(
+    buildManagerContact(session),
+    buildManagerMsg(session),
+    `${session.employee_name}'s onboarding window expired without completion. ` +
+      `Their session has been cleared. You can restart onboarding anytime.`
+  );
+}
+
 // L5 — is the employee this session is about ALREADY onboarded?
 //
 // The one question both sweepers now ask before reporting anyone as unfinished.
@@ -4648,47 +4670,7 @@ export async function expireOldOnboardingSessions(): Promise<void> {
       const session = JSON.parse(record.content) as OnboardingSession;
       if (new Date(session.expires_at) > now) continue;
 
-      // ── L5 — an ONBOARDED employee's expired row is not a timeout ──────────
-      //
-      // This reaper's only predicate was `expires_at`. It didn't check consent,
-      // completion, or even the `step === 'complete'` skip the warning sweeper
-      // has — so it logged `onboarding_timeout` and texted the manager
-      // "expired without completion" about people whose records were complete.
-      // That is where Homebase's contradictory "Timed Out + Completed <date>"
-      // row came from: the date shown WAS this event's timestamp.
-      //
-      // Close it silently instead. Nothing is wrong, so nothing is reported.
-      if (await isSessionSubjectOnboarded(session)) {
-        await supabase.from('aegis_memory').delete().eq('id', record.id);
-        console.log(`[onboarding-expire] ${session.employee_name} is already onboarded — closed a stale session row without a timeout event`);
-        continue;
-      }
-
-      // Delete first so a transient notify failure doesn't leave the row stuck.
-      await supabase.from('aegis_memory').delete().eq('id', record.id);
-
-      await logActivity({
-        company_id: session.company_id,
-        action: 'onboarding_timeout',
-        entity_type: 'employee',
-        entity_id: session.employee_id,
-        summary: `Onboarding session expired for ${session.employee_name}`,
-        metadata: {
-          step_reached: session.step,
-          started_at: session.started_at,
-          reaped_by: 'proactive_expiry',
-        },
-      });
-
-      const managerContact = buildManagerContact(session);
-      const managerMsg = buildManagerMsg(session);
-      await reply(
-        managerContact,
-        managerMsg,
-        `${session.employee_name}'s onboarding window expired without completion. ` +
-          `Their session has been cleared. You can restart onboarding anytime.`
-      );
-
+      await reapExpiredSession(record.id, session, 'proactive_expiry');
       expired++;
     } catch (err) {
       console.error('[onboarding-expire] error processing record:', err);

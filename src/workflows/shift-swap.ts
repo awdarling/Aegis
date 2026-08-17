@@ -296,6 +296,9 @@ export async function commitSwapPickup(params: {
     initiated_by: 'aegis',
     // L4 — kind is now PERSISTED so the Homebase UI approval path can prove
     // this row is one-way instead of assuming it (see lib/swap-kind.ts).
+    // L4b — kind persisted as a real COLUMN (migration 023). The notes marker
+    // is written too, as the fallback for a 023 rollback.
+    kind: 'pickup',
     notes: withSwapKind(`${receiver.name} offered to pick up the shift via the broadcast — one-way pickup (no trade).`, 'pickup'),
   }).select('id').single();
   const swapId = (swapRow as { id: string } | null)?.id ?? 'unknown';
@@ -609,6 +612,13 @@ export async function resolveSwapProposal(params: {
     initiated_by: 'aegis',
     // L4 — marked as a TRADE so the Homebase UI approval path refuses it
     // rather than running it as a one-way giveaway and dropping the return leg.
+    // L4b — THE RETURN SHIFT IS NOW STORED. It used to live only in the
+    // decision-token payload on the manager's approval email, which is why the
+    // Homebase UI could not approve a trade without dropping a leg.
+    kind: 'trade',
+    target_shift_date: p.target_shift_date ?? null,
+    target_shift_name: p.target_shift_name ?? null,
+    target_shift_role: p.target_role ?? null,
     notes: withSwapKind(`Two-way trade agreed by both via the broadcast: ${p.requester_name} gives ${p.shift_name} (${p.shift_date}) and takes ${p.target_shift_name} (${p.target_shift_date}).`, 'trade'),
   }).select('id').single();
   const swapId = (swapRow as { id: string } | null)?.id ?? 'unknown';
@@ -2336,6 +2346,7 @@ async function executeSwapNow(params: {
       // L4 — facilitated auto-approval is one-way by construction: a request
       // carrying a return shift is forced down the manager-approval path by
       // swapRequiresManagerApproval, so it never reaches here.
+      kind: 'pickup',
       notes: withSwapKind(`Auto-approval could not be applied to the schedule (${applied.code}): ${applied.reason} Needs a manager to publish the week and approve.`, 'pickup'),
     }).select('id').single();
 
@@ -2377,6 +2388,7 @@ async function executeSwapNow(params: {
     initiated_by: 'aegis',
     decided_at: new Date().toISOString(),
     decided_by: null, // UUID column — system auto-approval has no manager user; null (decided_at + notes record it). Writing a string here threw invalid-uuid and failed the insert.
+    kind: 'pickup',
     notes: withSwapKind('Auto-approved — no manager approval required per company policy.', 'pickup'),
   }).select('id').single();
 
@@ -3279,6 +3291,13 @@ export async function handleSwapOutreachResponse(
       // away. The Homebase UI approval path then had no way to know which it
       // was, so it ran every row as a giveaway and silently dropped trades'
       // return legs. Persist the kind.
+      // L4b — the root data defect, closed. `outreach.target_shift_*` was in
+      // scope here all along and thrown away, leaving the row unable to say
+      // whether it was a giveaway or a trade, let alone what came back.
+      kind: outreach.target_shift_name ? 'trade' : 'giveaway',
+      target_shift_date: outreach.target_shift_date ?? null,
+      target_shift_name: outreach.target_shift_name ?? null,
+      target_shift_role: outreach.target_role ?? null,
       notes: withSwapKind(
         `Both employees agreed via Aegis. ${outreach.mode === 'facilitated' ? 'Facilitated swap.' : 'Directed swap.'}`,
         outreach.target_shift_name ? 'trade' : 'giveaway',

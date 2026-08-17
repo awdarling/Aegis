@@ -28,7 +28,9 @@ import {
   withSwapKind,
   parseSwapKind,
   isOneWayKind,
-  canExecuteFromRowAlone,
+  swapKindOf,
+  tradeReturnShiftOf,
+  planRowExecution,
 } from '../swap-kind';
 
 // The two real legacy notes, verified against the live Watermark DB 2026-08-16.
@@ -89,44 +91,101 @@ describe('L4 · parseSwapKind returns null for anything it cannot read', () => {
   });
 });
 
-describe('L4 · canExecuteFromRowAlone FAILS CLOSED', () => {
-  it('allows a marked giveaway', () => {
-    const r = canExecuteFromRowAlone(withSwapKind(LEGACY_DIRECTED, 'giveaway'));
-    expect(r.ok).toBe(true);
-    expect(r.kind).toBe('giveaway');
+describe('L4b · swapKindOf reads the COLUMN first, notes as fallback', () => {
+  it('the real column wins', () => {
+    expect(swapKindOf({ kind: 'trade', notes: withSwapKind('n', 'giveaway') })).toBe('trade');
   });
 
-  it('allows a marked pickup', () => {
-    const r = canExecuteFromRowAlone(withSwapKind(LEGACY_PICKUP, 'pickup'));
-    expect(r.ok).toBe(true);
-    expect(r.kind).toBe('pickup');
+  it('falls back to the notes marker for a row created before migration 023', () => {
+    expect(swapKindOf({ kind: null, notes: withSwapKind('n', 'pickup') })).toBe('pickup');
   });
 
-  it('THE BUG: refuses a marked TRADE, and says why in manager language', () => {
-    const r = canExecuteFromRowAlone(withSwapKind('Two-way trade agreed by both.', 'trade'));
-    expect(r.ok).toBe(false);
-    expect(r.kind).toBe('trade');
-    expect(r.reason).toMatch(/two-way trade/i);
-    // A refusal is only acceptable if the manager is told exactly how to finish
-    // the job — otherwise "fail closed" just reads as "broken".
-    expect(r.reason).toMatch(/Approve button in the Aegis approval EMAIL/i);
-    expect(r.reason).toMatch(/Nothing has been changed/i);
+  it('a garbage column value falls back rather than being trusted', () => {
+    expect(swapKindOf({ kind: 'sideways', notes: withSwapKind('n', 'giveaway') })).toBe('giveaway');
   });
 
-  it('refuses an UNMARKED legacy row — unknown is unsafe, not assumed one-way', () => {
-    // This is the deliberate, slightly conservative call. The legacy directed
-    // note cannot distinguish a giveaway from a trade, so executing it is a coin
-    // flip on whether the schedule ends up half-changed. Verified read-only
-    // against the live DB on 2026-08-16: there are ZERO pending_manager rows, so
-    // this refuses nothing that actually exists today.
-    const r = canExecuteFromRowAlone(LEGACY_DIRECTED);
-    expect(r.ok).toBe(false);
-    expect(r.kind).toBe(null);
-    expect(r.reason).toMatch(/predates|cannot tell/i);
-    expect(r.reason).toMatch(/Approve button in the Aegis approval EMAIL/i);
+  it('null when neither source says anything', () => {
+    expect(swapKindOf({ kind: null, notes: LEGACY_DIRECTED })).toBe(null);
+    expect(swapKindOf({})).toBe(null);
+  });
+});
+
+describe('L4b · tradeReturnShiftOf', () => {
+  it('reads the stored return shift', () => {
+    const r = tradeReturnShiftOf({
+      target_shift_date: '2026-07-19', target_shift_name: 'Morning', target_shift_role: 'Lifeguard',
+    });
+    expect(r).toEqual({ date: '2026-07-19', shift_name: 'Morning', role: 'Lifeguard' });
   });
 
-  it('refuses a null note', () => {
-    expect(canExecuteFromRowAlone(null).ok).toBe(false);
+  it('tolerates a missing role — only date + name are load-bearing', () => {
+    expect(tradeReturnShiftOf({ target_shift_date: '2026-07-19', target_shift_name: 'Morning' }))
+      .toEqual({ date: '2026-07-19', shift_name: 'Morning', role: null });
+  });
+
+  it('null when either half is missing (a partial row is not a trade we can run)', () => {
+    expect(tradeReturnShiftOf({ target_shift_date: '2026-07-19' })).toBe(null);
+    expect(tradeReturnShiftOf({ target_shift_name: 'Morning' })).toBe(null);
+    expect(tradeReturnShiftOf({})).toBe(null);
+  });
+});
+
+describe('L4b · planRowExecution — HOW to execute, not merely whether', () => {
+  it('THE FIX: a trade WITH its return shift is now executable as a trade', () => {
+    // This is what migration 023 buys. Before it, this row was refused; the
+    // manager had to go find the approval email.
+    const plan = planRowExecution({
+      kind: 'trade',
+      target_shift_date: '2026-07-19', target_shift_name: 'Morning', target_shift_role: 'Lifeguard',
+    });
+    expect(plan.mode).toBe('trade');
+    if (plan.mode === 'trade') {
+      expect(plan.returnShift.date).toBe('2026-07-19');
+      expect(plan.returnShift.shift_name).toBe('Morning');
+    }
+  });
+
+  it('a giveaway runs one-way', () => {
+    const plan = planRowExecution({ kind: 'giveaway' });
+    expect(plan.mode).toBe('one_way');
+    if (plan.mode === 'one_way') expect(plan.kind).toBe('giveaway');
+  });
+
+  it('a pickup runs one-way', () => {
+    expect(planRowExecution({ kind: 'pickup' }).mode).toBe('one_way');
+  });
+
+  it('a PRE-023 trade (kind known, return shift never stored) is still REFUSED', () => {
+    // Its return shift only ever existed in the email token, so there is nothing
+    // to execute against. Refusing is correct — half-applying is not.
+    const plan = planRowExecution({ notes: withSwapKind('Two-way trade.', 'trade') });
+    expect(plan.mode).toBe('refuse');
+    if (plan.mode === 'refuse') {
+      expect(plan.kind).toBe('trade');
+      expect(plan.reason).toMatch(/two-way TRADE/i);
+      expect(plan.reason).toMatch(/Approve button in the Aegis approval EMAIL/i);
+      expect(plan.reason).toMatch(/Nothing has been changed/i);
+    }
+  });
+
+  it('an UNMARKED legacy row is REFUSED — unknown is unsafe, not assumed one-way', () => {
+    // The pre-L4 directed note was byte-identical for a giveaway and a trade, so
+    // executing it is a coin flip on whether the schedule ends up half-changed.
+    const plan = planRowExecution({ notes: LEGACY_DIRECTED });
+    expect(plan.mode).toBe('refuse');
+    if (plan.mode === 'refuse') {
+      expect(plan.kind).toBe(null);
+      expect(plan.reason).toMatch(/predates|cannot tell/i);
+      expect(plan.reason).toMatch(/Approve button in the Aegis approval EMAIL/i);
+    }
+  });
+
+  it('an empty row is REFUSED', () => {
+    expect(planRowExecution({}).mode).toBe('refuse');
+  });
+
+  it('a trade whose return shift is only HALF stored is REFUSED, not guessed', () => {
+    const plan = planRowExecution({ kind: 'trade', target_shift_date: '2026-07-19' });
+    expect(plan.mode).toBe('refuse');
   });
 });

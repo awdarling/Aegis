@@ -7,8 +7,9 @@ import { sendSms } from '../messaging/sms';
 import { env } from '../config/env';
 import { normalizeReSubject } from '../messaging/reply';
 import { executeScheduleSwap, executeScheduleTrade } from '../workflows/shift-swap';
-// L4 — RULE 0b: the single answer to "may this row be executed one-way?".
-import { canExecuteFromRowAlone } from '../lib/swap-kind';
+// L4 / L4b — RULE 0b: the single answer to "what kind of swap is this row, and
+// how (or whether) may the Homebase UI execute it?".
+import { planRowExecution } from '../lib/swap-kind';
 import { processCoverageButtonDecision, processCoverageBatchButton } from '../workflows/emergency-coverage';
 import { computeWageEstimate } from '../lib/schedule-simulator';
 import { BRAND, quriaLogoDataUri } from '../messaging/brand';
@@ -299,8 +300,12 @@ async function handleSwapDecision(
   const swap = swapRow as {
     id: string; status: string; requesting_employee_id: string; receiving_employee_id: string | null;
     shift_date: string; shift_name: string; role: string;
-    // L4 — carries the persisted swap-kind marker (lib/swap-kind.ts).
+    // L4 — the legacy swap-kind marker (fallback). L4b — the real columns.
     notes: string | null;
+    kind: string | null;
+    target_shift_date: string | null;
+    target_shift_name: string | null;
+    target_shift_role: string | null;
   };
 
   if (swap.status !== 'pending_manager') {
@@ -826,13 +831,17 @@ export async function sendSwapDecisionNotification(
   // Checked before ANY write and before either branch: a trade must not be
   // denied-and-notified from here either, because the email button carrying the
   // real shift details is the path that should decide it.
-  const executable = canExecuteFromRowAlone(swap.notes);
-  if (!executable.ok) {
+  // L4b — decide HOW to execute, not merely WHETHER. A trade with its return
+  // shift on the row is now executed properly here; only rows that are genuinely
+  // unexecutable (unmarked legacy, or a pre-023 trade whose return shift was
+  // never stored) are refused, and the refusal names the path that does work.
+  const plan = planRowExecution(swap);
+  if (plan.mode === 'refuse') {
     console.warn(
       `[sendSwapDecisionNotification] REFUSING ${decision} for swap ${swap.id} — ` +
-      `kind=${executable.kind ?? 'unknown'}. ${executable.reason}`
+      `kind=${plan.kind ?? 'unknown'}. ${plan.reason}`
     );
-    return { status: 'noop', notified: 0, reason: executable.reason! };
+    return { status: 'noop', notified: 0, reason: plan.reason };
   }
 
   const [requester, receiver] = await Promise.all([
@@ -852,10 +861,16 @@ export async function sendSwapDecisionNotification(
 
   if (decision === 'denied') {
     await supabase.from('swap_requests').update({ status: 'denied', decided_at: new Date().toISOString(), decided_by: null }).eq('id', swap.id);
-    const msg = `Your shift coverage request for the ${swap.shift_name} shift on ${dateShort} has been denied by your manager. Please contact them if you have questions.`;
+    // L4b — a TRADE denial must not be described as a "coverage request", or
+    // both people are told the wrong thing about what was refused.
+    const msg = plan.mode === 'trade'
+      ? `Your shift trade for the ${swap.shift_name} shift on ${dateShort} was not approved by your manager. ` +
+        `Both of you stay on your original shifts. Please contact them if you have questions.`
+      : `Your shift coverage request for the ${swap.shift_name} shift on ${dateShort} has been denied by your manager. Please contact them if you have questions.`;
+    const subject = plan.mode === 'trade' ? 'Shift trade not approved' : 'Coverage denied';
     let notified = 0;
-    if (await sendSwapNotice(requester, msg, 'Coverage denied', aegisSmsChannel, swap.company_id)) notified++;
-    if (await sendSwapNotice(receiver, msg, 'Coverage denied', aegisSmsChannel, swap.company_id)) notified++;
+    if (await sendSwapNotice(requester, msg, subject, aegisSmsChannel, swap.company_id)) notified++;
+    if (await sendSwapNotice(receiver, msg, subject, aegisSmsChannel, swap.company_id)) notified++;
     return { status: 'denied', notified };
   }
 
@@ -870,21 +885,70 @@ export async function sendSwapDecisionNotification(
     .order('generated_at', { ascending: false }).limit(1).maybeSingle();
   if (!schedRow) return { status: 'noop', notified: 0, reason: `no published schedule covers ${swap.shift_date}` };
 
-  const applied = await executeScheduleSwap(
-    swap.company_id, (schedRow as { id: string }).id, swap.shift_date, swap.shift_name,
-    swap.requesting_employee_id, swap.receiving_employee_id, receiver.name,
-  );
+  // L4b — TRADE vs ONE-WAY. This branch is the whole point of migration 023:
+  // the return shift is now on the row, so the UI can run the SAME two-leg
+  // executor the email button uses instead of silently running a giveaway.
+  //
+  // executeScheduleTrade requires EXACTLY ONE matching assignment per leg and
+  // writes nothing otherwise (L4), so a trade that no longer matches the
+  // schedule fails closed here exactly as it does on the email path.
+  const applied = plan.mode === 'trade'
+    ? await executeScheduleTrade(
+        swap.company_id, (schedRow as { id: string }).id,
+        { date: swap.shift_date, shift_name: swap.shift_name,
+          employee_id: swap.requesting_employee_id, employee_name: requester.name },
+        { date: plan.returnShift.date, shift_name: plan.returnShift.shift_name,
+          employee_id: swap.receiving_employee_id, employee_name: receiver.name },
+      )
+    : await executeScheduleSwap(
+        swap.company_id, (schedRow as { id: string }).id, swap.shift_date, swap.shift_name,
+        swap.requesting_employee_id, swap.receiving_employee_id, receiver.name,
+      );
   if (!applied.ok) return { status: 'noop', notified: 0, reason: applied.reason };
 
   await supabase.from('swap_requests').update({
     status: 'approved', schedule_id: applied.schedule_id, decided_at: new Date().toISOString(), decided_by: null,
   }).eq('id', swap.id);
 
+  // BOTH PARTIES, with wording that matches what actually happened. Previously
+  // this hard-coded `isTrade = false` and `target_shift_name: null`, so a trade
+  // approved here told the requester they were "off" when they had agreed to
+  // work the coworker's shift. buildSwapDecisionMessages is shared with the
+  // email-button path, so the two now say the same thing (RULE 0b).
+  const isTrade = plan.mode === 'trade';
+  const targetDateLong = isTrade
+    ? new Date(plan.returnShift.date + 'T12:00:00Z').toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' })
+    : dateLong;
   const { requesterMsg, receiverMsg } = buildSwapDecisionMessages(
-    { shift_name: swap.shift_name, receiver_name: receiver.name, target_shift_name: null }, false, dateLong, dateLong,
+    {
+      shift_name: swap.shift_name,
+      receiver_name: receiver.name,
+      target_shift_name: isTrade ? plan.returnShift.shift_name : null,
+    },
+    isTrade, dateLong, targetDateLong,
   );
+  const subject = isTrade ? 'Shift trade approved' : 'Coverage approved';
   let notified = 0;
-  if (await sendSwapNotice(requester, requesterMsg, 'Coverage approved', aegisSmsChannel, swap.company_id)) notified++;
-  if (await sendSwapNotice(receiver, receiverMsg, 'Coverage approved', aegisSmsChannel, swap.company_id)) notified++;
+  if (await sendSwapNotice(requester, requesterMsg, subject, aegisSmsChannel, swap.company_id)) notified++;
+  if (await sendSwapNotice(receiver, receiverMsg, subject, aegisSmsChannel, swap.company_id)) notified++;
+
+  // The MANAGER acted in the UI, so they already know the outcome — but the
+  // activity feed is the shared record, and a trade must not be logged with
+  // giveaway vocabulary.
+  await logActivity({
+    company_id: swap.company_id,
+    action: 'swap_approved',
+    entity_type: 'swap_request',
+    entity_id: swap.id,
+    summary: isTrade
+      ? `Trade approved in Homebase: ${requester.name} takes ${plan.returnShift.shift_name} on ${plan.returnShift.date}, ${receiver.name} takes ${swap.shift_name} on ${swap.shift_date}.`
+      : `Swap approved in Homebase: ${receiver.name} covers ${requester.name}'s ${swap.shift_name} shift on ${swap.shift_date}.`,
+    metadata: {
+      kind: plan.kind, requester_id: swap.requesting_employee_id,
+      receiver_id: swap.receiving_employee_id, schedule_id: applied.schedule_id,
+      notified, decided_via: 'homebase_ui',
+    },
+  });
+
   return { status: 'approved', notified };
 }

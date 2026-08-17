@@ -1205,7 +1205,38 @@ async function sendManagerResolutionReplies(args: {
 
 // ── Manager notification ───────────────────────────────────────────────────────
 
-async function notifyManager(
+/**
+ * Notify the manager(s) that an employee has requested time off, with
+ * approve/deny magic links. Used for SMS-channel submissions; the email channel
+ * goes through notifyManagersByEmail() below.
+ *
+ * ── ITEM 2 (2026-08-16) — THIS USED TO NOTIFY EXACTLY ONE MANAGER ───────────
+ *
+ * The lookup was `.order('role').limit(1).maybeSingle()` — literally "find first
+ * manager/owner for this company". So the SAME time-off request notified a
+ * different set of people depending on how the employee submitted it: every
+ * manager for an emailed request (notifyManagersByEmail already fans out), one
+ * arbitrary manager for a texted one. Alexander: "I want all managers to get
+ * notified of time off."
+ *
+ * That asymmetry gets worse, not better, as this build moves employees onto SMS:
+ * the one-manager path is the SMS path.
+ *
+ * WHAT FANS OUT AND WHAT DOESN'T:
+ *  • Per manager — their own approve/deny token PAIR, their own email, their own
+ *    SMS alert. Separate tokens matter: the token payload carries
+ *    manager_user_id/manager_name, which is what attributes the decision on
+ *    time_off_requests.decided_by and in the activity feed (Data Contract D17).
+ *    One shared token would credit whoever we happened to mint it for, not
+ *    whoever clicked.
+ *  • Once — the company SMS number, the policies, and the AI recommendation
+ *    (which is expensive and is persisted to the request row, not per-manager).
+ *
+ * RACE: two managers can click. Already handled — the decision webhook re-reads
+ * the request and refuses anything whose status is no longer 'pending', showing
+ * "This request has already been approved/denied" (webhooks/decision.ts).
+ */
+export async function notifyManager(
   companyId: string,
   employee: Employee,
   pending: PendingTimeOff,
@@ -1214,32 +1245,38 @@ async function notifyManager(
   stage2: SimulationResult | null,
   violations: TimeOffViolations | null
 ): Promise<void> {
-  // Find first manager/owner for this company
-  const { data: managerData } = await supabase
+  // EVERY manager/owner for this company. Not 'quria' platform admins, whose
+  // users row exists for company-scoped access rather than to receive
+  // operational manager mail — matches every other manager lookup in the repo.
+  const { data: managersData } = await supabase
     .from('users')
     .select('id, email, name, role')
     .eq('company_id', companyId)
     .in('role', ['manager', 'owner'])
-    .order('role', { ascending: true })
-    .limit(1)
-    .maybeSingle();
+    .order('role', { ascending: true });
 
-  if (!managerData) {
-    console.warn('[time-off] no manager/owner found for company', companyId);
+  const allManagers = (managersData ?? []) as { id: string; email: string | null; name: string; role: string }[];
+  const managers = allManagers.filter(m => !!m.email) as { id: string; email: string; name: string; role: string }[];
+
+  if (managers.length === 0) {
+    console.warn(
+      '[time-off] no manager/owner with an email on file for company', companyId,
+      `(${allManagers.length} manager row(s) total)`,
+    );
     return;
   }
 
-  const manager = managerData as { id: string; email: string; name: string; role: string };
-
-  // Try to find manager's phone via their employee record
+  // Manager phones, resolved in ONE query rather than per manager. A manager has
+  // a phone only if they also have an employee record matched by email.
   const { data: managerEmpData } = await supabase
     .from('employees')
-    .select('contact_phone')
+    .select('contact_email, contact_phone')
     .eq('company_id', companyId)
-    .eq('contact_email', manager.email)
-    .maybeSingle();
-  const managerPhone =
-    (managerEmpData as { contact_phone: string | null } | null)?.contact_phone ?? null;
+    .in('contact_email', managers.map(m => m.email));
+  const phoneByEmail = new Map<string, string>();
+  for (const row of (managerEmpData ?? []) as { contact_email: string | null; contact_phone: string | null }[]) {
+    if (row.contact_email && row.contact_phone) phoneByEmail.set(row.contact_email, row.contact_phone);
+  }
 
   // Find the company's Aegis SMS outbound number
   const { data: channelData } = await supabase
@@ -1254,52 +1291,17 @@ async function notifyManager(
   // Load time-off policies for the email
   const policies = await loadAllTimeOffPolicies(companyId);
 
-  // Create decision tokens (approve and deny are separate tokens)
-  const approveToken = randomUUID();
-  const denyToken = randomUUID();
-  const tokenExpiry = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
-
-  const sharedPayload = {
-    request_id: requestId,
-    company_id: companyId,
-    employee_id: employee.id,
-    employee_name: employee.name,
-    employee_channel: pending.channel,
-    employee_contact: pending.sender,
-    aegis_sms_channel: aegisSmsNumber,
-    thread_id: pending.thread_id ?? null,
-    raw_subject: pending.raw_subject ?? null,
-    // Carry the manager identity so the approve/deny decision is attributed to
-    // the manager on time_off_requests.decided_by + the activity feed (not the
-    // 'aegis' default). manager was resolved above from users (role manager/owner).
-    manager_user_id: manager.id,
-    manager_name: manager.name,
-    expires_at: tokenExpiry,
-  };
-
-  await Promise.all([
-    supabase.from('aegis_memory').insert({
-      company_id: companyId,
-      memory_type: 'observation',
-      source: `decision_token:${approveToken}`,
-      content: JSON.stringify({ ...sharedPayload, action: 'approve' }),
-    }),
-    supabase.from('aegis_memory').insert({
-      company_id: companyId,
-      memory_type: 'observation',
-      source: `decision_token:${denyToken}`,
-      content: JSON.stringify({ ...sharedPayload, action: 'deny' }),
-    }),
-  ]);
-
-  const baseUrl = env.BASE_URL;
-  const approveUrl = `${baseUrl}/webhooks/decision?action=approve&requestId=${requestId}&token=${approveToken}`;
-  const denyUrl = `${baseUrl}/webhooks/decision?action=deny&requestId=${requestId}&token=${denyToken}`;
-
-  // Generate AI recommendation only when we have stage-1 coverage data; the
+  // ── Generated ONCE, shared by every manager's email ───────────────────────
+  //
+  // Generate the AI recommendation only when we have stage-1 coverage data; the
   // recommendation prompt embeds simulation stats and would fail without them.
   // When the simulator was skipped (no shift_requirements), the manager email
   // still goes out — just without the recommendation section.
+  //
+  // Deliberately OUTSIDE the per-manager loop: it's an LLM call and it is
+  // persisted to the REQUEST row (one fact, one place — Rule 0), so generating
+  // it per manager would burn tokens to produce n answers where one is the
+  // truth, and the last writer would win on time_off_requests.
   let recommendation: DecisionRecommendation | null = null;
   if (stage1) {
     recommendation = await generateTimeOffRecommendation(
@@ -1325,48 +1327,113 @@ async function notifyManager(
       .eq('id', requestId);
   }
 
-  // Build and send manager email
-  const { subject, text, html } = buildManagerEmail({
-    employeeName: employee.name,
-    managerName: manager.name,
-    startDate: pending.start_date,
-    endDate: pending.end_date,
-    reason: pending.reason,
-    stage1,
-    stage2,
-    recommendation,
-    approveUrl,
-    denyUrl,
-    policies,
-    violations,
-    timeOffType: pending.time_off_type ?? 'full_day',
-    partialDays: pending.partial_days ?? null,
-  });
+  const baseUrl = env.BASE_URL;
+  const tokenExpiry = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+  const dateDisplay = formatDateRange(pending.start_date, pending.end_date);
 
-  await sendEmail({
-    to: manager.email,
-    subject,
-    text,
-    html,
-    company_id: companyId,
-  });
+  // ── Per manager: own tokens, own email, own SMS ───────────────────────────
+  //
+  // One manager's failure must not silence the rest — a bad address or a bounced
+  // send used to be the difference between "the manager was told" and "nobody
+  // was told" precisely because there was only ever one recipient. Each is
+  // wrapped so the loop always completes.
+  let emailed = 0;
+  for (const manager of managers) {
+    try {
+      // Separate approve/deny tokens PER MANAGER. The payload carries the
+      // manager identity, which is what attributes the decision on
+      // time_off_requests.decided_by and in the activity feed rather than
+      // falling back to 'aegis' (Data Contract D17). A shared token would
+      // credit whoever we minted it for, not whoever clicked.
+      const approveToken = randomUUID();
+      const denyToken = randomUUID();
 
-  // SMS alert — notification only, no analysis (the manager email above always
-  // sends; this is additive and skipped entirely in email-only mode).
-  if (!env.EMAIL_ONLY && managerPhone && aegisSmsNumber) {
-    const dateDisplay = formatDateRange(pending.start_date, pending.end_date);
-    await sendSms({
-      // Recipient is the MANAGER (not under the employee opt-in regime).
-      allowPreConsent: true,
-      to: managerPhone,
-      from: aegisSmsNumber,
-      body: managerAlertSms({
+      const sharedPayload = {
+        request_id: requestId,
+        company_id: companyId,
+        employee_id: employee.id,
+        employee_name: employee.name,
+        employee_channel: pending.channel,
+        employee_contact: pending.sender,
+        aegis_sms_channel: aegisSmsNumber,
+        thread_id: pending.thread_id ?? null,
+        raw_subject: pending.raw_subject ?? null,
+        manager_user_id: manager.id,
+        manager_name: manager.name,
+        expires_at: tokenExpiry,
+      };
+
+      await Promise.all([
+        supabase.from('aegis_memory').insert({
+          company_id: companyId,
+          memory_type: 'observation',
+          source: `decision_token:${approveToken}`,
+          content: JSON.stringify({ ...sharedPayload, action: 'approve' }),
+        }),
+        supabase.from('aegis_memory').insert({
+          company_id: companyId,
+          memory_type: 'observation',
+          source: `decision_token:${denyToken}`,
+          content: JSON.stringify({ ...sharedPayload, action: 'deny' }),
+        }),
+      ]);
+
+      const approveUrl = `${baseUrl}/webhooks/decision?action=approve&requestId=${requestId}&token=${approveToken}`;
+      const denyUrl = `${baseUrl}/webhooks/decision?action=deny&requestId=${requestId}&token=${denyToken}`;
+
+      const { subject, text, html } = buildManagerEmail({
+        employeeName: employee.name,
         managerName: manager.name,
-        summary: `${employee.name} wants ${dateDisplay} off${pending.reason ? ` for ${pending.reason}` : ''}.`,
-        inbox: 'approve',
-      }),
-      company_id: companyId,
-    });
+        startDate: pending.start_date,
+        endDate: pending.end_date,
+        reason: pending.reason,
+        stage1,
+        stage2,
+        recommendation,
+        approveUrl,
+        denyUrl,
+        policies,
+        violations,
+        timeOffType: pending.time_off_type ?? 'full_day',
+        partialDays: pending.partial_days ?? null,
+      });
+
+      await sendEmail({
+        to: manager.email,
+        subject,
+        text,
+        html,
+        company_id: companyId,
+      });
+      emailed++;
+
+      // SMS alert — notification only, no analysis (the manager email above
+      // always sends; this is additive and skipped entirely in email-only mode).
+      const managerPhone = phoneByEmail.get(manager.email) ?? null;
+      if (!env.EMAIL_ONLY && managerPhone && aegisSmsNumber) {
+        await sendSms({
+          // Recipient is the MANAGER (not under the employee opt-in regime).
+          allowPreConsent: true,
+          to: managerPhone,
+          from: aegisSmsNumber,
+          body: managerAlertSms({
+            managerName: manager.name,
+            summary: `${employee.name} wants ${dateDisplay} off${pending.reason ? ` for ${pending.reason}` : ''}.`,
+            inbox: 'approve',
+          }),
+          company_id: companyId,
+        });
+      }
+    } catch (err) {
+      console.warn('[time-off] manager notification failed for', manager.email, err);
+    }
+  }
+
+  if (emailed === 0) {
+    console.error(
+      '[time-off] NO manager was notified of request', requestId,
+      `— all ${managers.length} send(s) failed`,
+    );
   }
 }
 

@@ -11,6 +11,7 @@ import { runSimulation, getWeekBounds, loadTimeOffPolicies as loadAllTimeOffPoli
 import { computeTimeOffViolations } from '../lib/time-off-policies';
 import { env } from '../config/env';
 import { firstName, textOpener, managerAlertSms } from '../messaging/greeting';
+import { resolveManagers, recipientsFor, primaryRecipient, type ManagerContact } from '../messaging/manager-directory';
 import {
   BRAND,
   brandedEmailShell,
@@ -1168,17 +1169,16 @@ async function sendManagerResolutionReplies(args: {
   // Only actual club managers/owners get the resolution notice — NOT 'quria'
   // platform admins, whose users row exists for company-scoped access, not to
   // receive operational manager email. (Matches every other manager lookup.)
-  const { data: managersData } = await supabase
-    .from('users').select('id, email, name').eq('company_id', args.companyId)
-    .in('role', ['manager', 'owner']);
-  const managers = ((managersData ?? []) as { id: string; email: string | null; name: string | null }[])
+  const resolutionDirectory = await resolveManagers(args.companyId);
+  const managers = recipientsFor(resolutionDirectory, 'approvals', args.companyId)
     .filter(m => !!m.email);
 
   // N1 — never notify the manager who TOOK this decision about their own action
   // ("Jack approved … " → Jack). See excludeActor: when decided_by is NULL (the
   // shared magic-link path where we can't attribute — Data Contract D17) nobody
   // is excluded, so an unattributed decision still notifies everyone.
-  for (const m of excludeActor(managers, decidedById)) {
+  const asActors = managers.map((m) => ({ ...m, id: m.userId }));
+  for (const m of excludeActor(asActors, decidedById)) {
     try {
       const { subject, html, text } = buildTimeOffResolutionEmail({
         employeeName: args.employeeName,
@@ -1214,42 +1214,32 @@ async function notifyManager(
   stage2: SimulationResult | null,
   violations: TimeOffViolations | null
 ): Promise<void> {
-  // Find first manager/owner for this company
-  const { data: managerData } = await supabase
-    .from('users')
-    .select('id, email, name, role')
-    .eq('company_id', companyId)
-    .in('role', ['manager', 'owner'])
-    .order('role', { ascending: true })
-    .limit(1)
-    .maybeSingle();
+  // ONE resolver for "who are this company's managers and how do we reach them"
+  // (src/messaging/manager-directory.ts). It links users -> employees properly,
+  // skips revoked logins, honours per-person notification preferences, and logs
+  // loudly instead of silently skipping when someone is unreachable.
+  const directory = await resolveManagers(companyId);
+  const manager = primaryRecipient(directory, 'approvals', companyId);
 
-  if (!managerData) {
-    console.warn('[time-off] no manager/owner found for company', companyId);
+  if (!manager) {
+    console.error(
+      `[time-off] ${employee.name}'s time-off request cannot be routed — company ${companyId} ` +
+      'has no reachable manager or owner. The request is recorded but nobody has been told.'
+    );
     return;
   }
 
-  const manager = managerData as { id: string; email: string; name: string; role: string };
+  const managerPhone = manager.phone;
+  const aegisSmsNumber = directory.smsChannel;
 
-  // Try to find manager's phone via their employee record
-  const { data: managerEmpData } = await supabase
-    .from('employees')
-    .select('contact_phone')
-    .eq('company_id', companyId)
-    .eq('contact_email', manager.email)
-    .maybeSingle();
-  const managerPhone =
-    (managerEmpData as { contact_phone: string | null } | null)?.contact_phone ?? null;
-
-  // Find the company's Aegis SMS outbound number
-  const { data: channelData } = await supabase
-    .from('company_channels')
-    .select('channel_value')
-    .eq('company_id', companyId)
-    .eq('channel_type', 'sms')
-    .maybeSingle();
-  const aegisSmsNumber =
-    (channelData as { channel_value: string } | null)?.channel_value ?? null;
+  if (!managerPhone) {
+    // Previously silent: managerPhone was null and the SMS block below simply
+    // did not run. Now it says so, by name, with the reason.
+    console.warn(
+      `[time-off] no phone on file for ${manager.name} — sending the approval by email only. ` +
+      `(link source: ${manager.linkSource})`
+    );
+  }
 
   // Load time-off policies for the email
   const policies = await loadAllTimeOffPolicies(companyId);
@@ -1272,7 +1262,7 @@ async function notifyManager(
     // Carry the manager identity so the approve/deny decision is attributed to
     // the manager on time_off_requests.decided_by + the activity feed (not the
     // 'aegis' default). manager was resolved above from users (role manager/owner).
-    manager_user_id: manager.id,
+    manager_user_id: manager.userId,
     manager_name: manager.name,
     expires_at: tokenExpiry,
   };
@@ -1390,22 +1380,18 @@ async function notifyManagersByEmail(
   stage2: SimulationResult | null,
   violations: TimeOffViolations | null
 ): Promise<{ emailed: number; total_managers: number }> {
-  const { data: managersData } = await supabase
-    .from('users')
-    .select('id, email, name, role')
-    .eq('company_id', companyId)
-    .in('role', ['manager', 'owner']);
-
-  const managers = (managersData ?? []) as Array<{
-    id: string;
-    email: string | null;
-    name: string;
-    role: string;
-  }>;
+  // Same ONE resolver as the SMS-channel path above. Before this, an emailed
+  // request and a texted request notified DIFFERENT sets of managers — the same
+  // question answered two ways (Rule 0).
+  const directory = await resolveManagers(companyId);
+  const managers = recipientsFor(directory, 'approvals', companyId);
   const withEmail = managers.filter(m => !!m.email);
 
   if (withEmail.length === 0) {
-    console.warn('[time-off] email-channel: no manager/owner with email on file for company', companyId);
+    console.error(
+      `[time-off] ${employee.name}'s time-off request cannot be routed — company ${companyId} ` +
+      'has no manager or owner with an email on file. The request is recorded but nobody has been told.'
+    );
     return { emailed: 0, total_managers: managers.length };
   }
 
@@ -1454,7 +1440,7 @@ async function notifyManagersByEmail(
         company_id: companyId,
         company_name: companyName,
         manager_email: manager.email!,
-        manager_user_id: manager.id,
+        manager_user_id: manager.userId,
         manager_name: manager.name,
         simulation: simulation ?? undefined,
         recommendation,
@@ -1468,7 +1454,7 @@ async function notifyManagersByEmail(
         company_id: companyId,
         // Stamp a deterministic Message-ID so a later "Re-run check" reply
         // threads under this email in the manager's inbox (TO-RERUN-1).
-        message_id: toThreadMessageId(torRow.id, manager.id),
+        message_id: toThreadMessageId(torRow.id, manager.userId),
       });
       emailed++;
     } catch (err) {

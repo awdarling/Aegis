@@ -253,7 +253,19 @@ async function loadBuildData(
     stRes, reqRes, conflictRes, polRes, expRes,
   ] = await Promise.all([
     supabase.from('companies').select('name, timezone').eq('id', companyId).single(),
-    supabase.from('employees').select('*').eq('company_id', companyId).eq('active', true),
+    // The engine's roster. Two filters, two different meanings (migration 025):
+    //   active=true      → they are here right now. Someone between summers or
+    //                      on leave is active=false and comes back with a flip.
+    //   schedulable=true → they may be PLACED on a schedule. An owner or a
+    //                      bookkeeper is present, reachable and notified, but
+    //                      never rostered. Excluding them here (rather than
+    //                      inside eligibility) also stops the builder flagging
+    //                      them as "no availability on file", which they never
+    //                      will have.
+    // `.or()` rather than `.eq()` on schedulable so a tenant whose rows predate
+    // the migration (column NULL) is still treated as schedulable.
+    supabase.from('employees').select('*').eq('company_id', companyId).eq('active', true)
+      .or('schedulable.is.null,schedulable.eq.true'),
     supabase.from('availability').select('*').eq('company_id', companyId),
     supabase.from('time_off_requests')
       .select('employee_id, start_date, end_date, time_off_type, partial_days')

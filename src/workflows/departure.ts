@@ -25,7 +25,7 @@ import { reply } from '../messaging/reply';
 import { sendEmail } from '../messaging/email';
 import { sendSms } from '../messaging/sms';
 import { managerAlertSms } from '../messaging/greeting';
-import { getAegisSmsChannel } from '../messaging/notify';
+import { resolveManagers, primaryRecipient } from '../messaging/manager-directory';
 import { brandedEmailShell, brandedButtonRow, BRAND } from '../messaging/brand';
 import { logActivity } from '../logger/activity-log';
 import { formatDateRange } from './time-off';
@@ -67,16 +67,11 @@ export async function handleReportDeparture(
   const note = typeof extracted.note === 'string' && extracted.note.trim() ? extracted.note.trim() : null;
   const lastDayDisplay = lastDayDate ? formatDateRange(lastDayDate, lastDayDate) : null;
 
-  // Resolve the manager/owner to notify (first, deterministic — mirrors time-off).
-  const { data: managerData } = await supabase
-    .from('users')
-    .select('id, email, name, role')
-    .eq('company_id', companyId)
-    .in('role', ['manager', 'owner'])
-    .order('role', { ascending: true })
-    .limit(1)
-    .maybeSingle();
-  const manager = managerData as { id: string; email: string; name: string; role: string } | null;
+  // ONE resolver — src/messaging/manager-directory.ts. A departure needs a
+  // decision (the manager acknowledges it by setting a last day), so it routes
+  // as an 'approvals' action item and can never be opted out of into silence.
+  const directory = await resolveManagers(companyId);
+  const manager = primaryRecipient(directory, 'approvals', companyId);
 
   // ALWAYS record the signal (no employee write) — even if no manager is reachable,
   // so it's visible in the activity feed.
@@ -96,7 +91,10 @@ export async function handleReportDeparture(
   });
 
   if (!manager) {
-    console.warn('[departure] no manager/owner found for company', companyId);
+    console.error(
+      `[departure] ${employeeName} signalled a departure but company ${companyId} has no ` +
+      'reachable manager or owner. Recorded in the activity feed; nobody has been told directly.'
+    );
     await reply(
       contact,
       message,
@@ -105,16 +103,11 @@ export async function handleReportDeparture(
     return;
   }
 
-  // The manager's PERSONAL phone (employees row on contact_email) — NOT the Aegis
-  // outbound number. Null when the manager has no employee row / no phone on file.
-  const { data: managerEmpData } = await supabase
-    .from('employees')
-    .select('contact_phone')
-    .eq('company_id', companyId)
-    .eq('contact_email', manager.email)
-    .maybeSingle();
-  const managerPhone = (managerEmpData as { contact_phone: string | null } | null)?.contact_phone ?? null;
-  const aegisSmsNumber = await getAegisSmsChannel(companyId);
+  // The manager's PERSONAL phone, from their linked person record — NOT the
+  // Aegis outbound number. Null when nobody has linked them or they have no
+  // phone on file; the resolver has already said so in the log, by name.
+  const managerPhone = manager.phone;
+  const aegisSmsNumber = directory.smsChannel;
 
   // ── Mint the one-tap Acknowledge / Follow-up magic-link token ───────────────
   // ONE token carries the whole context; the URL's `action` selects the branch.
@@ -133,7 +126,7 @@ export async function handleReportDeparture(
     last_day_date: lastDayDate,
     note,
     manager_name: manager.name,
-    manager_user_id: manager.id,
+    manager_user_id: manager.userId,
     thread_id: message.thread_id ?? null,
     raw_subject: message.raw_subject ?? null,
     expires_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),

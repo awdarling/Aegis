@@ -34,7 +34,7 @@ const envSchema = z.object({
   EMAIL_ONLY: z.string().default('true').transform((s) => s.toLowerCase() !== 'false'),
 
   // RUN_SCHEDULERS — default true. The background schedulers (coverage-timeout +
-  // payroll) sweep aegis_memory / payroll_integrations across ALL tenants, so a
+  // employee-offboarding) sweep aegis_memory / employees across ALL tenants, so a
   // SECOND Aegis instance sharing this database would double-run them against
   // live tenants (e.g. Watermark) and could fire real emails / edit real data.
   // Set RUN_SCHEDULERS=false on any test/staging instance so it serves webhooks

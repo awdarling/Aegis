@@ -400,35 +400,11 @@ export interface Database {
           channel_value: string;
         };
       };
-      time_clock_integrations: {
-        Row: {
-          id: string;
-          company_id: string;
-          provider: string;
-          api_key: string | null;
-          api_base_url: string | null;
-          location_id: string | null;
-          active: boolean;
-          created_at: string;
-          updated_at: string;
-        };
-      };
-      payroll_integrations: {
-        Row: {
-          id: string;
-          company_id: string;
-          provider: string;
-          api_key: string | null;
-          company_identifier: string | null;
-          pay_period: 'weekly' | 'biweekly' | 'semimonthly';
-          payroll_check_day: number;
-          auto_check_enabled: boolean;
-          last_run_at: string | null;
-          active: boolean;
-          created_at: string;
-          updated_at: string;
-        };
-      };
+      // NOTE (2026-08-18): the time_clock_integrations and payroll_integrations
+      // row types were removed with the payroll code. The TABLES still exist in
+      // the database (both empty, 0 rows) and were deliberately left alone — no
+      // migration, nothing dropped. If payroll is built for real later, redeclare
+      // them from information_schema rather than from this file's history.
     };
   };
 }

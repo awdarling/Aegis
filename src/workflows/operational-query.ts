@@ -7,7 +7,6 @@ import { generateReply } from '../ai/claude';
 import { coerceJsonObject } from '../utils/coerce-json';
 import { computeWageEstimate } from '../lib/schedule-simulator';
 import { coercePolicyWrite } from '../lib/policy-write';
-import { handleWageRateSync } from './payroll';
 import {
   computeManagerAvailabilityChange,
   writeEmployeeAvailability,
@@ -1652,16 +1651,11 @@ async function executeEdit(pending: PendingEdit, companyId: string): Promise<voi
   // through to the "Done — updated" reply. No orphan outputs.
   if (updErr) throw new Error(`Update to ${pending.table}.${pending.field} failed: ${updErr.message}`);
 
-  // Sync wage rate to payroll provider when individual_wage is updated on an employee
-  if (pending.table === 'employees' && pending.field === 'individual_wage' && typeof newValue === 'number') {
-    void handleWageRateSync({
-      companyId,
-      employeeId: pending.entity_id,
-      employeeName: pending.entity_name,
-      newRate: newValue,
-      changedBy: pending.manager_id,
-    });
-  }
+  // NOTE (2026-08-18): an individual_wage edit used to fire a push to an outside
+  // payroll provider here. Payroll was never built — the adapter was a stub — so
+  // that call was removed with the rest of the payroll code. The wage WRITE above
+  // is untouched and every wage feature that reads it (labour-cost estimate on the
+  // schedule, the wage breakdown, the dashboard tile) is unaffected.
 
   // For schedule assignment edits: recompute wages
   if (pending.table === 'schedules' && pending.schedule_id) {

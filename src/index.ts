@@ -7,7 +7,6 @@ import { decisionWebhook } from './webhooks/decision';
 import { departureDecisionWebhook } from './webhooks/departure-decision';
 import { internalRouter } from './webhooks/internal';
 import { startCoverageTimeoutScheduler } from './scheduler/coverage-timeout';
-import { startPayrollScheduler } from './scheduler/payroll-scheduler';
 import { startEmployeeOffboardingScheduler } from './scheduler/employee-offboarding';
 
 process.on('unhandledRejection', (reason, promise) => {
@@ -71,7 +70,6 @@ app.listen(env.PORT, () => {
   }
   if (env.RUN_SCHEDULERS) {
     startCoverageTimeoutScheduler();
-    startPayrollScheduler();
     startEmployeeOffboardingScheduler();
   } else {
     console.log('[schedulers] DISABLED (RUN_SCHEDULERS=false) — webhooks-only mode; no cross-tenant background jobs.');

@@ -14,7 +14,6 @@ vi.mock('../../messaging/reply', () => ({ reply: vi.fn(), sendInThreadAck: vi.fn
 vi.mock('../../ai/claude', () => ({ generateReply: vi.fn(), withAnthropicRetry: vi.fn() }));
 vi.mock('../../logger/activity-log', () => ({ logActivity: vi.fn() }));
 vi.mock('../../lib/schedule-simulator', () => ({ computeWageEstimate: vi.fn() }));
-vi.mock('../payroll', () => ({ handleWageRateSync: vi.fn() }));
 
 import { collectAssignments, summarizeStaffingByDate, buildDataContext, formatMyShiftsReply, detectWeekScope, type MyShift } from '../operational-query';
 

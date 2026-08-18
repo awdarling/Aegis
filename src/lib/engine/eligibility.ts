@@ -54,6 +54,36 @@ export function isVeteranOnlyDate(date: string, ranges: VeteranOnlyRange[]): boo
   return ranges.some(r => date >= r.start_date && date <= r.end_date);
 }
 
+// L1 — DATE-LEVEL offboarding gate.
+//
+// `employees.last_day` (migration 020, live 2026-08-13) is the acknowledged
+// FINAL WORKING DAY. The employee WORKS it — so the boundary is strictly
+// `date > last_day`, never `>=`. This is the same boundary the daily
+// offboarding sweep uses (scheduler/employee-offboarding.ts deactivates on
+// `last_day < today`); keep the two in lockstep.
+//
+// Why this has to be per-DATE and not a roster-level exclude: the build loads
+// `active = true` employees for a whole week. Someone leaving on Wednesday is
+// still active all week, and must stay schedulable Sun–Wed while being
+// unschedulable Thu–Sat. A blanket exclude would wrongly strip them from days
+// they are contracted to work; no gate at all rosters them past their exit
+// (the live bug this closes).
+//
+// RULE 0b — one question, one function. Every placement path in the build
+// (initial fill, veteran swaps, the fairness floor, and cascade's
+// legalToPlace) reaches the roster through buildEligibility, so gating here
+// gates all of them. computeGapReason re-implements the filter chain for
+// manager-facing copy and calls THIS function rather than repeating the rule.
+export function isPastLastDay(emp: Employee, date: string): boolean {
+  // `last_day` is a live column that this repo's partial types mirror as
+  // optional; read defensively so a loader that didn't select it can't throw.
+  const lastDay = (emp as { last_day?: string | null }).last_day;
+  if (!lastDay) return false;
+  // Both sides are zero-padded YYYY-MM-DD, so lexicographic order IS date
+  // order. slice(0,10) tolerates a timestamp-shaped value defensively.
+  return date > lastDay.slice(0, 10);
+}
+
 // Pure time-window overlap. Inputs may be HH:MM or HH:MM:SS; both are sliced
 // to HH:MM, which compares lexicographically because the format is
 // zero-padded. Touching intervals (a.end === b.start) do NOT overlap.
@@ -162,6 +192,14 @@ export function buildEligibility(
   for (const e of employees) {
     if (!e.active) {
       removed.set(e.id, 'inactive');
+      continue;
+    }
+    // L1 — roster membership is per-DATE once a departure is acknowledged.
+    // Checked immediately after `active` because it answers the same question
+    // ("is this person on the roster for this date?"), just with day
+    // resolution instead of week resolution.
+    if (isPastLastDay(e, slot.date)) {
+      removed.set(e.id, 'past their last day');
       continue;
     }
     if (veteranOnly && !e.is_veteran) {

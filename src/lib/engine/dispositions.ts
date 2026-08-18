@@ -1,7 +1,7 @@
 import type { Availability, Employee, EmployeeConflict } from '../../db/types';
 import type { EngineSettings } from '../constraints/types';
 import type { TOWindow } from '../to-window';
-import { consecutiveDaysRunIncluding, isAvailableForShift, isBlockedByTOForSlot, sameDayDoubleReason } from './eligibility';
+import { consecutiveDaysRunIncluding, isAvailableForShift, isBlockedByTOForSlot, isPastLastDay, sameDayDoubleReason } from './eligibility';
 import type { CanvasSlot, WeekState } from './types';
 
 // Shared per-candidate disposition vocabulary. Attribute-mix shortage
@@ -9,6 +9,7 @@ import type { CanvasSlot, WeekState } from './types';
 // these codes so the manager-facing language stays uniform across flag types.
 export type DispositionReasonCode =
   | 'not_qualified'
+  | 'past_last_day'
   | 'on_time_off'
   | 'max_hours_reached'
   | 'max_consecutive_days_reached'
@@ -46,6 +47,7 @@ export interface DispositionContext {
 }
 
 export const REASON_LABELS: Record<DispositionReasonCode, string> = {
+  past_last_day: 'no longer with the team on this date (past their last day)',
   on_time_off: 'on approved time off',
   max_hours_reached: 'at max weekly hours',
   max_consecutive_days_reached: 'at max consecutive worked days',
@@ -60,6 +62,11 @@ export const REASON_LABELS: Record<DispositionReasonCode, string> = {
 // first → mentioned first. Bucketed roughly by "managers can act fastest"
 // (TO and hours first; structural reasons last).
 export const REASON_ORDER: DispositionReasonCode[] = [
+  // L1 — listed first: a departure is the least recoverable reason on the list
+  // and the one most likely to explain a gap the manager wasn't expecting.
+  // "Gary left on Wednesday" is a different conversation from "Gary is at max
+  // hours", and the manager should read it first.
+  'past_last_day',
   'on_time_off',
   'max_hours_reached',
   'max_consecutive_days_reached',
@@ -96,6 +103,12 @@ export function classifyEmployeeForSlot(emp: Employee, ctx: DispositionContext):
   const cohabIds = Array.from(ctx.assignedIds);
   const qualifies = emp.qualified_roles.some(r => ctx.acceptedRoles.has(r));
   if (!qualifies) return 'not_qualified';
+  // L1 — checked immediately after qualification and ahead of every soft/
+  // recoverable reason. Without this a departed employee was classified
+  // 'eligible_but_unchosen' and the manager was told the ranker simply passed
+  // them over, when in fact they are gone. Placed after 'not_qualified' to keep
+  // that code's existing precedence (both callers' tests depend on it).
+  if (isPastLastDay(emp, ctx.slot.date)) return 'past_last_day';
   if (isBlockedByTOForSlot(emp, ctx.slot, ctx.deps.toMap)) return 'on_time_off';
   if ((ctx.weekState.weeklyHoursMap.get(emp.id) ?? 0) + ctx.slot.hours > emp.max_weekly_hours) {
     return 'max_hours_reached';

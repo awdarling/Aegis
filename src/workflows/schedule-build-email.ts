@@ -124,6 +124,10 @@ function shiftRuleTagText(label: string): string {
 function dispositionLabel(reason: EmployeeDisposition['reason']): string {
   switch (reason) {
     case 'not_qualified': return 'not qualified for the role';
+    // L1 — an acknowledged departure. Wording deliberately avoids
+    // "terminated"/"inactive": the person may still be on the roster for
+    // earlier days of this same week, so this is a per-DATE statement.
+    case 'past_last_day': return 'no longer with the team on this date (past their last day)';
     case 'on_time_off': return 'on approved time off';
     case 'max_hours_reached': return 'at maximum weekly hours';
     case 'max_consecutive_days_reached': return 'at maximum consecutive worked days';

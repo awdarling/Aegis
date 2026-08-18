@@ -30,6 +30,7 @@ import {
   consecutiveDaysRunIncluding,
   isAvailableForShift as engineIsAvailable,
   isBlockedByTOForSlot,
+  isPastLastDay,
   isVeteranOnlyDate as engineIsVeteranOnlyDate,
   sameDayDoubleReason,
   shiftsOverlap,
@@ -473,7 +474,17 @@ function computeGapReason(input: GapReasonInput): string {
   const { slot, employees, availByEmp, toMap, veteranOnlyDates, weekState, shiftAssignmentIds, conflicts, settings } = input;
 
   const vetOnly = engineIsVeteranOnlyDate(slot.date, veteranOnlyDates);
-  const pool = vetOnly ? employees.filter(e => e.is_veteran) : employees;
+  const vetPool = vetOnly ? employees.filter(e => e.is_veteran) : employees;
+
+  // L1 — mirrors buildEligibility's date-level offboarding gate so the manager
+  // is told the ACTUAL binding constraint. Without this, a slot on Friday that
+  // only a Wednesday-departing employee could have filled reported "all
+  // qualified employees are unavailable" — technically true of the remaining
+  // roster, but it hides the real reason and reads like an availability bug.
+  const pool = vetPool.filter(e => !isPastLastDay(e, slot.date));
+  if (pool.length === 0 && vetPool.length > 0) {
+    return `Every otherwise-eligible employee has left the team before ${slot.date} (their last day has passed)`;
+  }
 
   // RULE 0b — same qualification function as the engine, the simulator, swaps and
   // coverage. Previously this filtered on `slot.role` alone, so the cascade

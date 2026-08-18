@@ -32,6 +32,7 @@ import { withAnthropicRetry } from '../ai/claude';
 import { resolvePartialWindow, createTimeOffRequestAndNotify, isTimeOffAffirmation } from './time-off';
 import { generateActionToken } from '../lib/aegis-actions/tokens';
 import { resolveManagers, recipientsFor, primaryRecipient } from '../messaging/manager-directory';
+import { sendManagerResolutionNotice } from '../messaging/manager-resolution-notice';
 import { formatDateRange } from './time-off';
 import {
   insertPendingAvailabilityChange,
@@ -309,6 +310,22 @@ function sessionSource(employeeId: string): string {
 
 function availConfirmSource(employeeId: string): string {
   return `avail_pending_confirm:${employeeId}`;
+}
+
+// A deterministic Message-ID for an availability request, per manager, so the
+// later "that's decided" notice collapses UNDER the original request in their
+// inbox instead of arriving as a fresh unread item. Same shape and same purpose
+// as time-off's toThreadMessageId. Without it, every manager who did NOT make
+// the decision was left holding a live Approve/Deny button with no way to learn
+// it had already been answered.
+export function availThreadMessageId(
+  companyId: string,
+  employeeId: string,
+  managerKey: string,
+  salt?: number
+): string {
+  const key = `${employeeId}-${managerKey}`.replace(/[^a-zA-Z0-9._-]/g, '_');
+  return `<avail-${companyId}-${key}${salt ? `.${salt}` : ''}@aegis.quriasolutions.com>`;
 }
 
 function availApprovalSource(companyId: string, employeeId: string): string {
@@ -3908,7 +3925,17 @@ export async function handleAvailabilityConfirmResponse(
         // on the aegis_memory pending row, so a later re-submit can't strand it).
         token_payload: approval as unknown as Record<string, unknown>,
       });
-      await sendEmail({ to: mgr.email, subject, text, html, company_id: contact.company_id });
+      await sendEmail({
+        to: mgr.email,
+        subject,
+        text,
+        html,
+        company_id: contact.company_id,
+        // See availThreadMessageId: this is what the "already decided" notice
+        // threads to, so a manager who didn't decide sees it collapse under the
+        // original rather than as a second unread item.
+        message_id: availThreadMessageId(contact.company_id, pending.employee_id, mgr.userId),
+      });
       // A manager with a phone ALSO gets a short SMS nudge — context (who + what)
       // plus a warm hand-off to the email where Approve/Deny lives — so they aren't
       // relying on noticing the email. Same principle as the time-off / swap alerts.
@@ -4128,6 +4155,52 @@ export interface AvailabilityDecisionInput {
   raw_subject?: string | null;
 }
 
+
+// ── "Already decided" — close the loop for every OTHER manager ────────────────
+//
+// An availability change fans out to ALL managers with live Approve/Deny
+// buttons. Until now, only the EMPLOYEE was told the outcome — so every other
+// manager was left holding a button for a request that had already been
+// answered. Clicking it hits the idempotency guard and quietly does nothing,
+// which looks like a broken button.
+//
+// Texts first and falls back to a THREADED email reply, per Alexander's policy:
+// email is only for someone unreachable by text, or for an action item with a
+// button. "It's handled" is neither.
+async function notifyOtherManagersAvailabilityResolved(input: {
+  company_id: string;
+  employee_id: string;
+  employee_name: string;
+  decision: 'approved' | 'denied';
+  decided_by?: string;
+  decided_by_user_id?: string | null;
+  scope: string;
+}): Promise<void> {
+  const verb = input.decision === 'approved' ? 'approved' : 'denied';
+  const who = input.decided_by?.trim() || 'Another manager';
+  const summary =
+    `${who} ${verb} ${input.employee_name}'s ${input.scope}. Nothing needed from you.`;
+
+  try {
+    await sendManagerResolutionNotice({
+      companyId: input.company_id,
+      decidedByUserId: input.decided_by_user_id ?? null,
+      decidedByName: input.decided_by ?? null,
+      summary,
+      subject: `Availability update request from ${input.employee_name}`,
+      body:
+        `${summary}\n\n` +
+        `The Approve / Deny buttons in the original request are no longer live — ` +
+        `you can ignore them.`,
+      inReplyTo: (m) => availThreadMessageId(input.company_id, input.employee_id, m.userId),
+      messageId: (m) => availThreadMessageId(input.company_id, input.employee_id, m.userId, Date.now()),
+    });
+  } catch (err) {
+    // Never let closing the loop break the decision that was already applied.
+    console.warn('[availability] could not tell the other managers it was decided:', err);
+  }
+}
+
 export async function applyAvailabilityDecision(input: AvailabilityDecisionInput): Promise<AvailabilityApplyOutcome> {
   // AVAIL-TAB-1 universal idempotency guard: only the surface that flips the still-
   // pending ledger row proceeds. A stale email button after a tab approval no-ops here.
@@ -4203,6 +4276,19 @@ export async function applyAvailabilityDecision(input: AvailabilityDecisionInput
       `Your availability change wasn't approved this time — give your manager a shout if you'd like to talk it through.`
     );
   }
+
+  // Close the loop for the managers who did NOT decide, so nobody is left
+  // holding a live Approve/Deny button for a settled request.
+  await notifyOtherManagersAvailabilityResolved({
+    company_id: input.company_id,
+    employee_id: input.employee_id,
+    employee_name: input.employee_name,
+    decision: input.decision,
+    decided_by: input.decided_by,
+    decided_by_user_id: input.decided_by_user_id,
+    scope: 'availability change',
+  });
+
   return { status: 'applied' };
 }
 
@@ -4331,6 +4417,19 @@ export async function applyCustomAvailabilityDecision(input: CustomAvailabilityD
         notifyContext,
         `Nice — your rotating availability is approved, set on a ${rot.cycle_weeks}-week cycle${rot.end_date ? ` through ${formatDateRange(rot.end_date, rot.end_date)}` : ''}. I'll work your schedule around it. Thanks!`
       );
+
+  // Close the loop for the managers who did NOT decide (see
+  // notifyOtherManagersAvailabilityResolved). Same reason as the permanent
+  // availability path: everyone else is holding a live Approve/Deny button.
+  await notifyOtherManagersAvailabilityResolved({
+    company_id: input.company_id,
+    employee_id: input.employee_id,
+    employee_name: input.employee_name,
+    decision: input.decision,
+    decided_by: input.decided_by,
+    decided_by_user_id: input.decided_by_user_id,
+    scope: input.rotation ? 'rotating availability change' : 'temporary availability change',
+  });
       return { status: 'applied' };
     }
 
@@ -4392,6 +4491,20 @@ export async function applyCustomAvailabilityDecision(input: CustomAvailabilityD
       `That change wasn't approved this time — give your manager a shout if you'd like to talk it through.`
     );
   }
+
+  // Close the loop for the managers who did NOT decide (see
+  // notifyOtherManagersAvailabilityResolved). Same reason as the permanent
+  // availability path: everyone else is holding a live Approve/Deny button.
+  await notifyOtherManagersAvailabilityResolved({
+    company_id: input.company_id,
+    employee_id: input.employee_id,
+    employee_name: input.employee_name,
+    decision: input.decision,
+    decided_by: input.decided_by,
+    decided_by_user_id: input.decided_by_user_id,
+    scope: input.rotation ? 'rotating availability change' : 'temporary availability change',
+  });
+
   return { status: 'applied' };
 }
 

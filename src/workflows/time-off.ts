@@ -517,7 +517,11 @@ export async function recomputeTimeOffRecommendation(
 // Deterministic Message-ID for a manager's copy of a TO request email, so the
 // "Re-run check" reply can thread to it (TO-RERUN-1). `salt` makes a reply's own
 // Message-ID unique while still referencing the original.
-function toThreadMessageId(requestId: string, managerKey: string, salt?: number): string {
+// Exported so the threading invariant is testable: the Message-ID stamped on a
+// manager's request email and the In-Reply-To on the later "resolved" reply must
+// be byte-identical, or the reply opens a new inbox item instead of collapsing
+// under the original. See __tests__/manager-email-threading.test.ts.
+export function toThreadMessageId(requestId: string, managerKey: string, salt?: number): string {
   const key = managerKey.replace(/[^a-zA-Z0-9._-]/g, '_');
   return `<to-${requestId}-${key}${salt ? `.${salt}` : ''}@aegis.quriasolutions.com>`;
 }
@@ -1339,6 +1343,14 @@ async function notifyManager(
     text,
     html,
     company_id: companyId,
+    // Stamp the SAME deterministic Message-ID the email-channel path uses
+    // (notifyManagersByEmail, below). Without it, a request that arrived BY TEXT
+    // produced a manager email with no Message-ID — so the later "resolved"
+    // reply had nothing to thread to and landed as a second unread item saying
+    // no action was needed. This is the whole fix: one header, and the follow-up
+    // collapses under the original. It matters because SMS is now the channel
+    // most requests arrive on.
+    message_id: toThreadMessageId(requestId, manager.userId),
   });
 
   // SMS alert — notification only, no analysis (the manager email above always

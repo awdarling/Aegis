@@ -52,6 +52,11 @@ export function verifyTelnyxRequest(req: Request, res: Response, next: NextFunct
 // Webhook once you attach a security policy to the Parse setting. Headers
 // are sent under the X-Twilio-Email-Event-Webhook-* namespace; if SendGrid
 // ever publishes Parse-specific header names, swap them here.
+//
+// NOTE — the only correct "twilio" string left in this codebase. SendGrid is a
+// Twilio-owned product and this is SendGrid's own header name; it has nothing to
+// do with SMS. Aegis's SMS provider is Telnyx (see verifyTelnyxRequest above).
+// Do not "clean this up".
 export const SENDGRID_SIGNATURE_HEADER = 'x-twilio-email-event-webhook-signature';
 export const SENDGRID_TIMESTAMP_HEADER = 'x-twilio-email-event-webhook-timestamp';
 

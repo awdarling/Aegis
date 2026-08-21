@@ -19,7 +19,7 @@ import { supabase } from '../db/client';
 import type { InboundMessage, VerifiedContact } from '../security/types';
 
 // Manager intents that carry an explicit ACTION verb ("approve …", "build …",
-// "run payroll"). Safe to yield to even when the pending handler was about to
+// "distribute …"). Safe to yield to even when the pending handler was about to
 // read the reply as a name to contact, because a bare name ("Kori") never
 // classifies as one of these. This is what lets "approve Sam's swap" mid-
 // coverage interrupt without a plain "Kori" being mistaken for a command.
@@ -36,7 +36,6 @@ export const INTERRUPTING_MANAGER_ACTION_INTENTS = new Set<string>([
   'request_emergency_coverage',
   'broadcast_message',
   'homebase_edit',
-  'run_payroll_check',
   'notify_day_closure',
 ]);
 

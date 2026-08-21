@@ -31,7 +31,6 @@ vi.mock('../../workflows/shift-swap', () => ({
 vi.mock('../../workflows/emergency-coverage', () => ({
   handleEmergencyCoverage: vi.fn(), routeManagerCoverageReply: vi.fn(), handleEmployeeCoverageResponse: vi.fn(), getActiveOutreach: vi.fn(),
 }));
-vi.mock('../../workflows/payroll', () => ({ handlePayrollCheck: vi.fn() }));
 vi.mock('../../workflows/employee-onboarding', () => ({
   getOnboardingSession: vi.fn(), getOnboardingSessionByPhone: h.getOnboardingSessionByPhone,
   getOnboardingSessionByEmail: h.getOnboardingSessionByEmail, handleOnboardingResponse: vi.fn(),

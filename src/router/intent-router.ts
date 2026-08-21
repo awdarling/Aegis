@@ -39,7 +39,6 @@ import {
   handleEmployeeCoverageResponse,
   getActiveOutreach,
 } from '../workflows/emergency-coverage';
-import { handlePayrollCheck } from '../workflows/payroll';
 import {
   getOnboardingSession,
   getOnboardingSessionByPhone,
@@ -91,7 +90,6 @@ const MANAGER_ONLY_INTENTS = new Set([
   'initiate_onboarding',
   'add_employee',
   'homebase_edit',
-  'run_payroll_check',
   'notify_day_closure',
   'recheck_time_off',
 ]);
@@ -533,11 +531,6 @@ async function routeIntentInner(
       case 'homebase_edit':
         console.log('[router] dispatching to handleHomebaseEdit');
         await handleHomebaseEdit(message, contact, classification.extracted);
-        break;
-
-      case 'run_payroll_check':
-        console.log('[router] dispatching to handlePayrollCheck');
-        await handlePayrollCheck(message, contact, classification.extracted);
         break;
 
       case 'broadcast_message':

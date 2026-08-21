@@ -14,9 +14,14 @@
 //
 // Recipient resolution mirrors time-off.ts notifyManager: first manager/owner user →
 // their PERSONAL phone via employees.contact_phone joined on contact_email → the
-// tenant Aegis outbound number via getAegisSmsChannel. It deliberately does NOT use
-// payroll.ts getManagerSmsChannel, which returns the Aegis outbound number (not the
-// manager's phone) — a latent bug we must not inherit.
+// tenant Aegis outbound number via getAegisSmsChannel.
+//
+// WARNING, still live (the code it named is gone, the mistake is not). payroll.ts
+// once had a getManagerSmsChannel() that queried users, threw the result away, and
+// returned the tenant's OWN Aegis outbound number — so `to` equalled `from` and
+// Aegis texted itself. That file was deleted 2026-08-18. Do not reinvent it: a
+// manager's phone comes from their employee record, never from company_channels.
+// company_channels holds the number Aegis sends FROM, for every tenant.
 
 import { randomUUID } from 'crypto';
 import { supabase } from '../db/client';

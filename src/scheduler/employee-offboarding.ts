@@ -10,14 +10,17 @@
 // (strictly before), so someone whose last_day is today is still active today and
 // gets deactivated on the next run. Whole-day granularity, cross-tenant.
 //
-// Modeled on payroll-scheduler.ts: a startup offset then a 24h interval, gated by
-// env.RUN_SCHEDULERS in src/index.ts so only ONE process runs cross-tenant jobs.
+// Shape: a startup offset then a 24h interval, gated by env.RUN_SCHEDULERS in
+// src/index.ts so only ONE process runs cross-tenant jobs. Each scheduler owns its
+// own timer — coverage-timeout, and this one. They do not share a clock.
+// (This comment used to name payroll-scheduler.ts as the model; that file was
+// removed 2026-08-18 with the rest of the unbuilt payroll feature.)
 
 import { supabase } from '../db/client';
 import { logActivity } from '../logger/activity-log';
 
 const CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
-const STARTUP_DELAY_MS = 2 * 60 * 60 * 1000;   // 2h offset — avoid colliding with coverage (0) + payroll (1h)
+const STARTUP_DELAY_MS = 2 * 60 * 60 * 1000;   // 2h offset — avoid colliding with coverage (starts at 0)
 
 export function startEmployeeOffboardingScheduler(): void {
   console.log('[offboarding-scheduler] starting — daily deactivation sweep will begin in 2 hours');

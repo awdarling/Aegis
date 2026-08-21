@@ -94,7 +94,6 @@ export const MANAGER_INTENTS = [
   'request_emergency_coverage',
   'build_schedule',
   'distribute_schedule',
-  'run_payroll_check',
   'homebase_edit',
   'notify_day_closure',
   'recheck_time_off',
@@ -928,7 +927,6 @@ Respond with ONLY valid JSON in this exact shape — no markdown, no explanation
     //   employment status from this — it alerts the manager, who acknowledges by
     //   setting the last day.
     // For operational_query: {}
-    // For run_payroll_check: { "period_start": "YYYY-MM-DD", "period_end": "YYYY-MM-DD" }
     // For broadcast_message: { "message_text": "exact message to send", "target_type": "all|managers|employees|role|specific", "target_role": "Lifeguard|null", "target_names": ["Name1"]|null, "channel": "sms|email|both" }
     // For notify_day_closure: {
     //   "date": "YYYY-MM-DD",

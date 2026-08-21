@@ -7,6 +7,9 @@ import { sendSms } from '../messaging/sms';
 import { env } from '../config/env';
 import { normalizeReSubject } from '../messaging/reply';
 import { executeScheduleSwap, executeScheduleTrade } from '../workflows/shift-swap';
+// L4 / L4b — RULE 0b: the single answer to "what kind of swap is this row, and
+// how (or whether) may the Homebase UI execute it?".
+import { planRowExecution } from '../lib/swap-kind';
 import { processCoverageButtonDecision, processCoverageBatchButton } from '../workflows/emergency-coverage';
 import { computeWageEstimate } from '../lib/schedule-simulator';
 import { BRAND, quriaLogoDataUri } from '../messaging/brand';
@@ -297,6 +300,12 @@ async function handleSwapDecision(
   const swap = swapRow as {
     id: string; status: string; requesting_employee_id: string; receiving_employee_id: string | null;
     shift_date: string; shift_name: string; role: string;
+    // L4 — the legacy swap-kind marker (fallback). L4b — the real columns.
+    notes: string | null;
+    kind: string | null;
+    target_shift_date: string | null;
+    target_shift_name: string | null;
+    target_shift_role: string | null;
   };
 
   if (swap.status !== 'pending_manager') {
@@ -341,7 +350,30 @@ async function handleSwapDecision(
     }
 
     // Find the schedule covering this shift date.
-    const { data: schedRow } = await supabase.from('schedules').select('id, data').is('deleted_at', null)
+    //
+    // L4 [SWAP-SCHEDULE-SELECT] — `.is('archived_at', null)` added so this agrees
+    // with the PUBLISHER's own definition of "the live row for this week".
+    //
+    // Both publish paths (schedule-build.ts distributeScheduleCore + the
+    // redistribute path, and Homebase's publish_schedule_swap RPC) supersede a
+    // prior row with `{ status: 'archived', archived_at, superseded_by }`, keyed
+    // on `published_at NOT NULL AND archived_at IS NULL`. So "live" is defined by
+    // archived_at, while this query defined it by the status enum plus newest
+    // generated_at — TWO definitions of one fact, which is precisely what lets a
+    // writer and a reader land on different rows (SCHEMA_DRIFT_LOG 2026-07-01 s2,
+    // where multiple published rows per week caused approved swaps not to appear
+    // on the schedule the employee sees).
+    //
+    // Verified read-only 2026-08-16: NOT currently reachable. Live Watermark has
+    // 12 published rows, ZERO with archived_at set and ZERO with status
+    // 'archived' — no republish has fired in production yet — and because the
+    // archive path sets BOTH status and archived_at, the status filter alone
+    // still excludes superseded rows. This is defence in depth: it removes the
+    // dependency on those two columns never disagreeing (a legacy row archived
+    // by an older code path, a manual DB edit, or a republish from an OLDER
+    // build whose generated_at outranks the live row).
+    const { data: schedRow } = await supabase.from('schedules').select('id, data')
+      .is('deleted_at', null).is('archived_at', null)
       .eq('company_id', token.company_id).eq('status', 'published')
       .lte('week_start', token.shift_date).gte('week_end', token.shift_date)
       .order('generated_at', { ascending: false }).limit(1).maybeSingle();
@@ -727,12 +759,30 @@ decisionWebhook.get('/', async (req, res) => {
 // the row (Homebase sends only the id), then run the SAME execute + confirm the
 // email path does, reusing buildSwapDecisionMessages so both speak identically.
 //
-// GIVEAWAY / PICKUP ONLY: swap_requests has NO target-shift columns (verified
-// against the live DB 2026-07-31), so a two-way trade's return shift cannot be
-// reconstructed from the row alone. Trades keep going through the manager email
-// button, whose decision token carries the target shift. A Homebase-UI approval
-// is a one-way pickup, so this covers the real path. (To approve trades in the
-// UI too, add target_shift_date/name/role columns to swap_requests first.)
+// GIVEAWAY / PICKUP ONLY — and as of L4 that is ENFORCED, not just asserted.
+//
+// swap_requests has NO target-shift columns (verified against the live DB
+// 2026-07-31), so a two-way trade's return shift cannot be reconstructed from
+// the row alone. Trades are supposed to go through the manager email button,
+// whose decision token carries the target shift.
+//
+// That restriction was documented in THREE files (here, webhooks/internal.ts,
+// and Homebase src/lib/swaps/decide.ts) and implemented in NONE. This function
+// called the one-way executeScheduleSwap unconditionally, so a manager who
+// approved a TRADE from the Homebase Swaps tab moved exactly one shift, silently
+// dropped the return leg, wrote status='approved', and told the requester they
+// were "off" when they had agreed to work the coworker's shift. Trades do reach
+// this path: both the broadcast trade and the directed trade create
+// status='pending_manager' rows with a receiver, and the tab renders live
+// Approve/Deny buttons for any such row.
+//
+// The guard is now real: canExecuteFromRowAlone (lib/swap-kind.ts) reads the
+// persisted kind marker and this function refuses anything it cannot PROVE is
+// one-way — including legacy rows with no marker, because the pre-L4 directed
+// note was byte-identical for giveaways and trades and guessing is exactly the
+// mistake that caused the bug. Refusals are returned as a noop with a manager-
+// readable reason, so Homebase can tell the manager to use the email button
+// instead of claiming the schedule was updated.
 type SwapNotifyResult = { status: 'approved' | 'denied' | 'noop'; notified: number; reason?: string };
 
 async function loadSwapEmployee(companyId: string, employeeId: string) {
@@ -770,10 +820,29 @@ export async function sendSwapDecisionNotification(
     id: string; company_id: string; status: string;
     requesting_employee_id: string; receiving_employee_id: string | null;
     shift_date: string; shift_name: string; role: string;
+    // L4 — carries the persisted swap-kind marker (lib/swap-kind.ts).
+    notes: string | null;
   };
   // Idempotent + safe: only a still-pending swap with a known coverer can execute.
   if (swap.status !== 'pending_manager') return { status: 'noop', notified: 0, reason: `swap already ${swap.status}` };
   if (!swap.receiving_employee_id) return { status: 'noop', notified: 0, reason: 'no coworker has taken this shift yet' };
+
+  // L4 — FAIL CLOSED. Only execute what we can prove is a one-way reassignment.
+  // Checked before ANY write and before either branch: a trade must not be
+  // denied-and-notified from here either, because the email button carrying the
+  // real shift details is the path that should decide it.
+  // L4b — decide HOW to execute, not merely WHETHER. A trade with its return
+  // shift on the row is now executed properly here; only rows that are genuinely
+  // unexecutable (unmarked legacy, or a pre-023 trade whose return shift was
+  // never stored) are refused, and the refusal names the path that does work.
+  const plan = planRowExecution(swap);
+  if (plan.mode === 'refuse') {
+    console.warn(
+      `[sendSwapDecisionNotification] REFUSING ${decision} for swap ${swap.id} — ` +
+      `kind=${plan.kind ?? 'unknown'}. ${plan.reason}`
+    );
+    return { status: 'noop', notified: 0, reason: plan.reason };
+  }
 
   const [requester, receiver] = await Promise.all([
     loadSwapEmployee(swap.company_id, swap.requesting_employee_id),
@@ -792,36 +861,94 @@ export async function sendSwapDecisionNotification(
 
   if (decision === 'denied') {
     await supabase.from('swap_requests').update({ status: 'denied', decided_at: new Date().toISOString(), decided_by: null }).eq('id', swap.id);
-    const msg = `Your shift coverage request for the ${swap.shift_name} shift on ${dateShort} has been denied by your manager. Please contact them if you have questions.`;
+    // L4b — a TRADE denial must not be described as a "coverage request", or
+    // both people are told the wrong thing about what was refused.
+    const msg = plan.mode === 'trade'
+      ? `Your shift trade for the ${swap.shift_name} shift on ${dateShort} was not approved by your manager. ` +
+        `Both of you stay on your original shifts. Please contact them if you have questions.`
+      : `Your shift coverage request for the ${swap.shift_name} shift on ${dateShort} has been denied by your manager. Please contact them if you have questions.`;
+    const subject = plan.mode === 'trade' ? 'Shift trade not approved' : 'Coverage denied';
     let notified = 0;
-    if (await sendSwapNotice(requester, msg, 'Coverage denied', aegisSmsChannel, swap.company_id)) notified++;
-    if (await sendSwapNotice(receiver, msg, 'Coverage denied', aegisSmsChannel, swap.company_id)) notified++;
+    if (await sendSwapNotice(requester, msg, subject, aegisSmsChannel, swap.company_id)) notified++;
+    if (await sendSwapNotice(receiver, msg, subject, aegisSmsChannel, swap.company_id)) notified++;
     return { status: 'denied', notified };
   }
 
   // Approve. The schedule write is authoritative (D2): apply first, and only mark
   // approved + notify if it actually lands — otherwise leave it pending and say why.
-  const { data: schedRow } = await supabase.from('schedules').select('id, data').is('deleted_at', null)
+  // L4 [SWAP-SCHEDULE-SELECT] — same `archived_at` guard as the email-button
+  // path above; see the long note there for why.
+  const { data: schedRow } = await supabase.from('schedules').select('id, data')
+    .is('deleted_at', null).is('archived_at', null)
     .eq('company_id', swap.company_id).eq('status', 'published')
     .lte('week_start', swap.shift_date).gte('week_end', swap.shift_date)
     .order('generated_at', { ascending: false }).limit(1).maybeSingle();
   if (!schedRow) return { status: 'noop', notified: 0, reason: `no published schedule covers ${swap.shift_date}` };
 
-  const applied = await executeScheduleSwap(
-    swap.company_id, (schedRow as { id: string }).id, swap.shift_date, swap.shift_name,
-    swap.requesting_employee_id, swap.receiving_employee_id, receiver.name,
-  );
+  // L4b — TRADE vs ONE-WAY. This branch is the whole point of migration 023:
+  // the return shift is now on the row, so the UI can run the SAME two-leg
+  // executor the email button uses instead of silently running a giveaway.
+  //
+  // executeScheduleTrade requires EXACTLY ONE matching assignment per leg and
+  // writes nothing otherwise (L4), so a trade that no longer matches the
+  // schedule fails closed here exactly as it does on the email path.
+  const applied = plan.mode === 'trade'
+    ? await executeScheduleTrade(
+        swap.company_id, (schedRow as { id: string }).id,
+        { date: swap.shift_date, shift_name: swap.shift_name,
+          employee_id: swap.requesting_employee_id, employee_name: requester.name },
+        { date: plan.returnShift.date, shift_name: plan.returnShift.shift_name,
+          employee_id: swap.receiving_employee_id, employee_name: receiver.name },
+      )
+    : await executeScheduleSwap(
+        swap.company_id, (schedRow as { id: string }).id, swap.shift_date, swap.shift_name,
+        swap.requesting_employee_id, swap.receiving_employee_id, receiver.name,
+      );
   if (!applied.ok) return { status: 'noop', notified: 0, reason: applied.reason };
 
   await supabase.from('swap_requests').update({
     status: 'approved', schedule_id: applied.schedule_id, decided_at: new Date().toISOString(), decided_by: null,
   }).eq('id', swap.id);
 
+  // BOTH PARTIES, with wording that matches what actually happened. Previously
+  // this hard-coded `isTrade = false` and `target_shift_name: null`, so a trade
+  // approved here told the requester they were "off" when they had agreed to
+  // work the coworker's shift. buildSwapDecisionMessages is shared with the
+  // email-button path, so the two now say the same thing (RULE 0b).
+  const isTrade = plan.mode === 'trade';
+  const targetDateLong = isTrade
+    ? new Date(plan.returnShift.date + 'T12:00:00Z').toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' })
+    : dateLong;
   const { requesterMsg, receiverMsg } = buildSwapDecisionMessages(
-    { shift_name: swap.shift_name, receiver_name: receiver.name, target_shift_name: null }, false, dateLong, dateLong,
+    {
+      shift_name: swap.shift_name,
+      receiver_name: receiver.name,
+      target_shift_name: isTrade ? plan.returnShift.shift_name : null,
+    },
+    isTrade, dateLong, targetDateLong,
   );
+  const subject = isTrade ? 'Shift trade approved' : 'Coverage approved';
   let notified = 0;
-  if (await sendSwapNotice(requester, requesterMsg, 'Coverage approved', aegisSmsChannel, swap.company_id)) notified++;
-  if (await sendSwapNotice(receiver, receiverMsg, 'Coverage approved', aegisSmsChannel, swap.company_id)) notified++;
+  if (await sendSwapNotice(requester, requesterMsg, subject, aegisSmsChannel, swap.company_id)) notified++;
+  if (await sendSwapNotice(receiver, receiverMsg, subject, aegisSmsChannel, swap.company_id)) notified++;
+
+  // The MANAGER acted in the UI, so they already know the outcome — but the
+  // activity feed is the shared record, and a trade must not be logged with
+  // giveaway vocabulary.
+  await logActivity({
+    company_id: swap.company_id,
+    action: 'swap_approved',
+    entity_type: 'swap_request',
+    entity_id: swap.id,
+    summary: isTrade
+      ? `Trade approved in Homebase: ${requester.name} takes ${plan.returnShift.shift_name} on ${plan.returnShift.date}, ${receiver.name} takes ${swap.shift_name} on ${swap.shift_date}.`
+      : `Swap approved in Homebase: ${receiver.name} covers ${requester.name}'s ${swap.shift_name} shift on ${swap.shift_date}.`,
+    metadata: {
+      kind: plan.kind, requester_id: swap.requesting_employee_id,
+      receiver_id: swap.receiving_employee_id, schedule_id: applied.schedule_id,
+      notified, decided_via: 'homebase_ui',
+    },
+  });
+
   return { status: 'approved', notified };
 }

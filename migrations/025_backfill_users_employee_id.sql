@@ -53,20 +53,20 @@ ORDER BY u.company_id, u.role, u.email;
 -- Only links where exactly ONE person in the SAME company has that email.
 -- Case- and whitespace-insensitive, unlike the code it replaces.
 -- Skips platform admins and anything already linked.
+-- NOTE 2026-08-22: an earlier draft of this used min(e.id) with GROUP BY /
+-- HAVING count(*) = 1. Postgres has no min() for uuid, so it failed with
+-- 42883 when actually run. Rewritten to enforce the same "exactly one match"
+-- rule with a subquery instead of an aggregate — clearer, and it works.
 UPDATE public.users u
-SET employee_id = sub.employee_id
-FROM (
-  SELECT u2.id AS user_id, min(e.id) AS employee_id
-  FROM public.users u2
-  JOIN public.employees e
-    ON e.company_id = u2.company_id
-   AND lower(trim(e.contact_email)) = lower(trim(u2.email))
-  WHERE u2.employee_id IS NULL
-    AND u2.role IN ('manager', 'owner')
-  GROUP BY u2.id
-  HAVING count(*) = 1
-) sub
-WHERE u.id = sub.user_id;
+SET employee_id = e.id
+FROM public.employees e
+WHERE u.employee_id IS NULL
+  AND u.role IN ('manager', 'owner')
+  AND e.company_id = u.company_id
+  AND lower(trim(e.contact_email)) = lower(trim(u.email))
+  AND (SELECT count(*) FROM public.employees e2
+        WHERE e2.company_id = u.company_id
+          AND lower(trim(e2.contact_email)) = lower(trim(u.email))) = 1;
 
 COMMIT;
 

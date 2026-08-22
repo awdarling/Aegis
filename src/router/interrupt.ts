@@ -55,6 +55,10 @@ export const INTERRUPTING_MANAGER_QUERY_INTENTS = new Set<string>([
 // should re-ask, not re-route.
 export const INTERRUPTING_EMPLOYEE_INTENTS = new Set<string>([
   'submit_time_off',
+  // L3 — a cancel raised mid-confirmation must YIELD rather than be read as
+  // "scrap the pending one". The two are different requests and only the word
+  // "cancel" is shared.
+  'cancel_time_off',
   'query_my_shifts',
   'query_my_time_off',
   'update_availability',

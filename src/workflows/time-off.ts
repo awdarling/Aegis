@@ -1205,7 +1205,38 @@ async function sendManagerResolutionReplies(args: {
 
 // ── Manager notification ───────────────────────────────────────────────────────
 
-async function notifyManager(
+/**
+ * Notify the manager(s) that an employee has requested time off, with
+ * approve/deny magic links. Used for SMS-channel submissions; the email channel
+ * goes through notifyManagersByEmail() below.
+ *
+ * ── ITEM 2 (2026-08-16) — THIS USED TO NOTIFY EXACTLY ONE MANAGER ───────────
+ *
+ * The lookup was `.order('role').limit(1).maybeSingle()` — literally "find first
+ * manager/owner for this company". So the SAME time-off request notified a
+ * different set of people depending on how the employee submitted it: every
+ * manager for an emailed request (notifyManagersByEmail already fans out), one
+ * arbitrary manager for a texted one. Alexander: "I want all managers to get
+ * notified of time off."
+ *
+ * That asymmetry gets worse, not better, as this build moves employees onto SMS:
+ * the one-manager path is the SMS path.
+ *
+ * WHAT FANS OUT AND WHAT DOESN'T:
+ *  • Per manager — their own approve/deny token PAIR, their own email, their own
+ *    SMS alert. Separate tokens matter: the token payload carries
+ *    manager_user_id/manager_name, which is what attributes the decision on
+ *    time_off_requests.decided_by and in the activity feed (Data Contract D17).
+ *    One shared token would credit whoever we happened to mint it for, not
+ *    whoever clicked.
+ *  • Once — the company SMS number, the policies, and the AI recommendation
+ *    (which is expensive and is persisted to the request row, not per-manager).
+ *
+ * RACE: two managers can click. Already handled — the decision webhook re-reads
+ * the request and refuses anything whose status is no longer 'pending', showing
+ * "This request has already been approved/denied" (webhooks/decision.ts).
+ */
+export async function notifyManager(
   companyId: string,
   employee: Employee,
   pending: PendingTimeOff,
@@ -1214,32 +1245,38 @@ async function notifyManager(
   stage2: SimulationResult | null,
   violations: TimeOffViolations | null
 ): Promise<void> {
-  // Find first manager/owner for this company
-  const { data: managerData } = await supabase
+  // EVERY manager/owner for this company. Not 'quria' platform admins, whose
+  // users row exists for company-scoped access rather than to receive
+  // operational manager mail — matches every other manager lookup in the repo.
+  const { data: managersData } = await supabase
     .from('users')
     .select('id, email, name, role')
     .eq('company_id', companyId)
     .in('role', ['manager', 'owner'])
-    .order('role', { ascending: true })
-    .limit(1)
-    .maybeSingle();
+    .order('role', { ascending: true });
 
-  if (!managerData) {
-    console.warn('[time-off] no manager/owner found for company', companyId);
+  const allManagers = (managersData ?? []) as { id: string; email: string | null; name: string; role: string }[];
+  const managers = allManagers.filter(m => !!m.email) as { id: string; email: string; name: string; role: string }[];
+
+  if (managers.length === 0) {
+    console.warn(
+      '[time-off] no manager/owner with an email on file for company', companyId,
+      `(${allManagers.length} manager row(s) total)`,
+    );
     return;
   }
 
-  const manager = managerData as { id: string; email: string; name: string; role: string };
-
-  // Try to find manager's phone via their employee record
+  // Manager phones, resolved in ONE query rather than per manager. A manager has
+  // a phone only if they also have an employee record matched by email.
   const { data: managerEmpData } = await supabase
     .from('employees')
-    .select('contact_phone')
+    .select('contact_email, contact_phone')
     .eq('company_id', companyId)
-    .eq('contact_email', manager.email)
-    .maybeSingle();
-  const managerPhone =
-    (managerEmpData as { contact_phone: string | null } | null)?.contact_phone ?? null;
+    .in('contact_email', managers.map(m => m.email));
+  const phoneByEmail = new Map<string, string>();
+  for (const row of (managerEmpData ?? []) as { contact_email: string | null; contact_phone: string | null }[]) {
+    if (row.contact_email && row.contact_phone) phoneByEmail.set(row.contact_email, row.contact_phone);
+  }
 
   // Find the company's Aegis SMS outbound number
   const { data: channelData } = await supabase
@@ -1254,52 +1291,17 @@ async function notifyManager(
   // Load time-off policies for the email
   const policies = await loadAllTimeOffPolicies(companyId);
 
-  // Create decision tokens (approve and deny are separate tokens)
-  const approveToken = randomUUID();
-  const denyToken = randomUUID();
-  const tokenExpiry = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
-
-  const sharedPayload = {
-    request_id: requestId,
-    company_id: companyId,
-    employee_id: employee.id,
-    employee_name: employee.name,
-    employee_channel: pending.channel,
-    employee_contact: pending.sender,
-    aegis_sms_channel: aegisSmsNumber,
-    thread_id: pending.thread_id ?? null,
-    raw_subject: pending.raw_subject ?? null,
-    // Carry the manager identity so the approve/deny decision is attributed to
-    // the manager on time_off_requests.decided_by + the activity feed (not the
-    // 'aegis' default). manager was resolved above from users (role manager/owner).
-    manager_user_id: manager.id,
-    manager_name: manager.name,
-    expires_at: tokenExpiry,
-  };
-
-  await Promise.all([
-    supabase.from('aegis_memory').insert({
-      company_id: companyId,
-      memory_type: 'observation',
-      source: `decision_token:${approveToken}`,
-      content: JSON.stringify({ ...sharedPayload, action: 'approve' }),
-    }),
-    supabase.from('aegis_memory').insert({
-      company_id: companyId,
-      memory_type: 'observation',
-      source: `decision_token:${denyToken}`,
-      content: JSON.stringify({ ...sharedPayload, action: 'deny' }),
-    }),
-  ]);
-
-  const baseUrl = env.BASE_URL;
-  const approveUrl = `${baseUrl}/webhooks/decision?action=approve&requestId=${requestId}&token=${approveToken}`;
-  const denyUrl = `${baseUrl}/webhooks/decision?action=deny&requestId=${requestId}&token=${denyToken}`;
-
-  // Generate AI recommendation only when we have stage-1 coverage data; the
+  // ── Generated ONCE, shared by every manager's email ───────────────────────
+  //
+  // Generate the AI recommendation only when we have stage-1 coverage data; the
   // recommendation prompt embeds simulation stats and would fail without them.
   // When the simulator was skipped (no shift_requirements), the manager email
   // still goes out — just without the recommendation section.
+  //
+  // Deliberately OUTSIDE the per-manager loop: it's an LLM call and it is
+  // persisted to the REQUEST row (one fact, one place — Rule 0), so generating
+  // it per manager would burn tokens to produce n answers where one is the
+  // truth, and the last writer would win on time_off_requests.
   let recommendation: DecisionRecommendation | null = null;
   if (stage1) {
     recommendation = await generateTimeOffRecommendation(
@@ -1325,48 +1327,113 @@ async function notifyManager(
       .eq('id', requestId);
   }
 
-  // Build and send manager email
-  const { subject, text, html } = buildManagerEmail({
-    employeeName: employee.name,
-    managerName: manager.name,
-    startDate: pending.start_date,
-    endDate: pending.end_date,
-    reason: pending.reason,
-    stage1,
-    stage2,
-    recommendation,
-    approveUrl,
-    denyUrl,
-    policies,
-    violations,
-    timeOffType: pending.time_off_type ?? 'full_day',
-    partialDays: pending.partial_days ?? null,
-  });
+  const baseUrl = env.BASE_URL;
+  const tokenExpiry = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+  const dateDisplay = formatDateRange(pending.start_date, pending.end_date);
 
-  await sendEmail({
-    to: manager.email,
-    subject,
-    text,
-    html,
-    company_id: companyId,
-  });
+  // ── Per manager: own tokens, own email, own SMS ───────────────────────────
+  //
+  // One manager's failure must not silence the rest — a bad address or a bounced
+  // send used to be the difference between "the manager was told" and "nobody
+  // was told" precisely because there was only ever one recipient. Each is
+  // wrapped so the loop always completes.
+  let emailed = 0;
+  for (const manager of managers) {
+    try {
+      // Separate approve/deny tokens PER MANAGER. The payload carries the
+      // manager identity, which is what attributes the decision on
+      // time_off_requests.decided_by and in the activity feed rather than
+      // falling back to 'aegis' (Data Contract D17). A shared token would
+      // credit whoever we minted it for, not whoever clicked.
+      const approveToken = randomUUID();
+      const denyToken = randomUUID();
 
-  // SMS alert — notification only, no analysis (the manager email above always
-  // sends; this is additive and skipped entirely in email-only mode).
-  if (!env.EMAIL_ONLY && managerPhone && aegisSmsNumber) {
-    const dateDisplay = formatDateRange(pending.start_date, pending.end_date);
-    await sendSms({
-      // Recipient is the MANAGER (not under the employee opt-in regime).
-      allowPreConsent: true,
-      to: managerPhone,
-      from: aegisSmsNumber,
-      body: managerAlertSms({
+      const sharedPayload = {
+        request_id: requestId,
+        company_id: companyId,
+        employee_id: employee.id,
+        employee_name: employee.name,
+        employee_channel: pending.channel,
+        employee_contact: pending.sender,
+        aegis_sms_channel: aegisSmsNumber,
+        thread_id: pending.thread_id ?? null,
+        raw_subject: pending.raw_subject ?? null,
+        manager_user_id: manager.id,
+        manager_name: manager.name,
+        expires_at: tokenExpiry,
+      };
+
+      await Promise.all([
+        supabase.from('aegis_memory').insert({
+          company_id: companyId,
+          memory_type: 'observation',
+          source: `decision_token:${approveToken}`,
+          content: JSON.stringify({ ...sharedPayload, action: 'approve' }),
+        }),
+        supabase.from('aegis_memory').insert({
+          company_id: companyId,
+          memory_type: 'observation',
+          source: `decision_token:${denyToken}`,
+          content: JSON.stringify({ ...sharedPayload, action: 'deny' }),
+        }),
+      ]);
+
+      const approveUrl = `${baseUrl}/webhooks/decision?action=approve&requestId=${requestId}&token=${approveToken}`;
+      const denyUrl = `${baseUrl}/webhooks/decision?action=deny&requestId=${requestId}&token=${denyToken}`;
+
+      const { subject, text, html } = buildManagerEmail({
+        employeeName: employee.name,
         managerName: manager.name,
-        summary: `${employee.name} wants ${dateDisplay} off${pending.reason ? ` for ${pending.reason}` : ''}.`,
-        inbox: 'approve',
-      }),
-      company_id: companyId,
-    });
+        startDate: pending.start_date,
+        endDate: pending.end_date,
+        reason: pending.reason,
+        stage1,
+        stage2,
+        recommendation,
+        approveUrl,
+        denyUrl,
+        policies,
+        violations,
+        timeOffType: pending.time_off_type ?? 'full_day',
+        partialDays: pending.partial_days ?? null,
+      });
+
+      await sendEmail({
+        to: manager.email,
+        subject,
+        text,
+        html,
+        company_id: companyId,
+      });
+      emailed++;
+
+      // SMS alert — notification only, no analysis (the manager email above
+      // always sends; this is additive and skipped entirely in email-only mode).
+      const managerPhone = phoneByEmail.get(manager.email) ?? null;
+      if (!env.EMAIL_ONLY && managerPhone && aegisSmsNumber) {
+        await sendSms({
+          // Recipient is the MANAGER (not under the employee opt-in regime).
+          allowPreConsent: true,
+          to: managerPhone,
+          from: aegisSmsNumber,
+          body: managerAlertSms({
+            managerName: manager.name,
+            summary: `${employee.name} wants ${dateDisplay} off${pending.reason ? ` for ${pending.reason}` : ''}.`,
+            inbox: 'approve',
+          }),
+          company_id: companyId,
+        });
+      }
+    } catch (err) {
+      console.warn('[time-off] manager notification failed for', manager.email, err);
+    }
+  }
+
+  if (emailed === 0) {
+    console.error(
+      '[time-off] NO manager was notified of request', requestId,
+      `— all ${managers.length} send(s) failed`,
+    );
   }
 }
 
@@ -1847,6 +1914,11 @@ export async function handlePendingTimeOffConfirmation(
     const MOVED_ON = new Set([
       'query_my_shifts',
       'query_my_time_off',
+      // L3 — cancelling an ALREADY-APPROVED request is a different subject from
+      // the unsent one being confirmed here. Without this it falls through to
+      // the nag, or worse is caught by isTimeOffCancellation above and scraps
+      // the wrong request.
+      'cancel_time_off',
       'initiate_swap',
       'update_availability',
       'capabilities',
@@ -1978,7 +2050,8 @@ export async function handleQueryMyTimeOff(
     end_date: string;
     time_off_type: 'full_day' | 'partial' | null;
     partial_days: PartialDayDetail[] | null;
-    status: 'pending' | 'approved' | 'denied' | null;
+    // L3 — 'cancelled' added (migration 022).
+    status: 'pending' | 'approved' | 'denied' | 'cancelled' | null;
   }>;
 
   if (rows.length === 0) {
@@ -1990,10 +2063,20 @@ export async function handleQueryMyTimeOff(
     return;
   }
 
-  const statusLabel = (s: string | null): string =>
-    s === 'approved' ? 'Approved'
-      : s === 'denied' ? 'Not approved'
-        : 'Pending — awaiting your manager';
+  // L3 — every branch is now EXPLICIT. This used to be a two-test ternary whose
+  // else-branch said "Pending — awaiting your manager", and the query above
+  // applies no status filter — so the moment a 'cancelled' row existed, the
+  // employee who had just cancelled would ask "what time off do I have?" and be
+  // told it was still pending with their manager.
+  const statusLabel = (s: string | null): string => {
+    if (s === 'approved') return 'Approved';
+    if (s === 'denied') return 'Not approved';
+    if (s === 'cancelled') return 'Cancelled by you';
+    if (s === 'pending' || s === null) return 'Pending — awaiting your manager';
+    // An unrecognised status must not be reported as any of the above. Say what
+    // we know and nothing more.
+    return `Status: ${s}`;
+  };
 
   const lines = rows.map(row => {
     const dateRange = formatDateRange(row.start_date, row.end_date);
@@ -2171,4 +2254,454 @@ export async function handleRecheckTimeOff(
     message,
     `${textOpener(contact.name)}Re-checked ${targetName}'s time off for ${dateDisplay} against everything approved so far — ${lean}.${pickedNote}${tail}`
   );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// L3 — EMPLOYEE-INITIATED CANCELLATION OF ALREADY-APPROVED TIME OFF
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// An employee can withdraw time off their manager has already approved, by text,
+// two ways:
+//   1. PROACTIVELY, naming a date — "cancel my time off Aug 1".
+//   2. REACTIVELY, when it surfaces mid-conversation — a shift swap is refused
+//      because "you have approved time off on that date", and they can cancel it
+//      right there (see shift-swap.ts, the youTakeTheirs refusal).
+//
+// ── SCOPE DECISION: whole-request cancellation, never partial ────────────────
+//
+// Approved time off is a RANGE (start_date/end_date). An employee naming ONE
+// date inside a multi-day approval cancels the WHOLE request — there is no
+// partial cancellation, and deliberately so:
+//
+//   • `time_off_requests` has no mechanism to shrink an approved range. Doing it
+//     would mean rewriting start_date/end_date (silently editing a decision the
+//     manager made) or splitting the row into two (inventing an approval the
+//     manager never granted). Both are Rule 0 violations.
+//   • `partial_days` models WITHIN-day windows, not a subset of days, so it
+//     can't express "cancel Wednesday out of Mon–Fri" either.
+//
+// So the confirmation must show the FULL RANGE, not the date they typed, and
+// when it spans more than a day it says so in as many words. An employee who
+// texts "cancel my time off Aug 1" while holding an approved Aug 1–5 must not be
+// able to answer YES without having seen that all five days are going.
+//
+// If partial cancellation is ever wanted, it is a schema change plus a manager
+// re-approval flow — not a tweak here.
+//
+// A CONFIRMATION IS MANDATORY, and that is a product requirement, not a nicety.
+// Everything else Aegis does for an employee is additive or reversible; this is
+// the one employee-triggered action that destroys something a MANAGER already
+// granted, and it frees a day the scheduler will immediately start filling. So:
+// state the date back in full, ask, and act only on an explicit yes.
+//
+// ── Why its own gate, and why a SHORT one ────────────────────────────────────
+//
+// The existing pending-time-off gate (`pending_to:`) holds an UNSENT request for
+// 24h. That TTL is right there: nothing has happened yet, and a stale "yes" just
+// submits a request the manager still has to approve.
+//
+// This gate holds a DESTRUCTIVE answer about an APPROVED request, so it expires
+// in ONE HOUR. A day-old "yes" arriving with no memory of the question would
+// silently cancel someone's approved vacation. An hour is far longer than any
+// real reply and short enough that a stray "yes" can't reach back to it.
+//
+// ── The keyword landmine ─────────────────────────────────────────────────────
+//
+// webhooks/sms.ts treats a bare "CANCEL" (also STOP/END/QUIT/UNSUBSCRIBE) as a
+// carrier-mandated SMS OPT-OUT, before verification and before routing. It flips
+// sms_consent_state to 'opted_out'. So this flow must NEVER invite the employee
+// to "reply CANCEL to confirm" — they would unsubscribe from Aegis entirely and
+// their time off would stay booked. Confirmation copy asks for YES / NO only.
+// ("cancel my time off" is a phrase, not the bare keyword, so inbound requests
+// are unaffected.)
+
+/**
+ * Inclusive day count for an approved range. Both ends are `date` columns, so
+ * this is anchored at noon UTC to stay DST-proof (same convention as
+ * eachDateInRange above). Exported for testing.
+ */
+export function countDaysInclusive(startDate: string, endDate: string): number {
+  const s = new Date(`${startDate}T12:00:00Z`).getTime();
+  const e = new Date(`${endDate}T12:00:00Z`).getTime();
+  if (Number.isNaN(s) || Number.isNaN(e) || e < s) return 1;
+  return Math.round((e - s) / (24 * 60 * 60 * 1000)) + 1;
+}
+
+/** aegis_memory source key for a cancellation awaiting a yes/no. */
+function timeOffCancelSource(employeeId: string): string {
+  return `to_cancel_pending:${employeeId}`;
+}
+
+/** ONE HOUR — see the header. Deliberately not the 24h used by `pending_to:`. */
+const TO_CANCEL_TTL_MS = 60 * 60 * 1000;
+
+interface PendingTimeOffCancel {
+  employee_id: string;
+  /** The approved time_off_requests row this cancellation targets. */
+  request_id: string;
+  start_date: string;
+  end_date: string;
+  /** Rendered once at ask time so the confirmation and the receipt agree. */
+  display_range: string;
+  /** Where the question was asked from, so the answer can be threaded back. */
+  channel: 'sms' | 'email';
+  sender: string;
+  recipient: string;
+  raw_subject?: string;
+  thread_id?: string;
+  expires_at: string;
+}
+
+export async function getPendingTimeOffCancel(
+  companyId: string,
+  employeeId: string
+): Promise<(PendingTimeOffCancel & { _memory_id: string }) | null> {
+  const { data } = await supabase
+    .from('aegis_memory')
+    .select('id, content')
+    .eq('company_id', companyId)
+    .eq('source', timeOffCancelSource(employeeId))
+    .maybeSingle();
+
+  if (!data) return null;
+
+  try {
+    const row = data as { id: string; content: string };
+    const pending = JSON.parse(row.content) as PendingTimeOffCancel;
+    if (new Date(pending.expires_at) < new Date()) {
+      await supabase.from('aegis_memory').delete().eq('id', row.id);
+      return null;
+    }
+    return { ...pending, _memory_id: row.id };
+  } catch {
+    return null;
+  }
+}
+
+export async function clearPendingTimeOffCancel(companyId: string, employeeId: string): Promise<void> {
+  await supabase
+    .from('aegis_memory')
+    .delete()
+    .eq('company_id', companyId)
+    .eq('source', timeOffCancelSource(employeeId));
+}
+
+async function storePendingTimeOffCancel(companyId: string, pending: PendingTimeOffCancel): Promise<void> {
+  // Delete-then-insert, matching storePendingSwap — there is no unique index on
+  // (company_id, source) to upsert against.
+  await clearPendingTimeOffCancel(companyId, pending.employee_id);
+  await supabase.from('aegis_memory').insert({
+    company_id: companyId,
+    memory_type: 'observation',
+    content: JSON.stringify(pending),
+    source: timeOffCancelSource(pending.employee_id),
+  });
+}
+
+/**
+ * Finds the employee's APPROVED request covering `date`.
+ *
+ * Only `status='approved'` — a pending request is withdrawn through the existing
+ * pending-time-off path, and a denied one has nothing to cancel. Range-covering
+ * match (`start_date <= date <= end_date`) mirrors the swap flow's TO check, so
+ * a single day inside an approved week resolves to that week's request.
+ *
+ * Exported for testing and for the reactive path in shift-swap.ts.
+ */
+export async function findApprovedTimeOffOn(
+  companyId: string,
+  employeeId: string,
+  date: string
+): Promise<{ id: string; start_date: string; end_date: string } | null> {
+  const { data } = await supabase
+    .from('time_off_requests')
+    .select('id, start_date, end_date')
+    .eq('company_id', companyId)
+    .eq('employee_id', employeeId)
+    .eq('status', 'approved')
+    .lte('start_date', date)
+    .gte('end_date', date)
+    .order('start_date', { ascending: true })
+    .limit(1);
+
+  const rows = (data ?? []) as Array<{ id: string; start_date: string; end_date: string }>;
+  return rows[0] ?? null;
+}
+
+/**
+ * Asks the confirmation question and parks the pending answer.
+ *
+ * Shared by the proactive path (handleCancelTimeOff) and the reactive one (a
+ * swap blocked by time off) so both phrase it identically — RULE 0b.
+ */
+export async function askToCancelTimeOff(opts: {
+  message: InboundMessage;
+  contact: VerifiedContact;
+  request: { id: string; start_date: string; end_date: string };
+  /** Extra sentence explaining WHY we're offering, for the reactive path. */
+  lead?: string;
+}): Promise<void> {
+  const { message, contact, request, lead } = opts;
+  // The FULL approved range — never the single date the employee happened to
+  // name. formatDateRange renders a multi-day request as e.g. "Aug 1-5, 2026".
+  const displayRange = formatDateRange(request.start_date, request.end_date);
+  const dayCount = countDaysInclusive(request.start_date, request.end_date);
+  // Spell the span out. A range buried in a date string is easy to skim past,
+  // and this is a destructive, whole-request action.
+  const spanNote = dayCount > 1
+    ? ` That's all ${dayCount} days — ${displayRange} — not just the one day.`
+    : '';
+
+  await storePendingTimeOffCancel(contact.company_id, {
+    employee_id: contact.employee_id!,
+    request_id: request.id,
+    start_date: request.start_date,
+    end_date: request.end_date,
+    display_range: displayRange,
+    channel: message.channel,
+    sender: message.sender,
+    recipient: message.recipient,
+    raw_subject: message.raw_subject,
+    thread_id: message.thread_id,
+    expires_at: new Date(Date.now() + TO_CANCEL_TTL_MS).toISOString(),
+  });
+
+  // YES / NO only — never "reply CANCEL", which is a carrier opt-out keyword.
+  await reply(
+    contact,
+    message,
+    `${lead ? `${lead} ` : `${textOpener(contact.name)}`}` +
+      `I hear you want to cancel your approved time off on ${displayRange} — are you sure?${spanNote} ` +
+      `Reply YES to cancel it, or NO to leave it as it is.`
+  );
+}
+
+/**
+ * Proactive entry point: "cancel my time off on Aug 1".
+ *
+ * Never cancels anything itself — it only resolves the request and asks.
+ */
+export async function handleCancelTimeOff(
+  message: InboundMessage,
+  contact: VerifiedContact,
+  extracted: Record<string, unknown>
+): Promise<void> {
+  if (!contact.employee_id) {
+    await reply(contact, message,
+      "I can only cancel time off for an employee record I recognise — please check with your manager.");
+    return;
+  }
+
+  const date = typeof extracted['date'] === 'string' ? extracted['date'].trim() : '';
+
+  // No date named. Rather than guessing at "your next one" — which on a
+  // destructive action is exactly the wrong instinct — list what they have and
+  // let them name it.
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    const today = new Date().toISOString().slice(0, 10);
+    const { data } = await supabase
+      .from('time_off_requests')
+      .select('start_date, end_date')
+      .eq('company_id', contact.company_id)
+      .eq('employee_id', contact.employee_id)
+      .eq('status', 'approved')
+      .gte('end_date', today)
+      .order('start_date', { ascending: true });
+
+    const upcoming = (data ?? []) as Array<{ start_date: string; end_date: string }>;
+    if (upcoming.length === 0) {
+      await reply(contact, message,
+        `${textOpener(contact.name)}You don't have any approved time off coming up to cancel.`);
+      return;
+    }
+    const list = upcoming.map(r => formatDateRange(r.start_date, r.end_date)).join('; ');
+    await reply(contact, message,
+      `${textOpener(contact.name)}Which one did you want to cancel? You have ${list}. ` +
+      `Just tell me the date.`);
+    return;
+  }
+
+  const request = await findApprovedTimeOffOn(contact.company_id, contact.employee_id, date);
+  if (!request) {
+    // Distinguish "nothing there" from "there's a pending one" — otherwise an
+    // employee whose request hasn't been approved yet is told they have nothing.
+    const { data: pendingData } = await supabase
+      .from('time_off_requests')
+      .select('id')
+      .eq('company_id', contact.company_id)
+      .eq('employee_id', contact.employee_id)
+      .eq('status', 'pending')
+      .lte('start_date', date)
+      .gte('end_date', date)
+      .limit(1);
+
+    const hasPending = ((pendingData ?? []) as unknown[]).length > 0;
+    await reply(contact, message,
+      hasPending
+        ? `${textOpener(contact.name)}Your time off for ${formatDateRange(date, date)} hasn't been approved yet — ` +
+          `it's still with your manager. I've let them know you'd like to withdraw it; reach out to them directly if it's urgent.`
+        : `${textOpener(contact.name)}I don't see any approved time off for you on ${formatDateRange(date, date)}. ` +
+          `Double-check the date, or ask me "what time off do I have?" and I'll list it.`);
+    return;
+  }
+
+  await askToCancelTimeOff({ message, contact, request });
+}
+
+/**
+ * The yes/no answer. Reached from the router BEFORE intent classification,
+ * because a bare "yes" carries no intent of its own.
+ */
+export async function handleTimeOffCancelConfirmation(
+  message: InboundMessage,
+  contact: VerifiedContact,
+  pending: PendingTimeOffCancel & { _memory_id: string }
+): Promise<void> {
+  const trimmed = message.body.trim();
+
+  // NO / anything declining → leave the time off exactly as it is.
+  if (isTimeOffDenial(trimmed)) {
+    await clearPendingTimeOffCancel(contact.company_id, contact.employee_id!);
+    await reply(contact, message,
+      `No problem — your time off on ${pending.display_range} is still booked. Nothing changed.`);
+    return;
+  }
+
+  if (!isTimeOffAffirmation(trimmed)) {
+    // Not an answer. Let a real intent through rather than trapping them in the
+    // gate — the same shape the swap confirm uses. The pending is cleared BEFORE
+    // re-routing so the new message can't bounce straight back in here.
+    const { employeeInterruptIntent } = await import('../router/interrupt');
+    const interrupt = await employeeInterruptIntent(message, contact);
+    if (interrupt) {
+      await clearPendingTimeOffCancel(contact.company_id, contact.employee_id!);
+      const { routeIntent } = await import('../router/intent-router');
+      await routeIntent(message, contact);
+      return;
+    }
+    await reply(contact, message,
+      `Just to be sure before I cancel anything — should I cancel your time off on ${pending.display_range}? ` +
+      `Reply YES or NO.`);
+    return;
+  }
+
+  // ── YES ────────────────────────────────────────────────────────────────────
+  //
+  // Re-read the row before writing. The confirmation may be an hour old, and in
+  // the meantime a manager could have changed it. Cancelling something that is
+  // no longer 'approved' would be acting on a stale premise.
+  const { data: current } = await supabase
+    .from('time_off_requests')
+    .select('id, status, start_date, end_date')
+    .eq('id', pending.request_id)
+    .eq('company_id', contact.company_id)
+    .maybeSingle();
+
+  const row = current as { id: string; status: string; start_date: string; end_date: string } | null;
+
+  if (!row || row.status !== 'approved') {
+    await clearPendingTimeOffCancel(contact.company_id, contact.employee_id!);
+    await reply(contact, message,
+      `Something changed with that request since I asked — it's no longer showing as approved, ` +
+      `so I haven't touched it. Ask me "what time off do I have?" for where it stands now.`);
+    return;
+  }
+
+  const { error: cancelErr } = await supabase
+    .from('time_off_requests')
+    .update({ status: 'cancelled', decided_at: new Date().toISOString() })
+    .eq('id', pending.request_id)
+    .eq('company_id', contact.company_id)
+    .eq('status', 'approved'); // optimistic guard — never clobber a concurrent decision
+
+  if (cancelErr) {
+    // FAIL CLOSED AND SAY SO. The single most likely cause is migration 022 not
+    // having been run (check-constraint violation, 23514): the code would then
+    // ask "are you sure?", get a yes, and — without this branch — reply as if it
+    // had worked while the day stayed booked. Leave the pending in place so a
+    // retry after the migration still works.
+    console.error(
+      `[time-off-cancel] FAILED to cancel request ${pending.request_id} for employee ` +
+      `${contact.employee_id}: ${cancelErr.message}. ` +
+      `If this is a check-constraint violation, migration 022 has not been run.`
+    );
+    await reply(contact, message,
+      `I wasn't able to cancel that just now — something went wrong on my end, so your time off on ` +
+      `${pending.display_range} is still booked. Please let your manager know directly.`);
+    return;
+  }
+
+  await clearPendingTimeOffCancel(contact.company_id, contact.employee_id!);
+
+  // Any live manager approve/deny magic links for this request now point at a
+  // cancelled row. Retire them so a manager clicking a stale email button can't
+  // resurrect it. Best-effort — a leftover token fails safe (the update is
+  // guarded on status='pending' upstream), this just avoids the confusing page.
+  await supabase
+    .from('aegis_memory')
+    .delete()
+    .eq('company_id', contact.company_id)
+    .like('source', 'decision_token:%')
+    .like('content', `%${pending.request_id}%`);
+
+  await logActivity({
+    company_id: contact.company_id,
+    action: 'time_off_cancelled_by_employee',
+    entity_type: 'time_off_request',
+    entity_id: pending.request_id,
+    summary: `${contact.name} cancelled their own approved time off (${pending.display_range}).`,
+    metadata: {
+      employee_id: contact.employee_id,
+      request_id: pending.request_id,
+      start_date: row.start_date,
+      end_date: row.end_date,
+      channel: message.channel,
+    },
+  });
+
+  await reply(contact, message,
+    `Done — your time off on ${pending.display_range} is cancelled and you're back on the schedule for those days. ` +
+    `I've let your manager know.`);
+
+  await notifyManagersOfTimeOffCancellation(contact, pending.display_range, row.start_date, row.end_date);
+}
+
+/**
+ * Manager FYI. Email only, deliberately: managers have no phone in the data
+ * model (DRIFT_REGISTER §J N-BUG — getManagerSmsChannel returns the AEGIS number,
+ * not a manager's), so an SMS attempt here would text Aegis's own line. Failure
+ * is swallowed: the employee's cancellation has already succeeded and must not
+ * be reported as failed because a notice bounced.
+ */
+async function notifyManagersOfTimeOffCancellation(
+  contact: VerifiedContact,
+  displayRange: string,
+  startDate: string,
+  endDate: string,
+): Promise<void> {
+  try {
+    const { data } = await supabase
+      .from('users')
+      .select('email, name')
+      .eq('company_id', contact.company_id)
+      .in('role', ['owner', 'manager']);
+
+    const managers = (data ?? []) as Array<{ email: string | null; name: string | null }>;
+    for (const m of managers) {
+      if (!m.email) continue;
+      await sendEmail({
+        to: m.email,
+        subject: `${contact.name} cancelled their approved time off — ${displayRange}`,
+        text:
+          `${greeting(m.name ?? '')}${contact.name} cancelled their own approved time off for ${displayRange} ` +
+          `(${startDate} to ${endDate}).\n\n` +
+          `They're available for those days again, so the schedule builder will include them from now on. ` +
+          `Any already-published schedule for that week is unchanged — take a look if you need them covering a shift.\n\n` +
+          `No action is needed unless you want to adjust the schedule.`,
+        company_id: contact.company_id,
+      });
+    }
+  } catch (err) {
+    console.error('[time-off-cancel] manager notification failed (cancellation itself succeeded):', err);
+  }
 }

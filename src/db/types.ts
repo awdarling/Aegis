@@ -133,7 +133,9 @@ export interface Database {
           start_date: string;
           end_date: string;
           reason: string | null;
-          status: 'pending' | 'approved' | 'denied';
+          // 'cancelled' = the EMPLOYEE withdrew their own already-approved
+          // request (L3, migration 022). A manager refusing one is 'denied'.
+          status: 'pending' | 'approved' | 'denied' | 'cancelled';
           requested_at: string;
           decided_at: string | null;
           decided_by: string | null;

@@ -2674,6 +2674,36 @@ export async function handleInitiateSwap(
       shift_hours: targetShiftHours, policies,
     });
     if (!youTakeTheirs.valid) {
+      // L3 — REACTIVE CANCEL. When the ONLY thing standing between this employee
+      // and the shift they want is their own approved time off, offering to
+      // cancel it right here is the difference between a dead end and a solved
+      // problem. Any other refusal reason (not qualified, at max hours, banned
+      // pair) is not theirs to fix, so it keeps the original copy.
+      //
+      // Note the argument order: validateSwap is called with the REQUESTER in
+      // the `receiver` slot for this leg, so `youTakeTheirs.reason` really is
+      // about the person we're talking to. It still offers rather than acts —
+      // the same explicit yes/no gate as the proactive path (RULE 0b: one
+      // question, one function — askToCancelTimeOff owns the wording).
+      const blockedByOwnTimeOff = /approved time off/i.test(youTakeTheirs.reason ?? '');
+      if (blockedByOwnTimeOff && contact.employee_id) {
+        const { findApprovedTimeOffOn, askToCancelTimeOff } = await import('./time-off');
+        const ownTimeOff = await findApprovedTimeOffOn(
+          contact.company_id, contact.employee_id, targetShift.date,
+        );
+        if (ownTimeOff) {
+          await logActivity({ company_id: contact.company_id, action: 'swap_blocked_offered_to_cancel_time_off',
+            summary: `${contact.name}'s trade with ${targetEmployee.name} is blocked by their own approved time off on ${targetShift.date} — offered to cancel it.`,
+            metadata: { requester_id: contact.employee_id, receiver_id: targetEmployee.id, target_shift_date: targetShift.date, time_off_request_id: ownTimeOff.id } });
+          await askToCancelTimeOff({
+            message, contact, request: ownTimeOff,
+            lead: `You can't take ${targetEmployee.name}'s ${targetShift.shift_name} shift on that date because you have approved time off then —` +
+              ` but you can cancel it if you want the shift.`,
+          });
+          return;
+        }
+      }
+
       await reply(contact, message,
         `This swap can't proceed — you wouldn't be able to take ${targetEmployee.name}'s ${targetShift.shift_name} shift: ${youTakeTheirs.reason} Want to try a different shift or coworker?`);
       await logActivity({ company_id: contact.company_id, action: 'swap_validation_failed',

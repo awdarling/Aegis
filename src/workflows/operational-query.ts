@@ -702,7 +702,7 @@ export async function handleOperationalQuery(
 Available Homebase tables (all scoped to this company):
 - employees: id, name, primary_role, qualified_roles, max_weekly_hours, contact_email, contact_phone, active, individual_wage
 - availability: employee_id, day_of_week (0=Sun), start_time, end_time
-- time_off_requests: employee_id, start_date, end_date, reason, status (pending/approved/denied), requested_at
+- time_off_requests: employee_id, start_date, end_date, reason, status (pending/approved/denied/cancelled — 'cancelled' means the EMPLOYEE withdrew their own approved request, so that day is NOT off), requested_at
 - schedules: week_start, week_end, status (draft/published), data (JSON: assignments[], gaps[]), staffing_report (JSON), generated_at
 - shift_types: name, start_time, end_time, days_active, active
 - shift_requirements: role, required_count

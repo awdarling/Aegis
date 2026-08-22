@@ -20,6 +20,7 @@ import {
   brandDetailRow,
 } from '../messaging/brand';
 import { buildTimeOffManagerEmail, buildTimeOffResolutionEmail, describePartialDay, buildPartialSummaryText, type TimeOffRecommendation } from './time-off-manager-email';
+import { resolveManagers, recipientsFor } from '../messaging/manager-directory';
 import type { InboundMessage, VerifiedContact } from '../security/types';
 import type { Employee, PartialDayDetail, Policy, TimeOffRequest } from '../db/types';
 import type { SimulationResult } from '../lib/schedule-simulator';
@@ -516,7 +517,11 @@ export async function recomputeTimeOffRecommendation(
 // Deterministic Message-ID for a manager's copy of a TO request email, so the
 // "Re-run check" reply can thread to it (TO-RERUN-1). `salt` makes a reply's own
 // Message-ID unique while still referencing the original.
-function toThreadMessageId(requestId: string, managerKey: string, salt?: number): string {
+// Exported so the threading invariant is testable: the Message-ID stamped on a
+// manager's request email and the In-Reply-To on the later "resolved" reply must
+// be byte-identical, or the reply opens a new inbox item instead of collapsing
+// under the original. See __tests__/manager-email-threading.test.ts.
+export function toThreadMessageId(requestId: string, managerKey: string, salt?: number): string {
   const key = managerKey.replace(/[^a-zA-Z0-9._-]/g, '_');
   return `<to-${requestId}-${key}${salt ? `.${salt}` : ''}@aegis.quriasolutions.com>`;
 }
@@ -1168,17 +1173,16 @@ async function sendManagerResolutionReplies(args: {
   // Only actual club managers/owners get the resolution notice — NOT 'quria'
   // platform admins, whose users row exists for company-scoped access, not to
   // receive operational manager email. (Matches every other manager lookup.)
-  const { data: managersData } = await supabase
-    .from('users').select('id, email, name').eq('company_id', args.companyId)
-    .in('role', ['manager', 'owner']);
-  const managers = ((managersData ?? []) as { id: string; email: string | null; name: string | null }[])
+  const resolutionDirectory = await resolveManagers(args.companyId);
+  const managers = recipientsFor(resolutionDirectory, 'approvals', args.companyId)
     .filter(m => !!m.email);
 
   // N1 — never notify the manager who TOOK this decision about their own action
   // ("Jack approved … " → Jack). See excludeActor: when decided_by is NULL (the
   // shared magic-link path where we can't attribute — Data Contract D17) nobody
   // is excluded, so an unattributed decision still notifies everyone.
-  for (const m of excludeActor(managers, decidedById)) {
+  const asActors = managers.map((m) => ({ ...m, id: m.userId }));
+  for (const m of excludeActor(asActors, decidedById)) {
     try {
       const { subject, html, text } = buildTimeOffResolutionEmail({
         employeeName: args.employeeName,
@@ -1189,7 +1193,7 @@ async function sendManagerResolutionReplies(args: {
         companyName,
       });
       await sendEmail({
-        to: m.email!,
+        to: m.email,
         subject: normalizeReSubject(subject),
         html,
         text,
@@ -1245,48 +1249,39 @@ export async function notifyManager(
   stage2: SimulationResult | null,
   violations: TimeOffViolations | null
 ): Promise<void> {
-  // EVERY manager/owner for this company. Not 'quria' platform admins, whose
-  // users row exists for company-scoped access rather than to receive
-  // operational manager mail — matches every other manager lookup in the repo.
-  const { data: managersData } = await supabase
-    .from('users')
-    .select('id, email, name, role')
-    .eq('company_id', companyId)
-    .in('role', ['manager', 'owner'])
-    .order('role', { ascending: true });
-
-  const allManagers = (managersData ?? []) as { id: string; email: string | null; name: string; role: string }[];
-  const managers = allManagers.filter(m => !!m.email) as { id: string; email: string; name: string; role: string }[];
+  // ── L3's fan-out, sourced from ONE resolver (Phase 2) ─────────────────────
+  //
+  // L3 made this notify EVERY manager instead of one arbitrary manager — that
+  // behaviour is kept exactly. What changed is WHERE the managers and their
+  // phones come from. L3 still found a phone by matching users.email against
+  // employees.contact_email, which is case-SENSITIVE, silently returns nothing
+  // on a miss OR on a duplicate, and never checked whether a login had been
+  // revoked. src/messaging/manager-directory.ts answers all of that once:
+  // it resolves through users.employee_id, skips revoked logins, honours each
+  // person's notification preferences, and logs loudly by name when someone
+  // cannot be reached.
+  //
+  // 'approvals' is the right category — this IS an action item — which also
+  // means the safety valve applies: if every manager had opted out, it still
+  // goes to all of them rather than to nobody.
+  const directory = await resolveManagers(companyId);
+  const managers = recipientsFor(directory, 'approvals', companyId).filter(m => !!m.email);
+  const aegisSmsNumber = directory.smsChannel;
 
   if (managers.length === 0) {
-    console.warn(
-      '[time-off] no manager/owner with an email on file for company', companyId,
-      `(${allManagers.length} manager row(s) total)`,
+    console.error(
+      `[time-off] ${employee.name}'s request ${requestId} cannot be routed — company ${companyId} ` +
+      'has no manager or owner with an email on file. The request is recorded but nobody has been told.',
     );
     return;
   }
 
-  // Manager phones, resolved in ONE query rather than per manager. A manager has
-  // a phone only if they also have an employee record matched by email.
-  const { data: managerEmpData } = await supabase
-    .from('employees')
-    .select('contact_email, contact_phone')
-    .eq('company_id', companyId)
-    .in('contact_email', managers.map(m => m.email));
-  const phoneByEmail = new Map<string, string>();
-  for (const row of (managerEmpData ?? []) as { contact_email: string | null; contact_phone: string | null }[]) {
-    if (row.contact_email && row.contact_phone) phoneByEmail.set(row.contact_email, row.contact_phone);
+  for (const m of directory.unreachableBySms) {
+    console.warn(
+      `[time-off] no phone on file for ${m.name} — they get the approval by email only. ` +
+      `(link source: ${m.linkSource})`,
+    );
   }
-
-  // Find the company's Aegis SMS outbound number
-  const { data: channelData } = await supabase
-    .from('company_channels')
-    .select('channel_value')
-    .eq('company_id', companyId)
-    .eq('channel_type', 'sms')
-    .maybeSingle();
-  const aegisSmsNumber =
-    (channelData as { channel_value: string } | null)?.channel_value ?? null;
 
   // Load time-off policies for the email
   const policies = await loadAllTimeOffPolicies(companyId);
@@ -1358,7 +1353,7 @@ export async function notifyManager(
         aegis_sms_channel: aegisSmsNumber,
         thread_id: pending.thread_id ?? null,
         raw_subject: pending.raw_subject ?? null,
-        manager_user_id: manager.id,
+        manager_user_id: manager.userId,
         manager_name: manager.name,
         expires_at: tokenExpiry,
       };
@@ -1404,12 +1399,20 @@ export async function notifyManager(
         text,
         html,
         company_id: companyId,
+        // Stamp the SAME deterministic Message-ID the email-channel path uses
+        // (notifyManagersByEmail, below). Without it, a request that arrived BY
+        // TEXT produced a manager email with no Message-ID — so the later
+        // "resolved" reply had nothing to thread to and landed as a second
+        // unread item saying no action was needed. One header, and the
+        // follow-up collapses under the original. It matters because SMS is now
+        // the channel most requests arrive on.
+        message_id: toThreadMessageId(requestId, manager.userId),
       });
       emailed++;
 
       // SMS alert — notification only, no analysis (the manager email above
       // always sends; this is additive and skipped entirely in email-only mode).
-      const managerPhone = phoneByEmail.get(manager.email) ?? null;
+      const managerPhone = manager.phone;
       if (!env.EMAIL_ONLY && managerPhone && aegisSmsNumber) {
         await sendSms({
           // Recipient is the MANAGER (not under the employee opt-in regime).
@@ -1457,22 +1460,18 @@ async function notifyManagersByEmail(
   stage2: SimulationResult | null,
   violations: TimeOffViolations | null
 ): Promise<{ emailed: number; total_managers: number }> {
-  const { data: managersData } = await supabase
-    .from('users')
-    .select('id, email, name, role')
-    .eq('company_id', companyId)
-    .in('role', ['manager', 'owner']);
-
-  const managers = (managersData ?? []) as Array<{
-    id: string;
-    email: string | null;
-    name: string;
-    role: string;
-  }>;
+  // The SAME resolver the SMS-channel path uses (notifyManager, above). Before
+  // this, an emailed request and a texted request resolved their recipients two
+  // different ways — one question, two answers (Rule 0b).
+  const directory = await resolveManagers(companyId);
+  const managers = recipientsFor(directory, 'approvals', companyId);
   const withEmail = managers.filter(m => !!m.email);
 
   if (withEmail.length === 0) {
-    console.warn('[time-off] email-channel: no manager/owner with email on file for company', companyId);
+    console.error(
+      `[time-off] email-channel: ${employee.name}'s request cannot be routed — company ${companyId} ` +
+      'has no manager or owner with an email on file. Recorded, but nobody has been told.',
+    );
     return { emailed: 0, total_managers: managers.length };
   }
 
@@ -1521,7 +1520,7 @@ async function notifyManagersByEmail(
         company_id: companyId,
         company_name: companyName,
         manager_email: manager.email!,
-        manager_user_id: manager.id,
+        manager_user_id: manager.userId,
         manager_name: manager.name,
         simulation: simulation ?? undefined,
         recommendation,
@@ -1535,7 +1534,7 @@ async function notifyManagersByEmail(
         company_id: companyId,
         // Stamp a deterministic Message-ID so a later "Re-run check" reply
         // threads under this email in the manager's inbox (TO-RERUN-1).
-        message_id: toThreadMessageId(torRow.id, manager.id),
+        message_id: toThreadMessageId(torRow.id, manager.userId),
       });
       emailed++;
     } catch (err) {

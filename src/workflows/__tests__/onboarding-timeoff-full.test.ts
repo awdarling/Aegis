@@ -33,7 +33,10 @@ const h = vi.hoisted(() => {
       maybeSingle() { return Promise.resolve({ data: dataFor(table), error: null }); },
       single() { return Promise.resolve({ data: dataFor(table), error: null }); },
       then(onF: (v: { data: unknown; error: null }) => unknown, onR?: (e: unknown) => unknown) {
-        return Promise.resolve({ data: null, error: null }).then(onF, onR);
+        // LIST queries (no .single()/.maybeSingle()). The manager directory
+        // loads a company's logins and its people as lists and joins them in
+        // memory, so these have to be arrays, not the single-row fixtures above.
+        return Promise.resolve({ data: listFor(table), error: null }).then(onF, onR);
       },
     };
     return b;
@@ -41,7 +44,22 @@ const h = vi.hoisted(() => {
   function dataFor(table: string): unknown {
     if (table === 'employees') return employeeRow;
     if (table === 'companies') return { name: 'Sandbox Club' };
-    if (table === 'users') return { email: 'morgan@sandbox.test', name: 'Morgan', role: 'manager' };
+    if (table === 'users') return MANAGER_LOGIN;
+    return null;
+  }
+  // Morgan's login points at Morgan's person record — the users.employee_id
+  // link, not a string match on her email address.
+  const MANAGER_LOGIN = {
+    id: 'mgr-1', email: 'morgan@sandbox.test', name: 'Morgan',
+    role: 'manager', employee_id: 'emp-morgan',
+  };
+  const MANAGER_PERSON = {
+    id: 'emp-morgan', name: 'Morgan', contact_phone: '+15550001111',
+    contact_email: 'morgan@sandbox.test', active: true, notification_prefs: {},
+  };
+  function listFor(table: string): unknown {
+    if (table === 'users') return [MANAGER_LOGIN];
+    if (table === 'employees') return [MANAGER_PERSON];
     return null;
   }
 

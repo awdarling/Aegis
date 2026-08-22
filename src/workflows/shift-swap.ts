@@ -23,6 +23,7 @@ import { generateActionToken } from '../lib/aegis-actions/tokens';
 import { resolveAvailabilityForWeek } from '../lib/custom-availability';
 // L4 — RULE 0b: one question ("what kind of swap is this?"), one function.
 import { withSwapKind } from '../lib/swap-kind';
+import { resolveManagers, primaryRecipient } from '../messaging/manager-directory';
 import type { InboundMessage, VerifiedContact } from '../security/types';
 import type { Employee, Policy, Availability, CustomAvailability } from '../db/types';
 import type { ScheduleAssignment } from './schedule-build';
@@ -2140,17 +2141,19 @@ export async function sendManagerSwapApprovalRequest(params: {
     }
   } catch { /* flag is best-effort — never let it block the approval email */ }
 
-  // Find manager
-  const { data: managerData } = await supabase.from('users').select('id, email, name')
-    .eq('company_id', company_id).in('role', ['manager', 'owner'])
-    .order('role', { ascending: true }).limit(1).maybeSingle();
-  if (!managerData) return;
-  const manager = managerData as { id: string; email: string; name: string };
-
-  // Manager phone (optional)
-  const { data: managerEmpData } = await supabase.from('employees').select('contact_phone')
-    .eq('company_id', company_id).eq('contact_email', manager.email).maybeSingle();
-  const managerPhone = (managerEmpData as { contact_phone: string | null } | null)?.contact_phone ?? null;
+  // Find manager — ONE resolver (src/messaging/manager-directory.ts). Replaces a
+  // first-manager-wins query plus a case-sensitive contact_email match that
+  // returned null on a miss AND on a duplicate, silently skipping the text.
+  const swapDirectory = await resolveManagers(company_id);
+  const manager = primaryRecipient(swapDirectory, 'approvals', company_id);
+  if (!manager) {
+    console.error(
+      `[shift-swap] swap ${swap_request_id} needs approval but company ${company_id} has no ` +
+      'reachable manager or owner. Nobody has been asked.'
+    );
+    return;
+  }
+  const managerPhone = manager.phone;
 
   const approveToken = randomUUID();
   const denyToken = randomUUID();
@@ -2168,7 +2171,7 @@ export async function sendManagerSwapApprovalRequest(params: {
     receiver_id: receiver.id,
     receiver_name: receiver.name,
     // The approving manager — persisted to swap_requests.decided_by (Batch-1.5 #9).
-    manager_user_id: manager.id,
+    manager_user_id: manager.userId,
     manager_name: manager.name,
     shift_date,
     shift_name,

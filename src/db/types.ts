@@ -41,6 +41,25 @@ export interface Database {
           role: 'quria' | 'owner' | 'manager';
           created_at: string;
           avatar_url: string | null;
+          /**
+           * When this login's access was revoked, or NULL while it is live.
+           * MUST be filtered on every notification-recipient query — a revoked
+           * login is not a person to notify. Aegis ignored this for months and a
+           * revoked test manager received 410 emails as a result. Resolve
+           * managers through src/messaging/manager-directory.ts, which filters
+           * it for you.
+           */
+          access_revoked_at?: string | null;
+          /**
+           * The PERSON this login belongs to (migration 025). Contact details —
+           * phone, email, notification preferences — live on that employee row
+           * and are read from there. `users` has no phone by design: one human,
+           * one phone number, one place (Rule 0).
+           *
+           * NULL means not yet linked; the resolver falls back to matching on
+           * email and logs a warning naming the person.
+           */
+          employee_id?: string | null;
         };
       };
       employees: {
@@ -57,6 +76,32 @@ export interface Database {
           created_at: string;
           individual_wage: number | null;
           is_veteran: boolean | null;
+          /**
+           * May this person be placed on a schedule? (migration 025, default true.)
+           *
+           * DISTINCT from `active`, deliberately:
+           *   active=false      → not here right now. Uncontactable AND
+           *                       unschedulable. Seasonal staff between summers,
+           *                       someone on leave. Reversible — a manager flips
+           *                       it back on when they return.
+           *   schedulable=false → here, reachable, gets messages, but never
+           *                       rostered. An owner, a bookkeeper.
+           *
+           * Applied where the engine loads its roster (schedule-build.ts), so an
+           * excluded person is never a candidate and never generates a
+           * "no availability on file" warning.
+           */
+          schedulable?: boolean;
+          /**
+           * Per-category notification opt-in/out (migration 025).
+           * {"approvals":bool,"trades":bool,"schedule_posts":bool,"reports":bool}
+           *
+           * An ABSENT key means "use the default for my role": owners default to
+           * OFF for every category, everyone else defaults to ON. Read it through
+           * src/messaging/manager-directory.ts (`wantsCategory`) — never inline,
+           * or the role defaults drift.
+           */
+          notification_prefs?: Record<string, unknown> | null;
           aegis_access?: 'manager' | 'employee' | 'blocked' | null;
           /**
            * Acknowledged FINAL WORKING DAY (migration 020, live since 2026-08-13).

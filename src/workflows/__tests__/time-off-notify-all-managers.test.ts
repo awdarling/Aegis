@@ -98,16 +98,23 @@ const PENDING = {
 } as never;
 
 function seedManagers(n: number, withPhones = false) {
+  // Phase 2 (2026-08-18): a manager IS an employee. users.employee_id points at
+  // the person record, and that record is the one place a phone number lives.
   h.reads['users'] = Array.from({ length: n }, (_, i) => ({
     id: `mgr-${i + 1}`,
     email: `mgr${i + 1}@club.test`,
     name: `Manager ${i + 1}`,
     role: i === 0 ? 'owner' : 'manager',
+    employee_id: withPhones ? `mgr-emp-${i + 1}` : null,
   }));
   h.reads['employees'] = withPhones
     ? Array.from({ length: n }, (_, i) => ({
+        id: `mgr-emp-${i + 1}`,
+        name: `Manager ${i + 1}`,
         contact_email: `mgr${i + 1}@club.test`,
         contact_phone: `+1555000900${i + 1}`,
+        active: true,
+        notification_prefs: {},
       }))
     : [];
   h.reads['company_channels'] = [{ channel_value: '+15559999999' }];
@@ -209,8 +216,8 @@ describe('time-off request → manager notification fan-out', () => {
 
   it('managers with no email on file are skipped, not crashed on', async () => {
     h.reads['users'] = [
-      { id: 'mgr-1', email: null, name: 'No Email', role: 'manager' },
-      { id: 'mgr-2', email: 'mgr2@club.test', name: 'Manager 2', role: 'owner' },
+      { id: 'mgr-1', email: null, name: 'No Email', role: 'manager', employee_id: null },
+      { id: 'mgr-2', email: 'mgr2@club.test', name: 'Manager 2', role: 'owner', employee_id: null },
     ];
     h.reads['employees'] = [];
     h.reads['company_channels'] = [{ channel_value: '+15559999999' }];

@@ -37,6 +37,8 @@ import { withAnthropicRetry } from '../ai/claude';
 // the normal flow cannot disagree about what "the afternoon" means.
 import { resolvePartialWindow, createTimeOffRequestAndNotify, isTimeOffAffirmation } from './time-off';
 import { generateActionToken } from '../lib/aegis-actions/tokens';
+import { resolveManagers, recipientsFor, primaryRecipient } from '../messaging/manager-directory';
+import { sendManagerResolutionNotice } from '../messaging/manager-resolution-notice';
 import { formatDateRange } from './time-off';
 import {
   insertPendingAvailabilityChange,
@@ -314,6 +316,22 @@ function sessionSource(employeeId: string): string {
 
 function availConfirmSource(employeeId: string): string {
   return `avail_pending_confirm:${employeeId}`;
+}
+
+// A deterministic Message-ID for an availability request, per manager, so the
+// later "that's decided" notice collapses UNDER the original request in their
+// inbox instead of arriving as a fresh unread item. Same shape and same purpose
+// as time-off's toThreadMessageId. Without it, every manager who did NOT make
+// the decision was left holding a live Approve/Deny button with no way to learn
+// it had already been answered.
+export function availThreadMessageId(
+  companyId: string,
+  employeeId: string,
+  managerKey: string,
+  salt?: number
+): string {
+  const key = `${employeeId}-${managerKey}`.replace(/[^a-zA-Z0-9._-]/g, '_');
+  return `<avail-${companyId}-${key}${salt ? `.${salt}` : ''}@aegis.quriasolutions.com>`;
 }
 
 function availApprovalSource(companyId: string, employeeId: string): string {
@@ -2634,19 +2652,18 @@ async function sendOnboardingSummaryEmail(
   timeOffRanges: string[],
   availabilitySlots: AvailabilitySlot[]
 ): Promise<void> {
-  const { data: managerData } = await supabase
-    .from('users')
-    .select('email, name, role')
-    .eq('company_id', session.company_id)
-    .in('role', ['manager', 'owner'])
-    .order('role', { ascending: true })
-    .limit(1)
-    .maybeSingle();
-  const manager = managerData as { email: string | null; name: string } | null;
+  // An onboarding summary is a REPORT, not an action item — so an owner who has
+  // switched reports off genuinely does not get it, and that is correct.
+  const summaryDirectory = await resolveManagers(session.company_id);
+  const manager = primaryRecipient(summaryDirectory, 'reports', session.company_id);
 
   if (!manager?.email) {
-    console.warn('[onboarding] no manager/owner email on file — summary email skipped', {
+    console.warn('[onboarding] nobody to send the onboarding summary to — skipped', {
       company_id: session.company_id,
+      managers_found: summaryDirectory.managers.length,
+      reason: summaryDirectory.managers.length === 0
+        ? 'company has no active manager or owner login'
+        : 'every manager has switched off report notifications',
     });
     return;
   }
@@ -3826,29 +3843,19 @@ export async function handleAvailabilityConfirmResponse(
     return;
   }
 
-  // Notify ALL managers/owners (mirrors the time-off manager fan-out rather
-  // than picking a single arbitrary row).
-  const { data: mgrData } = await supabase
-    .from('users')
-    .select('id, email, name')
-    .eq('company_id', contact.company_id)
-    .in('role', ['manager', 'owner']);
-
-  const managers = (mgrData ?? []) as { id: string; email: string; name: string }[];
+  // ONE resolver for managers and how to reach them
+  // (src/messaging/manager-directory.ts). An availability change needs a
+  // decision, so it routes as an 'approvals' action item — which also means the
+  // safety valve applies and it can never be opted out of into silence.
+  const availDirectory = await resolveManagers(contact.company_id);
+  const managers = recipientsFor(availDirectory, 'approvals', contact.company_id);
   if (managers.length === 0) {
     await reply(contact, message, `I couldn't locate a manager. Please speak with them directly.`);
     return;
   }
 
-  // Outbound SMS channel — manager-independent, fetch once.
-  const { data: chData } = await supabase
-    .from('company_channels')
-    .select('channel_value')
-    .eq('company_id', contact.company_id)
-    .eq('channel_type', 'sms')
-    .maybeSingle();
-
-  const aegisSmsChannel = (chData as { channel_value: string } | null)?.channel_value;
+  // Outbound SMS channel — manager-independent, resolved once by the directory.
+  const aegisSmsChannel = availDirectory.smsChannel ?? undefined;
 
   // Store the pending approval ONCE, keyed by employee. Any manager who replies
   // YES consumes this record, so a single shared record is correct even when
@@ -3917,14 +3924,10 @@ export async function handleAvailabilityConfirmResponse(
   // phone and an outbound SMS channel exists.
   let notifiedCount = 0;
   for (const mgr of managers) {
-    const { data: mgrEmpData } = await supabase
-      .from('employees')
-      .select('contact_phone')
-      .eq('company_id', contact.company_id)
-      .eq('contact_email', mgr.email)
-      .maybeSingle();
-
-    const managerPhone = (mgrEmpData as { contact_phone: string | null } | null)?.contact_phone;
+    // Phone comes from the manager's linked person record — already resolved,
+    // no per-manager round trip, and the directory has already logged by name
+    // if we cannot reach them.
+    const managerPhone = mgr.phone;
     const smsAvailable = !!(managerPhone && aegisSmsChannel);
     const emailAvailable = !!mgr.email;
     if (!smsAvailable && !emailAvailable) continue;
@@ -3936,7 +3939,7 @@ export async function handleAvailabilityConfirmResponse(
       const { subject, text, html } = await buildAvailabilityManagerEmail({
         company_id: contact.company_id,
         manager_email: mgr.email,
-        manager_user_id: mgr.id ?? undefined,
+        manager_user_id: mgr.userId ?? undefined,
         manager_name: mgr.name,
         employee_name: pending.employee_name,
         current_availability: pending.current_availability,
@@ -3948,7 +3951,17 @@ export async function handleAvailabilityConfirmResponse(
         // on the aegis_memory pending row, so a later re-submit can't strand it).
         token_payload: approval as unknown as Record<string, unknown>,
       });
-      await sendEmail({ to: mgr.email, subject, text, html, company_id: contact.company_id });
+      await sendEmail({
+        to: mgr.email,
+        subject,
+        text,
+        html,
+        company_id: contact.company_id,
+        // See availThreadMessageId: this is what the "already decided" notice
+        // threads to, so a manager who didn't decide sees it collapse under the
+        // original rather than as a second unread item.
+        message_id: availThreadMessageId(contact.company_id, pending.employee_id, mgr.userId),
+      });
       // A manager with a phone ALSO gets a short SMS nudge — context (who + what)
       // plus a warm hand-off to the email where Approve/Deny lives — so they aren't
       // relying on noticing the email. Same principle as the time-off / swap alerts.
@@ -4168,6 +4181,52 @@ export interface AvailabilityDecisionInput {
   raw_subject?: string | null;
 }
 
+
+// ── "Already decided" — close the loop for every OTHER manager ────────────────
+//
+// An availability change fans out to ALL managers with live Approve/Deny
+// buttons. Until now, only the EMPLOYEE was told the outcome — so every other
+// manager was left holding a button for a request that had already been
+// answered. Clicking it hits the idempotency guard and quietly does nothing,
+// which looks like a broken button.
+//
+// Texts first and falls back to a THREADED email reply, per Alexander's policy:
+// email is only for someone unreachable by text, or for an action item with a
+// button. "It's handled" is neither.
+async function notifyOtherManagersAvailabilityResolved(input: {
+  company_id: string;
+  employee_id: string;
+  employee_name: string;
+  decision: 'approved' | 'denied';
+  decided_by?: string;
+  decided_by_user_id?: string | null;
+  scope: string;
+}): Promise<void> {
+  const verb = input.decision === 'approved' ? 'approved' : 'denied';
+  const who = input.decided_by?.trim() || 'Another manager';
+  const summary =
+    `${who} ${verb} ${input.employee_name}'s ${input.scope}. Nothing needed from you.`;
+
+  try {
+    await sendManagerResolutionNotice({
+      companyId: input.company_id,
+      decidedByUserId: input.decided_by_user_id ?? null,
+      decidedByName: input.decided_by ?? null,
+      summary,
+      subject: `Availability update request from ${input.employee_name}`,
+      body:
+        `${summary}\n\n` +
+        `The Approve / Deny buttons in the original request are no longer live — ` +
+        `you can ignore them.`,
+      inReplyTo: (m) => availThreadMessageId(input.company_id, input.employee_id, m.userId),
+      messageId: (m) => availThreadMessageId(input.company_id, input.employee_id, m.userId, Date.now()),
+    });
+  } catch (err) {
+    // Never let closing the loop break the decision that was already applied.
+    console.warn('[availability] could not tell the other managers it was decided:', err);
+  }
+}
+
 export async function applyAvailabilityDecision(input: AvailabilityDecisionInput): Promise<AvailabilityApplyOutcome> {
   // AVAIL-TAB-1 universal idempotency guard: only the surface that flips the still-
   // pending ledger row proceeds. A stale email button after a tab approval no-ops here.
@@ -4243,6 +4302,19 @@ export async function applyAvailabilityDecision(input: AvailabilityDecisionInput
       `Your availability change wasn't approved this time — give your manager a shout if you'd like to talk it through.`
     );
   }
+
+  // Close the loop for the managers who did NOT decide, so nobody is left
+  // holding a live Approve/Deny button for a settled request.
+  await notifyOtherManagersAvailabilityResolved({
+    company_id: input.company_id,
+    employee_id: input.employee_id,
+    employee_name: input.employee_name,
+    decision: input.decision,
+    decided_by: input.decided_by,
+    decided_by_user_id: input.decided_by_user_id,
+    scope: 'availability change',
+  });
+
   return { status: 'applied' };
 }
 
@@ -4371,6 +4443,19 @@ export async function applyCustomAvailabilityDecision(input: CustomAvailabilityD
         notifyContext,
         `Nice — your rotating availability is approved, set on a ${rot.cycle_weeks}-week cycle${rot.end_date ? ` through ${formatDateRange(rot.end_date, rot.end_date)}` : ''}. I'll work your schedule around it. Thanks!`
       );
+
+  // Close the loop for the managers who did NOT decide (see
+  // notifyOtherManagersAvailabilityResolved). Same reason as the permanent
+  // availability path: everyone else is holding a live Approve/Deny button.
+  await notifyOtherManagersAvailabilityResolved({
+    company_id: input.company_id,
+    employee_id: input.employee_id,
+    employee_name: input.employee_name,
+    decision: input.decision,
+    decided_by: input.decided_by,
+    decided_by_user_id: input.decided_by_user_id,
+    scope: input.rotation ? 'rotating availability change' : 'temporary availability change',
+  });
       return { status: 'applied' };
     }
 
@@ -4432,6 +4517,20 @@ export async function applyCustomAvailabilityDecision(input: CustomAvailabilityD
       `That change wasn't approved this time — give your manager a shout if you'd like to talk it through.`
     );
   }
+
+  // Close the loop for the managers who did NOT decide (see
+  // notifyOtherManagersAvailabilityResolved). Same reason as the permanent
+  // availability path: everyone else is holding a live Approve/Deny button.
+  await notifyOtherManagersAvailabilityResolved({
+    company_id: input.company_id,
+    employee_id: input.employee_id,
+    employee_name: input.employee_name,
+    decision: input.decision,
+    decided_by: input.decided_by,
+    decided_by_user_id: input.decided_by_user_id,
+    scope: input.rotation ? 'rotating availability change' : 'temporary availability change',
+  });
+
   return { status: 'applied' };
 }
 

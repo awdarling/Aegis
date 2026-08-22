@@ -120,8 +120,16 @@ describe('handleReportDeparture', () => {
   const message: InboundMessage = { sender: '+16163280114', recipient: '+16166164898', body: 'my last day is Aug 30', channel: 'sms' };
 
   it('alerts the manager (email + additive SMS), writes NOTHING to employees, logs the signal', async () => {
-    h.config['users:select'] = { id: 'mgr-1', email: 'manager@wm.com', name: 'Jack', role: 'manager' };
-    h.config['employees:select'] = { contact_phone: '+16165551234' };       // manager's personal phone
+    // The manager directory (src/messaging/manager-directory.ts) loads the
+    // company's logins and its people as LISTS and joins them in memory, so a
+    // duplicate email is visible instead of being swallowed by .maybeSingle().
+    // Jack's login points at his person record — the link, not an email match.
+    h.config['users:select'] = [
+      { id: 'mgr-1', email: 'manager@wm.com', name: 'Jack', role: 'manager', employee_id: 'emp-jack' },
+    ];
+    h.config['employees:select'] = [
+      { id: 'emp-jack', name: 'Jack', contact_phone: '+16165551234', contact_email: 'manager@wm.com', active: true, notification_prefs: {} },
+    ];
     h.config['company_channels:select'] = { channel_value: '+16166164898' }; // Aegis outbound
 
     await handleReportDeparture(message, contact, { last_day_date: '2026-08-30', note: null });
@@ -155,7 +163,7 @@ describe('handleReportDeparture', () => {
   });
 
   it('still acks + logs when no manager is found (no employee write)', async () => {
-    // users:select stays null → no manager.
+    // users:select stays null → the directory finds no manager at all.
     await handleReportDeparture(message, contact, { last_day_date: null, note: null });
 
     expect(h.sendEmailMock).not.toHaveBeenCalled();

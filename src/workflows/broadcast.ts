@@ -5,6 +5,7 @@ import { reply } from '../messaging/reply';
 import { sendEmail } from '../messaging/email';
 import { sendSms } from '../messaging/sms';
 import { notifyEmployeeSmsFirst } from '../messaging/notify';
+import { resolveManagers } from '../messaging/manager-directory';
 import { env } from '../config/env';
 import { generateReply } from '../ai/claude';
 import type { InboundMessage, VerifiedContact } from '../security/types';
@@ -93,14 +94,18 @@ async function clearBroadcastSession(companyId: string, adminContact: string): P
 
 // ── Recipient resolution ──────────────────────────────────────────────────────
 
-async function resolveRecipients(
+/**
+ * Exported for tests only — this is the query that decides who a broadcast
+ * physically reaches, and it is worth pinning directly rather than inferring it
+ * from the send counts three layers up.
+ */
+export async function resolveRecipients(
   companyId: string,
   targetType: BroadcastSession['target_type'],
   targetRole: string | null,
   targetNames: string[] | null
 ): Promise<BroadcastSession['resolved_recipients']> {
   type EmpRow = { id: string; name: string; contact_phone: string | null; contact_email: string | null; primary_role: string };
-  type UserRow = { id: string; name: string; email: string };
 
   if (targetType === 'all') {
     const { data } = await supabase
@@ -132,21 +137,28 @@ async function resolveRecipients(
       email: e.contact_email,
     }));
 
-    // Also include users with manager/owner role not already in employee list
-    const empEmails = new Set(empRecipients.map(r => r.email).filter(Boolean));
-    const { data: userData } = await supabase
-      .from('users')
-      .select('id, name, email')
-      .eq('company_id', companyId)
-      .in('role', ['manager', 'owner']);
+    // Also include manager/owner LOGINS not already covered by an employee row —
+    // an owner who never works the floor still gets the broadcast.
+    //
+    // FIXED 2026-08-22 (Phase 2). This used to query `users` directly with no
+    // access_revoked_at filter, so a manager whose access had been revoked kept
+    // receiving every company broadcast. That is exactly how a revoked test
+    // account collected 410 messages over two months. resolveManagers is the one
+    // place that question is answered, and it excludes revoked logins — and
+    // hands back the manager's real mobile, which this path used to hardcode as
+    // null so an owner could only ever be emailed.
+    const empEmails = new Set(
+      empRecipients.map(r => (r.email ?? '').trim().toLowerCase()).filter(Boolean)
+    );
+    const directory = await resolveManagers(companyId);
 
-    const extraRecipients = (userData ?? [])
-      .filter((u: UserRow) => !empEmails.has(u.email))
-      .map((u: UserRow) => ({
-        employee_id: u.id,
-        name: u.name,
-        phone: null as string | null,
-        email: u.email,
+    const extraRecipients = directory.managers
+      .filter((m) => !empEmails.has(m.email.trim().toLowerCase()))
+      .map((m) => ({
+        employee_id: m.employeeId ?? m.userId,
+        name: m.name,
+        phone: m.phone,
+        email: m.email,
       }));
 
     return [...empRecipients, ...extraRecipients];

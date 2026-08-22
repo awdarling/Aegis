@@ -232,7 +232,16 @@ describe('smart onboarding walk over SMS (B6)', () => {
     expect(wroteEmail).toBe(true);
   });
 
-  it('fully-complete employee: consent + warm close, with NO field prompts', async () => {
+  it('L5 — fully-complete employee COMPLETES on consent; the time-off ask is optional', async () => {
+    // REWRITTEN FOR L5. This test used to assert `step === 'time_off'` after
+    // consent — i.e. the employee was left parked on an OPTIONAL courtesy
+    // question, and `onboarding_complete` was only reachable by answering it.
+    //
+    // That is precisely the live bug: Bennet Nieukoop and Rosa Thornburg landed
+    // here on 8/13 with role, email and availability all on file, were told
+    // "you're all set", never answered the question, and were then re-warned on
+    // 8/15 and re-timed-out on 8/16 with the manager texted "hasn't completed
+    // onboarding" both times. An optional question must not gate completion.
     h.setEmployee({
       id: EMPLOYEE_ID, name: 'Sam Rivera', contact_phone: EMPLOYEE_PHONE, contact_email: 'sam@example.com',
       company_id: COMPANY_ID, primary_role: 'guard', active: true, aegis_access: 'employee',
@@ -241,20 +250,22 @@ describe('smart onboarding walk over SMS (B6)', () => {
     h.setAvailabilityPresent(true);
     const s = makeSession();
 
-    // Consent → nothing to collect → warm intro + the always-asked time-off question.
+    // Consent → nothing left to collect → COMPLETE right here.
     await handleOnboardingResponse(inbound('YES'), CONTACT, s);
     expect(s.opt_in_confirmed).toBe(true);
-    expect(s.step).toBe('time_off');
-    const afterConsent = lastSms().toLowerCase();
-    expect(afterConsent).toContain('already have everything');
-    expect(afterConsent).toContain('coming up');
 
-    // Time-off "no" → warm complete-record close + capabilities nudge.
-    await handleOnboardingResponse(inbound('no'), CONTACT, s);
-    expect(s.step).toBe('complete');
-    const close = lastSms().toLowerCase();
-    expect(close).toContain('all set');
-    expect(close).toContain('what can you do');
+    // The durable completion is recorded (logActivity writes to activity_log)...
+    expect(h.writes.some(w => w.table === 'activity_log' && w.op === 'insert')).toBe(true);
+    // ...and the session row is DELETED, so neither sweeper has anything left to
+    // nag about. This is the assertion that would have caught the live bug.
+    expect(h.writes.some(w => w.table === 'aegis_memory' && w.op === 'delete')).toBe(true);
+
+    const bodiesSoFar = h.sendSmsMock.mock.calls.map(c => (c[0] as { body: string }).body.toLowerCase());
+    // They're told they're set...
+    expect(bodiesSoFar.some(b => b.includes('all set'))).toBe(true);
+    // ...and the time-off question is still ASKED — just as an open invitation
+    // with no session behind it, not a step they must clear.
+    expect(bodiesSoFar.some(b => b.includes('coming up') && b.includes('no rush'))).toBe(true);
 
     // No name / email / role / availability prompt was ever sent.
     const bodies = h.sendSmsMock.mock.calls.map(c => (c[0] as { body: string }).body.toLowerCase());

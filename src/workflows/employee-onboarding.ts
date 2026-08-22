@@ -12,6 +12,12 @@ import { coerceJsonObject } from '../utils/coerce-json';
 import { logActivity } from '../logger/activity-log';
 import { sendSms } from '../messaging/sms';
 import { setEmployeeConsentState } from '../messaging/consent';
+// L5 — RULE 0b: the ONE definition of "is this employee onboarded?".
+import {
+  deriveOnboardingStatus,
+  isUnfinishedStatus,
+  type OnboardingStatusInput,
+} from '../lib/onboarding-status';
 import { sendEmail } from '../messaging/email';
 import { reply, sendInThreadAck } from '../messaging/reply';
 import { getAegisSmsChannel } from '../messaging/notify';
@@ -344,25 +350,10 @@ export async function getOnboardingSession(
     const session = JSON.parse(row.content) as OnboardingSession;
 
     if (new Date(session.expires_at) < new Date()) {
-      await supabase.from('aegis_memory').delete().eq('id', row.id);
-      await logActivity({
-        company_id: companyId,
-        action: 'onboarding_timeout',
-        entity_type: 'employee',
-        entity_id: employeeId,
-        summary: `Onboarding session expired for ${session.employee_name}`,
-        metadata: {
-          step_reached: session.step,
-          started_at: session.started_at,
-        },
-      });
-      const managerContact = buildManagerContact(session);
-      const managerMsg = buildManagerMsg(session);
-      await reply(
-        managerContact,
-        managerMsg,
-        `${session.employee_name}'s onboarding window (48h) expired without completion. Their session has been cleared.`
-      );
+      // L5 — ONE reaper (see reapExpiredSession). This used to be ~20 lines
+      // duplicated here and in the two by-phone/by-email lookups, all of which
+      // fired `onboarding_timeout` + texted the manager unconditionally.
+      await reapExpiredSession(row.id, session, 'lazy_read');
       return null;
     }
 
@@ -397,25 +388,10 @@ export async function getOnboardingSessionByPhone(
     if (session.employee_phone !== phone) continue;
 
     if (new Date(session.expires_at) < new Date()) {
-      await supabase.from('aegis_memory').delete().eq('id', row.id);
-      await logActivity({
-        company_id: session.company_id,
-        action: 'onboarding_timeout',
-        entity_type: 'employee',
-        entity_id: session.employee_id,
-        summary: `Onboarding session expired for ${session.employee_name}`,
-        metadata: {
-          step_reached: session.step,
-          started_at: session.started_at,
-        },
-      });
-      const managerContact = buildManagerContact(session);
-      const managerMsg = buildManagerMsg(session);
-      await reply(
-        managerContact,
-        managerMsg,
-        `${session.employee_name}'s onboarding window (48h) expired without completion. Their session has been cleared.`
-      );
+      // L5 — ONE reaper (see reapExpiredSession). This used to be ~20 lines
+      // duplicated here and in the two by-phone/by-email lookups, all of which
+      // fired `onboarding_timeout` + texted the manager unconditionally.
+      await reapExpiredSession(row.id, session, 'lazy_read');
       return null;
     }
 
@@ -451,25 +427,10 @@ export async function getOnboardingSessionByEmail(
     if (session.employee_email?.toLowerCase() !== target) continue;
 
     if (new Date(session.expires_at) < new Date()) {
-      await supabase.from('aegis_memory').delete().eq('id', row.id);
-      await logActivity({
-        company_id: session.company_id,
-        action: 'onboarding_timeout',
-        entity_type: 'employee',
-        entity_id: session.employee_id,
-        summary: `Onboarding session expired for ${session.employee_name}`,
-        metadata: {
-          step_reached: session.step,
-          started_at: session.started_at,
-        },
-      });
-      const managerContact = buildManagerContact(session);
-      const managerMsg = buildManagerMsg(session);
-      await reply(
-        managerContact,
-        managerMsg,
-        `${session.employee_name}'s onboarding window (48h) expired without completion. Their session has been cleared.`
-      );
+      // L5 — ONE reaper (see reapExpiredSession). This used to be ~20 lines
+      // duplicated here and in the two by-phone/by-email lookups, all of which
+      // fired `onboarding_timeout` + texted the manager unconditionally.
+      await reapExpiredSession(row.id, session, 'lazy_read');
       return null;
     }
 
@@ -479,9 +440,21 @@ export async function getOnboardingSessionByEmail(
   return null;
 }
 
+// L5 — SLIDING EXPIRY. The 48h window used to be stamped once at creation and
+// never moved, so an employee actively replying at hour 47 was still reaped at
+// hour 48 — mid-conversation, with the manager told they "expired without
+// completion".
+//
+// Every save happens because the employee just did something, so each save
+// pushes the window out another 48h from now. An abandoned session still dies on
+// schedule (nothing saves it); an engaged one can no longer be killed for being
+// slow.
+const ONBOARDING_TTL_MS = 48 * 60 * 60 * 1000;
+
 async function saveOnboardingSession(
   session: OnboardingSession & { _memory_id?: string }
 ): Promise<void> {
+  session.expires_at = new Date(Date.now() + ONBOARDING_TTL_MS).toISOString();
   const { _memory_id, ...data } = session;
   const content = JSON.stringify(data);
 
@@ -649,20 +622,28 @@ export function humanJoin(items: string[]): string {
 
 export type OnboardingSubset = 'all' | 'unfinished';
 
-// An employee has NOT finished onboarding when they haven't confirmed the opt-in
-// and haven't explicitly declined. The onboarding flow's completion marker is the
-// opt-in confirmation, mirrored on `employees.sms_consent_state` (N3): 'confirmed'
-// / 'resubscribed' = done; 'declined'/'opted_out' = deliberately out (never
-// re-onboard automatically — that would re-pester someone who said no); anything
-// else (none/null — never started, mid-flow, or timed out) = unfinished.
-// NOTE: for an email-only onboarding (no SMS opt-in event) a completed employee
-// can still read as unfinished; the manager reviews the list at the fan-out
-// confirmation gate before anything sends, so a false positive is caught there.
-export function isUnfinishedOnboarding(e: Employee): boolean {
-  const state = (e as { sms_consent_state?: string | null }).sms_consent_state ?? null;
-  if (state === 'confirmed' || state === 'resubscribed') return false;
-  if (state === 'declined' || state === 'opted_out') return false;
-  return true;
+// L5 — "unfinished" now means NOT FINISHED, not "hasn't consented".
+//
+// THE BUG (live, 2026-08-16): this read `sms_consent_state` and treated
+// 'confirmed' as done. But consent is not completion — Bennet Nieukoop and Rosa
+// Thornburg both consented on 8/13 and never finished the walk, so
+// "onboard everyone who hasn't finished" silently skipped exactly the two people
+// the manager had been texted about. The old comment above this function even
+// asserted "the onboarding flow's completion marker is the opt-in confirmation",
+// which was simply not true: `onboarding_complete` is gated four steps later.
+//
+// Migration 021 was explicit that `sms_consent_state` is a CONSENT cache with
+// activity_log as the record. N4 repurposed it as a completion flag. Undone here.
+//
+// RULE 0b — delegates to the one definition (lib/onboarding-status.ts). The
+// availability lookup can't come from the employee row, so callers pass it in;
+// `selectOnboardingCandidates` threads it through.
+export function isUnfinishedOnboarding(
+  e: Employee,
+  hasAvailability = false,
+  hasLiveSession = false,
+): boolean {
+  return isUnfinishedStatus(deriveOnboardingStatus(e as OnboardingStatusInput, hasAvailability, hasLiveSession));
 }
 
 export interface OnboardingSelection {
@@ -679,6 +660,18 @@ export function selectOnboardingCandidates(input: {
   active: Employee[];
   requestedNames?: string[] | null;
   subset?: OnboardingSubset | null;
+  /**
+   * L5 — employee_id → has at least one `availability` row. Onboarding exists to
+   * collect a role and availability, so "finished" cannot be decided without it.
+   * Optional so older callers/tests still compile; absent is read as "no
+   * availability on file", which errs toward INCLUDING someone in a re-onboard
+   * (a fan-out confirmation gate stands between this list and any message, so an
+   * over-inclusion is caught by the manager, while an omission is invisible —
+   * which is exactly how Bennet and Rosa went unnoticed).
+   */
+  availabilityByEmployee?: Map<string, boolean> | null;
+  /** L5 — employee_id → a live onboarding session row exists. */
+  liveSessionByEmployee?: Map<string, boolean> | null;
 }): OnboardingSelection {
   const names = (input.requestedNames ?? []).map((n) => n.trim()).filter(Boolean);
 
@@ -704,7 +697,14 @@ export function selectOnboardingCandidates(input: {
   }
 
   if (input.subset === 'unfinished') {
-    return { candidates: input.active.filter(isUnfinishedOnboarding), unmatchedNames: [], mode: 'subset' };
+    const avail = input.availabilityByEmployee ?? new Map<string, boolean>();
+    const live = input.liveSessionByEmployee ?? new Map<string, boolean>();
+    return {
+      candidates: input.active.filter(e =>
+        isUnfinishedOnboarding(e, avail.get(e.id) ?? false, live.get(e.id) ?? false)),
+      unmatchedNames: [],
+      mode: 'subset',
+    };
   }
 
   return { candidates: input.active, unmatchedNames: [], mode: 'all' };
@@ -1693,14 +1693,40 @@ async function proceedAfterConsent(
     );
     return;
   }
-  // Nothing left to collect — warm intro-and-close, but still ask the
-  // forward-looking upcoming-time-off question (never captured otherwise).
-  session.step = 'time_off';
-  await saveOnboardingSession(session);
+  // ── L5 — NOTHING LEFT TO COLLECT: RECORD IT AS DONE, *THEN* ASK ────────────
+  //
+  // THIS BRANCH WAS THE LIVE BUG. It used to set `step = 'time_off'`, save, and
+  // send the message below — leaving the session OPEN on an OPTIONAL courtesy
+  // question. Because `onboarding_complete` is only reachable through the
+  // time-off branch, an employee who simply didn't answer that one message could
+  // never be recorded as finished. Aegis literally told them "you're all set"
+  // and then filed them as incomplete.
+  //
+  // Bennet Nieukoop and Rosa Thornburg both landed here on 8/13: consented,
+  // role + email + availability all on file, told "you're all set" — and were
+  // then re-warned on 8/15 and re-timed-out on 8/16, with the manager texted
+  // "hasn't completed onboarding" both times.
+  //
+  // An optional question must never hold a completion hostage. So we complete
+  // FIRST — log it, close the session — and only then ask, as an ordinary
+  // follow-up rather than an open onboarding step. If they answer, the normal
+  // time-off intent handles it like any other request; if they don't, nothing
+  // is left hanging and no sweeper has anything to nag about.
+  // completeOnboarding does the whole durable job — writes any collected
+  // fields, logs `onboarding_complete`, notifies the manager, sends the audit
+  // summary, and CLEARS THE SESSION. Reusing it (rather than hand-rolling a
+  // "sort of complete" state here) is what guarantees this path and the normal
+  // one record completion identically — RULE 0b.
+  await completeOnboarding(session, buildManagerContact(session), buildManagerMsg(session));
+
+  // The courtesy question, now a genuine OPTION rather than a gate. Sent after
+  // completion, with no session behind it: if they answer, the ordinary
+  // submit_time_off intent handles it exactly like any other request; if they
+  // don't, nothing is left open and no sweeper has anything to nag about.
   await textEmployee(
     session,
-    `Great, you're confirmed! It looks like you're all set — I already have everything I need about you in my memory for scheduling. ` +
-      `One quick thing before I wrap up: do you have any time off coming up in the near future that you'd want your manager to know about? Reply NO if nothing comes to mind.`
+    `One more thing — if you have any time off coming up that you'd want your manager to know about, ` +
+      `just text me the dates whenever. No rush.`
   );
 }
 
@@ -4538,6 +4564,92 @@ async function notifyEmployeeOfAvailabilityDecision(
 // check inside getOnboardingSession only fires if the employee sends another
 // message — fully-silent sessions would otherwise linger indefinitely.
 
+// L5 — THE ONE PLACE an expired onboarding session is closed.
+//
+// This logic existed FOUR times: in getOnboardingSession, getOnboardingSessionByPhone,
+// getOnboardingSessionByEmail (all three reap lazily on read) and in the daily
+// reaper. Every copy deleted the row, logged `onboarding_timeout`, and texted the
+// manager "expired without completion" — unconditionally.
+//
+// That duplication is why the first pass of this fix was incomplete: guarding
+// only the two sweepers left the three READ paths still firing false alerts. In
+// particular `executeOnboardingForCandidates` calls getOnboardingSession to check
+// "is one already in progress?", so a MANAGER RESTARTING ONBOARDING would itself
+// emit a spurious timeout event and get texted about it — and an employee simply
+// replying after their window lapsed would do the same.
+//
+// One writer, one guard. If the employee is already onboarded, the leftover row
+// is stale bookkeeping: delete it QUIETLY. Nothing is wrong, so nothing is
+// reported to anyone.
+async function reapExpiredSession(
+  memoryRowId: string,
+  session: OnboardingSession,
+  reapedBy: 'lazy_read' | 'proactive_expiry',
+): Promise<void> {
+  // Delete first either way, so a transient notify failure can't leave the row
+  // stuck and re-reaping forever.
+  await supabase.from('aegis_memory').delete().eq('id', memoryRowId);
+
+  if (await isSessionSubjectOnboarded(session)) {
+    console.log(
+      `[onboarding-expire] ${session.employee_name} is already onboarded — ` +
+      `closed a stale session row (${reapedBy}) with no timeout event and no manager alert`
+    );
+    return;
+  }
+
+  await logActivity({
+    company_id: session.company_id,
+    action: 'onboarding_timeout',
+    entity_type: 'employee',
+    entity_id: session.employee_id,
+    summary: `Onboarding session expired for ${session.employee_name}`,
+    metadata: {
+      step_reached: session.step,
+      started_at: session.started_at,
+      reaped_by: reapedBy,
+    },
+  });
+
+  await reply(
+    buildManagerContact(session),
+    buildManagerMsg(session),
+    `${session.employee_name}'s onboarding window expired without completion. ` +
+      `Their session has been cleared. You can restart onboarding anytime.`
+  );
+}
+
+// L5 — is the employee this session is about ALREADY onboarded?
+//
+// The one question both sweepers now ask before reporting anyone as unfinished.
+// Loads the live employee row + whether they have availability on file, and
+// hands both to the single shared definition (lib/onboarding-status.ts).
+//
+// `hasLiveSession` is passed as `true` because, by construction, we are looking
+// at a live session row — it can only ever move the answer between 'not_started'
+// and 'in_progress', never away from 'onboarded'.
+//
+// FAILS OPEN, deliberately: if the employee row can't be read we return false,
+// i.e. "not known to be onboarded", which preserves the pre-L5 behaviour of
+// warning/timing out. A DB blip must not silently swallow a legitimate warning
+// about someone who really hasn't finished.
+export async function isSessionSubjectOnboarded(session: OnboardingSession): Promise<boolean> {
+  try {
+    const { data } = await supabase
+      .from('employees')
+      .select('contact_phone, contact_email, primary_role, qualified_roles, sms_consent_state')
+      .eq('id', session.employee_id)
+      .eq('company_id', session.company_id)
+      .maybeSingle();
+    if (!data) return false;
+    const hasAvail = await hasAvailabilityOnFile(session.company_id, session.employee_id);
+    return deriveOnboardingStatus(data as OnboardingStatusInput, hasAvail, true) === 'onboarded';
+  } catch (err) {
+    console.error('[onboarding] onboarded-check failed; treating as NOT onboarded:', err);
+    return false;
+  }
+}
+
 export async function expireOldOnboardingSessions(): Promise<void> {
   const { data: rows, error } = await supabase
     .from('aegis_memory')
@@ -4558,31 +4670,7 @@ export async function expireOldOnboardingSessions(): Promise<void> {
       const session = JSON.parse(record.content) as OnboardingSession;
       if (new Date(session.expires_at) > now) continue;
 
-      // Delete first so a transient notify failure doesn't leave the row stuck.
-      await supabase.from('aegis_memory').delete().eq('id', record.id);
-
-      await logActivity({
-        company_id: session.company_id,
-        action: 'onboarding_timeout',
-        entity_type: 'employee',
-        entity_id: session.employee_id,
-        summary: `Onboarding session expired for ${session.employee_name}`,
-        metadata: {
-          step_reached: session.step,
-          started_at: session.started_at,
-          reaped_by: 'proactive_expiry',
-        },
-      });
-
-      const managerContact = buildManagerContact(session);
-      const managerMsg = buildManagerMsg(session);
-      await reply(
-        managerContact,
-        managerMsg,
-        `${session.employee_name}'s onboarding window expired without completion. ` +
-          `Their session has been cleared. You can restart onboarding anytime.`
-      );
-
+      await reapExpiredSession(record.id, session, 'proactive_expiry');
       expired++;
     } catch (err) {
       console.error('[onboarding-expire] error processing record:', err);
@@ -4617,6 +4705,24 @@ export async function checkStaleOnboardingSessions(): Promise<void> {
       if (session.step === 'complete') continue;
       if (session.warned_24h) continue;
       if (new Date(session.started_at) > twentyFourHoursAgo) continue;
+
+      // ── L5 — DON'T NAG SOMEONE WHO IS ACTUALLY DONE ────────────────────────
+      //
+      // This sweeper knew only one thing: the walk hadn't reached its last step.
+      // It never consulted consent, and never asked whether anything was still
+      // MISSING. So Bennet Nieukoop and Rosa Thornburg — consented, with role,
+      // email and availability all on file — were reported to the manager as
+      // "hasn't completed onboarding yet" two days AFTER they opted in, purely
+      // because they hadn't answered an optional time-off question.
+      //
+      // Now it asks the one authoritative question (RULE 0b). If they're
+      // onboarded, the leftover row is stale bookkeeping: close it QUIETLY —
+      // no manager alert, no timeout event — and move on.
+      if (await isSessionSubjectOnboarded(session)) {
+        await supabase.from('aegis_memory').delete().eq('id', record.id);
+        console.log(`[onboarding-timeout] ${session.employee_name} is already onboarded — closed a stale session row without warning the manager`);
+        continue;
+      }
 
       // Mark warned before sending so a service restart doesn't double-notify
       const updated: OnboardingSession = { ...session, warned_24h: true };

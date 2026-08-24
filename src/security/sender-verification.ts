@@ -60,6 +60,8 @@ async function lookupContact(
       .select('id, name, email, company_id')
       .eq('company_id', companyId)
       .eq('email', sender)
+      // S-3 (actor half): a revoked login's saved inbox is no longer a manager.
+      .is('access_revoked_at', null)
       .maybeSingle(),
   ]);
 

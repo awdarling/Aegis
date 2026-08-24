@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { supabase } from '../db/client';
 import { formatDateRange } from '../workflows/time-off-manager-email';
+import { managerStillActive } from '../security/manager-active';
 import { logActivity } from '../logger/activity-log';
 import { sendEmail } from '../messaging/email';
 import { sendSms } from '../messaging/sms';
@@ -599,6 +600,15 @@ decisionWebhook.get('/', async (req, res) => {
   // Verify action matches token (each token has a fixed action)
   if (decisionToken.action !== action) {
     res.status(400).send(errorPage('Action mismatch. Please use the correct Approve or Deny button from your email.'));
+    return;
+  }
+
+  // S-3 (actor half): the link was minted for a specific manager. If that
+  // login has since been revoked, the link is dead — regardless of expiry.
+  const actorId = 'manager_user_id' in decisionToken ? decisionToken.manager_user_id : null;
+  if (!(await managerStillActive(actorId))) {
+    console.log('[decision] refused — manager login revoked or unknown', { actorId, requestId });
+    res.status(403).send(errorPage('This link belongs to a login that no longer has manager access. Please ask a current manager to review the request in Homebase.'));
     return;
   }
 

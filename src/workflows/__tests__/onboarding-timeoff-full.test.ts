@@ -90,6 +90,9 @@ vi.mock('../../messaging/reply', () => ({ reply: h.replyMock, sendInThreadAck: v
 vi.mock('../time-off', () => ({
   createTimeOffRequestAndNotify: h.createTimeOffMock,
   resolvePartialWindow: () => null,
+  // W-1 branch 2: partial entries resolve against the schedule before staging;
+  // pass-through here (these tests stage full days).
+  resolvePartialEntries: async (entries: unknown[]) => entries,
   formatDateRange: (a: string, b: string) => (a === b ? a : `${a} to ${b}`),
   // Onboarding now reuses the normal flow's affirmation detector at the confirm
   // step; mirror the real regex so the mocked module keeps the same behavior.

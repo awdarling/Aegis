@@ -112,7 +112,9 @@ function escapeHtml(s: string): string {
 
 export function describePartialDay(d: PartialDayDetail): string {
   if (d.shift_name) {
-    return `${formatWeekdayShort(d.date)} ${formatShortDate(d.date)} — ${d.shift_name} off`;
+    // W-1 branch 2: shift_name is now filled from the real shift; show its hours too.
+    const hours = d.start_time && d.end_time ? ` (${formatTime(d.start_time)}–${formatTime(d.end_time)})` : '';
+    return `${formatWeekdayShort(d.date)} ${formatShortDate(d.date)} — ${d.shift_name}${hours} off`;
   }
   if (d.start_time && d.end_time) {
     return `${formatWeekdayShort(d.date)} ${formatShortDate(d.date)} — ${formatTime(d.start_time)}–${formatTime(d.end_time)}`;
@@ -131,7 +133,8 @@ export function buildPartialSummaryText(partialDays: PartialDayDetail[]): string
   );
   if (allSame) {
     if (sample.shift_name) {
-      return `${sample.shift_name} off every day in the range`;
+      const hours = sample.start_time && sample.end_time ? ` (${formatTime(sample.start_time)}–${formatTime(sample.end_time)})` : '';
+      return `${sample.shift_name}${hours} off every day in the range`;
     }
     if (sample.start_time && sample.end_time) {
       return `${formatTime(sample.start_time)}–${formatTime(sample.end_time)} off every day in the range`;

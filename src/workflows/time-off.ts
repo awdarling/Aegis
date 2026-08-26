@@ -25,6 +25,7 @@ import type { InboundMessage, VerifiedContact } from '../security/types';
 import type { Employee, PartialDayDetail, Policy, TimeOffRequest } from '../db/types';
 import type { SimulationResult } from '../lib/schedule-simulator';
 import type { TimeOffViolations } from '../lib/time-off-policies';
+import { resolveMeantHours, loadShiftTemplates, formatClockRange, type ShiftTemplate } from '../lib/shift-hours';
 
 // ── N1: self-notification guard ───────────────────────────────────────────────
 // Exclude the actor who TOOK a decision from that decision's notification
@@ -57,20 +58,21 @@ interface PendingTimeOff {
   partial_days: PartialDayDetail[] | null;
 }
 
-interface ExtractedDateEntry {
+export interface ExtractedDateEntry {
   start_date: string;
   end_date?: string | null;
   time_off_type?: 'full_day' | 'partial' | null;
   period_label?: 'morning' | 'afternoon' | 'evening' | null;
   start_time?: string | null;
   end_time?: string | null;
+  // W-1 branch 2: filled by resolvePartialEntries from the employee's REAL shift
+  // that day (never from a clock-word table).
+  shift_id?: string | null;
+  shift_name?: string | null;
+  // The employee asked for part of a day they are not scheduled on. There is no
+  // shift to take off; the confirm says so and offers to log a plain day off.
+  unscheduled?: boolean;
 }
-
-const PERIOD_TIMES: Record<'morning' | 'afternoon' | 'evening', { start: string; end: string }> = {
-  morning: { start: '09:00', end: '13:00' },
-  afternoon: { start: '13:00', end: '17:00' },
-  evening: { start: '17:00', end: '21:00' },
-};
 
 interface DecisionRecommendation {
   recommendation: 'approve' | 'deny';
@@ -149,29 +151,76 @@ function eachDateInRange(startDate: string, endDate: string): string[] {
   return out;
 }
 
-// Implicit operating-day bounds for partial time-off, kept in sync with
-// PERIOD_TIMES (morning opens the day, evening closes it). Used to fill the open
-// side of one-sided windows.
-const DAY_OPEN = PERIOD_TIMES.morning.start;  // '09:00'
-const DAY_CLOSE = PERIOD_TIMES.evening.end;   // '21:00'
-
-export function resolvePartialWindow(entry: ExtractedDateEntry): { start_time: string; end_time: string } | null {
+// W-1 branch 2 (C-4 / J-1a): a partial-day window comes from the employee's REAL
+// shift on that date, never from a clock-word table. (The old table — morning
+// 09–13, afternoon 13–17, evening 17–21 — invented a 17:00–21:00 shift for Mia on
+// a day she wasn't working, and turned Katie's 11:00–15:30 Friday into 09:00–13:00.)
+//
+//   • both times explicit ("1pm to 3pm")           → exactly those
+//   • one side explicit ("leave at 3", "after 4pm") → that side, the other side
+//                                                     from the shift; null with no shift
+//   • only a period word ("the morning")           → the shift's own hours; null with no shift
+//
+// `shift` is the resolved hours for that date (lib/shift-hours.ts). Pure.
+export function resolvePartialWindow(
+  entry: ExtractedDateEntry,
+  shift?: { start_time: string; end_time: string } | null,
+): { start_time: string; end_time: string } | null {
   if (entry.start_time && entry.end_time) {
     return { start_time: entry.start_time, end_time: entry.end_time };
   }
-  // Open-ended partials: one side given → fill the other from the operating day.
-  // "off after 4pm" → 16:00–close; "off before noon" / "off until 2pm" → open–12:00/14:00.
+  if (!shift) return null;
   if (entry.start_time && !entry.end_time) {
-    return { start_time: entry.start_time, end_time: DAY_CLOSE };
+    // "off from 3pm" on an 11–3:30 shift → 15:00–15:30; a start after the shift
+    // ends means the whole shift is unaffected → treat as the shift's tail anyway
+    // so nothing is silently dropped.
+    return entry.start_time < shift.end_time
+      ? { start_time: entry.start_time, end_time: shift.end_time }
+      : { start_time: shift.start_time, end_time: shift.end_time };
   }
   if (!entry.start_time && entry.end_time) {
-    return { start_time: DAY_OPEN, end_time: entry.end_time };
+    return entry.end_time > shift.start_time
+      ? { start_time: shift.start_time, end_time: entry.end_time }
+      : { start_time: shift.start_time, end_time: shift.end_time };
   }
-  if (entry.period_label && PERIOD_TIMES[entry.period_label]) {
-    const period = PERIOD_TIMES[entry.period_label];
-    return { start_time: period.start, end_time: period.end };
+  return { start_time: shift.start_time, end_time: shift.end_time };
+}
+
+// Resolve every PARTIAL entry against the employee's published schedule: one
+// entry per date, carrying the real shift's hours + name, or `unscheduled` when
+// they have no shift that day. Full-day entries pass through untouched.
+// Deterministic — no model call; two small DB reads (shift templates + the
+// schedule row for each date).
+export async function resolvePartialEntries(
+  entries: ExtractedDateEntry[],
+  ctx: { companyId: string; employeeId: string; words: string; templates?: ShiftTemplate[] },
+): Promise<ExtractedDateEntry[]> {
+  const out: ExtractedDateEntry[] = [];
+  let templates: ShiftTemplate[] | undefined = ctx.templates;
+  for (const entry of entries) {
+    if (entry.time_off_type !== 'partial' || !entry.start_date) { out.push(entry); continue; }
+    if (!templates) templates = await loadShiftTemplates(ctx.companyId);
+    for (const date of eachDateInRange(entry.start_date, entry.end_date ?? entry.start_date)) {
+      const meant = await resolveMeantHours({ companyId: ctx.companyId, employeeId: ctx.employeeId, date, words: ctx.words, templates });
+      const shift = meant ? { start_time: meant.start_time, end_time: meant.end_time } : null;
+      const window = resolvePartialWindow(entry, shift);
+      if (!window) {
+        out.push({ ...entry, start_date: date, end_date: date, start_time: null, end_time: null, shift_id: null, shift_name: null, unscheduled: true });
+        continue;
+      }
+      out.push({
+        ...entry,
+        start_date: date,
+        end_date: date,
+        start_time: window.start_time,
+        end_time: window.end_time,
+        shift_id: meant?.shift_id ?? null,
+        shift_name: meant?.shift_name ?? null,
+        unscheduled: false,
+      });
+    }
   }
-  return null;
+  return out;
 }
 
 function normalizeExtractedDates(extracted: Record<string, unknown>): ExtractedDateEntry[] {
@@ -196,18 +245,22 @@ function normalizeExtractedDates(extracted: Record<string, unknown>): ExtractedD
   return [];
 }
 
-interface ParsedRequest {
+export interface ParsedRequest {
   start_date: string;
   end_date: string;
   time_off_type: 'full_day' | 'partial';
   partial_days: PartialDayDetail[] | null;
+  // Dates the employee asked for PART of but has no shift on (W-1 branch 2).
+  // Logged as full days if they confirm; the confirm copy says so.
+  unscheduled_dates: string[];
 }
 
-function parseRequest(entries: ExtractedDateEntry[]): ParsedRequest | null {
+export function parseRequest(entries: ExtractedDateEntry[]): ParsedRequest | null {
   if (entries.length === 0) return null;
 
   const allDates: string[] = [];
   const partialDays: PartialDayDetail[] = [];
+  const unscheduled: string[] = [];
   let anyPartial = false;
 
   for (const entry of entries) {
@@ -220,16 +273,17 @@ function parseRequest(entries: ExtractedDateEntry[]): ParsedRequest | null {
 
     if (entry.time_off_type === 'partial') {
       anyPartial = true;
+      if (entry.unscheduled) { unscheduled.push(...dates); continue; }
+      // Entries reach here already resolved (resolvePartialEntries); an
+      // unresolved one has no honest window and falls back to a full day.
       const window = resolvePartialWindow(entry);
-      // If we can't resolve a window for a partial entry, fall back to full_day for
-      // those dates so we don't drop the request entirely.
       if (!window) continue;
       for (const date of dates) {
         partialDays.push({
           date,
-          type: 'custom_hours',
-          shift_id: null,
-          shift_name: null,
+          type: entry.shift_name ? 'shift_off' : 'custom_hours',
+          shift_id: entry.shift_id ?? null,
+          shift_name: entry.shift_name ?? null,
           start_time: window.start_time,
           end_time: window.end_time,
         });
@@ -245,36 +299,46 @@ function parseRequest(entries: ExtractedDateEntry[]): ParsedRequest | null {
     end_date: allDates[allDates.length - 1],
     time_off_type: anyPartial && partialDays.length > 0 ? 'partial' : 'full_day',
     partial_days: anyPartial && partialDays.length > 0 ? partialDays : null,
+    unscheduled_dates: [...new Set(unscheduled)].sort(),
   };
 }
 
-function formatTimeRange(start: string, end: string): string {
-  return `${start}–${end}`;
-}
-
-function formatRequestSummary(parsed: ParsedRequest): string {
+// Employee-facing summary of the request. Hours are ALWAYS shown for a partial
+// day (the "(partial day)" blank is what let Mia confirm the wrong window), and a
+// day names the real shift when one matched: "your AM Weekday shift (11am–3:30pm)
+// on Friday, August 21". Exported for tests.
+export function formatRequestSummary(parsed: ParsedRequest): string {
   const range = formatDateRange(parsed.start_date, parsed.end_date);
-  if (parsed.time_off_type === 'full_day' || !parsed.partial_days || parsed.partial_days.length === 0) {
-    return range;
+  const partial = parsed.partial_days ?? [];
+  const unscheduled = parsed.unscheduled_dates ?? [];
+  if (parsed.time_off_type === 'full_day' && unscheduled.length === 0) return range;
+  if (partial.length === 0 && unscheduled.length > 0) {
+    // Only unscheduled days: the caller words the "not scheduled" ask itself.
+    return unscheduled.map(d => formatDateRange(d, d)).join(' and ');
   }
-  // Compact summary: if all partial_days share one window, show once.
-  const windows = new Set(
-    parsed.partial_days.map(d => `${d.start_time ?? ''}|${d.end_time ?? ''}`)
-  );
-  if (windows.size === 1) {
-    const sample = parsed.partial_days[0];
-    if (sample.start_time && sample.end_time) {
-      return `${range} (${formatTimeRange(sample.start_time, sample.end_time)})`;
-    }
+  const describe = (d: PartialDayDetail): string => {
+    const when = formatDateRange(d.date, d.date);
+    const hours = d.start_time && d.end_time ? formatClockRange(d.start_time, d.end_time) : null;
+    if (d.shift_name && hours) return `your ${d.shift_name} shift (${hours}) on ${when}`;
+    if (hours) return `${hours} on ${when}`;
+    return when;
+  };
+  // Compact: one window shared across a run of days → say it once.
+  const windows = new Set(partial.map(d => `${d.shift_name ?? ''}|${d.start_time ?? ''}|${d.end_time ?? ''}`));
+  let text: string;
+  if (windows.size === 1 && partial.length > 1 && unscheduled.length === 0) {
+    const s = partial[0];
+    const hours = s.start_time && s.end_time ? formatClockRange(s.start_time, s.end_time) : null;
+    text = s.shift_name && hours
+      ? `your ${s.shift_name} shifts (${hours}) ${range}`
+      : hours ? `${hours} each day, ${range}` : range;
+  } else {
+    text = partial.map(describe).join(', ');
   }
-  const perDay = parsed.partial_days
-    .map(d =>
-      d.start_time && d.end_time
-        ? `${formatShortDate(d.date)} ${formatTimeRange(d.start_time, d.end_time)}`
-        : formatShortDate(d.date)
-    )
-    .join(', ');
-  return `${range} — partial (${perDay})`;
+  if (unscheduled.length > 0) {
+    text += ` — plus ${unscheduled.map(d => formatDateRange(d, d)).join(' and ')}, where you're not scheduled, logged as a day off`;
+  }
+  return text;
 }
 
 async function clearPendingTimeOff(companyId: string, employeeId: string): Promise<void> {
@@ -1562,7 +1626,11 @@ export async function handleSubmitTimeOff(
   contact: VerifiedContact,
   extracted: Record<string, unknown>
 ): Promise<void> {
-  const entries = normalizeExtractedDates(extracted);
+  const rawEntries = normalizeExtractedDates(extracted);
+  // W-1 branch 2: partial days resolve against the employee's REAL shifts.
+  const entries = contact.employee_id
+    ? await resolvePartialEntries(rawEntries, { companyId: contact.company_id, employeeId: contact.employee_id, words: message.body })
+    : rawEntries;
   const parsed = parseRequest(entries);
   const reason = (extracted['reason'] as string | undefined) ?? 'personal reasons';
 
@@ -1574,6 +1642,8 @@ export async function handleSubmitTimeOff(
     );
     return;
   }
+
+  const onlyUnscheduled = parsed.unscheduled_dates.length > 0 && !parsed.partial_days?.length;
 
   // Store pending confirmation (TTL: 24 hours). Email replies can lag hours behind
   // the request (people confirm when they next check mail), and the router resolves a
@@ -1612,9 +1682,14 @@ export async function handleSubmitTimeOff(
   // it needs one (see the classifier), so "off for ${reason}" reads correctly.
   const first = firstName(contact.name);
   const lead = first ? `Got it, ${first} —` : 'Got it —';
-  const confirmText =
-    `${lead} ${summary} off for ${reason}. Want me to send that over to your manager?` +
-    availabilityFollowupNote(extracted);
+  // W-1 branch 2: a part-day request on a day with NO shift gets an honest ask,
+  // never invented hours ("sick tonight" on an unscheduled Friday). A "yes" logs
+  // it as a plain day off so the manager still knows.
+  const confirmText = onlyUnscheduled
+    ? `${lead} ${summary}: you're not on the schedule that day, so there's no shift to take off. Want me to log it as a day off anyway (${reason}) so your manager knows?` +
+      availabilityFollowupNote(extracted)
+    : `${lead} ${summary} off for ${reason}. Want me to send that over to your manager?` +
+      availabilityFollowupNote(extracted);
 
   // Rich HTML sibling: reflect the employee's own words, present the requested
   // time off as a single accent detail row, then ask to confirm. SMS + the text
@@ -2085,6 +2160,7 @@ export async function handleQueryMyTimeOff(
       end_date: row.end_date,
       time_off_type: row.time_off_type === 'partial' ? 'partial' : 'full_day',
       partial_days: row.partial_days ?? null,
+      unscheduled_dates: [],
     };
 
     if (parsed.time_off_type === 'full_day' || !parsed.partial_days || parsed.partial_days.length === 0) {
@@ -2097,21 +2173,19 @@ export async function handleQueryMyTimeOff(
     );
 
     if (allSame) {
+      const hours = sample.start_time && sample.end_time ? formatClockRange(sample.start_time, sample.end_time) : null;
       const detail = sample.shift_name
-        ? sample.shift_name
-        : sample.start_time && sample.end_time
-          ? formatTimeRange(sample.start_time, sample.end_time)
-          : 'partial';
+        ? (hours ? `${sample.shift_name} ${hours}` : sample.shift_name)
+        : hours ?? 'partial';
       return `• ${dateRange}: Partial (${detail}) — ${stat}`;
     }
 
     const perDay = parsed.partial_days
       .map(d => {
+        const hours = d.start_time && d.end_time ? formatClockRange(d.start_time, d.end_time) : null;
         const label = d.shift_name
-          ? d.shift_name
-          : d.start_time && d.end_time
-            ? formatTimeRange(d.start_time, d.end_time)
-            : 'partial';
+          ? (hours ? `${d.shift_name} ${hours}` : d.shift_name)
+          : hours ?? 'partial';
         return `${formatShortDate(d.date)} ${label}`;
       })
       .join(', ');

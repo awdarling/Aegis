@@ -21,6 +21,8 @@ import {
 } from '../messaging/brand';
 import { buildTimeOffManagerEmail, buildTimeOffResolutionEmail, describePartialDay, buildPartialSummaryText, type TimeOffRecommendation } from './time-off-manager-email';
 import { resolveManagers, recipientsFor } from '../messaging/manager-directory';
+import { sendManagerResolutionNotice } from '../messaging/manager-resolution-notice';
+import { tenantTodayAndZone } from '../lib/tenant-date';
 import type { InboundMessage, VerifiedContact } from '../security/types';
 import type { Employee, PartialDayDetail, Policy, TimeOffRequest } from '../db/types';
 import type { SimulationResult } from '../lib/schedule-simulator';
@@ -2408,14 +2410,23 @@ function timeOffCancelSource(employeeId: string): string {
 /** ONE HOUR — see the header. Deliberately not the 24h used by `pending_to:`. */
 const TO_CANCEL_TTL_MS = 60 * 60 * 1000;
 
+export interface CancelTarget {
+  id: string;
+  start_date: string;
+  end_date: string;
+  status: 'approved' | 'pending';
+}
+
 interface PendingTimeOffCancel {
   employee_id: string;
-  /** The approved time_off_requests row this cancellation targets. */
+  /** The first target (kept for older pendings written before W-1 branch 4). */
   request_id: string;
   start_date: string;
   end_date: string;
   /** Rendered once at ask time so the confirmation and the receipt agree. */
   display_range: string;
+  /** W-1 branch 4: EVERY row this cancellation targets ("all of them"). */
+  targets?: CancelTarget[];
   /** Where the question was asked from, so the answer can be threaded back. */
   channel: 'sms' | 'email';
   sender: string;
@@ -2507,30 +2518,46 @@ export async function findApprovedTimeOffOn(
  * Shared by the proactive path (handleCancelTimeOff) and the reactive one (a
  * swap blocked by time off) so both phrase it identically — RULE 0b.
  */
+// "Aug 1–5 (approved)" — the one way a target is named in the ask and the receipt.
+export function describeCancelTarget(t: { start_date: string; end_date: string; status?: string }): string {
+  const range = formatDateRange(t.start_date, t.end_date);
+  return t.status === 'pending' ? `${range} (still waiting on your manager)` : range;
+}
+
+function joinNatural(parts: string[]): string {
+  if (parts.length <= 1) return parts[0] ?? '';
+  return `${parts.slice(0, -1).join(', ')} and ${parts[parts.length - 1]}`;
+}
+
 export async function askToCancelTimeOff(opts: {
   message: InboundMessage;
   contact: VerifiedContact;
-  request: { id: string; start_date: string; end_date: string };
+  /** One row (the reactive swap path) or several ("all of them"). */
+  request: { id: string; start_date: string; end_date: string; status?: 'approved' | 'pending' } | CancelTarget[];
   /** Extra sentence explaining WHY we're offering, for the reactive path. */
   lead?: string;
 }): Promise<void> {
-  const { message, contact, request, lead } = opts;
-  // The FULL approved range — never the single date the employee happened to
-  // name. formatDateRange renders a multi-day request as e.g. "Aug 1-5, 2026".
-  const displayRange = formatDateRange(request.start_date, request.end_date);
-  const dayCount = countDaysInclusive(request.start_date, request.end_date);
+  const { message, contact, lead } = opts;
+  const targets: CancelTarget[] = (Array.isArray(opts.request) ? opts.request : [opts.request])
+    .map(r => ({ id: r.id, start_date: r.start_date, end_date: r.end_date, status: r.status ?? 'approved' }));
+  const first = targets[0];
+  // The FULL range of each request — never the single date the employee happened
+  // to name. formatDateRange renders a multi-day request as e.g. "Aug 1-5, 2026".
+  const displayRange = joinNatural(targets.map(describeCancelTarget));
+  const dayCount = targets.length === 1 ? countDaysInclusive(first.start_date, first.end_date) : 0;
   // Spell the span out. A range buried in a date string is easy to skim past,
   // and this is a destructive, whole-request action.
   const spanNote = dayCount > 1
-    ? ` That's all ${dayCount} days — ${displayRange} — not just the one day.`
+    ? ` That's all ${dayCount} days — ${formatDateRange(first.start_date, first.end_date)} — not just the one day.`
     : '';
 
   await storePendingTimeOffCancel(contact.company_id, {
     employee_id: contact.employee_id!,
-    request_id: request.id,
-    start_date: request.start_date,
-    end_date: request.end_date,
+    request_id: first.id,
+    start_date: first.start_date,
+    end_date: first.end_date,
     display_range: displayRange,
+    targets,
     channel: message.channel,
     sender: message.sender,
     recipient: message.recipient,
@@ -2539,14 +2566,97 @@ export async function askToCancelTimeOff(opts: {
     expires_at: new Date(Date.now() + TO_CANCEL_TTL_MS).toISOString(),
   });
 
-  // YES / NO only — never "reply CANCEL", which is a carrier opt-out keyword.
+  // A natural yes/no question — and never "reply CANCEL", which is a carrier
+  // opt-out keyword (see the header).
+  const what = targets.length === 1
+    ? (first.status === 'pending'
+        ? `withdraw your time-off request for ${formatDateRange(first.start_date, first.end_date)} (it's still waiting on your manager)`
+        : `cancel your approved time off on ${formatDateRange(first.start_date, first.end_date)}`)
+    : `cancel all ${targets.length} of these: ${displayRange}`;
   await reply(
     contact,
     message,
     `${lead ? `${lead} ` : `${textOpener(contact.name)}`}` +
-      `I hear you want to cancel your approved time off on ${displayRange} — are you sure?${spanNote} ` +
-      `Reply YES to cancel it, or NO to leave it as it is.`
+      `Just checking — are you sure you want me to ${what}?${spanNote} ` +
+      `Say yes and I'll take care of it, or no to leave ${targets.length === 1 ? 'it' : 'them'} as ${targets.length === 1 ? 'it is' : 'they are'}.`
   );
+}
+
+// ── W-1 branch 4 (C-6, J-1c): which request(s) does the employee mean? ───────
+//
+// Deterministic read of the referents in a cancel message. "The pending one",
+// "that one", "all of them", "everything from today" (= requests MADE today,
+// tenant-local — Maisey's "undo all of my requests for today" was read as
+// requests ABOUT today and found none; there were three). No model call.
+export interface CancelReferent {
+  all: boolean;          // "all", "everything", "both", "every one"
+  madeToday: boolean;    // "today" in a cancel means REQUESTED today
+  pendingOnly: boolean;  // "the pending one", "the one waiting", "not approved yet"
+  approvedOnly: boolean; // "the approved one"
+  latest: boolean;       // "that one", "the last one", "the one I just sent", "it"
+}
+
+export function parseCancelReferent(body: string): CancelReferent {
+  const t = (body || '').toLowerCase();
+  return {
+    all: /\b(all of (?:them|my|the)|all (?:my|the|of them|three|two)|everything|every one|both|each of them)\b/.test(t),
+    madeToday: /\btoday\b|\bthis morning\b|\bjust (?:now|sent|made|put in|submitted)\b|\bearlier\b/.test(t),
+    pendingOnly: /\bpending\b|\bwaiting\b|\bnot (?:yet )?approved\b|\bunapproved\b|\bstill with (?:my )?manager\b/.test(t),
+    approvedOnly: /\bapproved one\b|\bthe approved\b/.test(t),
+    latest: /\b(that one|this one|the last one|the (?:one|request) i just|it)\b/.test(t),
+  };
+}
+
+/** The employee's cancellable rows (approved or still pending) ending today or later. */
+export async function loadCancellableTimeOff(companyId: string, employeeId: string, today: string): Promise<Array<CancelTarget & { requested_at: string | null }>> {
+  const { data } = await supabase
+    .from('time_off_requests')
+    .select('id, start_date, end_date, status, requested_at')
+    .eq('company_id', companyId)
+    .eq('employee_id', employeeId)
+    .in('status', ['approved', 'pending'])
+    .gte('end_date', today)
+    .order('start_date', { ascending: true });
+  return ((data ?? []) as Array<{ id: string; start_date: string; end_date: string; status: 'approved' | 'pending'; requested_at: string | null }>);
+}
+
+/**
+ * Pure: pick the target rows from the candidates, the extracted date and the
+ * referents. Returns the rows to offer, or 'ask' when it can't be settled.
+ */
+export function resolveCancelTargets(input: {
+  candidates: Array<CancelTarget & { requested_at: string | null }>;
+  date: string | null;
+  referent: CancelReferent;
+  today: string;
+  timezone: string;
+}): { kind: 'targets'; rows: CancelTarget[] } | { kind: 'ask'; rows: CancelTarget[] } | { kind: 'none' } {
+  const { candidates, date, referent, today, timezone } = input;
+  if (candidates.length === 0) return { kind: 'none' };
+  let pool = candidates;
+  if (referent.pendingOnly) pool = pool.filter(c => c.status === 'pending');
+  if (referent.approvedOnly) pool = pool.filter(c => c.status === 'approved');
+  if (referent.madeToday) {
+    pool = pool.filter(c => {
+      if (!c.requested_at) return false;
+      const local = new Intl.DateTimeFormat('en-CA', { timeZone: timezone }).format(new Date(c.requested_at));
+      return local === today;
+    });
+  }
+  if (date) {
+    const covering = pool.filter(c => c.start_date <= date && c.end_date >= date);
+    if (covering.length >= 1) return { kind: 'targets', rows: covering };
+    // A date that matches nothing: fall through to the other referents, else say so.
+    if (!referent.all && !referent.latest && !referent.pendingOnly) return { kind: 'none' };
+  }
+  if (pool.length === 0) return { kind: 'none' };
+  if (referent.all) return { kind: 'targets', rows: pool };
+  if (pool.length === 1) return { kind: 'targets', rows: [pool[0]] };
+  if (referent.latest) {
+    const byCreated = [...pool].sort((a, b) => (b.requested_at ?? '').localeCompare(a.requested_at ?? ''));
+    return { kind: 'targets', rows: [byCreated[0]] };
+  }
+  return { kind: 'ask', rows: pool };
 }
 
 /**
@@ -2565,60 +2675,43 @@ export async function handleCancelTimeOff(
     return;
   }
 
-  const date = typeof extracted['date'] === 'string' ? extracted['date'].trim() : '';
+  const dateRaw = typeof extracted['date'] === 'string' ? extracted['date'].trim() : '';
+  const date = /^\d{4}-\d{2}-\d{2}$/.test(dateRaw) ? dateRaw : null;
+  const { today, timezone } = await tenantTodayAndZone(contact.company_id);
 
-  // No date named. Rather than guessing at "your next one" — which on a
-  // destructive action is exactly the wrong instinct — list what they have and
-  // let them name it.
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
-    const today = new Date().toISOString().slice(0, 10);
-    const { data } = await supabase
-      .from('time_off_requests')
-      .select('start_date, end_date')
-      .eq('company_id', contact.company_id)
-      .eq('employee_id', contact.employee_id)
-      .eq('status', 'approved')
-      .gte('end_date', today)
-      .order('start_date', { ascending: true });
+  // W-1 branch 4 (J-1c, C-6): PENDING requests are cancellable too — "Cancel the
+  // pending one" used to be told there was nothing on file thirty seconds after
+  // Aegis had listed it. And the referents in the message ("that one", "all of
+  // them", "everything from today") are honoured. Never guesses on a destructive
+  // action: anything unsettled lists the options and asks.
+  const candidates = await loadCancellableTimeOff(contact.company_id, contact.employee_id, today);
+  const referent = parseCancelReferent(message.body);
+  const resolved = resolveCancelTargets({ candidates, date, referent, today, timezone });
 
-    const upcoming = (data ?? []) as Array<{ start_date: string; end_date: string }>;
-    if (upcoming.length === 0) {
+  if (resolved.kind === 'none') {
+    if (date && candidates.length > 0) {
+      const list = joinNatural(candidates.map(describeCancelTarget));
       await reply(contact, message,
-        `${textOpener(contact.name)}You don't have any approved time off coming up to cancel.`);
+        `${textOpener(contact.name)}I don't see any time off for you on ${formatDateRange(date, date)}. ` +
+        `What you do have coming up: ${list}. Tell me which one and I'll take care of it.`);
       return;
     }
-    const list = upcoming.map(r => formatDateRange(r.start_date, r.end_date)).join('; ');
+    await reply(contact, message,
+      referent.madeToday && candidates.length > 0
+        ? `${textOpener(contact.name)}You didn't put in any time-off requests today. What you have coming up: ${joinNatural(candidates.map(describeCancelTarget))}. Tell me which one to cancel.`
+        : `${textOpener(contact.name)}You don't have any time off coming up to cancel — nothing approved and nothing waiting on your manager.`);
+    return;
+  }
+
+  if (resolved.kind === 'ask') {
+    const list = joinNatural(resolved.rows.map(describeCancelTarget));
     await reply(contact, message,
       `${textOpener(contact.name)}Which one did you want to cancel? You have ${list}. ` +
-      `Just tell me the date.`);
+      `Just tell me the date — or say "all of them".`);
     return;
   }
 
-  const request = await findApprovedTimeOffOn(contact.company_id, contact.employee_id, date);
-  if (!request) {
-    // Distinguish "nothing there" from "there's a pending one" — otherwise an
-    // employee whose request hasn't been approved yet is told they have nothing.
-    const { data: pendingData } = await supabase
-      .from('time_off_requests')
-      .select('id')
-      .eq('company_id', contact.company_id)
-      .eq('employee_id', contact.employee_id)
-      .eq('status', 'pending')
-      .lte('start_date', date)
-      .gte('end_date', date)
-      .limit(1);
-
-    const hasPending = ((pendingData ?? []) as unknown[]).length > 0;
-    await reply(contact, message,
-      hasPending
-        ? `${textOpener(contact.name)}Your time off for ${formatDateRange(date, date)} hasn't been approved yet — ` +
-          `it's still with your manager. I've let them know you'd like to withdraw it; reach out to them directly if it's urgent.`
-        : `${textOpener(contact.name)}I don't see any approved time off for you on ${formatDateRange(date, date)}. ` +
-          `Double-check the date, or ask me "what time off do I have?" and I'll list it.`);
-    return;
-  }
-
-  await askToCancelTimeOff({ message, contact, request });
+  await askToCancelTimeOff({ message, contact, request: resolved.rows });
 }
 
 /**
@@ -2660,44 +2753,80 @@ export async function handleTimeOffCancelConfirmation(
 
   // ── YES ────────────────────────────────────────────────────────────────────
   //
-  // Re-read the row before writing. The confirmation may be an hour old, and in
+  // Re-read each row before writing. The confirmation may be an hour old, and in
   // the meantime a manager could have changed it. Cancelling something that is
-  // no longer 'approved' would be acting on a stale premise.
-  const { data: current } = await supabase
-    .from('time_off_requests')
-    .select('id, status, start_date, end_date')
-    .eq('id', pending.request_id)
-    .eq('company_id', contact.company_id)
-    .maybeSingle();
+  // no longer approved/pending would be acting on a stale premise.
+  const targets: CancelTarget[] = pending.targets?.length
+    ? pending.targets
+    : [{ id: pending.request_id, start_date: pending.start_date, end_date: pending.end_date, status: 'approved' }];
 
-  const row = current as { id: string; status: string; start_date: string; end_date: string } | null;
+  const done: CancelTarget[] = [];
+  const changed: CancelTarget[] = [];
+  const failed: CancelTarget[] = [];
+  for (const t of targets) {
+    const { data: current } = await supabase
+      .from('time_off_requests')
+      .select('id, status, start_date, end_date')
+      .eq('id', t.id)
+      .eq('company_id', contact.company_id)
+      .maybeSingle();
+    const row = current as { id: string; status: string; start_date: string; end_date: string } | null;
+    if (!row || (row.status !== 'approved' && row.status !== 'pending')) { changed.push(t); continue; }
 
-  if (!row || row.status !== 'approved') {
-    await clearPendingTimeOffCancel(contact.company_id, contact.employee_id!);
-    await reply(contact, message,
-      `Something changed with that request since I asked — it's no longer showing as approved, ` +
-      `so I haven't touched it. Ask me "what time off do I have?" for where it stands now.`);
-    return;
+    const { error: cancelErr } = await supabase
+      .from('time_off_requests')
+      .update({ status: 'cancelled', decided_at: new Date().toISOString() })
+      .eq('id', t.id)
+      .eq('company_id', contact.company_id)
+      .eq('status', row.status); // optimistic guard — never clobber a concurrent decision
+
+    if (cancelErr) {
+      // FAIL CLOSED AND SAY SO. The single most likely cause is migration 022 not
+      // having been run (check-constraint violation, 23514): the code would then
+      // ask "are you sure?", get a yes, and — without this branch — reply as if it
+      // had worked while the day stayed booked.
+      console.error(
+        `[time-off-cancel] FAILED to cancel request ${t.id} for employee ` +
+        `${contact.employee_id}: ${cancelErr.message}. ` +
+        `If this is a check-constraint violation, migration 022 has not been run.`
+      );
+      failed.push(t);
+      continue;
+    }
+
+    // Any live manager approve/deny magic links for this request now point at a
+    // cancelled row. Retire them so a manager clicking a stale email button can't
+    // resurrect it. Best-effort — a leftover token fails safe (the update is
+    // guarded on status='pending' upstream), this just avoids the confusing page.
+    await supabase
+      .from('aegis_memory')
+      .delete()
+      .eq('company_id', contact.company_id)
+      .like('source', 'decision_token:%')
+      .like('content', `%${t.id}%`);
+
+    await logActivity({
+      company_id: contact.company_id,
+      action: 'time_off_cancelled_by_employee',
+      entity_type: 'time_off_request',
+      entity_id: t.id,
+      summary: row.status === 'pending'
+        ? `${contact.name} withdrew their own pending time-off request (${formatDateRange(row.start_date, row.end_date)}).`
+        : `${contact.name} cancelled their own approved time off (${formatDateRange(row.start_date, row.end_date)}).`,
+      metadata: {
+        employee_id: contact.employee_id,
+        request_id: t.id,
+        start_date: row.start_date,
+        end_date: row.end_date,
+        previous_status: row.status,
+        channel: message.channel,
+      },
+    });
+    done.push({ ...t, status: row.status as 'approved' | 'pending' });
   }
 
-  const { error: cancelErr } = await supabase
-    .from('time_off_requests')
-    .update({ status: 'cancelled', decided_at: new Date().toISOString() })
-    .eq('id', pending.request_id)
-    .eq('company_id', contact.company_id)
-    .eq('status', 'approved'); // optimistic guard — never clobber a concurrent decision
-
-  if (cancelErr) {
-    // FAIL CLOSED AND SAY SO. The single most likely cause is migration 022 not
-    // having been run (check-constraint violation, 23514): the code would then
-    // ask "are you sure?", get a yes, and — without this branch — reply as if it
-    // had worked while the day stayed booked. Leave the pending in place so a
-    // retry after the migration still works.
-    console.error(
-      `[time-off-cancel] FAILED to cancel request ${pending.request_id} for employee ` +
-      `${contact.employee_id}: ${cancelErr.message}. ` +
-      `If this is a check-constraint violation, migration 022 has not been run.`
-    );
+  if (failed.length > 0 && done.length === 0) {
+    // Leave the pending in place so a retry after the migration still works.
     await reply(contact, message,
       `I wasn't able to cancel that just now — something went wrong on my end, so your time off on ` +
       `${pending.display_range} is still booked. Please let your manager know directly.`);
@@ -2706,75 +2835,59 @@ export async function handleTimeOffCancelConfirmation(
 
   await clearPendingTimeOffCancel(contact.company_id, contact.employee_id!);
 
-  // Any live manager approve/deny magic links for this request now point at a
-  // cancelled row. Retire them so a manager clicking a stale email button can't
-  // resurrect it. Best-effort — a leftover token fails safe (the update is
-  // guarded on status='pending' upstream), this just avoids the confusing page.
-  await supabase
-    .from('aegis_memory')
-    .delete()
-    .eq('company_id', contact.company_id)
-    .like('source', 'decision_token:%')
-    .like('content', `%${pending.request_id}%`);
+  if (done.length === 0) {
+    await reply(contact, message,
+      `Something changed with ${targets.length === 1 ? 'that request' : 'those requests'} since I asked — ` +
+      `${targets.length === 1 ? "it's" : "they're"} no longer showing as approved or pending, so I haven't touched anything. ` +
+      `Ask me "what time off do I have?" for where things stand now.`);
+    return;
+  }
 
-  await logActivity({
-    company_id: contact.company_id,
-    action: 'time_off_cancelled_by_employee',
-    entity_type: 'time_off_request',
-    entity_id: pending.request_id,
-    summary: `${contact.name} cancelled their own approved time off (${pending.display_range}).`,
-    metadata: {
-      employee_id: contact.employee_id,
-      request_id: pending.request_id,
-      start_date: row.start_date,
-      end_date: row.end_date,
-      channel: message.channel,
-    },
-  });
-
+  const doneText = joinNatural(done.map(describeCancelTarget));
+  const backOn = done.some(d => d.status === 'approved') ? ` and you're back on the schedule for those days` : '';
+  const leftover = [...changed, ...failed];
+  const leftoverNote = leftover.length > 0
+    ? ` I couldn't touch ${joinNatural(leftover.map(describeCancelTarget))} — ask me "what time off do I have?" to see where ${leftover.length === 1 ? 'it stands' : 'they stand'}.`
+    : '';
   await reply(contact, message,
-    `Done — your time off on ${pending.display_range} is cancelled and you're back on the schedule for those days. ` +
-    `I've let your manager know.`);
+    `Done — ${doneText} ${done.length === 1 ? 'is' : 'are'} cancelled${backOn}. I've let your manager know.${leftoverNote}`);
 
-  await notifyManagersOfTimeOffCancellation(contact, pending.display_range, row.start_date, row.end_date);
+  await notifyManagersOfTimeOffCancellation(contact, done);
 }
 
 /**
- * Manager FYI. Email only, deliberately: managers have no phone in the data
- * model (DRIFT_REGISTER §J N-BUG — getManagerSmsChannel returns the AEGIS number,
- * not a manager's), so an SMS attempt here would text Aegis's own line. Failure
- * is swallowed: the employee's cancellation has already succeeded and must not
- * be reported as failed because a notice bounced.
+ * Manager FYI — one notice through the shared resolver (text first, threaded
+ * email fallback, revoked logins excluded). This closes OPEN_ITEMS #2's last
+ * bespoke email. Failure is swallowed: the employee's cancellation has already
+ * succeeded and must not be reported as failed because a notice bounced.
  */
 async function notifyManagersOfTimeOffCancellation(
   contact: VerifiedContact,
-  displayRange: string,
-  startDate: string,
-  endDate: string,
+  done: CancelTarget[],
 ): Promise<void> {
   try {
-    const { data } = await supabase
-      .from('users')
-      .select('email, name')
-      .eq('company_id', contact.company_id)
-      .in('role', ['owner', 'manager']);
-
-    const managers = (data ?? []) as Array<{ email: string | null; name: string | null }>;
-    for (const m of managers) {
-      if (!m.email) continue;
-      await sendEmail({
-        to: m.email,
-        subject: `${contact.name} cancelled their approved time off — ${displayRange}`,
-        text:
-          `${greeting(m.name ?? '')}${contact.name} cancelled their own approved time off for ${displayRange} ` +
-          `(${startDate} to ${endDate}).\n\n` +
-          `They're available for those days again, so the schedule builder will include them from now on. ` +
-          `Any already-published schedule for that week is unchanged — take a look if you need them covering a shift.\n\n` +
-          `No action is needed unless you want to adjust the schedule.`,
-        company_id: contact.company_id,
-      });
-    }
+    const approved = done.filter(d => d.status === 'approved');
+    const pendingOnes = done.filter(d => d.status === 'pending');
+    const what = [
+      approved.length ? `cancelled their approved time off for ${joinNatural(approved.map(d => formatDateRange(d.start_date, d.end_date)))}` : '',
+      pendingOnes.length ? `withdrew their pending request for ${joinNatural(pendingOnes.map(d => formatDateRange(d.start_date, d.end_date)))}` : '',
+    ].filter(Boolean).join(' and ');
+    const summary = `${contact.name} ${what}`;
+    await sendManagerResolutionNotice({
+      companyId: contact.company_id,
+      decidedByUserId: null,
+      decidedByName: contact.name,
+      summary,
+      subject: `${summary}`,
+      body:
+        `${summary}.\n\n` +
+        (approved.length
+          ? `They're available for those days again, so the schedule builder will include them from now on. ` +
+            `Any already-published schedule for that week is unchanged — take a look if you need them covering a shift.\n\n`
+          : '') +
+        `No action is needed unless you want to adjust the schedule.`,
+    });
   } catch (err) {
-    console.error('[time-off-cancel] manager notification failed (cancellation itself succeeded):', err);
+    console.error('[time-off-cancel] manager notice failed (non-fatal):', err);
   }
 }

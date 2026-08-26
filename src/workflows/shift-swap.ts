@@ -1664,6 +1664,23 @@ export function avoidCohabPartnerName(
 
 // ── Swap validation ───────────────────────────────────────────────────────────
 
+// W-1 branch 4 (J-5): validateSwap phrases its reason about "the receiver" in
+// the third person. When the receiver IS the person we're talking to, that read
+// "Mya Vanderzwaag has approved time off on that date" — to Mya. Rewrite the
+// subject to "you" for that one case; every other reader keeps the name.
+export function reasonAddressedToYou(reason: string, selfName: string): string {
+  const name = (selfName || '').trim();
+  if (!name) return reason;
+  const esc = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return reason
+    .replace(new RegExp(`^${esc} has approved time off on that date\\.`), 'you have approved time off that day.')
+    .replace(new RegExp(`^${esc} has `), 'you have ')
+    .replace(new RegExp(`^${esc} is `), "you're ")
+    .replace(new RegExp(`^${esc} would `), 'you would ')
+    .replace(new RegExp(`^${esc}'s `), 'your ')
+    .replace(/\btheir maximum weekly hours\b/, 'your maximum weekly hours');
+}
+
 async function validateSwap(params: {
   company_id: string;
   requester_id: string;
@@ -2708,7 +2725,7 @@ export async function handleInitiateSwap(
       }
 
       await reply(contact, message,
-        `This swap can't proceed — you wouldn't be able to take ${targetEmployee.name}'s ${targetShift.shift_name} shift: ${youTakeTheirs.reason} Want to try a different shift or coworker?`);
+        `This swap can't proceed — you wouldn't be able to take ${targetEmployee.name}'s ${targetShift.shift_name} shift: ${reasonAddressedToYou(youTakeTheirs.reason ?? '', contact.name)} Want to try a different shift or coworker?`);
       await logActivity({ company_id: contact.company_id, action: 'swap_validation_failed',
         summary: `${contact.name}'s trade with ${targetEmployee.name} failed (requester taking target's shift): ${youTakeTheirs.reason}`,
         metadata: { requester_id: contact.employee_id, receiver_id: targetEmployee.id, target_shift_date: targetShift.date, reason: youTakeTheirs.reason } });

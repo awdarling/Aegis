@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { managerStillActive } from '../security/manager-active';
 import { supabase } from '../db/client';
 import { logActivity } from '../logger/activity-log';
 import { getAegisSmsChannel, notifyEmployeeSmsFirst } from '../messaging/notify';
@@ -73,6 +74,10 @@ export async function processDepartureDecision(params: {
   }
   if (payload.departure_id !== departureId) {
     return { status: 400, html: errorPage('This link does not match the request. Please use the buttons from your Aegis email.') };
+  }
+  // S-3 (actor half): a revoked manager's link is dead.
+  if (!(await managerStillActive(payload.manager_user_id))) {
+    return { status: 403, html: errorPage('This link belongs to a login that no longer has manager access. Please ask a current manager to handle this in Homebase.') };
   }
 
   const companyId = payload.company_id;

@@ -36,6 +36,7 @@ vi.mock('../../db/client', () => ({
         select() { return builder; },
         eq(col: string, val: unknown) { filters[col] = val; return builder; },
         or(str: string) { filters._or = str; return builder; },
+        is(col: string, val: unknown) { filters[`is:${col}`] = val; return builder; },
         maybeSingle() {
           if (table === 'company_channels') return Promise.resolve(h.channelResponder(filters));
           if (table === 'employees') return Promise.resolve(h.empResponder(filters));
@@ -139,5 +140,34 @@ describe('verifySender — no cross-tenant routing (B1/D4)', () => {
       expect(result.contact.employee_id).toBe('emp-b');
     }
     expect(h.securityInserts).toHaveLength(0);
+  });
+});
+
+describe('verifySender — revoked manager logins (S-3 actor half, 2026-08-24)', () => {
+  const channel = (f: Record<string, unknown>) =>
+    f.channel_value === 'aegis@b.quriasolutions.com'
+      ? { data: { company_id: TENANT_B }, error: null }
+      : { data: null, error: null };
+
+  it('the users lookup carries the revocation filter, so a revoked inbox is not a manager', async () => {
+    h.channelResponder = channel;
+    h.empResponder = () => ({ data: null, error: null });
+    // Simulate the database honouring `.is('access_revoked_at', null)`: the
+    // revoked row is not returned. Assert the filter is actually on the query.
+    h.userResponder = (f) => {
+      expect(f['is:access_revoked_at']).toBeNull();
+      return { data: null, error: null };
+    };
+    const result = await verifySender(inbound('aegis@b.quriasolutions.com', 'revoked.manager@club.test'));
+    expect(result.ok).toBe(false);
+  });
+
+  it('a live manager login still verifies as a manager', async () => {
+    h.channelResponder = channel;
+    h.empResponder = () => ({ data: null, error: null });
+    h.userResponder = () => ({ data: { id: 'u-1', name: 'Live Manager', email: 'live@club.test', company_id: TENANT_B }, error: null });
+    const result = await verifySender(inbound('aegis@b.quriasolutions.com', 'live@club.test'));
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.contact.role).toBe('manager');
   });
 });

@@ -71,6 +71,9 @@ function tokenRow(over: Record<string, unknown> = {}) {
 beforeEach(() => {
   h.recorded.length = 0;
   for (const k of Object.keys(h.config)) delete h.config[k];
+  // S-3 (actor half): the minting manager is looked up at click time. Default
+  // to a live login so the existing branches still run.
+  h.config['users:select'] = { id: 'mgr-1', access_revoked_at: null };
   h.logActivity.mockClear();
   h.notifyEmployeeSmsFirst.mockClear();
   h.config['employees:select'] = { contact_phone: '+16163280114', contact_email: 'sam@wm.com' };
@@ -129,6 +132,23 @@ describe('processDepartureDecision — acknowledge', () => {
     expect(h.recorded.some(x => x.table === 'employees' && x.op === 'update')).toBe(false);
     expect(h.logActivity.mock.calls[0][0].action).toBe('departure_acknowledged');
     expect(h.notifyEmployeeSmsFirst).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('processDepartureDecision — revoked manager (S-3 actor half)', () => {
+  it('refuses the link when the minting manager has been revoked, and writes nothing', async () => {
+    h.config['aegis_memory:select'] = tokenRow();
+    h.config['users:select'] = { id: 'mgr-1', access_revoked_at: '2026-06-18T00:00:00Z' };
+    const r = await processDepartureDecision({ action: 'acknowledge', departureId: 'dep-1', token: 't' });
+    expect(r.status).toBe(403);
+    expect(h.recorded.filter((x) => x.table === 'employees' && x.op === 'update')).toHaveLength(0);
+    expect(h.notifyEmployeeSmsFirst).not.toHaveBeenCalled();
+  });
+  it('refuses when the manager login no longer exists (fail closed)', async () => {
+    h.config['aegis_memory:select'] = tokenRow();
+    h.config['users:select'] = null;
+    const r = await processDepartureDecision({ action: 'followup', departureId: 'dep-1', token: 't' });
+    expect(r.status).toBe(403);
   });
 });
 

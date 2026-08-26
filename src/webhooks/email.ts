@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { authenticateInboundEmail } from '../security/email-alignment';
 import multer from 'multer';
 import { captureRawBody } from '../middleware/capture-raw-body';
 import { verifySendGridRequest } from '../middleware/verify-signature';
@@ -57,24 +58,34 @@ emailWebhook.post(
       return;
     }
 
-    // SPF/DKIM gate — From: is trivially spoofable without this.
-    // Policy: accept if EITHER SPF or DKIM passes (handles forwarded mail
-    // where one verdict fails). SendGrid Inbound Parse sets these fields.
+    // Sender authentication with alignment (N-1, 2026-08-24). From: is whatever
+    // the sender typed; SPF vouches for the envelope domain and DKIM for the
+    // signing domain. One of those MUST be the From: domain, or anyone with
+    // their own mail domain could write "From: <a manager's address>" and act
+    // as that manager. See src/security/email-alignment.ts.
     const spf = (body['SPF'] ?? '').trim().toLowerCase();
     const dkimRaw = (body['dkim'] ?? '').trim();
-    const dkimPassed = dkimRaw.includes(': pass}') || dkimRaw.includes(' pass');
+    const verdict = authenticateInboundEmail({
+      fromHeader: senderRaw,
+      spf,
+      dkim: dkimRaw,
+      envelope: body['envelope'] ?? '',
+    });
 
-    if (spf !== 'pass' && !dkimPassed) {
-      console.log('[email-auth] rejecting unauthenticated email', {
+    if (!verdict.authenticated) {
+      console.log('[email-auth] rejecting email — sender not authenticated for its From: domain', {
         sender,
         recipient: recipientAddress,
+        reason: verdict.reason,
+        fromDomain: verdict.fromDomain,
+        envelopeDomain: verdict.envelopeDomain,
+        dkimPassDomains: verdict.dkimPassDomains,
         spf,
-        dkim: dkimRaw,
       });
       return;
     }
 
-    console.log('[email-auth] authenticated', { sender, spf, dkim: dkimRaw });
+    console.log('[email-auth] authenticated', { sender, via: verdict.reason, spf, dkim: dkimRaw });
 
     const message: InboundMessage = {
       sender,

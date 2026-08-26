@@ -12,7 +12,8 @@ export type CapabilityRole = 'employee' | 'manager' | 'quria_admin';
 // What anyone can ask Aegis for, about their own work life. Managers get these
 // too — they're also employees of the club.
 const EMPLOYEE_ACTIONS = [
-  'Request time off, or check where a request stands',
+  'Request time off, check where a request stands, or cancel one — approved or still waiting',
+  "Call in sick — just say you can't make your shift and I'll log it and tell your manager",
   'Check your current availability, or change it — including just until a date, or on a repeating schedule',
   'Ask about your own shifts',
   'Swap a shift with a coworker, or accept/decline a swap someone asks you about',
@@ -36,7 +37,7 @@ const QURIA_ACTIONS = [
 // Short inline phrases for the out-of-scope redirect ("happy to help with X, Y,
 // Z"). Kept terse on purpose — the full sentences above are too long for a list
 // inside a sentence.
-const EMPLOYEE_SHORT = ['time off', 'your availability', 'your shifts', 'shift swaps'];
+const EMPLOYEE_SHORT = ['time off (or cancelling it)', 'sick calls', 'your availability', 'your shifts', 'shift swaps'];
 
 function firstNameOf(name?: string | null): string {
   const n = (name ?? '').trim().split(/\s+/)[0];

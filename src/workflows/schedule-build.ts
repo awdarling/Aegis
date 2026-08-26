@@ -148,6 +148,26 @@ export type FlaggedIssue =
       };
     }
   | {
+      // W-1 branch 3 (J-1d): an active, schedulable employee ended the build with
+      // ZERO shifts. Mia Shaffer, week of Aug 17: two approved partial time-offs
+      // plus a 09:00–12:00 availability override left nothing she could work,
+      // every step was "approved", and no screen said so. The reason comes from
+      // the SAME eligibility chain the builder used (buildEligibility) — never a
+      // re-implementation (DRIFT_REGISTER [GAPREASON-DUP]).
+      type: 'zero_shifts';
+      date: string; // week start
+      description: string;
+      metadata: {
+        employee_id: string;
+        employee_name: string;
+        // How many canvas slots each reason removed them from, in engine words.
+        reasons: Record<string, number>;
+        availability: string; // human summary of the availability the engine saw
+        time_off: string;     // human summary of the approved time off the engine saw
+        eligible_slots: number; // slots they were eligible for but not chosen
+      };
+    }
+  | {
       // Universal safety invariant (any shift, any client): one person cannot
       // hold two time-overlapping assignments on the same day. Raised by the
       // build-level backstop in distributeScheduleCore as a final guard.
@@ -1316,6 +1336,9 @@ function buildScheduleForWeek(ctx: BuildContext): BuildResult {
     ).length;
   }
 
+  // W-1 branch 3 (J-1d): flag every active employee who ended with 0 shifts.
+  weekState.flagged_issues.push(...computeZeroShiftFlags(canvas, weekState.assignments, data, veteranOnlyDates, weekDates));
+
   return {
     assignments: weekState.assignments,
     gaps: weekState.gaps,
@@ -1324,6 +1347,132 @@ function buildScheduleForWeek(ctx: BuildContext): BuildResult {
     totalRequired,
     totalFilled,
   };
+}
+
+// ── Zero-shift flags (W-1 branch 3, J-1d) ─────────────────────────────────────
+//
+// For each active employee still on the roster this week who received NO
+// assignment, re-ask the engine's own gate — buildEligibility, the exact function
+// the fill loop called for every slot — and count why each slot excluded them.
+// The manager gets one line: who, 0 shifts, the reasons in engine words, and the
+// availability + time off the engine actually saw, so "she said she wanted AM
+// shifts" can be checked against "her override says 9–12" at a glance.
+// Pure; exported for tests.
+
+const DAY_ABBR = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+function hhmm(t: string): string {
+  return (t ?? '').slice(0, 5);
+}
+
+// "Mon–Fri 09:00–12:00; Sat–Sun 09:00–15:30" from availability rows (groups
+// consecutive days that share a window). Empty → "none on file".
+export function summarizeAvailabilityWindows(rows: Availability[]): string {
+  if (!rows || rows.length === 0) return 'none on file';
+  const byDay = new Map<number, string[]>();
+  for (const r of rows) {
+    const list = byDay.get(r.day_of_week) ?? [];
+    list.push(`${hhmm(r.start_time)}–${hhmm(r.end_time)}`);
+    byDay.set(r.day_of_week, list);
+  }
+  const parts: string[] = [];
+  let run: number[] = [];
+  let runKey = '';
+  const flush = () => {
+    if (run.length === 0) return;
+    const label = run.length === 1 ? DAY_ABBR[run[0]] : `${DAY_ABBR[run[0]]}–${DAY_ABBR[run[run.length - 1]]}`;
+    parts.push(`${label} ${runKey}`);
+    run = []; runKey = '';
+  };
+  for (let d = 0; d <= 6; d++) {
+    const key = (byDay.get(d) ?? []).sort().join(', ');
+    if (!key) { flush(); continue; }
+    if (run.length > 0 && key === runKey && run[run.length - 1] === d - 1) { run.push(d); continue; }
+    flush(); run = [d]; runKey = key;
+  }
+  flush();
+  return parts.join('; ');
+}
+
+// "Aug 17–21 09:00–13:00 and 15:00–21:00; Aug 23 (all day)" from the TO map.
+export function summarizeTimeOffWindows(employeeId: string, toMap: Map<string, TOWindow>, weekDates: string[]): string {
+  const days: Array<{ date: string; key: string }> = [];
+  for (const date of weekDates) {
+    const w = toMap.get(`${employeeId}:${date}`);
+    if (!w) continue;
+    const key = w.type === 'full_day'
+      ? 'all day'
+      : w.blockedWindows.map(b => `${hhmm(b.start)}–${hhmm(b.end)}`).sort().join(' and ');
+    days.push({ date, key });
+  }
+  if (days.length === 0) return 'none';
+  const parts: string[] = [];
+  let i = 0;
+  while (i < days.length) {
+    let j = i;
+    while (j + 1 < days.length && days[j + 1].key === days[i].key && addDaysISO(days[j].date, 1) === days[j + 1].date) j++;
+    const label = i === j ? formatShortDate(days[i].date) : `${formatShortDate(days[i].date)}–${formatShortDate(days[j].date).replace(/^[A-Za-z]+ /, '')}`;
+    parts.push(days[i].key === 'all day' ? `${label} (all day)` : `${label} ${days[i].key}`);
+    i = j + 1;
+  }
+  return parts.join('; ');
+}
+
+export function computeZeroShiftFlags(
+  canvas: CanvasSlot[],
+  assignments: ScheduleAssignment[],
+  data: Pick<BuildData, 'employees' | 'availByEmp' | 'toMap'>,
+  veteranOnlyDates: VeteranOnlyRange[],
+  weekDates: string[],
+): FlaggedIssue[] {
+  const assigned = new Set(assignments.map(a => a.employee_id));
+  const weekStart = weekDates[0] ?? '';
+  const out: FlaggedIssue[] = [];
+  if (canvas.length === 0) return out;
+
+  for (const emp of data.employees) {
+    if (!emp.active || assigned.has(emp.id)) continue;
+    // Someone past their last day for the WHOLE week is not "unscheduled" —
+    // they're gone. (A mid-week departure is still flagged with that reason.)
+    if (weekDates.every(d => isPastLastDay(emp, d))) continue;
+
+    const reasons: Record<string, number> = {};
+    let eligibleSlots = 0;
+    for (const slot of canvas) {
+      const pool = buildEligibility(slot, [emp], data.availByEmp, data.toMap, veteranOnlyDates);
+      const why = pool.removed_reasons.get(emp.id);
+      if (why) reasons[why] = (reasons[why] ?? 0) + 1;
+      else eligibleSlots++;
+    }
+
+    const availability = summarizeAvailabilityWindows(data.availByEmp.get(emp.id) ?? []);
+    const time_off = summarizeTimeOffWindows(emp.id, data.toMap, weekDates);
+
+    const reasonBits = Object.entries(reasons)
+      .sort((a, b) => b[1] - a[1])
+      .map(([why, n]) => `${why} (${n} slot${n === 1 ? '' : 's'})`);
+    const cause = eligibleSlots > 0 && reasonBits.length === 0
+      ? `eligible for ${eligibleSlots} slot${eligibleSlots === 1 ? '' : 's'} but never chosen (others ranked ahead)`
+      : eligibleSlots > 0
+        ? `${reasonBits.join(', ')}; eligible for ${eligibleSlots} but not chosen`
+        : reasonBits.join(', ');
+
+    const detail: string[] = [];
+    if (reasons['unavailable on this day/time']) detail.push(`availability ${availability}`);
+    // Time off is worth seeing whenever there is any — availability is checked
+    // first by the engine, so TO rarely shows up as THE reason even when it's
+    // half the story (Mia had both).
+    if (time_off !== 'none') detail.push(`time off ${time_off}`);
+    const description = `${emp.name}: 0 shifts — ${cause}${detail.length ? `. ${detail.join('; ')}` : ''}.`;
+
+    out.push({
+      type: 'zero_shifts',
+      date: weekStart,
+      description,
+      metadata: { employee_id: emp.id, employee_name: emp.name, reasons, availability, time_off, eligible_slots: eligibleSlots },
+    });
+  }
+  return out;
 }
 
 // ── Public engine entry point ─────────────────────────────────────────────────
@@ -1393,14 +1542,15 @@ export function runScheduleBuild(
 
 // ── Staffing report ───────────────────────────────────────────────────────────
 
-function buildStaffingReport(
+export function buildStaffingReport(
   assignments: ScheduleAssignment[],
   gaps: ScheduleGap[],
   totalRequired: number,
   totalFilled: number,
   employees: Employee[],
   specialNotes: Event[],
-  closedDates: ClosedDate[]
+  closedDates: ClosedDate[],
+  flaggedIssues: FlaggedIssue[] = [],
 ): Record<string, unknown> {
   const coverage_rate = totalRequired > 0 ? Math.round((totalFilled / totalRequired) * 1000) / 10 : 100;
 
@@ -1436,6 +1586,11 @@ function buildStaffingReport(
     .filter(n => n.staffing_notes)
     .map(n => n.title);
 
+  const zeroShift = flaggedIssues.filter((f): f is Extract<FlaggedIssue, { type: 'zero_shifts' }> => f.type === 'zero_shifts');
+  const notes: string[] = [];
+  if (overtime_risk.length > 0) notes.push(`${overtime_risk.length} employee(s) are near or at maximum weekly hours.`);
+  if (zeroShift.length > 0) notes.push(...zeroShift.map(f => f.description));
+
   return {
     coverage_rate,
     top_contributors,
@@ -1443,9 +1598,9 @@ function buildStaffingReport(
     gap_summary,
     special_notes_applied,
     closed_dates: closedDates,
-    aegis_notes: overtime_risk.length > 0
-      ? `${overtime_risk.length} employee(s) are near or at maximum weekly hours.`
-      : '',
+    // W-1 branch 3: active people who got no shifts, with the engine's reason.
+    zero_shift_employees: zeroShift.map(f => ({ employee_id: f.metadata.employee_id, name: f.metadata.employee_name, description: f.description })),
+    aegis_notes: notes.join(' '),
   };
 }
 
@@ -1461,7 +1616,8 @@ async function buildManagerSummary(
   specialNotes: Event[],
   _companyName: string,
   estimatedWages: { total_estimated: number; missing_wages?: Array<{ name: string }> },
-  closedDates: ClosedDate[]
+  closedDates: ClosedDate[],
+  flaggedIssues: FlaggedIssue[] = [],
 ): Promise<string> {
   const coverageRate = totalRequired > 0 ? Math.round((totalFilled / totalRequired) * 1000) / 10 : 100;
   const weekLabel = `${formatShortDate(weekStart)}–${formatShortDate(weekEnd)}`;
@@ -1492,6 +1648,14 @@ async function buildManagerSummary(
 
   if (top3.length > 0) {
     lines.push(`Top contributors: ${top3.map(e => `${e.name} (${e.hours}h)`).join(', ')}`);
+  }
+
+  // W-1 branch 3 (J-1d): who got nothing, and why — in the same notice, so the
+  // manager sees it before approving.
+  const zeroShift = flaggedIssues.filter(f => f.type === 'zero_shifts');
+  if (zeroShift.length > 0) {
+    lines.push(`No shifts for ${zeroShift.length} active employee${zeroShift.length === 1 ? '' : 's'}:`);
+    for (const f of zeroShift) lines.push(`  • ${f.description}`);
   }
 
   lines.push(`Estimated labor: $${estimatedWages.total_estimated.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`);
@@ -1673,7 +1837,7 @@ export async function buildScheduleAndSave(
   const wages = await computeWageEstimate(companyId, assignments);
 
   const staffingReport = {
-    ...buildStaffingReport(assignments, gaps, totalRequired, totalFilled, data.employees, specialNotes, closed_dates),
+    ...buildStaffingReport(assignments, gaps, totalRequired, totalFilled, data.employees, specialNotes, closed_dates, flagged_issues),
     estimated_wages: wages,
     engine_version: ENGINE_VERSION,
   };
@@ -1862,7 +2026,7 @@ export async function handleBuildSchedule(
 
   const summaryMsg = await buildManagerSummary(
     weekStart, weekEnd, assignments, gaps, totalFilled, totalRequired,
-    specialNotes, companyName, wages, closed_dates
+    specialNotes, companyName, wages, closed_dates, flagged_issues
   );
 
   await reply(contact, message, summaryMsg);

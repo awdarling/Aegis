@@ -249,6 +249,9 @@ function flaggedIssueSubLabel(issue: FlaggedIssue): string {
   if (issue.type === 'double_booking') {
     return `${issue.metadata.employee_name} (double-booked)`;
   }
+  if (issue.type === 'zero_shifts') {
+    return `${issue.metadata.employee_name} (no shifts this week)`;
+  }
   return issue.shift_name;
 }
 

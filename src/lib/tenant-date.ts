@@ -29,3 +29,14 @@ export async function tenantToday(companyId: string): Promise<string> {
   const tz = (data as { timezone?: string | null } | null)?.timezone || DEFAULT_TENANT_TIMEZONE;
   return todayInTimezone(tz);
 }
+
+/** Both at once, for callers that also need the zone (e.g. to localise a timestamp). */
+export async function tenantTodayAndZone(companyId: string): Promise<{ today: string; timezone: string }> {
+  const { data } = await supabase
+    .from('companies')
+    .select('timezone')
+    .eq('id', companyId)
+    .maybeSingle();
+  const timezone = (data as { timezone?: string | null } | null)?.timezone || DEFAULT_TENANT_TIMEZONE;
+  return { today: todayInTimezone(timezone), timezone };
+}

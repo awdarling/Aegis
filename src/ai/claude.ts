@@ -145,7 +145,10 @@ export async function classifyIntent(
 
   return applyManagerCoverageBackstop(
     applyDepartureBackstop(
-      applyBareTimeOffBackstop(applyAvailabilityBackstop(parsed, message), message),
+      applyCancelTimeOffBackstop(
+        applyBareTimeOffBackstop(applyAvailabilityBackstop(parsed, message), message),
+        message
+      ),
       message
     ),
     message,
@@ -282,6 +285,36 @@ export function applyBareTimeOffBackstop(result: ClassifyResult, message: string
     intent: 'submit_time_off',
     confidence: result.confidence === 'low' ? 'medium' : result.confidence,
     extracted: {},
+  };
+}
+
+// W-1 branch 4 (J-5, C-6): cancel/undo language about an EXISTING time-off
+// request must reach the cancel workflow, never the free-form answer (which can
+// only describe, and used to promise "I'll pull it back right away" with no
+// workflow behind it). Deterministic; fires only from the general buckets, so a
+// confident specific intent is never overridden. Requires BOTH a cancel verb and
+// a time-off referent so "cancel that" mid-flow (case (a) above) stays put.
+export function looksLikeTimeOffCancel(body: string): boolean {
+  const t = (body || '').toLowerCase();
+  const verb = /\b(cancel|pull(?:ed)? back|rescind|undo|withdraw|retract|scrap|take back|remove|delete|drop)\b/.test(t);
+  if (!verb) return false;
+  const referent = /\b(time[ -]?off|day off|days off|vacation|pto|request(?:s)?|the pending one|all of them|approved one|that one)\b/.test(t);
+  return referent;
+}
+
+export function applyCancelTimeOffBackstop(result: ClassifyResult, message: string): ClassifyResult {
+  if (
+    result.intent !== 'general_question' &&
+    result.intent !== 'operational_query' &&
+    result.intent !== 'unknown'
+  ) {
+    return result;
+  }
+  if (!looksLikeTimeOffCancel(message)) return result;
+  return {
+    intent: 'cancel_time_off',
+    confidence: result.confidence === 'low' ? 'medium' : result.confidence,
+    extracted: { date: null },
   };
 }
 
@@ -610,6 +643,14 @@ requesting. There are TWO backing-out cases and they are NOT the same:
 The tell is whether the message points at a SPECIFIC existing day off. A date, a named day,
 "my vacation", "my day off" → (b) cancel_time_off. A bare retraction with nothing to point
 at → (a) general_question.
+
+ALSO (b): any message asking to CANCEL / PULL BACK / RESCIND / UNDO / WITHDRAW / SCRAP / TAKE
+BACK a time-off request that already exists — approved OR still pending — including by
+reference rather than by date: "cancel the pending one", "undo all of my requests for
+today", "withdraw that one", "you said you would pull back the approved time off for Aug 21".
+Classify cancel_time_off; extract the date when one is named, else date null. The workflow
+resolves "the pending one" / "all of them" / "today" itself. Never general_question for these —
+the free-form answer cannot act, and it must not promise to.
 
 ## Off-topic / unrelated messages → general_question
 

@@ -189,7 +189,7 @@ describe('L3 · handleCancelTimeOff asks before it acts', () => {
     h.reads['time_off_requests'] = [APPROVED_ROW];
     await handleCancelTimeOff(msg('cancel my time off Aug 1'), contact, { date: '2026-08-01' });
 
-    expect(lastReply()).toMatch(/Reply YES/);
+    expect(lastReply()).toMatch(/say yes/i);
     expect(lastReply()).not.toMatch(/reply CANCEL|reply STOP|reply END|reply QUIT/i);
   });
 
@@ -213,7 +213,8 @@ describe('L3 · handleCancelTimeOff asks before it acts', () => {
     h.reads['time_off_requests'] = [];
     await handleCancelTimeOff(msg('cancel my time off Aug 1'), contact, { date: '2026-08-01' });
 
-    expect(lastReply()).toMatch(/don't see any approved time off/i);
+    // W-1 branch 4: with nothing approved AND nothing pending, say exactly that.
+    expect(lastReply()).toMatch(/don't have any time off coming up to cancel/i);
     expect(h.writes.some(w => w.table === 'aegis_memory' && w.op === 'insert')).toBe(false);
   });
 
@@ -356,7 +357,7 @@ describe('L3 · askToCancelTimeOff is the single confirmation voice (Rule 0b)', 
 
     expect(lastReply()).toMatch(/because you have approved time off/i);
     expect(lastReply()).toMatch(/are you sure/i);
-    expect(lastReply()).toMatch(/Reply YES/);
+    expect(lastReply()).toMatch(/say yes/i);
     expect(lastReply()).not.toMatch(/reply CANCEL/i);
     // Still only an offer.
     expect(timeOffUpdates()).toHaveLength(0);

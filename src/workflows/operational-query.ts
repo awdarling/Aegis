@@ -674,16 +674,29 @@ export function buildOperationalAnswerSystem(
         `The staffing summary below already gives you exact per-day headcounts and who was on by role — treat those counts as authoritative and answer with them directly. ` +
         `When someone asks about a specific SHIFT rather than the whole day ("who's on the PM shift Monday", "who's working Twilight on Saturday"), scope your answer to just that shift: each person in the summary is tagged with their shift name and start–end time, so match the shift they named — by the tenant's shift name, or by AM/PM read from the times shown — and list only the people on it.`;
 
+  // W-1 branch 4 (J-5): this path ANSWERS. It has no hands. It told Mya "I'll
+  // pull back the approved time-off request for Aug 21 right away" and then
+  // "just confirm and I'll get it handled" — with nothing behind either. The
+  // free-form reply may describe and route; it may never promise a state change.
+  const noPromiseGuard =
+    `You are answering a question. You cannot take ANY action from this reply — you cannot cancel, withdraw, submit, change, approve, swap, ` +
+    `or "get it handled", and nothing the person says next will make this reply act. NEVER say you will do something, have done something, ` +
+    `or that you're "on it" / "taking care of it" / "will get it handled" / "just confirm and I'll…". ` +
+    `If they want something changed, tell them plainly what to send as its own message so the right workflow picks it up — ` +
+    `for example: to cancel time off, text "cancel my time off on Aug 21"; to request time off, "I need Aug 21 off"; to change availability, "going forward I can work …"; ` +
+    `to swap a shift, "can anyone take my Saturday shift?".`;
+
   // Order matters: personality (voice) → date → GROUNDING → SCOPE → role data
-  // scope → no-leak. Grounding and scope come before the role scope so the model
-  // reads "here's how the system works and what's off-limits" before it decides
-  // how to answer.
+  // scope → no-leak → no-promise. Grounding and scope come before the role scope
+  // so the model reads "here's how the system works and what's off-limits"
+  // before it decides how to answer.
   return [
     personality,
     `Today is ${today}.`,
     aegisSystemFacts(role),
     aegisScopeGuard(role),
     `${roleScope} Be direct and specific. ${noLeakGuard}`,
+    noPromiseGuard,
   ].join('\n\n');
 }
 

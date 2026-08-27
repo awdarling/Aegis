@@ -89,5 +89,39 @@ export async function runDailySweep(): Promise<number> {
   }
 
   console.log(`[offboarding-scheduler] deactivated ${flipped} employee(s)`);
+
+  // W-1 / C-1 (c): housekeeping ride-along — switch off availability overrides
+  // that ended a while ago, so no reader can trip over a dead `active = true` row
+  // again. Never affects a schedule (the builder already ignores expired rows).
+  try {
+    await retireExpiredOverrides();
+  } catch (err) {
+    console.error('[offboarding-scheduler] retireExpiredOverrides failed:', err);
+  }
+
   return flipped;
+}
+
+// Marks date-limited custom_availability rows inactive once their end_date is
+// safely in the past. "Safely" = at least TWO days before the server's UTC date,
+// so that no tenant timezone (UTC-12 … UTC+14) can see an override switched off
+// while its last day is still running locally. The conversational readers use
+// isOverrideCurrent() with the tenant-local date for the precise answer; this is
+// only the broom. Idempotent; returns the number of rows flipped.
+export async function retireExpiredOverrides(): Promise<number> {
+  const cutoff = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const { data, error } = await supabase
+    .from('custom_availability')
+    .update({ active: false })
+    .eq('active', true)
+    .not('end_date', 'is', null)
+    .lt('end_date', cutoff)
+    .select('id');
+  if (error) {
+    console.error('[offboarding-scheduler] failed to retire expired overrides:', error.message);
+    return 0;
+  }
+  const n = (data ?? []).length;
+  if (n > 0) console.log(`[offboarding-scheduler] retired ${n} expired availability override(s) (end_date < ${cutoff})`);
+  return n;
 }

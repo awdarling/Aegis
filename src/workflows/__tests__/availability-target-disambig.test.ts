@@ -31,7 +31,9 @@ function makeBuilder(table: string) {
     then(onF: (v: { data: unknown; error: null }) => unknown, onR?: (e: unknown) => unknown) {
       let data: unknown = null;
       if (table === 'availability') data = h.hasNormal ? [{ day_of_week: 1 }] : [];
-      else if (table === 'custom_availability') data = h.hasOverride ? [{ end_date: '2026-08-31' }] : [];
+      // W-1: the gate now checks end_date against today, so the fixture must be a
+      // CURRENT override (far future) — an expired one is correctly ignored.
+      else if (table === 'custom_availability') data = h.hasOverride ? [{ end_date: '2099-12-31', active: true }] : [];
       return Promise.resolve({ data, error: null }).then(onF, onR);
     },
   };

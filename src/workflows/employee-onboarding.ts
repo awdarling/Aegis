@@ -47,6 +47,8 @@ import {
 } from './availability-change-requests';
 import type { InboundMessage, VerifiedContact } from '../security/types';
 import type { Employee, PartialDayDetail } from '../db/types';
+import { isOverrideCurrent, pickCurrentOverride } from '../lib/custom-availability';
+import { tenantToday } from '../lib/tenant-date';
 
 const client = new Anthropic({ apiKey: env.ANTHROPIC_API_KEY });
 const MODEL = 'claude-sonnet-4-6';
@@ -777,23 +779,32 @@ export async function handleMyAvailabilityQuery(
     return;
   }
 
-  const [{ data: availRows }, { data: customRows }] = await Promise.all([
+  const [{ data: availRows }, { data: customRows }, today] = await Promise.all([
     supabase.from('availability')
       .select('day_of_week, start_time, end_time')
       .eq('employee_id', contact.employee_id)
       .eq('company_id', contact.company_id),
     supabase.from('custom_availability')
-      .select('type, end_date, cycle_weeks, patterns, active')
+      .select('type, end_date, effective_start_date, cycle_weeks, patterns, active')
       .eq('employee_id', contact.employee_id)
       .eq('company_id', contact.company_id)
       .eq('active', true),
+    tenantToday(contact.company_id),
   ]);
 
   const normal = ((availRows ?? []) as AvailabilitySlot[])
     .map(s => ({ day_of_week: s.day_of_week, start_time: s.start_time, end_time: s.end_time }));
-  const custom = ((customRows ?? []) as Array<{
-    type: 'date_limited' | 'rotating'; end_date: string | null; cycle_weeks: number | null; patterns: unknown; active: boolean;
-  }>)[0] ?? null;
+  // W-1 / C-1: an override that has already ENDED is not "in force" no matter what
+  // `active` says (10 of Watermark's 17 active rows had expired). One rule for
+  // "is it current?" — isOverrideCurrent — shared with the change-side gate.
+  const custom = pickCurrentOverride(
+    (customRows ?? []) as Array<{
+      type: 'date_limited' | 'rotating'; end_date: string | null; effective_start_date?: string | null;
+      cycle_weeks: number | null; patterns: unknown; active: boolean;
+    }>,
+    today,
+  );
+  const startsLater = !!(custom?.effective_start_date && custom.effective_start_date > today);
 
   const normalText = normal.length ? formatAvailabilityList(normal) : null;
 
@@ -818,9 +829,14 @@ export async function handleMyAvailabilityQuery(
   if (!normalText && !customText) {
     body = `${opener}you don't have any availability set yet. Just text me the days and times you can work and I'll get it saved.`;
   } else if (normalText && customText) {
-    body = `${opener}here's your availability.\n\nNormal:\n${normalText}\n\nTemporary override (this one takes priority right now):\n${customText}`;
+    const overrideLabel = startsLater
+      ? `Temporary override (starts ${formatDateRange(custom!.effective_start_date!, custom!.effective_start_date!)}, then takes priority)`
+      : `Temporary override (this one takes priority right now)`;
+    body = `${opener}here's your availability.\n\nNormal:\n${normalText}\n\n${overrideLabel}:\n${customText}`;
   } else if (customText) {
-    body = `${opener}you're on a temporary availability override right now:\n${customText}`;
+    body = startsLater
+      ? `${opener}you have a temporary availability override starting ${formatDateRange(custom!.effective_start_date!, custom!.effective_start_date!)}:\n${customText}`
+      : `${opener}you're on a temporary availability override right now:\n${customText}`;
   } else {
     body = `${opener}here's your availability:\n${normalText}`;
   }
@@ -3277,11 +3293,42 @@ export async function clearPendingAvailTargetDisambig(companyId: string, employe
 // than trap the employee.
 export function classifyAvailTarget(body: string): 'normal' | 'temporary' | 'unclear' {
   const t = (body || '').toLowerCase();
-  const normal = /\b(normal|permanent|regular|usual|standard|default|forever|for good)\b/.test(t);
-  const temp = /\b(temp|temporary|temporarily|override|current one|short[-\s]?term)\b/.test(t);
+  const normal = /\b(normal|permanent|permanently|regular|usual|standard|default|forever|for good|going forward|from now on)\b/.test(t);
+  const temp = /\b(temp|temporary|temporarily|override|current one|short[-\s]?term|(?:that|this|the) stretch|until then|for now|just for now)\b/.test(t);
   if (normal && !temp) return 'normal';
   if (temp && !normal) return 'temporary';
   return 'unclear';
+}
+
+// W-1 / C-1 (b): does the CHANGE message itself already say whether it is a
+// permanent change or a bounded one? When it does, the "normal or temporary?"
+// question is noise — Katie's "going forward I can only work Friday mornings" and
+// Jenna's "for Aug 24–Aug 30 I can only work Sunday" both got asked, and Jenna's
+// own dates were then thrown away in favour of a dead override's. Deterministic;
+// no model call. Returns:
+//   'normal'    — permanence language ("going forward", "from now on", "for the
+//                 rest of the season", "permanently", "anymore", …)
+//   'temporary' — the classifier already extracted a bounding end_date (or a
+//                 future start date, which is an override by construction)
+//   null        — genuinely unsaid; the caller may ask
+//
+// Precedence: an explicit end_date wins over permanence words. "Until the end of
+// the season" is a bounded change if the classifier resolved a date for it, and
+// a permanent one if it didn't — either way the employee's own words decide, and
+// a stored override's end date is never substituted for them.
+export function readAvailTargetFromMessage(
+  body: string,
+  extracted: Record<string, unknown>,
+): 'normal' | 'temporary' | null {
+  const endRaw = typeof extracted.end_date === 'string' ? extracted.end_date.trim() : '';
+  if (/^\d{4}-\d{2}-\d{2}$/.test(endRaw)) return 'temporary';
+  const startRaw = typeof extracted.effective_start_date === 'string' ? extracted.effective_start_date.trim() : '';
+  if (/^\d{4}-\d{2}-\d{2}$/.test(startRaw)) return 'temporary';
+  const t = (body || '').toLowerCase();
+  if (/\b(going forward|from now on|from here on(?: out)?|permanent(?:ly)?|for good|for the rest of the (?:season|summer|year)|rest of the (?:season|summer|year)|anymore|no longer|indefinitely|my new (?:normal|regular|usual) (?:availability|schedule|hours))\b/.test(t)) {
+    return 'normal';
+  }
+  return null;
 }
 
 // ── Mid-availability "switch to a different request?" offer ────────────────────
@@ -3394,22 +3441,35 @@ export async function handleUpdateAvailability(
 ): Promise<void> {
   const employeeIdForGate = contact.employee_id!;
   const availTarget = typeof extracted.avail_target === 'string' ? extracted.avail_target : null;
+  const todayLocal = await tenantToday(contact.company_id);
 
-  // F7 — when BOTH a normal availability and an ACTIVE custom override exist, a
+  // F7 — when BOTH a normal availability and a CURRENT custom override exist, a
   // change is ambiguous. Ask which the employee means and remember the request,
-  // UNLESS the target is already resolved (the disambiguation reply set
-  // extracted.avail_target). Never auto-clobber.
-  if (availTarget !== 'normal' && availTarget !== 'temporary') {
+  // UNLESS the target is already resolved — either by the disambiguation reply
+  // (extracted.avail_target) or by the message itself saying "going forward" /
+  // "until Aug 30" (W-1 / C-1 (b)). Never auto-clobber.
+  //
+  // W-1 / C-1 (a): the override must actually be IN FORCE. An `active = true` row
+  // whose end_date has passed is not (the builder already ignores it); asking
+  // about it, or worse carrying its dead end_date into the change, is the bug that
+  // locked Jenna and Mya out of changing their availability at all.
+  const saidInMessage = readAvailTargetFromMessage(message.body, extracted);
+  if (availTarget !== 'normal' && availTarget !== 'temporary' && saidInMessage === null) {
     const [{ data: normalRows }, { data: overrideRows }] = await Promise.all([
       supabase.from('availability').select('day_of_week')
         .eq('employee_id', employeeIdForGate).eq('company_id', contact.company_id).limit(1),
-      supabase.from('custom_availability').select('end_date')
-        .eq('employee_id', employeeIdForGate).eq('company_id', contact.company_id).eq('active', true).limit(1),
+      supabase.from('custom_availability').select('end_date, effective_start_date, active')
+        .eq('employee_id', employeeIdForGate).eq('company_id', contact.company_id).eq('active', true),
     ]);
     const hasNormal = ((normalRows ?? []) as unknown[]).length > 0;
-    const override = ((overrideRows ?? []) as Array<{ end_date: string | null }>)[0] ?? null;
-    if (hasNormal && override) {
-      const endTail = override.end_date ? ` (through ${formatDateRange(override.end_date, override.end_date)})` : '';
+    const override = pickCurrentOverride(
+      (overrideRows ?? []) as Array<{ end_date: string | null; effective_start_date?: string | null; active?: boolean }>,
+      todayLocal,
+    );
+    if (hasNormal && override && isOverrideCurrent(override, todayLocal)) {
+      const stretch = override.end_date
+        ? `a temporary schedule through ${formatDateRange(override.end_date, override.end_date)}`
+        : `a temporary schedule right now`;
       await supabase.from('aegis_memory').delete()
         .eq('company_id', contact.company_id).eq('source', availTargetSource(employeeIdForGate));
       await supabase.from('aegis_memory').insert({
@@ -3427,8 +3487,7 @@ export async function handleUpdateAvailability(
       await reply(
         contact,
         message,
-        `Quick check — do you want to change your normal availability, or your temporary one${endTail}? ` +
-          `Just say "normal" or "temporary" and I'll take it from there.`,
+        `Quick check — you're on ${stretch}. Is this change just for that temporary stretch, or for your normal week going forward?`,
       );
       return;
     }
@@ -3471,7 +3530,7 @@ export async function handleUpdateAvailability(
       return;
     }
 
-    const anchor = startOfWeekSunday(new Date().toISOString().slice(0, 10));
+    const anchor = startOfWeekSunday(todayLocal);
     const rotation: RotationSpec = {
       cycle_weeks: parsedRotation.cycle_weeks,
       cycle_start_date: anchor,
@@ -3540,8 +3599,7 @@ export async function handleUpdateAvailability(
   // pending. Ignore a start date that is today or in the past (treat as immediate).
   const startRaw = typeof extracted.effective_start_date === 'string' ? extracted.effective_start_date.trim() : '';
   const startCandidate = /^\d{4}-\d{2}-\d{2}$/.test(startRaw) ? startRaw : null;
-  const todayStr = new Date().toISOString().slice(0, 10);
-  const effectiveStartDate = startCandidate && startCandidate > todayStr ? startCandidate : null;
+  const effectiveStartDate = startCandidate && startCandidate > todayLocal ? startCandidate : null;
 
   let proposed: AvailabilitySlot[];
   let assumedFullWeek = false;

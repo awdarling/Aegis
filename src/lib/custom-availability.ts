@@ -97,6 +97,41 @@ function alignToWeekday(date: string, weekAligned: string): string {
   return d.toISOString().slice(0, 10);
 }
 
+// ── "Is this override in force?" — ONE answer (Rule 0b) ──────────────────────
+//
+// W-1 / C-1 (2026-08-26): two conversational readers (the availability query and
+// the normal-vs-temporary question) filtered on `active = true` only and never
+// looked at `end_date`, so an override that ended in June was still "in force"
+// in August — employees were asked about it, and one approved change was built
+// through a date in the past. The schedule builder was right all along because
+// `resolveAvailabilityForWeek` below gates on end_date. This is that gate,
+// exposed for every reader that needs a yes/no.
+//
+// `today` is the TENANT's local date (YYYY-MM-DD) — see lib/tenant-date.ts.
+// "Current" means: switched on, and not yet past its end date. A row whose
+// effective_start_date is still in the future IS current (it's a live
+// commitment; the display decides how to word "starting <date>").
+export interface OverrideCurrencyFields {
+  active?: boolean | null;
+  end_date?: string | null;
+  effective_start_date?: string | null;
+}
+
+export function isOverrideCurrent(row: OverrideCurrencyFields | null | undefined, today: string): boolean {
+  if (!row) return false;
+  if (row.active === false) return false;
+  if (row.end_date && row.end_date < today) return false;
+  return true;
+}
+
+// Convenience: the first current row from a list (or null).
+export function pickCurrentOverride<T extends OverrideCurrencyFields>(rows: T[] | null | undefined, today: string): T | null {
+  for (const row of rows ?? []) {
+    if (isOverrideCurrent(row, today)) return row;
+  }
+  return null;
+}
+
 // Resolves the effective availability for an employee for the given schedule
 // week, taking any active custom_availability override into account. Returns
 // `normalAvailability` unchanged when no override applies, when the override

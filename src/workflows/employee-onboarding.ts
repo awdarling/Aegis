@@ -35,7 +35,8 @@ import { env } from '../config/env';
 import { withAnthropicRetry } from '../ai/claude';
 // D21 — reuse the real time-off flow's partial-window resolver so onboarding and
 // the normal flow cannot disagree about what "the afternoon" means.
-import { resolvePartialWindow, createTimeOffRequestAndNotify, isTimeOffAffirmation } from './time-off';
+import { resolvePartialWindow, resolvePartialEntries, createTimeOffRequestAndNotify, isTimeOffAffirmation } from './time-off';
+import { looksLikePositiveAvailability } from '../lib/availability-words';
 import { generateActionToken } from '../lib/aegis-actions/tokens';
 import { resolveManagers, recipientsFor, primaryRecipient } from '../messaging/manager-directory';
 import { sendManagerResolutionNotice } from '../messaging/manager-resolution-notice';
@@ -49,6 +50,7 @@ import type { InboundMessage, VerifiedContact } from '../security/types';
 import type { Employee, PartialDayDetail } from '../db/types';
 import { isOverrideCurrent, pickCurrentOverride } from '../lib/custom-availability';
 import { tenantToday } from '../lib/tenant-date';
+import { loadShiftTemplates, resolveMeantHoursPure, windowsCoveringShifts, describeShifts, formatClockRange, toHHMM, type ShiftTemplate } from '../lib/shift-hours';
 
 const client = new Anthropic({ apiKey: env.ANTHROPIC_API_KEY });
 const MODEL = 'claude-sonnet-4-6';
@@ -71,6 +73,8 @@ interface OnboardingPendingTimeOff {
   end_date: string;
   time_off_type: 'full_day' | 'partial';
   partial_days: PartialDayDetail[] | null;
+  // W-1 branch 2: they asked for part of a day they have no shift on.
+  unscheduled?: boolean;
   // Reason stated in the request ("…off for a wedding") — captured at staging so
   // it survives to the manager email even when the employee just confirms "yes".
   reason?: string | null;
@@ -104,6 +108,9 @@ export interface OnboardingSession {
     // WINDOW ("I'm open 3–9pm") rather than a day off. While true, the next reply
     // is a clarifier answer (off vs availability), not a fresh parse.
     time_off_avail_clarify?: boolean | null;
+    // The employee's own words behind a pending F6 clarifier, replayed into the
+    // availability path if they answer "available" (W-1 branch 2).
+    time_off_avail_original?: string | null;
   };
   flagged_low_availability: boolean;
   invalid_email_attempts: number;
@@ -512,7 +519,11 @@ async function loadShiftBounds(companyId: string): Promise<ShiftBounds> {
     .eq('company_id', companyId)
     .eq('active', true);
 
-  const shifts = (data ?? []) as { start_time: string; end_time: string }[];
+  // Postgres `time` columns come back as HH:MM:SS; normalise to HH:MM so the
+  // bounds compare correctly against HH:MM slots and never leak seconds into
+  // availability rows via clampTime (W-1 branch 2 found this).
+  const shifts = ((data ?? []) as { start_time: string; end_time: string }[])
+    .map(s => ({ start_time: toHHMM(s.start_time) ?? s.start_time, end_time: toHHMM(s.end_time) ?? s.end_time }));
 
   if (shifts.length === 0) {
     return { earliest_start: '06:00', latest_end: '23:00', min_shift_hours: 4 };
@@ -1084,8 +1095,20 @@ export type AvailabilityIntent = { mode: 'set' | 'remove'; slots: AvailabilitySl
 
 export async function parseAvailabilityIntent(
   message: string,
-  bounds: ShiftBounds
+  bounds: ShiftBounds,
+  // W-1 branch 2: the company's own shift definitions, so a named shift or a
+  // time-of-day word maps to REAL shift hours in the model's answer too (the
+  // deterministic resolver in handleUpdateAvailability still has the last word).
+  templates: ShiftTemplate[] = [],
 ): Promise<AvailabilityIntent> {
+  const DAY_ABBR = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  const shiftLines = templates
+    .filter(t => t.active !== false)
+    .map(t => `${t.name} ${t.start_time}–${t.end_time} (${t.days_active.map(d => DAY_ABBR[d]).join('/')})`)
+    .join('; ');
+  const periodRule = shiftLines
+    ? `This company's shifts are: ${shiftLines}. When the employee names one of these shifts, or a time of day ("mornings", "AM", "afternoons", "PM", "evenings", "nights"), use the hours of the matching shift(s) on each day — morning/AM = shifts starting before 12:00, afternoon/PM/evening/night = shifts starting at or after 12:00. `
+    : `Named periods (no explicit times): morning = ${bounds.earliest_start}–12:00, afternoon = 12:00–17:00, evening/night = 17:00–${bounds.latest_end}; clamp to ${bounds.earliest_start}–${bounds.latest_end}. `;
   const response = await withAnthropicRetry(() =>
     client.messages.create({
       model: MODEL,
@@ -1099,9 +1122,7 @@ export async function parseAvailabilityIntent(
         `For mode "set", also decide SCOPE: "exclusive" when the employee states their COMPLETE availability — the ONLY days/times they can work, replacing everything else ("I can only work Saturdays", "I'm only available weekends", "just Mondays and Wednesdays now", "my availability is ..."); "partial" when they are editing or adding specific day(s) and leaving the rest of the week as-is ("change Saturday to 3-5", "I can work Saturday mornings", "also add Sunday 10-2"). When unsure use "partial". For mode "remove", scope is always "partial". ` +
         `Then list the day+time windows the message refers to — the windows they CAN work (mode "set") ` +
         `or the windows they CANNOT work (mode "remove"). ` +
-        // Same named-period rules as the positive parser.
-        `Named periods (no explicit times): morning = ${bounds.earliest_start}–12:00, afternoon = 12:00–17:00, ` +
-        `evening/night = 17:00–${bounds.latest_end}; clamp to ${bounds.earliest_start}–${bounds.latest_end}. ` +
+        periodRule +
         `A whole-day negative with no time-of-day ("can't work Wednesdays") covers the ENTIRE day — use start_time "00:00" and end_time "23:59" so the whole day is removed cleanly. ` +
         `Day words: "weekdays" = Mon–Fri; "weekends" = Sat + Sun; a plural weekday ("Mondays") = that weekday. ` +
         `Ignore any trailing date boundary like "until <date>". day_of_week: 0=Sunday..6=Saturday. Times HH:MM (24h). ` +
@@ -1513,10 +1534,14 @@ interface OnboardingDateEntry {
   period_label?: 'morning' | 'afternoon' | 'evening' | null;
   start_time?: string | null;
   end_time?: string | null;
+  shift_id?: string | null;
+  shift_name?: string | null;
+  unscheduled?: boolean;
 }
 
-async function claudeExtractDates(message: string): Promise<OnboardingDateEntry[]> {
-  const today = new Date().toISOString().split('T')[0];
+async function claudeExtractDates(message: string, companyId?: string): Promise<OnboardingDateEntry[]> {
+  // CLAUDE.md hard rule: "today" for date resolution is the TENANT's local date.
+  const today = companyId ? await tenantToday(companyId) : new Date().toISOString().split('T')[0];
   const response = await withAnthropicRetry(() =>
     client.messages.create({
       model: MODEL,
@@ -2103,10 +2128,14 @@ export function isClearNoTimeOff(body: string): boolean {
 // Friday" / "I can't work the 5th" is still treated as time off.
 export function looksLikeAvailabilityWindow(body: string): boolean {
   const t = (body || '').toLowerCase();
+  // W-1 branch 2 (J-1b): "I can ONLY work pm shifts" is the commonest phrasing of
+  // an availability statement and used to slip past both detectors (the word
+  // "only"/"just" broke the "i can work" match). Mia's onboarding answer became a
+  // time-off request because of it.
   const windowish =
     /\b(open|available|free)\b/.test(t) ||
-    /\bi can (work|do|make|come in)\b/.test(t) ||
-    /\bcan work\b/.test(t);
+    /\bi can (?:only |just )?(work|do|make|come in)\b/.test(t) ||
+    /\bcan (?:only |just )?work\b/.test(t);
   if (!windowish) return false;
   const offish =
     /\boff\b|\bcan['’]?t work\b|\bcannot work\b|\bcan ?not work\b|\bunavailable\b|\bnot available\b|\bout of town\b|\baway\b|\bon vacation\b|\bday off\b|\bdays off\b|\bneed[s]?\b[^.]*\boff\b|\btake\b[^.]*\boff\b/.test(t);
@@ -2120,14 +2149,50 @@ function clarifyMeansTimeOff(body: string): boolean {
   return /\boff\b|\bday off\b|\bneed it off\b|\btake it off\b|\btime off\b|\byes\b|\byeah\b|\byep\b|\bcorrect\b/.test(t);
 }
 
+// W-1 branch 2 (J-1b): an availability statement given in answer to "any time
+// off coming up?" is routed to the AVAILABILITY path — onboarding finishes with
+// no time-off request, and the same availability-change confirm the employee
+// would get outside onboarding runs against their original words. The bounded
+// week ("next week") rides along as end_date so the change is temporary, exactly
+// as the classifier would have set it.
+async function routeOnboardingReplyToAvailability(
+  message: InboundMessage,
+  contact: VerifiedContact,
+  session: OnboardingSession & { _memory_id: string },
+  managerContact: VerifiedContact,
+  managerMsg: InboundMessage,
+  endDate: string | null,
+): Promise<void> {
+  session.collected.time_off_pending = null;
+  session.collected.time_off_avail_clarify = null;
+  session.step = 'complete';
+  await saveOnboardingSession(session);
+  await textEmployee(
+    session,
+    `Got it — that reads as your availability rather than time off, so I won't put in a time-off request. Let me set it up as an availability change instead.`,
+  );
+  await completeOnboarding(session, managerContact, managerMsg);
+  await handleUpdateAvailability(message, contact, endDate ? { end_date: endDate } : {});
+}
+
+function lastEndDateOf(dates: Array<{ start_date: string; end_date?: string | null }>): string | null {
+  const ends = dates
+    .map(d => d.end_date ?? d.start_date)
+    .filter((d): d is string => typeof d === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(d))
+    .sort();
+  return ends.length ? ends[ends.length - 1] : null;
+}
+
 async function handleTimeOffStep(
-  body: string,
+  message: InboundMessage,
+  contact: VerifiedContact,
   session: OnboardingSession & { _memory_id: string },
   managerContact: VerifiedContact,
   managerMsg: InboundMessage
 ): Promise<void> {
+  const body = message.body;
   // F6 — resolving a prior availability-vs-time-off clarifier. The next reply says
-  // whether they meant a day off (file it) or an availability note (don't file).
+  // whether they meant a day off (file it) or an availability note (route it).
   if (session.collected.time_off_avail_clarify) {
     const meansOff = clarifyMeansTimeOff(body);
     session.collected.time_off_avail_clarify = null;
@@ -2139,6 +2204,13 @@ async function handleTimeOffStep(
       return;
     }
     // It was an availability note, not a day off — never file spurious time off.
+    // W-1 branch 2: and DO set it up as availability, using the words they gave.
+    const original = session.collected.time_off_avail_original ?? null;
+    const endDate = lastEndDateOf(staged);
+    if (original) {
+      await routeOnboardingReplyToAvailability({ ...message, body: original }, contact, session, managerContact, managerMsg, endDate);
+      return;
+    }
     session.collected.time_off_pending = null;
     session.step = 'complete';
     await saveOnboardingSession(session);
@@ -2150,7 +2222,17 @@ async function handleTimeOffStep(
     return;
   }
 
-  const dates = await claudeExtractDates(body);
+  // W-1 branch 2 (J-1b): a POSITIVE availability statement ("Next week I can only
+  // work pm shifts Monday through Friday") is availability, full stop — route it
+  // before any time-off parsing. The one extraction call below is still made,
+  // only to find the bound ("next week") for a temporary change.
+  if (looksLikePositiveAvailability(body)) {
+    const bound = await claudeExtractDates(body, session.company_id);
+    await routeOnboardingReplyToAvailability(message, contact, session, managerContact, managerMsg, lastEndDateOf(bound));
+    return;
+  }
+
+  const dates = await claudeExtractDates(body, session.company_id);
 
   if (dates.length === 0) {
     // Don't silently complete on an empty parse — confirm the employee really
@@ -2184,7 +2266,15 @@ async function handleTimeOffStep(
   // confirm or edit before anything reaches the manager (time_off_confirm step).
   // Coalesce first: a contiguous trip the extractor split into per-day rows
   // ("UP weekend" → Sat + Sun) becomes ONE start..end request, not two.
-  const pending = coalesceDateEntries(dates).map(buildPendingFromEntry);
+  // W-1 branch 2: partial days resolve against the employee's REAL shifts (or the
+  // club's shift definitions when no schedule covers that week yet); the read-back
+  // always shows hours.
+  const resolved = await resolvePartialEntries(coalesceDateEntries(dates), {
+    companyId: session.company_id,
+    employeeId: session.employee_id,
+    words: body,
+  });
+  const pending = resolved.map(buildPendingFromEntry);
 
   // F6 — the message named a date but reads like an AVAILABILITY WINDOW ("Friday
   // I'm open 3–9pm"), not a day off. Don't silently file a (partial) time-off;
@@ -2192,6 +2282,7 @@ async function handleTimeOffStep(
   if (looksLikeAvailabilityWindow(body)) {
     session.collected.time_off_pending = pending;
     session.collected.time_off_avail_clarify = true;
+    session.collected.time_off_avail_original = body;
     await saveOnboardingSession(session);
     await textEmployee(
       session,
@@ -2317,29 +2408,41 @@ function buildPendingFromEntry(entry: OnboardingDateEntry): OnboardingPendingTim
   let time_off_type: 'full_day' | 'partial' = 'full_day';
   let partial_days: PartialDayDetail[] | null = null;
 
-  if (entry.time_off_type === 'partial') {
+  if (entry.time_off_type === 'partial' && !entry.unscheduled) {
+    // Entries arrive already resolved against the schedule (resolvePartialEntries);
+    // an unresolved one has no honest window and stays a full day.
     const window = resolvePartialWindow(entry);
     if (window) {
       time_off_type = 'partial';
       partial_days = eachDateInRangeLocal(start_date, end_date).map(date => ({
         date,
-        type: 'custom_hours' as const,
-        shift_id: null,
-        shift_name: null,
+        type: entry.shift_name ? ('shift_off' as const) : ('custom_hours' as const),
+        shift_id: entry.shift_id ?? null,
+        shift_name: entry.shift_name ?? null,
         start_time: window.start_time,
         end_time: window.end_time,
       }));
     }
   }
-  return { start_date, end_date, time_off_type, partial_days };
+  return { start_date, end_date, time_off_type, partial_days, unscheduled: entry.unscheduled === true };
 }
 
-// One human-readable line per staged item for the confirm prompt. Partial days
-// are marked so the employee sees it's not a whole day off.
+// One human-readable line per staged item for the confirm prompt. A partial day
+// ALWAYS shows its hours (and the shift's name when one matched) — the bare
+// "(partial day)" is what let Mia confirm a window she never saw (J-1b).
 function describePendingTimeOff(p: OnboardingPendingTimeOff): string {
   const range = formatDateRange(p.start_date, p.end_date);
   const isPartial = p.time_off_type === 'partial' && !!p.partial_days && p.partial_days.length > 0;
-  return isPartial ? `• ${range} (partial day)` : `• ${range}`;
+  if (isPartial) {
+    const d = p.partial_days![0];
+    const hours = d.start_time && d.end_time ? formatClockRange(d.start_time, d.end_time) : null;
+    const what = d.shift_name && hours ? `your ${d.shift_name} shift, ${hours}` : hours ? `${hours}` : 'part of the day';
+    return `• ${range} — ${what}`;
+  }
+  if (p.unscheduled) {
+    return `• ${range} — you're not on the schedule that day, so I'll log it as a day off`;
+  }
+  return `• ${range}`;
 }
 
 // The "does this look right?" read-back the employee confirms before we submit.
@@ -2831,7 +2934,7 @@ export async function handleOnboardingResponse(
       await handleAvailabilityConfirmStep(message.body, session, managerContact, managerMsg);
       break;
     case 'time_off':
-      await handleTimeOffStep(message.body, session, managerContact, managerMsg);
+      await handleTimeOffStep(message, contact, session, managerContact, managerMsg);
       break;
     case 'time_off_confirm':
       await handleTimeOffConfirmStep(message.body, session, managerContact, managerMsg);
@@ -3577,7 +3680,29 @@ export async function handleUpdateAvailability(
     return;
   }
 
-  const intent = await parseAvailabilityIntent(message.body, bounds);
+  const shiftTemplates = contact.employee_id ? await loadShiftTemplates(contact.company_id) : [];
+  const intent = await parseAvailabilityIntent(message.body, bounds, shiftTemplates);
+
+  // W-1 branch 2 (J-1a): when the change is phrased in the club's shift terms
+  // ("the AM shifts", "pm shifts", "mornings"), the hours are the SHIFTS' hours,
+  // per day, from shift_types — not the model's clock guess. Mia's "I want to
+  // work the am shifts" became a 09:00–12:00 window that covered no shift; it now
+  // becomes Mon–Fri 11:00–15:30 / Sat–Sun 09:00–15:30, and the confirm names
+  // the shifts. Deterministic; no extra model call.
+  let shiftNote: string | null = null;
+  if (intent.mode === 'set' && contact.employee_id) {
+    const templates = shiftTemplates;
+    const meant = resolveMeantHoursPure({ words: message.body, templates, assignments: [] });
+    if (meant && meant.source !== 'explicit' && meant.shifts.length > 0) {
+      const namedDays = [...new Set(intent.slots.map(s => s.day_of_week))];
+      const windows = windowsCoveringShifts(meant.shifts, namedDays.length > 0 ? namedDays : null);
+      if (windows.length > 0) {
+        intent.slots = windows.map(w => ({ day_of_week: w.day_of_week, start_time: w.start_time, end_time: w.end_time }));
+        const covered = meant.shifts.filter(t => windows.some(w => t.days_active.includes(w.day_of_week)));
+        shiftNote = describeShifts([...covered].sort((a, b) => a.start_time.localeCompare(b.start_time) || a.name.localeCompare(b.name)));
+      }
+    }
+  }
 
   const clamp = (s: AvailabilitySlot): AvailabilitySlot => ({
     day_of_week: s.day_of_week,
@@ -3684,7 +3809,7 @@ export async function handleUpdateAvailability(
     content: JSON.stringify(pending),
   });
 
-  const confirmBody = buildAvailChangeConfirmBody(proposed, { customEndDate, effectiveStartDate, assumedFullWeek, merged, exclusive });
+  const confirmBody = buildAvailChangeConfirmBody(proposed, { customEndDate, effectiveStartDate, assumedFullWeek, merged, exclusive, shiftNote });
 
   // Rich HTML sibling of the plain confirmBody: reflect the employee's own words
   // back, then the proposed availability as accent detail rows, then the reply-YES
@@ -3734,9 +3859,11 @@ export function mergeDayScopedAvailability(
 // partial correction, which handleAvailabilityConfirmResponse applies in place.
 export function buildAvailChangeConfirmBody(
   proposed: AvailabilitySlot[],
-  opts: { customEndDate?: string | null; effectiveStartDate?: string | null; assumedFullWeek?: boolean; merged?: boolean; exclusive?: boolean } = {}
+  opts: { customEndDate?: string | null; effectiveStartDate?: string | null; assumedFullWeek?: boolean; merged?: boolean; exclusive?: boolean; shiftNote?: string | null } = {}
 ): string {
-  const proposedDisplay = formatAvailabilityList(proposed);
+  // W-1 branch 2: when the windows were derived from named shifts, say which —
+  // "That covers your AM Weekday (11am–3:30pm) and AM Weekend (9am–3:30pm) shifts."
+  const proposedDisplay = formatAvailabilityList(proposed) + (opts.shiftNote ? `\nThat covers your ${opts.shiftNote} shifts.` : '');
   const startDisp = opts.effectiveStartDate ? formatDateRange(opts.effectiveStartDate, opts.effectiveStartDate) : '';
   const endDisp = opts.customEndDate ? formatDateRange(opts.customEndDate, opts.customEndDate) : '';
   if (opts.assumedFullWeek) {

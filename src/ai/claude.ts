@@ -209,18 +209,10 @@ export function applyManagerCoverageBackstop(
   };
 }
 
-// A purely-positive availability statement ("I can work …", "I'm available …")
-// states when the employee CAN work — the opposite of time off. The classifier
-// occasionally mis-fires these to submit_time_off when a specific date/week is
-// present (the "specific date wins" rule). Returns true ONLY for clearly positive
-// statements with NO off/can't/unavailable language, so mixed messages ("I can
-// work Mon but need Fri off") are left to the model.
-export function looksLikePositiveAvailability(body: string): boolean {
-  const positive = /\bi can work\b|\bi can do\b|\bi['’ ]?a?m available\b|\bavailable to work\b|\bput me down for\b|\bi['’ ]?a?m free\b/i.test(body);
-  if (!positive) return false;
-  const negative = /\boff\b|\bcan['’]?t\b|\bcannot\b|\bcan ?not\b|\bunavailable\b|\bno more\b|\btake me off\b|\bneed[s]?\b.*\boff\b/i.test(body);
-  return !negative;
-}
+// looksLikePositiveAvailability lives in lib/availability-words.ts (pure; shared
+// with onboarding without dragging this module's Anthropic client along).
+import { looksLikePositiveAvailability } from '../lib/availability-words';
+export { looksLikePositiveAvailability };
 
 // Deterministic backstop for the availability-vs-time-off bug: if the model picked
 // submit_time_off but the message is a clear positive availability statement,

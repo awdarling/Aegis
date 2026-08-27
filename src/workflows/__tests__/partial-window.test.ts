@@ -27,20 +27,25 @@ describe('resolvePartialWindow', () => {
       .toEqual({ start_time: '10:00', end_time: '13:00' });
   });
 
-  // Quin's case: "June 29 after 4pm" → off from 16:00 through the day's close.
-  it('fills the close for an open-ended "after X" window (start only)', () => {
-    expect(resolvePartialWindow(entry({ start_time: '16:00', end_time: null })))
-      .toEqual({ start_time: '16:00', end_time: '21:00' });
+  // W-1 branch 2 (C-4 / J-1a): the open side of a one-sided window comes from the
+  // employee's REAL shift that day, never from a hard-coded 09:00 / 21:00 "operating
+  // day". With no shift there is no honest answer → null (the caller asks).
+  const shift = { start_time: '11:00', end_time: '15:30' }; // Katie's AM Weekday
+  it('"after 3pm" on an 11–3:30 shift → 15:00–15:30; with no shift → null', () => {
+    expect(resolvePartialWindow(entry({ start_time: '15:00', end_time: null }), shift))
+      .toEqual({ start_time: '15:00', end_time: '15:30' });
+    expect(resolvePartialWindow(entry({ start_time: '16:00', end_time: null }))).toBeNull();
   });
 
-  it('fills the open for an "until X" / "before X" window (end only)', () => {
-    expect(resolvePartialWindow(entry({ start_time: null, end_time: '14:00' })))
-      .toEqual({ start_time: '09:00', end_time: '14:00' });
+  it('"until 2pm" on an 11–3:30 shift → 11:00–14:00; with no shift → null', () => {
+    expect(resolvePartialWindow(entry({ start_time: null, end_time: '14:00' }), shift))
+      .toEqual({ start_time: '11:00', end_time: '14:00' });
+    expect(resolvePartialWindow(entry({ start_time: null, end_time: '14:00' }))).toBeNull();
   });
 
-  it('resolves named periods', () => {
-    expect(resolvePartialWindow(entry({ period_label: 'morning' }))).toEqual({ start_time: '09:00', end_time: '13:00' });
-    expect(resolvePartialWindow(entry({ period_label: 'evening' }))).toEqual({ start_time: '17:00', end_time: '21:00' });
+  it('a period word alone ("the morning") means the SHIFT\'s hours, never 09:00–13:00 / 17:00–21:00', () => {
+    expect(resolvePartialWindow(entry({ period_label: 'morning' }), shift)).toEqual({ start_time: '11:00', end_time: '15:30' });
+    expect(resolvePartialWindow(entry({ period_label: 'evening' }))).toBeNull();
   });
 
   it('returns null when there is nothing partial to resolve (→ treated as full day)', () => {

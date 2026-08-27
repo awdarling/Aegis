@@ -22,12 +22,12 @@ import {
 import { buildTimeOffManagerEmail, buildTimeOffResolutionEmail, describePartialDay, buildPartialSummaryText, type TimeOffRecommendation } from './time-off-manager-email';
 import { resolveManagers, recipientsFor } from '../messaging/manager-directory';
 import { sendManagerResolutionNotice } from '../messaging/manager-resolution-notice';
-import { tenantTodayAndZone } from '../lib/tenant-date';
+import { tenantTodayAndZone, addDays, minutesUntilTenantTime } from '../lib/tenant-date';
 import type { InboundMessage, VerifiedContact } from '../security/types';
 import type { Employee, PartialDayDetail, Policy, TimeOffRequest } from '../db/types';
 import type { SimulationResult } from '../lib/schedule-simulator';
 import type { TimeOffViolations } from '../lib/time-off-policies';
-import { resolveMeantHours, loadShiftTemplates, formatClockRange, type ShiftTemplate } from '../lib/shift-hours';
+import { resolveMeantHours, loadShiftTemplates, formatClock, formatClockRange, loadAssignmentsOnDate, type ShiftTemplate } from '../lib/shift-hours';
 
 // ── N1: self-notification guard ───────────────────────────────────────────────
 // Exclude the actor who TOOK a decision from that decision's notification
@@ -58,6 +58,23 @@ interface PendingTimeOff {
   expires_at: string;
   time_off_type: 'full_day' | 'partial';
   partial_days: PartialDayDetail[] | null;
+  // W-2 call-out (spec §3.5): set when the request is for today/tomorrow AND the
+  // employee has a PUBLISHED shift on one of those days. Changes the employee
+  // copy (pending-not-granted), the manager email (three buttons), and the
+  // manager nudge (near-shift escalation). Absent on an ordinary request.
+  call_out?: CallOutShift[];
+  // The employee's actual words — the spec says the manager sees them verbatim.
+  employee_words?: string;
+}
+
+// W-2 — one shift the employee is calling out of. Deterministic: read from the
+// published schedule, never inferred from clock words (F10).
+export interface CallOutShift {
+  date: string;
+  shift_name: string;
+  role: string;
+  start_time: string; // HH:MM or HH:MM:SS as stored
+  end_time: string;
 }
 
 export interface ExtractedDateEntry {
@@ -415,6 +432,85 @@ export async function getPendingTimeOff(
   }
 }
 
+// ── W-2: employee call-out (spec §3.5) ───────────────────────────────────────
+//
+// A CALL-OUT is a time-off request whose dates are today or tomorrow
+// (tenant-local) AND on which the employee has a PUBLISHED assignment. It is a
+// REQUEST, not a declaration (Alexander, 2026-08-27): the manager decides with
+// three choices — Approve & find coverage, Approve only, Deny — and the
+// employee is told it's in motion but pending, never granted. Detection is
+// fully deterministic — no model call.
+
+export interface DetectedCallOut {
+  shifts: CallOutShift[];
+  today: string;
+  timezone: string;
+}
+
+export async function detectCallOut(
+  parsed: ParsedRequest,
+  ctx: { companyId: string; employeeId: string },
+): Promise<DetectedCallOut | null> {
+  const { today, timezone } = await tenantTodayAndZone(ctx.companyId);
+  const tomorrow = addDays(today, 1);
+  // The whole request must sit inside [today, tomorrow] — "off next Tuesday"
+  // or a week-long stretch starting today is ordinary time off.
+  if (parsed.start_date < today || parsed.end_date > tomorrow) return null;
+
+  const dates = [...new Set([parsed.start_date, parsed.end_date])].sort();
+  const shifts: CallOutShift[] = [];
+  for (const date of dates) {
+    // publishedOnly: an employee can only call out of a shift they were TOLD
+    // about — a draft nobody has seen is not a commitment.
+    const { assignments } = await loadAssignmentsOnDate(ctx.companyId, ctx.employeeId, date, { publishedOnly: true });
+    let dayAssignments = assignments;
+    // A partial request already resolved to a window (W-1); keep only the
+    // assignments that window touches, so "I can't do the morning" on a
+    // double-shift day doesn't call out the evening too.
+    const partials = (parsed.partial_days ?? []).filter(p => p.date === date && p.start_time && p.end_time);
+    if (partials.length > 0) {
+      dayAssignments = assignments.filter(a =>
+        partials.some(p => p.start_time!.slice(0, 5) < a.end_time.slice(0, 5) && p.end_time!.slice(0, 5) > a.start_time.slice(0, 5)),
+      );
+    }
+    for (const a of dayAssignments) {
+      shifts.push({ date, shift_name: a.shift_name, role: a.role, start_time: a.start_time, end_time: a.end_time });
+    }
+  }
+  return shifts.length > 0 ? { shifts, today, timezone } : null;
+}
+
+// "your Afternoon shift (3pm–8:15pm) tonight" — the one way a call-out's shift
+// is spoken of in employee- and manager-facing copy. `perspective` picks the
+// possessive ("your" to the employee, "her/his" is never guessed — the manager
+// copy uses the employee's name instead via `noun`).
+export function describeCallOutShifts(
+  shifts: CallOutShift[],
+  today: string,
+  noun: string = 'your',
+): string {
+  const dayWord = (s: CallOutShift): string => {
+    if (s.date === today) return s.start_time.slice(0, 5) >= '15:00' ? 'tonight' : 'today';
+    if (s.date === addDays(today, 1)) return 'tomorrow';
+    return `on ${formatDateRange(s.date, s.date)}`;
+  };
+  return shifts
+    .map(s => `${noun} ${s.shift_name} shift (${formatClockRange(s.start_time, s.end_time)}) ${dayWord(s)}`)
+    .join(' and ');
+}
+
+// Minutes until the FIRST called-out shift starts, tenant-local. Drives the
+// near-shift escalation in the manager nudge (§2.6: a call-out landing close to
+// shift start makes the coverage window real — say so).
+export function minutesUntilFirstCallOutShift(
+  callOut: DetectedCallOut,
+  now: Date = new Date(),
+): number {
+  return Math.min(
+    ...callOut.shifts.map(s => minutesUntilTenantTime(callOut.timezone, s.date, s.start_time, now)),
+  );
+}
+
 // ── AI recommendation ─────────────────────────────────────────────────────────
 
 async function generateTimeOffRecommendation(
@@ -753,6 +849,10 @@ function buildManagerEmail(params: {
   recommendation: DecisionRecommendation | null;
   approveUrl: string;
   denyUrl: string;
+  // W-2 call-out (spec §3.5): third button + the lead. All three set together.
+  approveAndCoverUrl?: string | null;
+  callOutLine?: string | null;      // "Mia's Afternoon shift (3pm–8:15pm) tonight"
+  employeeWords?: string | null;    // forwarded verbatim (spec)
   policies: Policy[];
   violations: TimeOffViolations | null;
   timeOffType?: 'full_day' | 'partial' | null;
@@ -769,11 +869,15 @@ function buildManagerEmail(params: {
     recommendation,
     approveUrl,
     denyUrl,
+    approveAndCoverUrl,
+    callOutLine,
+    employeeWords,
     policies,
     violations,
     timeOffType,
     partialDays,
   } = params;
+  const isCallOut = !!approveAndCoverUrl && !!callOutLine;
   const violationLines = formatViolationLines(violations);
 
   // Partial-day requests must render the actual window (e.g. "Wed Aug 12 —
@@ -783,17 +887,30 @@ function buildManagerEmail(params: {
   const dateDisplay = isPartial
     ? `${partialDays!.map(describePartialDay).join('; ')} (partial day)`
     : formatDateRange(startDate, endDate);
-  const subject = `Time-Off Request — ${employeeName} (${formatShortDate(startDate)}${startDate !== endDate ? ` – ${formatShortDate(endDate)}` : ''}${isPartial ? ', partial' : ''})`;
+  const subject = isCallOut
+    ? `Call-Out — ${employeeName} (${formatShortDate(startDate)}${startDate !== endDate ? ` – ${formatShortDate(endDate)}` : ''})`
+    : `Time-Off Request — ${employeeName} (${formatShortDate(startDate)}${startDate !== endDate ? ` – ${formatShortDate(endDate)}` : ''}${isPartial ? ', partial' : ''})`;
   const employeeFirst = firstName(employeeName);
+
+  // Call-out intro — leads with who / which shift / when, and what each button
+  // does. The employee's own words ride along verbatim below.
+  const callOutIntroText = isCallOut
+    ? `${employeeFirst} just called out of ${callOutLine}. Your call: ` +
+      `"Approve & find coverage" approves the absence and I immediately text everyone qualified to cover the shift; ` +
+      `"Approve" approves the absence and leaves coverage with you; "Deny" turns it down. ` +
+      `Either way I'll tell ${employeeFirst} the moment you decide — they've been told they're still on the schedule until you do.`
+    : null;
 
   // Plain text version. Sim/alternates/recommendation sections are only
   // rendered when the simulator ran (stage1 non-null).
   const text = [
     greeting(managerName),
     '',
-    `${employeeFirst} just put in a ${isPartial ? 'partial-day ' : ''}time-off request, and I've taken a first pass at the coverage picture for you. ` +
+    callOutIntroText ??
+      `${employeeFirst} just put in a ${isPartial ? 'partial-day ' : ''}time-off request, and I've taken a first pass at the coverage picture for you. ` +
       `The details are below — either link records your decision right away, and I'll let ${employeeFirst} know which way it went, so there's nothing else you'll need to do.`,
     '',
+    ...(isCallOut && employeeWords ? [`In ${employeeFirst}'s own words: "${employeeWords.trim()}"`, ''] : []),
     ...(violationLines.length > 0
       ? [
           '── POLICY CONSIDERATIONS ──',
@@ -846,7 +963,10 @@ function buildManagerEmail(params: {
           '',
         ]
       : []),
-    'Approve this request:',
+    ...(isCallOut && approveAndCoverUrl
+      ? ['Approve & find coverage (I text the whole qualified pool right away):', approveAndCoverUrl, '']
+      : []),
+    isCallOut ? 'Approve (absence only — coverage stays with you):' : 'Approve this request:',
     approveUrl,
     '',
     'Deny this request:',
@@ -865,7 +985,11 @@ function buildManagerEmail(params: {
   // Conclusion-first intro — the whole ask sits above the card.
   const introHtml = `
 <p style="margin:0 0 12px;font-size:16px;color:${BRAND.textPrimary};">${escapeHtmlTo(greeting(managerName))}</p>
-<p style="margin:0;font-size:16px;color:${BRAND.textPrimary};line-height:1.65;">${escapeHtmlTo(employeeFirst)} just put in a ${isPartial ? 'partial-day ' : ''}time-off request, and I've taken a first pass at the coverage picture for you. Everything's in the card below — either button records your decision right away, and I'll let ${escapeHtmlTo(employeeFirst)} know which way it went, so there's nothing else you'll need to do.</p>`;
+<p style="margin:0;font-size:16px;color:${BRAND.textPrimary};line-height:1.65;">${
+    callOutIntroText
+      ? escapeHtmlTo(callOutIntroText)
+      : `${escapeHtmlTo(employeeFirst)} just put in a ${isPartial ? 'partial-day ' : ''}time-off request, and I've taken a first pass at the coverage picture for you. Everything's in the card below — either button records your decision right away, and I'll let ${escapeHtmlTo(employeeFirst)} know which way it went, so there's nothing else you'll need to do.`
+  }</p>`;
 
   // Policy considerations — warn-tinted callout (omitted when no violations).
   const policyConsiderationsHtml =
@@ -885,7 +1009,9 @@ function buildManagerEmail(params: {
   const requestDetailsHtml = `
 <div style="margin:0 0 20px;padding:16px;background:${BRAND.surface2};border:1px solid ${BRAND.borderDefault};border-radius:8px;">
   <div style="font-size:14px;color:${BRAND.textPrimary};"><strong>Employee:</strong> ${escapeHtmlTo(employeeName)}</div>
+  ${isCallOut ? `<div style="font-size:14px;color:${BRAND.textPrimary};margin-top:8px;"><strong>Shift:</strong> ${escapeHtmlTo(callOutLine!)}</div>` : ''}
   <div style="font-size:14px;color:${BRAND.textPrimary};margin-top:8px;"><strong>Dates:</strong> ${escapeHtmlTo(dateDisplay)}</div>
+  ${isCallOut && employeeWords ? `<div style="font-size:14px;color:${BRAND.textPrimary};margin-top:8px;"><strong>Their words:</strong> &ldquo;${escapeHtmlTo(employeeWords.trim())}&rdquo;</div>` : ''}
   <div style="font-size:14px;color:${BRAND.textPrimary};margin-top:8px;"><strong>Reason:</strong> ${escapeHtmlTo(reason)}</div>
 </div>`;
 
@@ -997,10 +1123,18 @@ function buildManagerEmail(params: {
   // Deny the cautious silver outline.
   const ctaHtml = `
 <div style="border-top:1px solid ${BRAND.borderDefault};margin:6px 0 0;padding-top:18px;">
-${brandedButtonRow([
-  { url: approveUrl, label: 'Approve', variant: 'primary' },
-  { url: denyUrl, label: 'Deny', variant: 'secondary' },
-])}
+${brandedButtonRow(
+  isCallOut && approveAndCoverUrl
+    ? [
+        { url: approveAndCoverUrl, label: 'Approve & find coverage', variant: 'primary' },
+        { url: approveUrl, label: 'Approve only', variant: 'secondary' },
+        { url: denyUrl, label: 'Deny', variant: 'secondary' },
+      ]
+    : [
+        { url: approveUrl, label: 'Approve', variant: 'primary' },
+        { url: denyUrl, label: 'Deny', variant: 'secondary' },
+      ],
+)}
   <div style="font-size:13px;color:${BRAND.textMuted};margin:2px 0 6px;">These links expire in 7 days.</div>
 </div>`;
 
@@ -1012,11 +1146,13 @@ ${recommendationHtml}
 ${ctaHtml}`;
 
   const bodyHtml = `${introHtml}
-${brandActionCard('Action needed · Time off', cardInner)}`;
+${brandActionCard(isCallOut ? 'Action needed · Call-out' : 'Action needed · Time off', cardInner)}`;
 
   const html = brandedEmailShell({
     bodyHtml,
-    preheader: `Time-off request from ${employeeName} — ${dateDisplay}`,
+    preheader: isCallOut
+      ? `Call-out from ${employeeName} — ${callOutLine}`
+      : `Time-off request from ${employeeName} — ${dateDisplay}`,
   });
 
   return { subject, text, html };
@@ -1427,6 +1563,24 @@ export async function notifyManager(
   const tokenExpiry = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
   const dateDisplay = formatDateRange(pending.start_date, pending.end_date);
 
+  // W-2 — call-out extras, computed ONCE for every manager (spec §3.5):
+  //  • callOutLine: "Mia's Afternoon shift (3pm–8:15pm) tonight" for email + SMS
+  //  • near-shift escalation: shift starts within 6 hours → the nudge says so
+  const isCallOut = !!pending.call_out?.length;
+  let callOutLine: string | null = null;
+  let nearShiftLine = '';
+  if (isCallOut) {
+    const { today, timezone } = await tenantTodayAndZone(companyId);
+    const first = firstName(employee.name);
+    callOutLine = describeCallOutShifts(pending.call_out!, today, `${first}'s`);
+    const soonest = [...pending.call_out!].sort((a, b) =>
+      `${a.date}T${a.start_time}`.localeCompare(`${b.date}T${b.start_time}`))[0];
+    const minsUntil = minutesUntilTenantTime(timezone, soonest.date, soonest.start_time);
+    if (minsUntil > 0 && minsUntil <= 6 * 60) {
+      nearShiftLine = ` The shift starts at ${formatClock(soonest.start_time)} — the coverage window is real.`;
+    }
+  }
+
   // ── Per manager: own tokens, own email, own SMS ───────────────────────────
   //
   // One manager's failure must not silence the rest — a bad address or a bounced
@@ -1443,6 +1597,9 @@ export async function notifyManager(
       // credit whoever we minted it for, not whoever clicked.
       const approveToken = randomUUID();
       const denyToken = randomUUID();
+      // W-2 — a CALL-OUT mints a third choice: Approve & find coverage (spec
+      // §3.5). Same token family; the action string is what the click carries.
+      const approveAndCoverToken = isCallOut ? randomUUID() : null;
 
       const sharedPayload = {
         request_id: requestId,
@@ -1457,6 +1614,7 @@ export async function notifyManager(
         manager_user_id: manager.userId,
         manager_name: manager.name,
         expires_at: tokenExpiry,
+        call_out: pending.call_out ?? null,
       };
 
       await Promise.all([
@@ -1472,10 +1630,23 @@ export async function notifyManager(
           source: `decision_token:${denyToken}`,
           content: JSON.stringify({ ...sharedPayload, action: 'deny' }),
         }),
+        ...(approveAndCoverToken
+          ? [
+              supabase.from('aegis_memory').insert({
+                company_id: companyId,
+                memory_type: 'observation',
+                source: `decision_token:${approveAndCoverToken}`,
+                content: JSON.stringify({ ...sharedPayload, action: 'approve_and_cover' }),
+              }),
+            ]
+          : []),
       ]);
 
       const approveUrl = `${baseUrl}/webhooks/decision?action=approve&requestId=${requestId}&token=${approveToken}`;
       const denyUrl = `${baseUrl}/webhooks/decision?action=deny&requestId=${requestId}&token=${denyToken}`;
+      const approveAndCoverUrl = approveAndCoverToken
+        ? `${baseUrl}/webhooks/decision?action=approve_and_cover&requestId=${requestId}&token=${approveAndCoverToken}`
+        : null;
 
       const { subject, text, html } = buildManagerEmail({
         employeeName: employee.name,
@@ -1488,6 +1659,9 @@ export async function notifyManager(
         recommendation,
         approveUrl,
         denyUrl,
+        approveAndCoverUrl,
+        callOutLine,
+        employeeWords: isCallOut ? pending.employee_words ?? null : null,
         policies,
         violations,
         timeOffType: pending.time_off_type ?? 'full_day',
@@ -1522,8 +1696,12 @@ export async function notifyManager(
           from: aegisSmsNumber,
           body: managerAlertSms({
             managerName: manager.name,
-            summary: `${employee.name} wants ${dateDisplay} off${pending.reason ? ` for ${pending.reason}` : ` (${NO_REASON_GIVEN})`}.`,
-            inbox: 'approve',
+            // A call-out leads with the shift and the urgency, not the dates —
+            // and hands off to an email with THREE choices, not approve/deny.
+            summary: isCallOut
+              ? `${employee.name} just called out of ${callOutLine}${pending.reason ? ` — ${pending.reason}` : ''}.${nearShiftLine}`
+              : `${employee.name} wants ${dateDisplay} off${pending.reason ? ` for ${pending.reason}` : ` (${NO_REASON_GIVEN})`}.`,
+            inbox: isCallOut ? 'decide' : 'approve',
           }),
           company_id: companyId,
         });
@@ -1688,6 +1866,14 @@ export async function handleSubmitTimeOff(
 
   const onlyUnscheduled = parsed.unscheduled_dates.length > 0 && !parsed.partial_days?.length;
 
+  // W-2 (spec §3.5): dates today/tomorrow + a published shift = a CALL-OUT.
+  // Deterministic; the unscheduled path above already catches "sick tonight"
+  // with no shift (W-1), so a call-out and "you're not on the schedule" can
+  // never both fire.
+  const callOut = !onlyUnscheduled && contact.employee_id
+    ? await detectCallOut(parsed, { companyId: contact.company_id, employeeId: contact.employee_id })
+    : null;
+
   // Store pending confirmation (TTL: 24 hours). Email replies can lag hours behind
   // the request (people confirm when they next check mail), and the router resolves a
   // pending TO deterministically BEFORE the classifier — so a longer window keeps a
@@ -1706,6 +1892,8 @@ export async function handleSubmitTimeOff(
     expires_at: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
     time_off_type: parsed.time_off_type,
     partial_days: parsed.partial_days,
+    call_out: callOut?.shifts,
+    employee_words: callOut ? message.body : undefined,
   };
 
   // Delete any stale pending confirmation before inserting
@@ -1729,8 +1917,14 @@ export async function handleSubmitTimeOff(
   // never invented hours ("sick tonight" on an unscheduled Friday). A "yes" logs
   // it as a plain day off so the manager still knows.
   const forReason = reason ? ` for ${reason}` : '';
+  // W-2: a call-out's confirm names the real shift(s) and reads as urgent-but-
+  // pending — never as "you're off". "Sorry" only when they said they're sick.
+  const callOutSummary = callOut ? describeCallOutShifts(callOut.shifts, callOut.today) : null;
   const confirmText = onlyUnscheduled
     ? `${lead} ${summary}${weekdayNote}: you're not on the schedule that day, so there's no shift to take off. Want me to log it as a day off anyway${forReason} so your manager knows?` +
+      availabilityFollowupNote(extracted)
+    : callOutSummary
+    ? `${lead} you're calling out of ${callOutSummary}${forReason}. Want me to send that to your manager right away?` +
       availabilityFollowupNote(extracted)
     : `${lead} ${summary}${weekdayNote} off${forReason}. Want me to send that over to your manager?` +
       availabilityFollowupNote(extracted);
@@ -1867,6 +2061,9 @@ export async function createTimeOffRequestAndNotify(
       channel: pending.channel,
       thread_id: pending.thread_id ?? null,
       raw_subject: pending.raw_subject ?? null,
+      // W-2 — marks the stored request as a CALL-OUT (no schema change; the
+      // status query reads this to say "called out" instead of "time off").
+      call_out: pending.call_out?.length ? pending.call_out : null,
     }),
   });
 
@@ -1875,7 +2072,9 @@ export async function createTimeOffRequestAndNotify(
     action: 'time_off_request_created',
     entity_type: 'time_off_request',
     entity_id: requestId,
-    summary: `${employee.name} submitted a time-off request for ${formatDateRange(pending.start_date, pending.end_date)}`,
+    summary: pending.call_out?.length
+      ? `${employee.name} called out of ${pending.call_out.map(s => `${s.shift_name} on ${s.date}`).join(', ')} (pending manager decision)`
+      : `${employee.name} submitted a time-off request for ${formatDateRange(pending.start_date, pending.end_date)}`,
     metadata: {
       reason: pending.reason,
       stage1_feasible: stage1Result?.overall_feasible ?? null,
@@ -2101,6 +2300,22 @@ export async function handlePendingTimeOffConfirmation(
   const dateDisplay = formatDateRange(pending.start_date, pending.end_date);
   // No second greeting here — they just replied in an active thread, so opening
   // with "Hi Sam," again reads robotic. Keep it warm and conversational.
+  //
+  // W-2 call-out: PENDING-NOT-GRANTED must be unmistakable (spec §3.5) —
+  // "you'll hear the moment they confirm. Until then you're still on the
+  // schedule." Never anything that reads like "you're off", which causes an
+  // assumed-approval no-show.
+  if (pending.call_out?.length) {
+    const { today } = await tenantTodayAndZone(contact.company_id);
+    const shiftLine = describeCallOutShifts(pending.call_out, today);
+    await reply(
+      contact,
+      message,
+      `I've sent your call-out for ${shiftLine} to your manager — you'll hear the moment they confirm. ` +
+        `Until then you're still on the schedule.`
+    );
+    return;
+  }
   await reply(
     contact,
     message,
@@ -2149,7 +2364,9 @@ export async function handleQueryMyTimeOff(
     return;
   }
 
-  const today = new Date().toISOString().slice(0, 10);
+  // W-2: tenant-local "today" (CLAUDE.md hard rule — this read was server-UTC,
+  // which hid a request from a late-evening "where does it stand?" query).
+  const { today } = await tenantTodayAndZone(contact.company_id);
 
   // Surface EVERY current/upcoming request with its status, not just approved
   // (Batch-1.5 #5): "where does my request stand?" for a PENDING request used to
@@ -2157,13 +2374,14 @@ export async function handleQueryMyTimeOff(
   // stands"; still windowed to end_date >= today so old history doesn't pile up.
   const { data } = await supabase
     .from('time_off_requests')
-    .select('start_date, end_date, time_off_type, partial_days, status')
+    .select('id, start_date, end_date, time_off_type, partial_days, status')
     .eq('employee_id', contact.employee_id)
     .eq('company_id', contact.company_id)
     .gte('end_date', today)
     .order('start_date', { ascending: true });
 
   const rows = (data ?? []) as Array<{
+    id: string;
     start_date: string;
     end_date: string;
     time_off_type: 'full_day' | 'partial' | null;
@@ -2171,6 +2389,25 @@ export async function handleQueryMyTimeOff(
     // L3 — 'cancelled' added (migration 022).
     status: 'pending' | 'approved' | 'denied' | 'cancelled' | null;
   }>;
+
+  // W-2 — which of these were CALL-OUTS. The marker lives on the to_thread:<id>
+  // side row (no schema change); one read for all listed requests.
+  const callOutIds = new Set<string>();
+  if (rows.length > 0) {
+    const { data: threadRows } = await supabase
+      .from('aegis_memory')
+      .select('source, content')
+      .eq('company_id', contact.company_id)
+      .in('source', rows.map(r => `to_thread:${r.id}`));
+    for (const tr of (threadRows ?? []) as Array<{ source: string; content: string }>) {
+      try {
+        const parsed = JSON.parse(tr.content) as { call_out?: unknown };
+        if (Array.isArray(parsed.call_out) && parsed.call_out.length > 0) {
+          callOutIds.add(tr.source.slice('to_thread:'.length));
+        }
+      } catch { /* ignore malformed side rows */ }
+    }
+  }
 
   if (rows.length === 0) {
     await reply(
@@ -2198,7 +2435,9 @@ export async function handleQueryMyTimeOff(
 
   const lines = rows.map(row => {
     const dateRange = formatDateRange(row.start_date, row.end_date);
-    const stat = statusLabel(row.status);
+    // W-2 — a call-out is named as one, so "what did I send in?" matches what
+    // the employee actually did ("I called out", not generic time off).
+    const stat = (callOutIds.has(row.id) ? 'Call-out — ' : '') + statusLabel(row.status);
     const parsed: ParsedRequest = {
       start_date: row.start_date,
       end_date: row.end_date,

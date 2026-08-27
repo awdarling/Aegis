@@ -11,7 +11,18 @@ import { executeScheduleSwap, executeScheduleTrade } from '../workflows/shift-sw
 // L4 / L4b — RULE 0b: the single answer to "what kind of swap is this row, and
 // how (or whether) may the Homebase UI execute it?".
 import { planRowExecution } from '../lib/swap-kind';
-import { processCoverageButtonDecision, processCoverageBatchButton } from '../workflows/emergency-coverage';
+import {
+  processCoverageButtonDecision,
+  processCoverageBatchButton,
+  // W-2 call-out (spec §3.5): "Approve & find coverage" + the approved-absence
+  // schedule marker, plus the idempotency lookup for a second click.
+  startCoverageForCallOut,
+  markAssignmentsCalledOut,
+  findCoverageSessionForTimeOffRequest,
+} from '../workflows/emergency-coverage';
+import { resolveManagers } from '../messaging/manager-directory';
+import { describeCallOutShifts, type CallOutShift } from '../workflows/time-off';
+import { tenantTodayAndZone } from '../lib/tenant-date';
 import { computeWageEstimate } from '../lib/schedule-simulator';
 import { BRAND, quriaLogoDataUri } from '../messaging/brand';
 import type { Employee } from '../db/types';
@@ -67,7 +78,9 @@ export const decisionWebhook = Router();
 // conversation. Both are null for SMS submissions.
 interface TimeOffDecisionToken {
   decision_type: 'time_off';
-  action: 'approve' | 'deny';
+  // W-2 — a CALL-OUT (call_out present) mints a third token:
+  // 'approve_and_cover' = approve the absence AND blast the qualified pool.
+  action: 'approve' | 'deny' | 'approve_and_cover';
   request_id: string;
   company_id: string;
   employee_id: string;
@@ -81,6 +94,10 @@ interface TimeOffDecisionToken {
   // decision (decided_by + activity feed) to the person, not a system default.
   manager_user_id?: string | null;
   manager_name?: string | null;
+  // W-2 — the published shift(s) the employee called out of, carried so the
+  // decision page + employee notice can name the shift and the approve paths
+  // can mark it on the schedule. Null/absent on an ordinary request.
+  call_out?: CallOutShift[] | null;
   expires_at: string;
 }
 
@@ -147,6 +164,21 @@ type DecisionToken = TimeOffDecisionToken | SwapDecisionToken | CoverageDecision
 
 // ── HTML response helpers ─────────────────────────────────────────────────────
 
+// W-2 — the idempotent "Approve & find coverage" landing for a repeat click:
+// the truth is that coverage is already in motion (or filled), so say that.
+function alreadyCoveringPage(shiftName: string, filled: boolean): string {
+  return brandedPage({
+    title: 'Already On It',
+    heading: filled ? 'Covered' : 'Already On It',
+    headingColor: BRAND.goodText,
+    icon: '✓',
+    iconColor: BRAND.goodText,
+    body: filled
+      ? `The ${escapeHtml(shiftName)} shift is covered — a teammate accepted. Nothing further is needed.`
+      : `The absence is approved and I'm already out asking teammates to cover the ${escapeHtml(shiftName)} shift. I'll text you the moment someone accepts — nothing further is needed.`,
+  });
+}
+
 function confirmationPage(employeeName: string, action: 'approve' | 'deny'): string {
   const verb = action === 'approve' ? 'approved' : 'denied';
   const statusColor = action === 'approve' ? BRAND.goodText : BRAND.badText;
@@ -212,9 +244,9 @@ export async function notifyEmployeeDecision(opts: {
 async function notifyEmployee(
   token: TimeOffDecisionToken,
   employee: Employee,
-  action: 'approve' | 'deny'
+  action: 'approve' | 'deny' | 'approve_and_cover'
 ): Promise<void> {
-  const verb = action === 'approve' ? 'approved' : 'denied';
+  const verb = action === 'deny' ? 'denied' : 'approved';
   // Name the date(s) so an employee with several requests in flight knows exactly
   // which one this decision covers.
   const { data: torDates } = await supabase
@@ -224,10 +256,23 @@ async function notifyEmployee(
     .maybeSingle();
   const tr = torDates as { start_date: string; end_date: string } | null;
   const forDates = tr ? ` for ${formatDateRange(tr.start_date, tr.end_date)}` : '';
-  const messageText =
-    action === 'approve'
-      ? `Great news! Your time-off request${forDates} has been approved. Enjoy your time off!`
-      : `Your time-off request${forDates} has been denied. Please contact your manager if you have questions or would like to discuss alternatives.`;
+  // W-2 — a call-out's outcome names the shift and closes the "still on the
+  // schedule" loop the confirmation opened. Approved = you're off, definitively.
+  const callOut = token.call_out ?? null;
+  let callOutLine: string | null = null;
+  if (callOut?.length) {
+    const { today } = await tenantTodayAndZone(token.company_id);
+    callOutLine = describeCallOutShifts(callOut, today);
+  }
+  const messageText = callOutLine
+    ? action === 'deny'
+      ? `Your manager wasn't able to approve your call-out for ${callOutLine} — you're still expected for that shift. If that's a real problem, reach out to them directly.`
+      : action === 'approve_and_cover'
+      ? `Your manager approved your call-out for ${callOutLine} — you're off, and I'm already reaching out to teammates to cover the shift.`
+      : `Your manager approved your call-out for ${callOutLine} — you're off. They're handling coverage from here.`
+    : action === 'deny'
+      ? `Your time-off request${forDates} has been denied. Please contact your manager if you have questions or would like to discuss alternatives.`
+      : `Great news! Your time-off request${forDates} has been approved. Enjoy your time off!`;
 
   const subject = token.raw_subject
     ? normalizeReSubject(token.raw_subject)
@@ -549,7 +594,7 @@ decisionWebhook.get('/', async (req, res) => {
     return;
   }
 
-  if (action !== 'approve' && action !== 'deny') {
+  if (action !== 'approve' && action !== 'deny' && action !== 'approve_and_cover') {
     res.status(400).send(errorPage('Unknown action. Please use the links from your Aegis email.'));
     return;
   }
@@ -562,6 +607,39 @@ decisionWebhook.get('/', async (req, res) => {
     .maybeSingle();
 
   if (!tokenData) {
+    // W-2 — say what actually happened, never a generic "used or expired" that
+    // reads as "nothing changed" (J-3: a manager was told the opposite of the
+    // truth after a double-fetch). The token is gone, but the REQUEST knows its
+    // own state — read it and report that.
+    const { data: priorTor } = await supabase
+      .from('time_off_requests')
+      .select('id, status, company_id, employee_id')
+      .eq('id', requestId)
+      .maybeSingle();
+    const prior = priorTor as { id: string; status: string; company_id: string; employee_id: string } | null;
+    if (prior && (prior.status === 'approved' || prior.status === 'denied')) {
+      if (prior.status === 'approved' && action === 'approve_and_cover') {
+        // Second click on "Approve & find coverage" (or a mail client fetching
+        // the link twice): the first click consumed the tokens and opened the
+        // session. Find it and say so — idempotent, never "nothing changed".
+        const openSession = await findCoverageSessionForTimeOffRequest(prior.company_id, prior.id);
+        if (openSession) {
+          res.send(alreadyCoveringPage(openSession.shift_info.shift_name, openSession.coverage_filled));
+          return;
+        }
+      }
+      res.send(
+        brandedPage({
+          title: 'Already Decided',
+          heading: prior.status === 'approved' ? 'Already Approved' : 'Already Denied',
+          headingColor: prior.status === 'approved' ? BRAND.goodText : BRAND.badText,
+          icon: prior.status === 'approved' ? '✓' : '✕',
+          iconColor: prior.status === 'approved' ? BRAND.goodText : BRAND.badText,
+          body: `This request was already ${prior.status} — that decision stands and the employee has been told. Nothing further is needed.`,
+        }),
+      );
+      return;
+    }
     res
       .status(404)
       .send(
@@ -646,6 +724,16 @@ decisionWebhook.get('/', async (req, res) => {
   const tor = torData as { id: string; status: string; employee_id: string; start_date: string; end_date: string; reason: string | null };
 
   if (tor.status !== 'pending') {
+    // W-2 idempotency: a second "Approve & find coverage" click that somehow
+    // still holds a live token (e.g. a different manager's copy) reports the
+    // open coverage session instead of a bare conflict.
+    if (action === 'approve_and_cover' && tor.status === 'approved') {
+      const openSession = await findCoverageSessionForTimeOffRequest(decisionToken.company_id, requestId);
+      if (openSession) {
+        res.send(alreadyCoveringPage(openSession.shift_info.shift_name, openSession.coverage_filled));
+        return;
+      }
+    }
     res
       .status(409)
       .send(
@@ -668,10 +756,13 @@ decisionWebhook.get('/', async (req, res) => {
 
   // Update time_off_requests status. Attribute the decision to the manager the
   // approve/deny link was sent to, so the record credits the person who acted.
+  // W-2: 'approve_and_cover' approves the absence exactly like 'approve' — the
+  // coverage blast is additive, after the write.
+  const approves = action !== 'deny';
   await supabase
     .from('time_off_requests')
     .update({
-      status: action === 'approve' ? 'approved' : 'denied',
+      status: approves ? 'approved' : 'denied',
       decided_at: new Date().toISOString(),
       decided_by: decisionToken.manager_user_id ?? null,
     })
@@ -709,8 +800,10 @@ decisionWebhook.get('/', async (req, res) => {
   }
 
   // Log the decision
-  const decisionPast = action === 'approve' ? 'approved' : 'denied';
+  const decisionPast = approves ? 'approved' : 'denied';
   const deciderName = decisionToken.manager_name ?? null;
+  const tokenCallOut = (decisionToken as TimeOffDecisionToken).call_out ?? null;
+  const isCallOut = Array.isArray(tokenCallOut) && tokenCallOut.length > 0;
   await logActivity({
     company_id: decisionToken.company_id,
     // A manager clicked the approve/deny link — credit the manager, not the
@@ -720,15 +813,32 @@ decisionWebhook.get('/', async (req, res) => {
     action: `time_off_${decisionPast}`,
     entity_type: 'time_off_request',
     entity_id: requestId,
-    summary: `Time-off request for ${decisionToken.employee_name} ${decisionPast}${deciderName ? ` by ${deciderName}` : ''} via email link`,
+    summary: `${isCallOut ? 'Call-out' : 'Time-off request'} for ${decisionToken.employee_name} ${decisionPast}${deciderName ? ` by ${deciderName}` : ''} via email link`,
     metadata: {
       employee_id: decisionToken.employee_id,
       start_date: tor.start_date,
       end_date: tor.end_date,
       reason: tor.reason,
       decided_by: decisionToken.manager_user_id ?? null,
+      ...(isCallOut ? { call_out: true, via: action } : {}),
     },
   });
+
+  // W-2 — an APPROVED call-out marks the shift on the published schedule
+  // (Alexander, 2026-08-27): it STAYS on, greyed out, excluded from the wage
+  // estimate. Both approve paths do this; a coverer later replacing the
+  // assignment clears the marker.
+  if (isCallOut && approves) {
+    try {
+      await markAssignmentsCalledOut({
+        company_id: decisionToken.company_id,
+        employee_id: decisionToken.employee_id,
+        dates: tokenCallOut!.map(s => s.date),
+      });
+    } catch (err) {
+      console.error('[decision] failed to mark call-out on schedule:', err);
+    }
+  }
 
   // Record a pattern in aegis_memory for future reference
   await supabase.from('aegis_memory').insert({
@@ -746,6 +856,37 @@ decisionWebhook.get('/', async (req, res) => {
     }),
   });
 
+  // W-2 — "Approve & find coverage": absence is approved above; now start the
+  // manager-initiated coverage workflow with employee + shift + date already
+  // filled in (spec §3.5 — no re-asking "who" or "which shift"), blasting the
+  // whole qualified pool. The clicking manager gets the coverage play-by-play
+  // on their own channel from here.
+  let coverOutcome: Awaited<ReturnType<typeof startCoverageForCallOut>> | null = null;
+  if (action === 'approve_and_cover' && isCallOut) {
+    try {
+      const directory = await resolveManagers(decisionToken.company_id);
+      const clicker = directory.managers.find(m => m.userId === decisionToken.manager_user_id) ?? null;
+      const soonest = [...tokenCallOut!].sort((a, b) =>
+        `${a.date}T${a.start_time}`.localeCompare(`${b.date}T${b.start_time}`))[0];
+      coverOutcome = await startCoverageForCallOut({
+        companyId: decisionToken.company_id,
+        timeOffRequestId: requestId,
+        absentEmployeeId: decisionToken.employee_id,
+        absentEmployeeName: decisionToken.employee_name,
+        shiftDate: soonest.date,
+        shiftNameHint: soonest.shift_name,
+        manager: {
+          userId: decisionToken.manager_user_id ?? null,
+          name: decisionToken.manager_name ?? clicker?.name ?? null,
+          email: clicker?.email ?? null,
+          phone: clicker?.phone ?? null,
+        },
+      });
+    } catch (err) {
+      console.error('[decision] failed to start call-out coverage:', err);
+    }
+  }
+
   // Notify employee
   if (employee) {
     try {
@@ -757,7 +898,73 @@ decisionWebhook.get('/', async (req, res) => {
 
   // Return HTML confirmation page to the manager's browser
   const employeeName = decisionToken.employee_name;
-  res.send(confirmationPage(employeeName, action));
+  if (action === 'approve_and_cover') {
+    const first = tokenCallOut?.[0]?.shift_name ?? 'shift';
+    if (coverOutcome?.outcome === 'started') {
+      res.send(
+        brandedPage({
+          title: 'On It',
+          heading: 'Absence Approved — Finding Coverage',
+          headingColor: BRAND.goodText,
+          icon: '✓',
+          iconColor: BRAND.goodText,
+          body: `I've told ${escapeHtml(employeeName)} and I'm texting ${coverOutcome.contacted.length} qualified teammate${coverOutcome.contacted.length === 1 ? '' : 's'} about the ${escapeHtml(coverOutcome.shiftName)} shift right now. I'll keep you posted the moment someone accepts.`,
+        }),
+      );
+    } else if (coverOutcome?.outcome === 'already_open') {
+      res.send(alreadyCoveringPage(coverOutcome.shiftName, false));
+    } else if (coverOutcome?.outcome === 'choose') {
+      res.send(
+        brandedPage({
+          title: 'Your Call',
+          heading: 'Absence Approved — Your Call on Coverage',
+          headingColor: BRAND.goodText,
+          icon: '✓',
+          iconColor: BRAND.goodText,
+          body: `I've told ${escapeHtml(employeeName)}. Everyone qualified for the ${escapeHtml(coverOutcome.shiftName)} shift is already working that day, so I haven't texted anyone — I've sent you the list to pick from instead.`,
+        }),
+      );
+    } else if (coverOutcome?.outcome === 'no_candidates') {
+      res.send(
+        brandedPage({
+          title: 'Approved — No Cover Found',
+          heading: 'Absence Approved — Nobody Available',
+          headingColor: BRAND.warnText,
+          icon: '⚠️',
+          iconColor: BRAND.warnText,
+          body: `I've told ${escapeHtml(employeeName)}, but I couldn't find anyone qualified and available to cover the ${escapeHtml(coverOutcome.shiftName)} shift. This one needs your hands directly — sorry.`,
+        }),
+      );
+    } else {
+      // no_shift or an unexpected failure: the ABSENCE is approved either way —
+      // never claim otherwise.
+      res.send(
+        brandedPage({
+          title: 'Approved',
+          heading: 'Absence Approved',
+          headingColor: BRAND.goodText,
+          icon: '✓',
+          iconColor: BRAND.goodText,
+          body: `I've told ${escapeHtml(employeeName)} their absence is approved, but I couldn't line up the ${escapeHtml(first)} shift for automatic coverage — please handle coverage directly.`,
+        }),
+      );
+    }
+    return;
+  }
+  if (isCallOut && action === 'approve') {
+    res.send(
+      brandedPage({
+        title: 'Approved',
+        heading: 'Absence Approved',
+        headingColor: BRAND.goodText,
+        icon: '✓',
+        iconColor: BRAND.goodText,
+        body: `I've told ${escapeHtml(employeeName)} they're off and that you're handling coverage — you've got it from here. The shift stays on the schedule, greyed out, so the hole is visible until you fill it.`,
+      }),
+    );
+    return;
+  }
+  res.send(confirmationPage(employeeName, action as 'approve' | 'deny'));
 });
 
 

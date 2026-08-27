@@ -235,13 +235,17 @@ export async function loadAssignmentsOnDate(
   companyId: string,
   employeeId: string,
   date: string,
+  // W-2: a call-out only counts against a shift the employee was actually TOLD
+  // about. `publishedOnly` skips the draft fallback — an unpublished draft is
+  // not a commitment anyone can call out of.
+  opts?: { publishedOnly?: boolean },
 ): Promise<{ scheduleExists: boolean; assignments: ScheduleAssignment[] }> {
   const base = () => supabase.from('schedules').select('id, data').is('deleted_at', null)
     .eq('company_id', companyId).lte('week_start', date).gte('week_end', date)
     .order('published_at', { ascending: false, nullsFirst: false }).limit(1);
   const { data: pub } = await base().eq('status', 'published').maybeSingle();
   let sched = (pub as { data: ScheduleData } | null)?.data ?? null;
-  if (!sched) {
+  if (!sched && !opts?.publishedOnly) {
     const { data: draft } = await base().eq('status', 'draft').maybeSingle();
     sched = (draft as { data: ScheduleData } | null)?.data ?? null;
   }

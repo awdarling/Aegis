@@ -36,7 +36,9 @@ export function textOpener(name?: string | null): string {
 export function managerAlertSms(params: {
   managerName?: string | null;
   summary: string;
-  inbox?: 'approve' | 'action' | 'details' | null;
+  // 'decide' — the email offers MORE than approve/deny (W-2 call-outs carry
+  // three choices), so the 'approve' tail's "approve/deny link" would be a lie.
+  inbox?: 'approve' | 'action' | 'details' | 'decide' | null;
 }): string {
   const { managerName, summary, inbox } = params;
   const tail =
@@ -46,6 +48,8 @@ export function managerAlertSms(params: {
       ? " The details and how to handle it are in your email whenever you get a chance."
       : inbox === 'details'
       ? " Full details are in your email if you want them."
+      : inbox === 'decide'
+      ? " The details and your options are in your email — take a look when you can."
       : '';
   return `${textOpener(managerName)}${summary}${tail}`;
 }

@@ -6,6 +6,8 @@ import { isQualified, acceptedRolesOf, roleLabel, resolveAcceptedRoles } from '.
 import { coerceJsonObject } from '../utils/coerce-json';
 import { logActivity } from '../logger/activity-log';
 import { formatClockRange } from '../lib/shift-hours';
+// W-2 (C-5/J-4) — deterministic confirm-gate edit readings (shared, Rule 0b).
+import { parseNamedDirective, parseWillingDaysReply, parseShiftAnswer } from '../lib/confirm-edits';
 import { reply } from '../messaging/reply';
 import { sendSms } from '../messaging/sms';
 import { sendEmail } from '../messaging/email';
@@ -73,7 +75,28 @@ export interface PendingSwap {
   // Facilitated only: weekdays (0=Sun..6=Sat) the requester can work in return.
   // Drives the swap option on the broadcast; empty → the broadcast is pickup-only.
   willing_days?: number[];
+  // ── W-2 (J-4): an OPEN QUESTION keeps its state ─────────────────────────────
+  // "Which shift did you want to swap?" used to keep nothing: the answer
+  // ("Sunday") re-entered the router cold and was re-classified as a schedule
+  // query. When set, this pending row is that open question, `raw` holds
+  // everything already extracted, and the next reply is read as the ANSWER
+  // (parseShiftAnswer) — never re-classified. The shift_* fields hold
+  // placeholders while awaiting is set.
+  awaiting?: 'which_shift' | 'which_target_shift';
+  raw?: StoredSwapExtraction;
   expires_at: string;
+}
+
+// The extractor's output, persisted across an open question so the model is
+// never re-asked (MINIMIZE LLM CALLS — the answer merges into this).
+export interface StoredSwapExtraction {
+  direction: SwapDirection;
+  shift_date: string | null;
+  shift_name: string | null;
+  target_employee_name: string | null;
+  target_shift_date: string | null;
+  target_shift_name: string | null;
+  willing_days: number[];
 }
 
 export interface SwapOutreach {
@@ -2480,12 +2503,44 @@ async function executeSwapNow(params: {
 export async function handleInitiateSwap(
   message: InboundMessage,
   contact: VerifiedContact,
-  extracted: Record<string, unknown>
+  extracted: Record<string, unknown>,
+  // W-2 (J-4): when the router resumes an open question ("which shift?"), the
+  // original extraction rides back in with the answer merged — the model is
+  // never asked to re-read a one-word reply.
+  rawOverride?: StoredSwapExtraction
 ): Promise<void> {
   // Tenant-local date (companies.timezone), NOT server UTC — so bare weekdays
   // ("Saturday", "Friday") resolve to the right day for any client's timezone.
   const today = await companyLocalToday(contact.company_id);
-  const raw = await extractSwapDetails(message.body, today);
+  const raw = rawOverride ?? await extractSwapDetails(message.body, today);
+
+  // One writer for the open-question state (Rule 0b): the ask keeps everything
+  // extracted so far, and handleSwapConfirmation reads the next reply as the
+  // answer instead of letting the router re-classify it (J-4's "Sunday" became
+  // a schedule query exactly because these asks kept nothing).
+  const storeAsk = async (awaiting: 'which_shift' | 'which_target_shift', shiftDate?: string) => {
+    const pendingAsk: PendingSwap = {
+      mode: raw.target_employee_name ? 'directed' : 'facilitated',
+      company_id: contact.company_id,
+      requester_id: contact.employee_id!,
+      requester_name: contact.name,
+      channel: message.channel,
+      sender: message.sender,
+      recipient: message.recipient,
+      raw_subject: message.raw_subject,
+      thread_id: message.thread_id,
+      shift_date: shiftDate ?? raw.shift_date ?? '',
+      shift_name: raw.shift_name ?? '',
+      role: '',
+      shift_start: '',
+      shift_end: '',
+      schedule_id: null,
+      awaiting,
+      raw,
+      expires_at: new Date(Date.now() + PENDING_SWAP_TTL_MS).toISOString(),
+    };
+    await storePendingSwap(pendingAsk);
+  };
 
   const shiftNameHint = raw.shift_name ?? null;
   const targetName = raw.target_employee_name ?? null;
@@ -2509,9 +2564,11 @@ export async function handleInitiateSwap(
       );
       if (own.kind === 'ambiguous') {
         // They work more than one shift that day and didn't say which. Ask —
-        // picking one silently gives away a shift they never named.
+        // picking one silently gives away a shift they never named — and KEEP
+        // the question open so the answer lands here, not in the classifier.
+        await storeAsk('which_shift', shiftDate);
         const list = own.shifts
-          .map(a => `${a.shift_name} (${(a.start_time ?? '').slice(0, 5)}–${(a.end_time ?? '').slice(0, 5)})`)
+          .map(a => `${a.shift_name} (${formatClockRange(a.start_time, a.end_time)})`)
           .join(', or ');
         await reply(contact, message,
           `You're on more than one shift on ${formatDisplayDate(shiftDate)} — which one did you mean: ${list}? ` +
@@ -2549,6 +2606,8 @@ export async function handleInitiateSwap(
       return;
     }
     if (choice.kind === 'ambiguous') {
+      // W-2 (J-4) — keep the question open: "Sunday" is the answer, not a query.
+      await storeAsk('which_shift');
       const list = choice.shifts.map(a => `your ${a.shift_name} shift on ${formatDisplayDate(a.date)}`).join(', or ');
       await reply(contact, message, `Which shift did you want to swap — ${list}? Just tell me which one.`);
       return;
@@ -2691,6 +2750,8 @@ export async function handleInitiateSwap(
       return;
     }
     if (choice.kind === 'ambiguous') {
+      // W-2 (J-4) — keep the question open for the one-word answer.
+      await storeAsk('which_target_shift', shiftDate);
       const list = choice.shifts
         .map(s => `${s.shift_name} on ${formatDisplayDate(s.date)} (${formatClockRange(s.start_time, s.end_time)})`)
         .join('; ');
@@ -2911,20 +2972,34 @@ async function sendOutreachMessage(params: {
   return 'none';
 }
 
-// Called from router pre-check when swap_pending:{employeeId} exists.
-export async function handleSwapConfirmation(
+// ── W-2 (J-4/C-5): confirm-gate edit support ─────────────────────────────────
+
+function stripSwapMemoryId(p: PendingSwap & { _memory_id?: string }): PendingSwap {
+  const { _memory_id: _drop, ...rest } = p;
+  return rest;
+}
+
+// The reply to an OPEN QUESTION ("which shift?" / "which of theirs?") is its
+// answer. Merge it into the stored extraction and resume handleInitiateSwap —
+// no model re-read of a one-word reply, and never a re-classification
+// (Katie's "Sunday" became a schedule query; this is that fix).
+async function handleSwapOpenQuestionAnswer(
   message: InboundMessage,
   contact: VerifiedContact,
-  pending: PendingSwap & { _memory_id?: string }
+  pending: PendingSwap & { awaiting: 'which_shift' | 'which_target_shift'; raw: StoredSwapExtraction }
 ): Promise<void> {
-  const answer = parseYesNo(message.body);
+  const yn = parseYesNo(message.body);
+  if (yn === 'no') {
+    await clearPendingSwap(contact.company_id, contact.employee_id!);
+    await reply(contact, message, "No problem — I've dropped it. Let me know if you need anything else.");
+    return;
+  }
 
-  if (answer === 'unclear') {
-    // H7 — before re-asking, yield to a clearly-different actionable request so a
-    // pending (unsent) swap confirmation does not hold a schedule query / time-off
-    // / new swap hostage. The pending swap was never sent to anyone, so abandoning
-    // it to handle the new request is safe (mirrors the time-off-confirm MOVED_ON
-    // re-route). A genuine fumbled yes/no still falls through to the re-ask below.
+  const today = await companyLocalToday(contact.company_id);
+  const answer = yn === 'yes' ? null : parseShiftAnswer(message.body, today);
+  if (!answer) {
+    // Not an answer we can read. A clearly-different request may take over
+    // (explicit different intent — the gate never clears on mere "unclear").
     const { employeeInterruptIntent } = await import('../router/interrupt');
     const interrupt = await employeeInterruptIntent(message, contact);
     if (interrupt) {
@@ -2934,7 +3009,131 @@ export async function handleSwapConfirmation(
       return;
     }
     await reply(contact, message,
-      "Just let me know — should I set that swap up? Or tell me no and I'll drop it."
+      pending.awaiting === 'which_shift'
+        ? `Just tell me which shift you meant — a day ("Sunday") or the shift name works.`
+        : `Just tell me which of their shifts you want — a day ("Sunday") or the shift name works.`);
+    return;
+  }
+
+  const raw: StoredSwapExtraction = { ...pending.raw };
+  if (pending.awaiting === 'which_shift') {
+    if (answer.shift_date) raw.shift_date = answer.shift_date;
+    if (answer.shift_name_hint) raw.shift_name = answer.shift_name_hint;
+  } else {
+    if (answer.shift_date) raw.target_shift_date = answer.shift_date;
+    if (answer.shift_name_hint) raw.target_shift_name = answer.shift_name_hint;
+  }
+  await clearPendingSwap(contact.company_id, contact.employee_id!);
+  await handleInitiateSwap(message, contact, {}, raw);
+}
+
+// A named person at the swap gate ("ask mia", "send it to Jenna"):
+//  • the person it's ALREADY set up with → 'yes' (caller re-enters as a yes)
+//  • someone else, found and not the requester → re-run the swap DIRECTED at
+//    them ('redirected'; validation + a fresh confirm come from the one
+//    initiate path — Rule 0b)
+//  • not found / self → say so, keep the gate open ('kept'), offer the broadcast
+async function handleSwapGateNamedPerson(
+  message: InboundMessage,
+  contact: VerifiedContact,
+  pending: PendingSwap,
+  name: string
+): Promise<'yes' | 'redirected' | 'kept'> {
+  const emp = await findEmployeeByName(contact.company_id, name);
+  if (!emp) {
+    await reply(contact, message,
+      `I don't see anyone named "${name}" on the team — double-check the name? ` +
+      `Or say the word and I'll ask everyone who's qualified instead.`);
+    return 'kept';
+  }
+  if (pending.target_employee_id && emp.id === pending.target_employee_id) return 'yes';
+  if (emp.id === contact.employee_id) {
+    await reply(contact, message,
+      `That's you — I need a coworker to take the shift. Who should I ask, or want me to ask the team?`);
+    return 'kept';
+  }
+  await clearPendingSwap(contact.company_id, contact.employee_id!);
+  const raw: StoredSwapExtraction = {
+    // A directed trade keeps trading; anything else becomes a directed giveaway.
+    direction: pending.target_shift_name ? 'trade' : 'giveaway',
+    shift_date: pending.shift_date || null,
+    shift_name: pending.shift_name || null,
+    target_employee_name: emp.name,
+    target_shift_date: null,
+    target_shift_name: null,
+    willing_days: pending.willing_days ?? [],
+  };
+  await handleInitiateSwap(message, contact, {}, raw);
+  return 'redirected';
+}
+
+// Called from router pre-check when swap_pending:{employeeId} exists.
+export async function handleSwapConfirmation(
+  message: InboundMessage,
+  contact: VerifiedContact,
+  pending: PendingSwap & { _memory_id?: string }
+): Promise<void> {
+  // ── W-2 (J-4): an open question reads the reply as its ANSWER ──────────────
+  if (pending.awaiting && pending.raw) {
+    await handleSwapOpenQuestionAnswer(message, contact, pending as PendingSwap & { awaiting: NonNullable<PendingSwap['awaiting']>; raw: StoredSwapExtraction });
+    return;
+  }
+
+  const answer = parseYesNo(message.body);
+
+  if (answer === 'unclear') {
+    // ── W-2 (C-5): a non-yes/no reply is an EDIT before it is anything else ──
+    //
+    // 1. A NAMED PERSON ("ask mia", "send it to Jenna") directs the swap to
+    //    that person — never a broadcast (Maisey's "ask mia" went to three
+    //    people, none of them Mia). Naming the person it's ALREADY set up with
+    //    is a yes.
+    const namedRaw = parseNamedDirective(message.body);
+    if (namedRaw) {
+      const handled = await handleSwapGateNamedPerson(message, contact, pending, namedRaw);
+      if (handled === 'redirected' || handled === 'kept') return;
+      // handled === 'yes': naming the person it's already set up with IS the
+      // confirmation — re-enter as a yes.
+      await handleSwapConfirmation({ ...message, body: 'yes' }, contact, pending);
+      return;
+    }
+    // 2. A WILLING-DAYS reply at the facilitated gate answers the confirm's own
+    //    invitation ("tell me which days you can work") — it is NOT an
+    //    availability change, and it must not clear the gate (J-4's root
+    //    cause: the interrupt below re-routed it to update_availability).
+    if (pending.mode === 'facilitated' && !namedRaw) {
+      const willing = parseWillingDaysReply(message.body);
+      if (willing) {
+        const updated: PendingSwap = { ...stripSwapMemoryId(pending), willing_days: willing };
+        await storePendingSwap(updated);
+        await reply(contact, message,
+          buildFacilitatedSwapConfirm({
+            shiftLabel: `${pending.shift_name} shift (${pending.role}, ${formatClockRange(pending.shift_start, pending.shift_end)})`,
+            dateLabel: formatDisplayDate(pending.shift_date),
+            candidateNote: 'Noted. ',
+            tradeNote: `Anyone who'd rather trade can offer you a shift on ${formatWeekdayNames(willing)} in return. `,
+          })
+        );
+        return;
+      }
+    }
+    // H7 — before re-asking, yield to a clearly-different actionable request so a
+    // pending (unsent) swap confirmation does not hold a schedule query / time-off
+    // / new swap hostage. The pending swap was never sent to anyone, so abandoning
+    // it to handle the new request is safe (mirrors the time-off-confirm MOVED_ON
+    // re-route). A genuine fumbled yes/no still falls through to the re-ask below —
+    // the gate clears ONLY on yes / no / an explicit different intent, never on
+    // "unclear" (W-2/J-4).
+    const { employeeInterruptIntent } = await import('../router/interrupt');
+    const interrupt = await employeeInterruptIntent(message, contact);
+    if (interrupt) {
+      await clearPendingSwap(contact.company_id, contact.employee_id!);
+      const { routeIntent } = await import('../router/intent-router');
+      await routeIntent(message, contact);
+      return;
+    }
+    await reply(contact, message,
+      "Just let me know — should I set that swap up? Or tell me what to change — a different day, or a specific person to ask — and I'll fix it up."
     );
     return;
   }

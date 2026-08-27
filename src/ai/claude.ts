@@ -1,6 +1,8 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { env } from '../config/env';
 import { coerceJsonObject } from '../utils/coerce-json';
+// W-2 (C-5) — deterministic reason-edit reading, shared with the confirm gates.
+import { looksLikeReasonEdit } from '../lib/confirm-edits';
 
 const client = new Anthropic({ apiKey: env.ANTHROPIC_API_KEY });
 
@@ -145,9 +147,13 @@ export async function classifyIntent(
 
   return applyManagerCoverageBackstop(
     applyDepartureBackstop(
-      applyCancelTimeOffBackstop(
-        applyBareTimeOffBackstop(applyAvailabilityBackstop(parsed, message), message),
-        message
+      applyReasonEditBackstop(
+        applyCancelTimeOffBackstop(
+          applyBareTimeOffBackstop(applyAvailabilityBackstop(parsed, message), message),
+          message
+        ),
+        message,
+        role
       ),
       message
     ),
@@ -315,6 +321,30 @@ export function applyCancelTimeOffBackstop(result: ClassifyResult, message: stri
     intent: 'cancel_time_off',
     confidence: result.confidence === 'low' ? 'medium' : result.confidence,
     extracted: { date: null },
+  };
+}
+
+// W-2 (C-5) — an employee ADDING OR FIXING THE REASON on a request that already
+// went to the manager ("make sure to say it's for the competition") used to hit
+// the scope wall as general_question. Deterministic upgrade from the general
+// buckets only (same shape as the cancel backstop above; a cancel wins — "scrap
+// that request, it's for nothing" is a cancel, not a reason edit). The handler
+// re-parses the reason itself; nothing extracted here.
+export function applyReasonEditBackstop(result: ClassifyResult, message: string, role: string): ClassifyResult {
+  if (role !== 'employee') return result;
+  if (
+    result.intent !== 'general_question' &&
+    result.intent !== 'operational_query' &&
+    result.intent !== 'unknown'
+  ) {
+    return result;
+  }
+  if (looksLikeTimeOffCancel(message)) return result;
+  if (!looksLikeReasonEdit(message)) return result;
+  return {
+    intent: 'edit_time_off_reason',
+    confidence: result.confidence === 'low' ? 'medium' : result.confidence,
+    extracted: {},
   };
 }
 

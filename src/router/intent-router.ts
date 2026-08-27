@@ -12,6 +12,7 @@ import {
   handleDenyTimeOff,
   handlePendingTimeOffConfirmation,
   handleQueryMyTimeOff,
+  handleTimeOffReasonEdit,
   handleRecheckTimeOff,
   getPendingTimeOff,
   // L3 — cancel already-approved time off, behind an explicit confirmation.
@@ -471,6 +472,15 @@ async function routeIntentInner(
       case 'query_my_time_off':
         console.log('[router] dispatching to handleQueryMyTimeOff');
         await handleQueryMyTimeOff(message, contact, classification.extracted);
+        break;
+
+      // W-2 (C-5) — deterministic backstop only (applyReasonEditBackstop):
+      // "make sure to say it's for the competition" after the request already
+      // went to the manager updates the pending row + sends a manager FYI,
+      // instead of hitting the scope wall.
+      case 'edit_time_off_reason':
+        console.log('[router] dispatching to handleTimeOffReasonEdit');
+        await handleTimeOffReasonEdit(message, contact, classification.extracted);
         break;
 
       case 'query_my_availability':

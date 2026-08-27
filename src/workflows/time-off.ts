@@ -28,6 +28,7 @@ import type { Employee, PartialDayDetail, Policy, TimeOffRequest } from '../db/t
 import type { SimulationResult } from '../lib/schedule-simulator';
 import type { TimeOffViolations } from '../lib/time-off-policies';
 import { resolveMeantHours, loadShiftTemplates, formatClock, formatClockRange, loadAssignmentsOnDate, type ShiftTemplate } from '../lib/shift-hours';
+import { parseReasonEdit } from '../lib/confirm-edits';
 
 // ── N1: self-notification guard ───────────────────────────────────────────────
 // Exclude the actor who TOOK a decision from that decision's notification
@@ -1896,14 +1897,8 @@ export async function handleSubmitTimeOff(
     employee_words: callOut ? message.body : undefined,
   };
 
-  // Delete any stale pending confirmation before inserting
-  await clearPendingTimeOff(contact.company_id, contact.employee_id!);
-  await supabase.from('aegis_memory').insert({
-    company_id: contact.company_id,
-    memory_type: 'observation',
-    source: `pending_to:${contact.employee_id}`,
-    content: JSON.stringify(pendingData),
-  });
+  // One writer for the pending row (shared with the gate's edit paths — Rule 0b).
+  await storePendingTimeOff(contact.company_id, contact.employee_id!, pendingData);
 
   const summary = formatRequestSummary(parsed);
   // Human, conversational confirmation — no "(reply yes/no)" mechanics, and no
@@ -2191,9 +2186,27 @@ export async function handlePendingTimeOffConfirmation(
     return;
   }
 
+  // ── W-2 (C-5): a non-yes/no reply is an EDIT, not noise ────────────────────
+  //
+  // Deterministic pre-pass FIRST (no model call): a reason-only correction —
+  // Maisey's "make sure to say it's due to the watermark entry", Katie's
+  // "THIS IS FOR COMPETITION" — updates the reason and re-shows the confirm.
+  const reasonEdit = parseReasonEdit(trimmed);
+  if (reasonEdit && !isTimeOffAffirmation(trimmed.toLowerCase()) && !isTimeOffDenial(trimmed.toLowerCase())) {
+    const updated: PendingTimeOff = { ...stripMemoryId(pending), reason: normalizeReason(reasonEdit) };
+    await storePendingTimeOff(contact.company_id, contact.employee_id!, updated);
+    await replyWithUpdatedConfirm(message, contact, updated);
+    return;
+  }
+
   // Classify before yes/no: a new submit_time_off (e.g. "ok so I need Friday
   // off") would otherwise match the YES regex on its leading word and silently
   // consume the OLD pending while dropping the new dates.
+  //
+  // W-2: the EXISTING call now carries the gate as context (companyContext slot
+  // — zero extra calls), so a fragmentary correction ("actually the 19th",
+  // "not start at 3") classifies as submit_time_off with the corrected fields
+  // instead of falling into the nag.
   const { data: companyData } = await supabase
     .from('companies')
     .select('timezone')
@@ -2201,16 +2214,55 @@ export async function handlePendingTimeOffConfirmation(
     .single();
   const companyTimezone =
     (companyData as { timezone: string | null } | null)?.timezone ?? 'America/New_York';
-  const classification = await classifyIntent(message.body, contact.role, '', companyTimezone);
+  const gateContext =
+    `CONTEXT: This employee has an UNSENT time-off request awaiting their yes/no confirmation: ` +
+    `${pending.start_date === pending.end_date ? pending.start_date : `${pending.start_date} to ${pending.end_date}`}` +
+    `${pending.reason ? ` (reason: ${pending.reason})` : ''}. ` +
+    `A reply that corrects or adds detail to that request — even a fragment like "actually the 19th", ` +
+    `"not start at 3", or a restatement of the same request — is submit_time_off; extract the corrected ` +
+    `details and carry over any field the reply does not change. It is NOT a schedule question.`;
+  const classification = await classifyIntent(message.body, contact.role, gateContext, companyTimezone);
 
   if (classification.intent === 'submit_time_off') {
-    // The employee sent a NEW request instead of confirming the old one — treat it as
-    // a correction: replace the unconfirmed pending with the new dates rather than
-    // dropping them (BUG-5). handleSubmitTimeOff re-parses, stores the new pending, and
-    // asks the employee to confirm the new dates. (The old pending was never sent to a
-    // manager, so replacing it is safe.)
+    // The employee restated or corrected instead of saying yes. W-2 (C-5):
+    //  • the IDENTICAL request re-sent (Katie, IMG_5411) means "yes" — submit it;
+    //  • the same dates with a NEW reason means "fix the reason" — update + re-show;
+    //  • different dates replace the pending (BUG-5 behaviour, kept), carrying
+    //    the old reason forward when the correction didn't restate one.
+    const rawEntries = normalizeExtractedDates(classification.extracted);
+    const entries = contact.employee_id
+      ? await resolvePartialEntries(rawEntries, { companyId: contact.company_id, employeeId: contact.employee_id, words: message.body })
+      : rawEntries;
+    const reParsed = parseRequest(entries);
+    const newReason = normalizeReason(classification.extracted['reason']);
+
+    if (!reParsed) {
+      // The "new request" carries no dates at all — a fragment the extractor
+      // couldn't ground. Keep the pending; never restart the flow (C-5).
+      await reply(
+        contact,
+        message,
+        "Just let me know — should I send that to your manager? Or tell me what to change and I'll fix it up."
+      );
+      return;
+    }
+
+    if (samePendingRequest(pending, reParsed)) {
+      if (newReason && newReason !== pending.reason) {
+        const updated: PendingTimeOff = { ...stripMemoryId(pending), reason: newReason };
+        await storePendingTimeOff(contact.company_id, contact.employee_id!, updated);
+        await replyWithUpdatedConfirm(message, contact, updated);
+        return;
+      }
+      // Same request, same substance → that's a yes.
+      await submitConfirmedTimeOff(message, contact, pending);
+      return;
+    }
+
     await clearPendingTimeOff(contact.company_id, contact.employee_id!);
-    await handleSubmitTimeOff(message, contact, classification.extracted);
+    const mergedExtracted = { ...classification.extracted };
+    if (!newReason && pending.reason) mergedExtracted['reason'] = pending.reason;
+    await handleSubmitTimeOff(message, contact, mergedExtracted);
     return;
   }
 
@@ -2264,7 +2316,24 @@ export async function handlePendingTimeOffConfirmation(
     return;
   }
 
-  // Employee confirmed — clear pending state and proceed
+  // Employee confirmed. "Yes — and say it's for the competition" both confirms
+  // and corrects; honour the correction on the way through.
+  const rideAlongReason = normalizeReason(parseReasonEdit(trimmed));
+  await submitConfirmedTimeOff(
+    message,
+    contact,
+    rideAlongReason ? { ...stripMemoryId(pending), reason: rideAlongReason } : pending,
+  );
+}
+
+// The YES path, shared by the affirmation branch and W-2's "identical request
+// re-sent means yes" (C-5). Clears the pending, creates the request, notifies
+// the managers, and confirms to the employee.
+async function submitConfirmedTimeOff(
+  message: InboundMessage,
+  contact: VerifiedContact,
+  pending: PendingTimeOff
+): Promise<void> {
   await clearPendingTimeOff(contact.company_id, contact.employee_id!);
 
   // Load employee record
@@ -2321,6 +2390,164 @@ export async function handlePendingTimeOffConfirmation(
     message,
     `Done — I've passed your time off for ${dateDisplay} along to your manager. ` +
       "I'll let you know the moment they get back to me."
+  );
+}
+
+// ── W-2 (C-5) support: pending updates + the re-rendered confirm ─────────────
+
+// Drop the router's read-side _memory_id before re-storing (it isn't part of
+// the stored shape).
+function stripMemoryId(p: PendingTimeOff & { _memory_id?: string }): PendingTimeOff {
+  const { _memory_id: _drop, ...rest } = p as PendingTimeOff & { _memory_id?: string };
+  return rest;
+}
+
+// One writer for the pending confirm row (handleSubmitTimeOff and the gate's
+// edit paths share it — Rule 0b).
+async function storePendingTimeOff(
+  companyId: string,
+  employeeId: string,
+  pending: PendingTimeOff
+): Promise<void> {
+  await clearPendingTimeOff(companyId, employeeId);
+  await supabase.from('aegis_memory').insert({
+    company_id: companyId,
+    memory_type: 'observation',
+    source: `pending_to:${employeeId}`,
+    content: JSON.stringify(pending),
+  });
+}
+
+// "Same request?" — the substance an employee would call identical: dates,
+// full/partial shape, and each partial day's window. Reason differences are
+// handled separately (they update in place).
+export function samePendingRequest(
+  pending: { start_date: string; end_date: string; time_off_type: 'full_day' | 'partial'; partial_days: PartialDayDetail[] | null },
+  parsed: ParsedRequest
+): boolean {
+  if (pending.start_date !== parsed.start_date || pending.end_date !== parsed.end_date) return false;
+  if (pending.time_off_type !== parsed.time_off_type) return false;
+  const canon = (days: PartialDayDetail[] | null): string =>
+    (days ?? [])
+      .map(d => `${d.date}|${(d.start_time ?? '').slice(0, 5)}|${(d.end_time ?? '').slice(0, 5)}`)
+      .sort()
+      .join(';');
+  return canon(pending.partial_days) === canon(parsed.partial_days);
+}
+
+// Re-show the confirm after an in-place edit — same ask, one line acknowledging
+// the change, so the employee sees their correction landed (C-5's whole point).
+async function replyWithUpdatedConfirm(
+  message: InboundMessage,
+  contact: VerifiedContact,
+  pending: PendingTimeOff
+): Promise<void> {
+  const summary = formatRequestSummary({
+    start_date: pending.start_date,
+    end_date: pending.end_date,
+    time_off_type: pending.time_off_type,
+    partial_days: pending.partial_days,
+    unscheduled_dates: [],
+  });
+  const forReason = pending.reason ? ` for ${pending.reason}` : '';
+  if (pending.call_out?.length) {
+    const { today } = await tenantTodayAndZone(contact.company_id);
+    const line = describeCallOutShifts(pending.call_out, today);
+    await reply(contact, message,
+      `Got it — updated. You're calling out of ${line}${forReason}. Want me to send that to your manager right away?`);
+    return;
+  }
+  await reply(contact, message,
+    `Got it — updated. That's ${summary} off${forReason}. Want me to send that over to your manager?`);
+}
+
+// ── W-2 (C-5): post-send reason edit ─────────────────────────────────────────
+//
+// Maisey, after her request had already gone to Jack: "make sure to say it's
+// for the competition" → the scope wall ("I can't help with drafting messages
+// or adding notes"). The request is HERS and the reason is a column on her own
+// pending row — update it, tell the managers in a short FYI (never a second
+// approval email; the original links still work), and confirm to her.
+// Reached via the deterministic classifier backstop (edit_time_off_reason) —
+// no new model calls.
+export async function handleTimeOffReasonEdit(
+  message: InboundMessage,
+  contact: VerifiedContact,
+  _extracted: Record<string, unknown>
+): Promise<void> {
+  if (!contact.employee_id) {
+    await reply(contact, message, "I couldn't find your employee record. Please contact your manager directly.");
+    return;
+  }
+  const reason = normalizeReason(parseReasonEdit(message.body));
+  if (!reason) {
+    await reply(contact, message, "Happy to add that — what should I tell your manager the reason is?");
+    return;
+  }
+
+  const { today } = await tenantTodayAndZone(contact.company_id);
+  // The most recent still-PENDING request is the one a correction is about —
+  // an approved/denied one is decided, and editing its reason would rewrite
+  // history under the manager's decision.
+  const { data } = await supabase
+    .from('time_off_requests')
+    .select('id, start_date, end_date, reason, status')
+    .eq('employee_id', contact.employee_id)
+    .eq('company_id', contact.company_id)
+    .eq('status', 'pending')
+    .gte('end_date', today)
+    .order('requested_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  const row = data as { id: string; start_date: string; end_date: string; reason: string | null } | null;
+
+  if (!row) {
+    await reply(
+      contact,
+      message,
+      "I don't see a request of yours still waiting on your manager, so there's nothing to add that to. " +
+        'If you meant a new request, just send me the dates and the reason together.'
+    );
+    return;
+  }
+
+  const { error } = await supabase
+    .from('time_off_requests')
+    .update({ reason })
+    .eq('id', row.id)
+    .eq('status', 'pending'); // optimistic: never rewrite a decided row
+  if (error) {
+    await reply(contact, message, "I couldn't save that just now — please try again in a moment.");
+    return;
+  }
+
+  const dateDisplay = formatDateRange(row.start_date, row.end_date);
+  await logActivity({
+    company_id: contact.company_id,
+    action: 'time_off_reason_updated',
+    entity_type: 'time_off_request',
+    entity_id: row.id,
+    summary: `${contact.name} added a reason to their pending time-off request for ${dateDisplay}: "${reason}"`,
+    metadata: { employee_id: contact.employee_id, previous_reason: row.reason, reason },
+  });
+
+  // FYI to the managers — informational, threaded under the original where the
+  // channel allows; the approve/deny buttons they already have stay live.
+  await sendManagerResolutionNotice({
+    companyId: contact.company_id,
+    decidedByUserId: null,
+    decidedByName: null,
+    summary: `${contact.name} added a reason to the pending time-off request for ${dateDisplay}: "${reason}". Nothing new to do — the approve/deny links in the earlier email still work.`,
+    subject: `Reason added — ${contact.name}'s time-off request (${dateDisplay})`,
+    body:
+      `${contact.name} added a reason to their pending time-off request for ${dateDisplay}: "${reason}".\n\n` +
+      `Nothing new to do — the approve and deny links in the earlier email still work and now carry this reason on the record.`,
+  });
+
+  await reply(
+    contact,
+    message,
+    `Done — your request for ${dateDisplay} now says it's for ${reason}, and your manager has the note.`
   );
 }
 

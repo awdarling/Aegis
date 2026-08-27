@@ -27,6 +27,8 @@ import { resolveAvailabilityForWeek } from '../lib/custom-availability';
 // L4 — RULE 0b: one question ("what kind of swap is this?"), one function.
 import { withSwapKind } from '../lib/swap-kind';
 import { resolveManagers, primaryRecipient } from '../messaging/manager-directory';
+// W-2 (C-2) — withdrawals notify managers through the one shared resolver.
+import { sendManagerResolutionNotice } from '../messaging/manager-resolution-notice';
 import type { InboundMessage, VerifiedContact } from '../security/types';
 import type { Employee, Policy, Availability, CustomAvailability } from '../db/types';
 import type { ScheduleAssignment } from './schedule-build';
@@ -179,6 +181,12 @@ export async function getActiveSwapOutreach(
   try {
     const row = data as { id: string; content: string };
     const outreach = JSON.parse(row.content) as SwapOutreach;
+    // W-2 — every other gate expires on read; this one never did, so a stale
+    // outreach could trap its receiver's messages long after the 2h window.
+    if (new Date(outreach.expires_at) < new Date()) {
+      await supabase.from('aegis_memory').delete().eq('id', row.id);
+      return null;
+    }
     return { ...outreach, _memory_id: row.id };
   } catch {
     return null;
@@ -261,16 +269,19 @@ export async function getSwapBroadcast(
   }
 }
 
-export type SwapCommitGuard = { allowed: true } | { allowed: false; reason: 'expired' | 'locked' };
+export type SwapCommitGuard = { allowed: true } | { allowed: false; reason: 'expired' | 'locked' | 'withdrawn' };
 
 // First-commit-wins: only an OPEN broadcast accepts a commit. A locked one is
-// already being handled by whoever committed first; a missing one has expired.
+// already being handled by whoever committed first; a missing one has expired;
+// a WITHDRAWN one was called off by the requester (W-2/C-2) — the acceptance
+// must be refused kindly, never recorded.
 // (Residual race between read + lock is acceptable here — the manager approval is
 // the final gate; a DB-level atomic guard is a logged hardening follow-up.)
 export function swapBroadcastCommitGuard(
-  broadcast: { status: 'open' | 'locked' } | null,
+  broadcast: { status: 'open' | 'locked' | 'withdrawn' } | null,
 ): SwapCommitGuard {
   if (!broadcast) return { allowed: false, reason: 'expired' };
+  if (broadcast.status === 'withdrawn') return { allowed: false, reason: 'withdrawn' };
   if (broadcast.status === 'locked') return { allowed: false, reason: 'locked' };
   return { allowed: true };
 }
@@ -290,7 +301,9 @@ export async function commitSwapPickup(params: {
   if (!guard.allowed) {
     return {
       ok: false,
-      message: guard.reason === 'locked'
+      message: guard.reason === 'withdrawn'
+        ? `${firstName(broadcast!.requester_name)} doesn't need that shift covered anymore — it's been called off. Thanks for offering!`
+        : guard.reason === 'locked'
         ? "Someone just grabbed this shift — it's being handled now. Thanks for jumping on it!"
         : "This shift request has expired or already been resolved. Nothing more to do here.",
     };
@@ -459,7 +472,9 @@ export async function proposeSwapTrade(params: {
   if (!guard.allowed) {
     return {
       ok: false,
-      message: guard.reason === 'locked'
+      message: guard.reason === 'withdrawn'
+        ? `${firstName(broadcast!.requester_name)} doesn't need that shift covered anymore — it's been called off. Thanks for offering!`
+        : guard.reason === 'locked'
         ? "Someone just acted on this shift — it's being handled now. Thanks for offering!"
         : "This shift request has expired or already been resolved. Nothing more to do here.",
     };
@@ -815,7 +830,12 @@ export interface SwapBroadcast {
   // Dates (YYYY-MM-DD) the requester is willing to WORK in return — drives which
   // of a candidate's own shifts are tradeable.
   willing_dates: string[];
-  status: 'open' | 'locked';
+  // W-2 (C-2): 'withdrawn' — the requester called it off. The record is KEPT
+  // (not deleted) so a late "i can take it" or a late link tap gets a kind,
+  // truthful refusal instead of committing an unwanted pickup (Margaret's
+  // acceptance landed two minutes after Maisey cancelled — the offer was
+  // still live because cancel used to leave it open).
+  status: 'open' | 'locked' | 'withdrawn';
   locked_by?: string | null;   // receiver_id that committed first
   contacted_ids: string[];     // audit: who the broadcast reached
   expires_at: string;
@@ -3641,12 +3661,383 @@ export async function handleSwapOutreachResponse(
 
 // Fallback: called from intent router when respond_swap_accept/decline is classified
 // but no active outreach record exists for this employee.
+// ── W-2 branch 3 (C-2): ONE withdraw path for a requester's swap ─────────────
+//
+// Maisey's Aug 17 thread: "ok i don't need to swap it anymore" left the
+// broadcast live (Margaret's link tap still committed two minutes later), and
+// "i don't need it covered anymore" cancelled a TIME-OFF draft instead. This is
+// the single function that actually calls a swap off: close the live outreach
+// and broadcast, tell every contacted teammate, cancel the pending
+// swap_requests row(s), retire the manager's live approve/deny tokens, and
+// (unless the caller composes a combined notice) tell the managers once.
+
+export interface WithdrawnSwapItem {
+  kind: 'unsent_confirm' | 'outreach' | 'broadcast' | 'swap_request';
+  label: string;                 // "your ask to swap the AM Weekday shift on Wed, Aug 19"
+  teammates_told: string[];      // who got the "no longer needed" note
+  manager_knew: boolean;         // a pending_manager row / approval email existed
+}
+
+// The requester's live swap activity, described without touching it — used to
+// build the "are you sure?" ask for undo-all (W-1's resolveCancelTargets shape).
+export async function listWithdrawableSwaps(
+  companyId: string,
+  requesterId: string,
+  opts?: { createdOnOrAfter?: string },
+): Promise<Array<{ kind: WithdrawnSwapItem['kind']; label: string }>> {
+  const out: Array<{ kind: WithdrawnSwapItem['kind']; label: string }> = [];
+  const pending = await getPendingSwap(companyId, requesterId);
+  if (pending && !pending.awaiting) {
+    out.push({ kind: 'unsent_confirm', label: `the swap of your ${pending.shift_name} shift on ${formatShortDate(pending.shift_date)} (not sent yet)` });
+  }
+  for (const o of await findSwapOutreachByRequester(companyId, requesterId)) {
+    out.push({ kind: 'outreach', label: `your ask for the ${o.shift_name} shift on ${formatShortDate(o.shift_date)} (waiting on a teammate)` });
+  }
+  const broadcast = await getSwapBroadcast(companyId, requesterId);
+  if (broadcast && broadcast.status === 'open') {
+    out.push({ kind: 'broadcast', label: `your ask for the ${broadcast.shift_name} shift on ${formatShortDate(broadcast.shift_date)} (${broadcast.contacted_ids.length} teammates asked)` });
+  }
+  for (const r of await loadPendingSwapRows(companyId, requesterId, opts?.createdOnOrAfter)) {
+    out.push({ kind: 'swap_request', label: `the ${r.shift_name} shift swap on ${formatShortDate(r.shift_date)} (waiting on your manager)` });
+  }
+  return out;
+}
+
+async function findSwapOutreachByRequester(
+  companyId: string,
+  requesterId: string,
+): Promise<Array<SwapOutreach & { _memory_id: string }>> {
+  const { data } = await supabase
+    .from('aegis_memory')
+    .select('id, content')
+    .eq('company_id', companyId)
+    .like('source', 'swap_outreach:%');
+  const out: Array<SwapOutreach & { _memory_id: string }> = [];
+  const now = new Date();
+  for (const row of (data ?? []) as Array<{ id: string; content: string }>) {
+    try {
+      const o = JSON.parse(row.content) as SwapOutreach;
+      if (o.requester_id !== requesterId) continue;
+      if (new Date(o.expires_at) < now) continue;
+      out.push({ ...o, _memory_id: row.id });
+    } catch { /* skip malformed */ }
+  }
+  return out;
+}
+
+// The newest live broadcast that CONTACTED this employee — how a texted
+// "i can take it" finds the offer it answers (there is no per-recipient gate
+// on a broadcast; the links were the only path before W-2).
+export async function findBroadcastContactingEmployee(
+  companyId: string,
+  employeeId: string,
+): Promise<(SwapBroadcast & { _memory_id: string }) | null> {
+  const { data } = await supabase
+    .from('aegis_memory')
+    .select('id, content, created_at')
+    .eq('company_id', companyId)
+    .like('source', 'swap_broadcast:%')
+    .order('created_at', { ascending: false });
+  const now = new Date();
+  for (const row of (data ?? []) as Array<{ id: string; content: string }>) {
+    try {
+      const b = JSON.parse(row.content) as SwapBroadcast;
+      if (!b.contacted_ids?.includes(employeeId)) continue;
+      if (new Date(b.expires_at) < now) continue;
+      return { ...b, _memory_id: row.id };
+    } catch { /* skip malformed */ }
+  }
+  return null;
+}
+
+async function loadPendingSwapRows(
+  companyId: string,
+  requesterId: string,
+  createdOnOrAfter?: string,
+): Promise<Array<{ id: string; shift_date: string; shift_name: string; status: string; receiving_employee_id: string | null; created_at: string | null }>> {
+  let q = supabase
+    .from('swap_requests')
+    .select('id, shift_date, shift_name, status, receiving_employee_id, created_at')
+    .eq('company_id', companyId)
+    .eq('requesting_employee_id', requesterId)
+    .in('status', ['pending_employee', 'pending_manager']);
+  if (createdOnOrAfter) q = q.gte('created_at', createdOnOrAfter);
+  const { data } = await q;
+  return (data ?? []) as Array<{ id: string; shift_date: string; shift_name: string; status: string; receiving_employee_id: string | null; created_at: string | null }>;
+}
+
+export async function withdrawSwap(params: {
+  companyId: string;
+  requesterId: string;
+  requesterName: string;
+  /** Undo-all "for today": only swap_requests rows created on/after this UTC-ish bound. */
+  createdOnOrAfter?: string;
+  /** false when the caller (undo-all) composes ONE combined manager notice. */
+  notifyManagers?: boolean;
+}): Promise<{ items: WithdrawnSwapItem[]; managerSummary: string | null }> {
+  const { companyId, requesterId, requesterName } = params;
+  const items: WithdrawnSwapItem[] = [];
+  const aegisSmsNumber = await getAegisSmsChannel(companyId);
+  const first = firstName(requesterName);
+
+  // 1 — an unsent confirm gate simply evaporates.
+  const pending = await getPendingSwap(companyId, requesterId);
+  if (pending && !pending.awaiting) {
+    await clearPendingSwap(companyId, requesterId);
+    items.push({ kind: 'unsent_confirm', label: `the swap of your ${pending.shift_name} shift on ${formatShortDate(pending.shift_date)}`, teammates_told: [], manager_knew: false });
+  } else if (pending?.awaiting) {
+    await clearPendingSwap(companyId, requesterId);
+  }
+
+  // 2 — live directed outreach: tell the teammate, close the record.
+  for (const o of await findSwapOutreachByRequester(companyId, requesterId)) {
+    const { data: empData } = await supabase.from('employees').select('*').eq('id', o.receiver_id).single();
+    const emp = empData as Employee | null;
+    const told: string[] = [];
+    if (emp) {
+      await sendOutreachMessage({
+        receiverId: emp.id,
+        receiverEmail: emp.contact_email ?? null,
+        receiverPhone: emp.contact_phone ?? null,
+        aegisSmsNumber,
+        subject: `No longer needed — ${requesterName}'s ${o.shift_name} shift`,
+        text: `${textOpener(emp.name)}quick update: ${first} no longer needs the ${o.shift_name} shift on ${formatShortDate(o.shift_date)} covered, so you're all set — nothing to do. Thanks!`,
+        company_id: companyId,
+      });
+      told.push(emp.name);
+    }
+    await clearSwapOutreach(companyId, o.receiver_id);
+    items.push({ kind: 'outreach', label: `your ask for the ${o.shift_name} shift on ${formatShortDate(o.shift_date)}`, teammates_told: told, manager_knew: false });
+  }
+
+  // 3 — a live broadcast: mark WITHDRAWN (kept, so late replies get the kind
+  // refusal), and tell everyone it reached.
+  const broadcast = await getSwapBroadcast(companyId, requesterId);
+  if (broadcast && broadcast.status === 'open') {
+    await storeSwapBroadcast({ ...broadcast, status: 'withdrawn' });
+    const told: string[] = [];
+    for (const contactedId of broadcast.contacted_ids ?? []) {
+      const { data: empData } = await supabase.from('employees').select('*').eq('id', contactedId).single();
+      const emp = empData as Employee | null;
+      if (!emp) continue;
+      await sendOutreachMessage({
+        receiverId: emp.id,
+        receiverEmail: emp.contact_email ?? null,
+        receiverPhone: emp.contact_phone ?? null,
+        aegisSmsNumber,
+        subject: `No longer needed — ${requesterName}'s ${broadcast.shift_name} shift`,
+        text: `${textOpener(emp.name)}quick update: ${first} no longer needs the ${broadcast.shift_name} shift on ${formatShortDate(broadcast.shift_date)} covered, so you're all set — nothing to do. Thanks!`,
+        company_id: companyId,
+      });
+      told.push(emp.name);
+    }
+    items.push({ kind: 'broadcast', label: `your ask for the ${broadcast.shift_name} shift on ${formatShortDate(broadcast.shift_date)}`, teammates_told: told, manager_knew: false });
+  }
+
+  // 4 — pending swap_requests rows: cancel (optimistic guard), retire the
+  // manager's live approve/deny tokens, log.
+  const rows = await loadPendingSwapRows(companyId, requesterId, params.createdOnOrAfter);
+  for (const r of rows) {
+    const { error } = await supabase
+      .from('swap_requests')
+      .update({ status: 'cancelled', decided_at: new Date().toISOString() })
+      .eq('id', r.id)
+      .eq('company_id', companyId)
+      .eq('status', r.status);
+    if (error) {
+      console.error(`[swap-withdraw] failed to cancel swap_requests ${r.id}: ${error.message}`);
+      continue;
+    }
+    await supabase
+      .from('aegis_memory')
+      .delete()
+      .eq('company_id', companyId)
+      .like('source', 'decision_token:%')
+      .like('content', `%${r.id}%`);
+    await logActivity({
+      company_id: companyId,
+      action: 'swap_withdrawn_by_requester',
+      entity_type: 'swap_request',
+      entity_id: r.id,
+      summary: `${requesterName} withdrew their ${r.shift_name} swap on ${r.shift_date} (was ${r.status}).`,
+      metadata: { requester_id: requesterId, previous_status: r.status },
+    });
+    items.push({ kind: 'swap_request', label: `the ${r.shift_name} shift swap on ${formatShortDate(r.shift_date)}`, teammates_told: [], manager_knew: r.status === 'pending_manager' });
+  }
+
+  // One manager notice — only when a manager actually had something in flight.
+  const managerFacing = items.filter(i => i.manager_knew);
+  const managerSummary = managerFacing.length > 0
+    ? `${requesterName} withdrew ${joinNaturalSwap(managerFacing.map(i => i.label.replace(/^your /, 'their ')))} — nothing to approve anymore; the request is closed and any approve/deny links for it are dead.`
+    : null;
+  if (managerSummary && params.notifyManagers !== false) {
+    await sendManagerResolutionNotice({
+      companyId,
+      decidedByUserId: null,
+      decidedByName: null,
+      summary: managerSummary,
+      subject: `Withdrawn — ${requesterName}'s shift swap`,
+      body: managerSummary,
+    });
+  }
+  return { items, managerSummary };
+}
+
+function joinNaturalSwap(parts: string[]): string {
+  if (parts.length <= 1) return parts[0] ?? '';
+  return `${parts.slice(0, -1).join(', ')} and ${parts[parts.length - 1]}`;
+}
+
+// The requester says "cancel the swap" / "I don't need it covered anymore" /
+// "scrap the swap" (C-2 step 3 cancelled a TIME-OFF draft instead). Routed via
+// the classifier's cancel_swap intent + deterministic backstop.
+export async function handleCancelSwap(
+  message: InboundMessage,
+  contact: VerifiedContact,
+  _extracted: Record<string, unknown>
+): Promise<void> {
+  if (!contact.employee_id) {
+    await reply(contact, message, "I can only manage swaps for an employee record I recognise — please check with your manager.");
+    return;
+  }
+  const { items } = await withdrawSwap({
+    companyId: contact.company_id,
+    requesterId: contact.employee_id,
+    requesterName: contact.name,
+  });
+  if (items.length === 0) {
+    await reply(contact, message,
+      `${textOpener(contact.name)}I don't see a swap of yours in flight — nothing out with teammates and nothing waiting on your manager. If you meant a time-off request, say "cancel my time off" and I'll sort that instead.`);
+    return;
+  }
+  const told = [...new Set(items.flatMap(i => i.teammates_told))];
+  const managerNote = items.some(i => i.manager_knew) ? " I've let your manager know too." : '';
+  const toldNote = told.length > 0
+    ? ` I've told ${joinNaturalSwap(told)} it's no longer needed.`
+    : '';
+  await reply(contact, message,
+    `Done — I've called off ${joinNaturalSwap(items.map(i => i.label))}.${toldNote}${managerNote} Your schedule stays as it is.`);
+}
+
+// A teammate takes back their acceptance ("nevermind", "i can't actually swap
+// maiseys shift") AFTER it went to the manager: cancel the pending row under
+// their name and tell both the manager and the requester (C-2 defect c — they
+// used to be told "no active swap request" while one sat in the manager's inbox).
+export async function withdrawAcceptance(
+  message: InboundMessage,
+  contact: VerifiedContact,
+): Promise<boolean> {
+  if (!contact.employee_id) return false;
+  const { data } = await supabase
+    .from('swap_requests')
+    .select('id, shift_date, shift_name, status, requesting_employee_id')
+    .eq('company_id', contact.company_id)
+    .eq('receiving_employee_id', contact.employee_id)
+    .in('status', ['pending_employee', 'pending_manager'])
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  const row = data as { id: string; shift_date: string; shift_name: string; status: string; requesting_employee_id: string } | null;
+  if (!row) return false;
+  // Captured BEFORE the write — `row.status` after an update is not a receipt.
+  const prevStatus = row.status;
+
+  const { error } = await supabase
+    .from('swap_requests')
+    .update({ status: 'cancelled', decided_at: new Date().toISOString() })
+    .eq('id', row.id)
+    .eq('company_id', contact.company_id)
+    .eq('status', prevStatus);
+  if (error) {
+    console.error(`[swap-withdraw] failed to withdraw acceptance on ${row.id}: ${error.message}`);
+    await reply(contact, message, "I couldn't take that back just now — please try again in a moment or tell your manager directly.");
+    return true;
+  }
+  await supabase
+    .from('aegis_memory')
+    .delete()
+    .eq('company_id', contact.company_id)
+    .like('source', 'decision_token:%')
+    .like('content', `%${row.id}%`);
+  await logActivity({
+    company_id: contact.company_id,
+    action: 'swap_acceptance_withdrawn',
+    entity_type: 'swap_request',
+    entity_id: row.id,
+    summary: `${contact.name} withdrew their offer to take the ${row.shift_name} shift on ${row.shift_date} (was ${prevStatus}).`,
+    metadata: { receiver_id: contact.employee_id, previous_status: prevStatus },
+  });
+
+  const { data: reqData } = await supabase.from('employees').select('*').eq('id', row.requesting_employee_id).single();
+  const requester = reqData as Employee | null;
+
+  if (prevStatus === 'pending_manager') {
+    await sendManagerResolutionNotice({
+      companyId: contact.company_id,
+      decidedByUserId: null,
+      decidedByName: null,
+      summary: `${contact.name} can no longer take ${requester ? `${firstName(requester.name)}'s` : 'the'} ${row.shift_name} shift on ${formatShortDate(row.shift_date)} — that swap is withdrawn, nothing to approve anymore.`,
+      subject: `Withdrawn — ${row.shift_name} swap on ${formatShortDate(row.shift_date)}`,
+      body: `${contact.name} withdrew their offer to take ${requester ? `${requester.name}'s` : 'the'} ${row.shift_name} shift on ${formatShortDate(row.shift_date)}. The request is closed and any approve/deny links for it are dead. ${requester ? `${firstName(requester.name)} has been told the shift still needs covering.` : ''}`,
+    });
+  }
+  if (requester) {
+    const aegisSmsNumber = await getAegisSmsChannel(contact.company_id);
+    await sendOutreachMessage({
+      receiverId: requester.id,
+      receiverEmail: requester.contact_email ?? null,
+      receiverPhone: requester.contact_phone ?? null,
+      aegisSmsNumber,
+      subject: `Update on your ${row.shift_name} shift`,
+      text: `${textOpener(requester.name)}heads up — ${firstName(contact.name)} can't take your ${row.shift_name} shift on ${formatShortDate(row.shift_date)} after all, so it still needs covering. Want me to ask the rest of the team?`,
+      company_id: contact.company_id,
+    });
+  }
+  await reply(contact, message,
+    `No problem — I've taken you off ${requester ? `${firstName(requester.name)}'s` : 'that'} ${row.shift_name} shift on ${formatShortDate(row.shift_date)} and let ${requester ? `${firstName(requester.name)}` : 'them'}${prevStatus === 'pending_manager' ? ' and your manager' : ''} know. Thanks for flagging it.`);
+  return true;
+}
+
 export async function handleRespondSwap(
   message: InboundMessage,
   contact: VerifiedContact,
   _extracted: Record<string, unknown>,
-  _decision: 'accept' | 'decline'
+  decision: 'accept' | 'decline'
 ): Promise<void> {
+  // ── W-2 (C-2): a texted answer to a BROADCAST finally lands somewhere ──────
+  //
+  // Broadcast recipients only ever had links; Margaret's texted "i can take it"
+  // was answered with a generic question, and her "nevermind" with "no problem"
+  // — then the still-open link committed her anyway. Now:
+  //  • an ACCEPT from someone a live broadcast reached commits through the same
+  //    guarded path the link uses (first-commit-wins), and a withdrawn/locked
+  //    offer gets the kind, truthful refusal;
+  //  • a DECLINE/retraction from someone whose acceptance is already pending
+  //    with the manager withdraws it and tells everyone involved.
+  if (contact.employee_id) {
+    if (decision === 'accept') {
+      const broadcast = await findBroadcastContactingEmployee(contact.company_id, contact.employee_id);
+      if (broadcast) {
+        const result = await commitSwapPickup({
+          company_id: contact.company_id,
+          requester_id: broadcast.requester_id,
+          receiver_id: contact.employee_id,
+        });
+        await reply(contact, message, result.message);
+        return;
+      }
+    } else {
+      const withdrew = await withdrawAcceptance(message, contact);
+      if (withdrew) return;
+      // A decline aimed at a broadcast that reached them: acknowledge it.
+      const broadcast = await findBroadcastContactingEmployee(contact.company_id, contact.employee_id);
+      if (broadcast) {
+        await reply(contact, message, 'No problem — thanks for letting me know!');
+        return;
+      }
+    }
+  }
+
   // BUG-6 residual: a bare affirmation/negation ("yes"/"no") that reaches HERE means
   // the classifier labeled it a swap response but the router found no pending swap (or
   // TO/availability/onboarding) to intercept it first — i.e., whatever it was confirming

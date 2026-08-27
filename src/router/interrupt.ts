@@ -59,6 +59,9 @@ export const INTERRUPTING_EMPLOYEE_INTENTS = new Set<string>([
   // "scrap the pending one". The two are different requests and only the word
   // "cancel" is shared.
   'cancel_time_off',
+  // W-2 (C-2) — same shape: "cancel the swap" raised mid-confirmation yields
+  // to the swap withdraw path.
+  'cancel_swap',
   'query_my_shifts',
   'query_my_time_off',
   'update_availability',

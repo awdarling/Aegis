@@ -35,6 +35,7 @@ import {
   handleDenySwap,
   handleSwapConfirmation,
   handleSwapOutreachResponse,
+  handleCancelSwap,
   getPendingSwap,
   getActiveSwapOutreach,
 } from '../workflows/shift-swap';
@@ -506,6 +507,24 @@ async function routeIntentInner(
       case 'build_schedule':
         console.log('[router] dispatching to handleBuildSchedule');
         await handleBuildSchedule(message, contact, classification.extracted);
+        break;
+
+      // W-2 (found while building branch 3): L3 shipped handleCancelTimeOff and
+      // the classifier intent, but the router NEVER had this case — a fresh
+      // "cancel my time off on Aug 1" fell to the default "didn't quite follow".
+      // The proactive path only worked through the confirm-gate restates and
+      // the reactive swap-blocked offer. DRIFT_REGISTER §O.
+      case 'cancel_time_off':
+        console.log('[router] dispatching to handleCancelTimeOff');
+        await handleCancelTimeOff(message, contact, classification.extracted);
+        break;
+
+      // W-2 (C-2) — calling off a swap/cover ask reaches the swap withdraw
+      // path, never the time-off cancel path (step 3 of Maisey's Aug 17 thread
+      // cancelled the wrong thing).
+      case 'cancel_swap':
+        console.log('[router] dispatching to handleCancelSwap');
+        await handleCancelSwap(message, contact, classification.extracted);
         break;
 
       case 'initiate_swap':

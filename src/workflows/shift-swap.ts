@@ -5,6 +5,7 @@ import { supabase } from '../db/client';
 import { isQualified, acceptedRolesOf, roleLabel, resolveAcceptedRoles } from '../lib/qualification';
 import { coerceJsonObject } from '../utils/coerce-json';
 import { logActivity } from '../logger/activity-log';
+import { formatClockRange } from '../lib/shift-hours';
 import { reply } from '../messaging/reply';
 import { sendSms } from '../messaging/sms';
 import { sendEmail } from '../messaging/email';
@@ -675,6 +676,33 @@ export function computeShiftHours(start: string, end: string): number {
   let mins = toMins(end) - toMins(start);
   if (mins < 0) mins += 24 * 60;
   return Math.round((mins / 60) * 10) / 10;
+}
+
+// C-7 helpers for the "not scheduled" reply.
+function ordinalDay(dateStr: string): string {
+  const d = new Date(dateStr + 'T12:00:00Z').getUTCDate();
+  const suffix = d % 10 === 1 && d !== 11 ? 'st' : d % 10 === 2 && d !== 12 ? 'nd' : d % 10 === 3 && d !== 13 ? 'rd' : 'th';
+  return `${d}${suffix}`;
+}
+
+// "this Saturday (Aug 22)" when the date is within the coming week, else the long date.
+export function describeDayForNotScheduled(dateStr: string, today: string): string {
+  const weekday = new Date(dateStr + 'T12:00:00Z').toLocaleDateString('en-US', { weekday: 'long', timeZone: 'UTC' });
+  const short = new Date(dateStr + 'T12:00:00Z').toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' });
+  const diff = Math.round((new Date(dateStr + 'T12:00:00Z').getTime() - new Date(today + 'T12:00:00Z').getTime()) / 86_400_000);
+  if (diff >= 0 && diff < 7) return `this ${weekday} (${short})`;
+  return `on ${formatDisplayDate(dateStr)}`;
+}
+
+// The employee's own assignment on the same weekday one week later, if a
+// schedule exists for it. Used only to offer "did you mean the 29th?".
+async function suggestSameWeekdayNextWeek(companyId: string, employeeId: string, dateStr: string): Promise<ScheduleAssignment | null> {
+  const next = new Date(dateStr + 'T12:00:00Z');
+  next.setUTCDate(next.getUTCDate() + 7);
+  const nextDate = next.toISOString().slice(0, 10);
+  const sched = await findSchedule(companyId, nextDate);
+  if (!sched) return null;
+  return sched.data.assignments.find(a => a.employee_id === employeeId && a.date === nextDate) ?? null;
 }
 
 function formatDisplayDate(dateStr: string): string {
@@ -1995,14 +2023,21 @@ export function buildSwapAskText(params: {
   shiftDateDisplay: string;
   targetShiftName?: string | null;
   targetShiftDateDisplay?: string | null;
+  targetShiftStart?: string | null;
+  targetShiftEnd?: string | null;
 }): { subject: string; text: string; isGiveaway: boolean } {
-  const theirShift = `${params.requesterName}'s ${params.shiftName} shift (${params.shiftStart}–${params.shiftEnd}, ${params.role}) on ${params.shiftDateDisplay}`;
+  // C-7: one time formatter (no "11:00:00–15:30:00"), BOTH legs of a trade carry
+  // their times, and the ask is a natural question — never "reply yes or no".
+  const theirShift = `${params.requesterName}'s ${params.shiftName} shift (${formatClockRange(params.shiftStart, params.shiftEnd)}, ${params.role}) on ${params.shiftDateDisplay}`;
+  const yourShift = params.targetShiftName
+    ? `your ${params.targetShiftName} shift${params.targetShiftStart && params.targetShiftEnd ? ` (${formatClockRange(params.targetShiftStart, params.targetShiftEnd)})` : ''} on ${params.targetShiftDateDisplay ?? params.shiftDateDisplay}`
+    : '';
   const isGiveaway = !params.targetShiftName;
   const text = isGiveaway
     ? `${textOpener(params.receiverName)}this is Aegis. ${params.requesterName} says you agreed to take ${theirShift}. ` +
-      `Can you confirm you'll cover it? Just reply yes or no.`
+      `Can you confirm you'll cover it?`
     : `${textOpener(params.receiverName)}this is Aegis. ${params.requesterName} would like to trade shifts with you — ` +
-      `you'd give up your ${params.targetShiftName} shift on ${params.targetShiftDateDisplay ?? params.shiftDateDisplay} and pick up ${theirShift}. Want to do it? Just reply yes or no.`;
+      `you'd give up ${yourShift} and pick up ${theirShift}. Are you up for that?`;
   const subject = isGiveaway
     ? `Shift coverage request from ${params.requesterName}`
     : `Shift trade request from ${params.requesterName}`;
@@ -2492,9 +2527,15 @@ export async function handleInitiateSwap(
       if (own.kind === 'one') shift = own.shift;
     }
     if (!shift) {
+      // C-7: "I couldn't find a shift … matching 'Saturday'" read like a log line.
+      // Say plainly that they're not scheduled that day, and if they ARE on the
+      // same weekday the following week, offer that date.
+      const suggestion = await suggestSameWeekdayNextWeek(contact.company_id, contact.employee_id!, shiftDate);
       await reply(contact, message,
-        `I couldn't find a shift for you on ${formatDisplayDate(shiftDate)}${shiftNameHint ? ` matching "${shiftNameHint}"` : ''}. ` +
-        "Double-check the date, or reach out to your manager if you think there's a shift missing."
+        `${textOpener(contact.name)}you're not scheduled ${describeDayForNotScheduled(shiftDate, today)}` +
+        (suggestion
+          ? ` — did you mean the ${ordinalDay(suggestion.date)}? You're on ${suggestion.shift_name} (${formatClockRange(suggestion.start_time, suggestion.end_time)}) that day.`
+          : `. If you think a shift is missing, your manager can check the schedule.`)
       );
       return;
     }
@@ -2590,7 +2631,7 @@ export async function handleInitiateSwap(
       await storePendingSwap(pending);
 
       await reply(contact, message,
-        `Got it — ${firstName(targetEmployee.name)} would take your ${shift.shift_name} shift on ${formatDisplayDate(shiftDate)} (${shift.start_time}–${shift.end_time}) and you'd be off, no shift back. Want me to check with ${firstName(targetEmployee.name)} and line it up with your manager?`
+        `Got it — ${firstName(targetEmployee.name)} would take your ${shift.shift_name} shift on ${formatDisplayDate(shiftDate)} (${formatClockRange(shift.start_time, shift.end_time)}) and you'd be off, no shift back. Want me to check with ${firstName(targetEmployee.name)} and line it up with your manager?`
       );
       return;
     }
@@ -2651,7 +2692,7 @@ export async function handleInitiateSwap(
     }
     if (choice.kind === 'ambiguous') {
       const list = choice.shifts
-        .map(s => `${s.shift_name} on ${formatDisplayDate(s.date)} (${s.start_time}–${s.end_time})`)
+        .map(s => `${s.shift_name} on ${formatDisplayDate(s.date)} (${formatClockRange(s.start_time, s.end_time)})`)
         .join('; ');
       await reply(contact, message,
         `${targetEmployee.name} has more than one shift that week — which of theirs do you want to take? ${list}. Just tell me which one and I'll set up the trade.`
@@ -2811,7 +2852,7 @@ export async function handleInitiateSwap(
 
     await reply(contact, message,
       buildFacilitatedSwapConfirm({
-        shiftLabel: `${shift.shift_name} shift (${shift.role}, ${shift.start_time}–${shift.end_time})`,
+        shiftLabel: `${shift.shift_name} shift (${shift.role}, ${formatClockRange(shift.start_time, shift.end_time)})`,
         dateLabel: formatDisplayDate(shiftDate),
         candidateNote,
         tradeNote,
@@ -2976,6 +3017,8 @@ export async function handleSwapConfirmation(
       shiftDateDisplay: formatDisplayDate(pending.shift_date),
       targetShiftName: pending.target_shift_name,
       targetShiftDateDisplay: pending.target_shift_date ? formatDisplayDate(pending.target_shift_date) : null,
+      targetShiftStart: pending.target_shift_start ?? null,
+      targetShiftEnd: pending.target_shift_end ?? null,
     });
     const isGiveaway = ask.isGiveaway;
 
@@ -3246,8 +3289,8 @@ export async function handleSwapOutreachResponse(
       text:
         `${textOpener(nextEmp.name)}this is Aegis. ` +
         `${outreach.requester_name} is looking for someone to take their ${outreach.shift_name} shift ` +
-        `(${outreach.shift_start}–${outreach.shift_end}, ${outreach.role}) on ${formatDisplayDate(outreach.shift_date)}. ` +
-        'Would you like to take this shift? Reply YES or NO.',
+        `(${formatClockRange(outreach.shift_start, outreach.shift_end)}, ${outreach.role}) on ${formatDisplayDate(outreach.shift_date)}. ` +
+        'Would you like to take it?',
       company_id: outreach.company_id,
     });
 

@@ -2451,7 +2451,7 @@ function buildTimeOffConfirmPrompt(pending: OnboardingPendingTimeOff[], edited: 
     ? `Updated — here's the time off I'll send to your manager to approve:`
     : `Got it. Here's the time off I'll send to your manager to approve:`;
   const list = pending.map(describePendingTimeOff).join('\n');
-  return `${lead}\n${list}\n\nDoes that look right? Reply YES to send it, or tell me what to change.`;
+  return `${lead}\n${list}\n\nDoes that look right? Say yes and I'll send it, or tell me what to change.`;
 }
 
 // Explicit "actually, I don't need time off after all" at the confirm step. Kept
@@ -2537,7 +2537,7 @@ async function handleTimeOffConfirmStep(
     session,
     `I want to get this right before I send it. Here's what I have:\n` +
       `${pending.map(describePendingTimeOff).join('\n')}\n\n` +
-      `Reply YES to send it to your manager, send me the corrected date(s), or reply "skip" if you don't need time off after all.`
+      `Say yes and I'll send it to your manager, send me the corrected date(s), or say "skip" if you don't need time off after all.`
   );
 }
 
@@ -3675,7 +3675,7 @@ export async function handleUpdateAvailability(
       message,
       `Got it — a rotating schedule on a ${rotation.cycle_weeks}-week cycle, starting the week of ${formatDateRange(anchor, anchor)}:\n\n` +
         `${formatRotationWeeks(rotation)}\n\n` +
-        `Then it repeats from week 1.${endTail}\n\nReply YES to send this to your manager, or NO to redo it.`
+        `Then it repeats from week 1.${endTail}\n\nDoes that look right? Say yes and I'll send it to your manager, or tell me what to change.`
     );
     return;
   }

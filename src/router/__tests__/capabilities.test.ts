@@ -93,7 +93,8 @@ describe('isCapabilitiesQuery', () => {
 describe('allowedActionsLine', () => {
   it('names the employee actions as a natural list', () => {
     expect(allowedActionsLine('employee')).toBe(
-      'time off, your availability, your shifts, and shift swaps'
+      // W-1 branch 5 (C-7): sick calls and cancelling time off are named now.
+      'time off (or cancelling it), sick calls, your availability, your shifts, and shift swaps'
     );
   });
 });

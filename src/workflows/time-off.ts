@@ -49,7 +49,7 @@ interface PendingTimeOff {
   employee_id: string;
   start_date: string;
   end_date: string;
-  reason: string;
+  reason: string | null;
   channel: 'sms' | 'email';
   sender: string;
   recipient: string;
@@ -101,6 +101,41 @@ function formatShortDate(dateStr: string): string {
     month: 'short',
     day: 'numeric',
   });
+}
+
+// Decision (Alexander, 2026-08-26): a reason the employee did not give is NULL,
+// never "personal reasons". The classifier already returns null when nothing was
+// said; this also catches the model echoing the old default.
+export function normalizeReason(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null;
+  const t = raw.trim();
+  if (!t) return null;
+  if (/^(personal reasons?|no reason( given)?|none|n\/a|unspecified|not (?:given|stated|specified))$/i.test(t)) return null;
+  return t;
+}
+
+// The one manager-facing rendering of a missing reason.
+export const NO_REASON_GIVEN = 'no reason given';
+export function reasonForManager(reason: string | null | undefined): string {
+  return normalizeReason(reason) ?? NO_REASON_GIVEN;
+}
+
+// C-7: "Tuesday August 26th" when Aug 26 is a Wednesday. Returns " (that's a
+// Wednesday)" when the employee named a weekday next to a date that resolved to
+// a different weekday; '' otherwise. Deterministic; exported for tests.
+const WEEKDAYS = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+export function weekdayMismatchNote(body: string, dates: string[]): string {
+  const t = (body || '').toLowerCase();
+  const named = WEEKDAYS.filter(d => new RegExp(`\\b${d}\\b`).test(t));
+  if (named.length !== 1 || dates.length === 0) return '';
+  const namedIdx = WEEKDAYS.indexOf(named[0]);
+  // Only flag when NONE of the extracted dates falls on the named weekday — a
+  // range that spans the named day is fine.
+  const actual = [...new Set(dates.filter(d => /^\d{4}-\d{2}-\d{2}$/.test(d)).map(d => new Date(`${d}T12:00:00Z`).getUTCDay()))];
+  if (actual.length === 0 || actual.includes(namedIdx)) return '';
+  if (actual.length !== 1) return '';
+  const cap = (w: string) => w[0].toUpperCase() + w.slice(1);
+  return ` (that's a ${cap(WEEKDAYS[actual[0]])})`;
 }
 
 // Natural yes/no for the time-off confirmation ("Want me to send that over?").
@@ -1369,7 +1404,7 @@ export async function notifyManager(
       employee,
       pending.start_date,
       pending.end_date,
-      pending.reason,
+      pending.reason ?? '',
       stage1,
       stage2,
       policies,
@@ -1447,7 +1482,7 @@ export async function notifyManager(
         managerName: manager.name,
         startDate: pending.start_date,
         endDate: pending.end_date,
-        reason: pending.reason,
+        reason: reasonForManager(pending.reason),
         stage1,
         stage2,
         recommendation,
@@ -1487,7 +1522,7 @@ export async function notifyManager(
           from: aegisSmsNumber,
           body: managerAlertSms({
             managerName: manager.name,
-            summary: `${employee.name} wants ${dateDisplay} off${pending.reason ? ` for ${pending.reason}` : ''}.`,
+            summary: `${employee.name} wants ${dateDisplay} off${pending.reason ? ` for ${pending.reason}` : ` (${NO_REASON_GIVEN})`}.`,
             inbox: 'approve',
           }),
           company_id: companyId,
@@ -1553,7 +1588,7 @@ async function notifyManagersByEmail(
         employee,
         pending.start_date,
         pending.end_date,
-        pending.reason,
+        pending.reason ?? '',
         stage1,
         stage2,
         policies
@@ -1634,7 +1669,13 @@ export async function handleSubmitTimeOff(
     ? await resolvePartialEntries(rawEntries, { companyId: contact.company_id, employeeId: contact.employee_id, words: message.body })
     : rawEntries;
   const parsed = parseRequest(entries);
-  const reason = (extracted['reason'] as string | undefined) ?? 'personal reasons';
+  // Decision (Alexander, 2026-08-26): when no reason is given, store NULL and
+  // show "no reason given" to the manager — never invent "personal reasons"
+  // (a manager reading that believes the employee said it).
+  const reason = normalizeReason(extracted['reason']);
+  // C-7: "Tuesday August 26th" → the 26th is a Wednesday. Say so in the confirm
+  // so a wrong-date request is caught before the manager sees it.
+  const weekdayNote = weekdayMismatchNote(message.body, entries.map(e => e.start_date));
 
   if (!parsed) {
     await reply(
@@ -1687,10 +1728,11 @@ export async function handleSubmitTimeOff(
   // W-1 branch 2: a part-day request on a day with NO shift gets an honest ask,
   // never invented hours ("sick tonight" on an unscheduled Friday). A "yes" logs
   // it as a plain day off so the manager still knows.
+  const forReason = reason ? ` for ${reason}` : '';
   const confirmText = onlyUnscheduled
-    ? `${lead} ${summary}: you're not on the schedule that day, so there's no shift to take off. Want me to log it as a day off anyway (${reason}) so your manager knows?` +
+    ? `${lead} ${summary}${weekdayNote}: you're not on the schedule that day, so there's no shift to take off. Want me to log it as a day off anyway${forReason} so your manager knows?` +
       availabilityFollowupNote(extracted)
-    : `${lead} ${summary} off for ${reason}. Want me to send that over to your manager?` +
+    : `${lead} ${summary}${weekdayNote} off${forReason}. Want me to send that over to your manager?` +
       availabilityFollowupNote(extracted);
 
   // Rich HTML sibling: reflect the employee's own words, present the requested
@@ -1705,7 +1747,7 @@ export async function handleSubmitTimeOff(
       brandReflect(message.body) +
       `<p style="${pStyle}">${greeting(contact.name)}</p>` +
       `<p style="${pStyle}">Sure thing — here's the request I'll send over:</p>` +
-      brandDetailRow(escapeHtmlTo(summary), `for ${escapeHtmlTo(reason)}`) +
+      brandDetailRow(escapeHtmlTo(summary), reason ? `for ${escapeHtmlTo(reason)}` : 'no reason given') +
       `<p style="margin:4px 0 0;font-size:16px;line-height:1.65;color:${BRAND.textPrimary};">Want me to pass it to your manager? Just say the word — or tell me what to change.</p>` +
       psNote +
       `<p style="margin:22px 0 0;color:${BRAND.textSecondary};">— Aegis</p>`,

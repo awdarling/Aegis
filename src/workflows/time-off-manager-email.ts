@@ -184,7 +184,9 @@ function requestDetailsHtml(
     <div style="font-size:14px;color:${BRAND.textPrimary};margin-top:8px;"><strong>Full day${dayCount === 1 ? '' : 's'}</strong> requested (${dayCount} day${dayCount === 1 ? '' : 's'} total).</div>`;
   }
 
-  const reason = (tor.reason ?? '').trim();
+  // Decision (Alexander, 2026-08-26): a missing reason reads "no reason given" —
+  // never blank, never an invented one.
+  const reason = (tor.reason ?? '').trim() || 'no reason given';
   const reasonBlock = reason
     ? `<div style="font-size:14px;color:${BRAND.textPrimary};margin-top:12px;"><strong>Reason:</strong> ${escapeHtml(reason)}</div>`
     : '';
@@ -389,7 +391,7 @@ function buildPlainText(params: {
   } else {
     lines.push('Full day(s) requested.');
   }
-  const reason = (params.tor.reason ?? '').trim();
+  const reason = (params.tor.reason ?? '').trim() || 'no reason given';
   if (reason) {
     lines.push(`Reason: ${reason}`);
   }

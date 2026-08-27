@@ -263,12 +263,14 @@ export function buildSwapDecisionMessages(
   dateLong: string,
   targetDateLong: string,
 ): { requesterMsg: string; receiverMsg: string } {
-  const tradeMsg = (worksShift: string, worksDate: string) =>
-    `Your shift trade has been approved! You're now on the ${worksShift} shift on ${worksDate}.`;
+  // C-7: an approval names BOTH what was gained and what was given up — the old
+  // copy named only the shift gained, so a trade read like a pickup.
+  const tradeMsg = (worksShift: string, worksDate: string, gaveShift: string, gaveDate: string) =>
+    `Your shift trade has been approved! You're now on the ${worksShift} shift on ${worksDate}, and your ${gaveShift} shift on ${gaveDate} goes to the other side of the trade.`;
   if (isTrade) {
     return {
-      requesterMsg: tradeMsg(token.target_shift_name!, targetDateLong),
-      receiverMsg: tradeMsg(token.shift_name, dateLong),
+      requesterMsg: tradeMsg(token.target_shift_name!, targetDateLong, token.shift_name, dateLong),
+      receiverMsg: tradeMsg(token.shift_name, dateLong, token.target_shift_name!, targetDateLong),
     };
   }
   // Giveaway: the receiver covers for both. The requester (giver) is told they're

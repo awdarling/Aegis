@@ -60,7 +60,7 @@ describe('onboarding-fanout confirm interruptibility (#18)', () => {
     await handleOnboardingFanoutConfirm(msg('huh?'), mgr, pending);
     expect(routeIntent).not.toHaveBeenCalled();
     expect(reply).toHaveBeenCalledTimes(1);
-    expect(String(reply.mock.calls[0][2])).toMatch(/Reply YES to start onboarding/);
+    expect(String(reply.mock.calls[0][2])).toMatch(/should I start the onboarding/i); // W-2 copy pass
   });
 
   it('a clear NO still cancels (does not yield)', async () => {

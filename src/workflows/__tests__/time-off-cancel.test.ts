@@ -268,7 +268,7 @@ describe('L3 · the confirmation gate', () => {
     await handleTimeOffCancelConfirmation(msg('hmm what does that mean'), contact, pendingCancel());
 
     expect(timeOffUpdates()).toHaveLength(0);
-    expect(lastReply()).toMatch(/YES or NO/);
+    expect(lastReply()).toMatch(/A quick yes or no works/i); // W-2 copy pass: natural question, no keyword prompt
   });
 
   it('logs the cancellation with the request id for the audit trail', async () => {

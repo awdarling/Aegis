@@ -335,7 +335,7 @@ export async function handleBroadcast(
     `"${session.message_text}"\n\n` +
     `To: ${previewNames}${overflow}\n` +
     `How: ${channelLabel}\n\n` +
-    `Reply YES to send it, or NO to call it off.`
+    `Want me to send it? A yes from you sends it — or tell me to call it off.`
   );
 }
 
@@ -349,7 +349,7 @@ export async function handleBroadcastConfirmation(
   const isNo = /^(no|nope|n\b|cancel|stop|abort)/.test(body);
 
   if (!isYes && !isNo) {
-    await reply(contact, message, 'Reply YES to send the broadcast or NO to cancel.');
+    await reply(contact, message, 'Just let me know — should I send the broadcast? A quick yes or no works, or tell me what to change.');
     return;
   }
 

@@ -69,6 +69,7 @@ import {
   getPendingAvailTargetDisambig,
   clearPendingAvailTargetDisambig,
   classifyAvailTarget,
+  resolveAvailTargetReplay,
 } from '../workflows/employee-onboarding';
 import {
   handleBroadcast,
@@ -323,9 +324,13 @@ async function routeIntentInner(
       if (choice === 'normal' || choice === 'temporary') {
         await clearPendingAvailTargetDisambig(contact.company_id, contact.employee_id);
         const replay: InboundMessage = { ...message, body: pendingAvailTarget.original_body };
-        const extractedTarget: Record<string, unknown> = choice === 'temporary'
-          ? { avail_target: 'temporary', end_date: pendingAvailTarget.override_end_date ?? '' }
-          : { avail_target: 'normal' };
+        // W-2 (§N10): the ORIGINAL message's own read wins over the stored
+        // override's end date (Jenna's July 16). Pure + deterministic.
+        const extractedTarget = resolveAvailTargetReplay(
+          choice,
+          pendingAvailTarget.original_body,
+          pendingAvailTarget.override_end_date ?? null,
+        );
         await handleUpdateAvailability(replay, contact, extractedTarget);
         console.log('[router] EARLY RETURN', { reason: `avail_target_resolved_${choice}` });
         return;

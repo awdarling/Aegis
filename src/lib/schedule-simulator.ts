@@ -470,6 +470,7 @@ export async function computeWageEstimate(
     start_time: string;
     end_time: string;
     hours?: number;
+    called_out?: boolean;
   }>
 ): Promise<WageEstimate> {
   const [empRes, ratesRes] = await Promise.all([
@@ -493,17 +494,22 @@ export async function computeWageEstimate(
 // Pure helper extracted so wage logic is testable without supabase round-trips.
 // Called by the supabase-loading `computeWageEstimate` and directly by smoke.
 export function computeWageEstimateFromMaps(
-  shifts: Array<{
+  rawShifts: Array<{
     employee_id: string;
     employee_name: string;
     role: string;
     start_time: string;
     end_time: string;
     hours?: number;
+    called_out?: boolean;
   }>,
   individualWages: Map<string, number>,
   roleRates: Map<string, number>
 ): WageEstimate {
+  // W-2 (Alexander, 2026-08-27): an approved call-out stays ON the schedule
+  // (greyed out) but is never paid — every wage estimate excludes it. One
+  // filter, one place (Rule 0): every caller inherits the rule.
+  const shifts = rawShifts.filter(s => !s.called_out);
   const byEmployee = new Map<string, WageLineItem>();
   const missingMap = new Map<string, MissingWage>();
 

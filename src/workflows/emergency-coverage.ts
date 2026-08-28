@@ -24,6 +24,8 @@ import { parseConstraints } from '../lib/constraints/parser';
 import { isQualified, acceptedRolesOf } from '../lib/qualification';
 // D18 — coverage must recompute the wage estimate like the swap paths do.
 import { computeWageEstimate } from '../lib/schedule-simulator';
+// N2 — never interpolate a raw `time` column into copy (seconds leak).
+import { formatClockRange } from '../lib/shift-hours';
 import { coerceJsonObject } from '../utils/coerce-json';
 
 // Re-exported so existing tests importing it from this module keep working.
@@ -47,6 +49,8 @@ export interface ScheduleAssignment {
   start_time: string;
   end_time: string;
   hours: number;
+  /** W-2 — approved call-out: stays on the schedule, greyed out, excluded from wages. */
+  called_out?: boolean;
 }
 
 interface ScheduleGap {
@@ -132,6 +136,11 @@ export interface CoverageSession {
   // immediately after, leaving the call-out open for the manager to finish. Absent
   // on every at-rest session.
   paused?: boolean;
+  // W-2 — set when this session was opened by the manager's "Approve & find
+  // coverage" click on an employee call-out. The idempotency key: a second
+  // click finds the session by this id and says "already on it" instead of
+  // blasting the pool twice. Absent on manager-texted sessions.
+  time_off_request_id?: string;
   expires_at: string;
 }
 
@@ -295,6 +304,32 @@ export async function getActiveCoverageSession(
 ): Promise<CoverageSession | null> {
   const all = await listActiveCoverageSessions(companyId, managerContact);
   return all[0] ?? null;
+}
+
+/**
+ * W-2 — the coverage session (if any) opened for an employee CALL-OUT, keyed by
+ * the time-off request the manager approved. This is what makes the
+ * "Approve & find coverage" button idempotent: the second click finds the
+ * session and reports "already on it" instead of blasting the pool again.
+ */
+export async function findCoverageSessionForTimeOffRequest(
+  companyId: string,
+  timeOffRequestId: string,
+): Promise<CoverageSession | null> {
+  const { data } = await supabase
+    .from('aegis_memory')
+    .select('id, content')
+    .eq('company_id', companyId)
+    .like('source', 'coverage_session:%');
+  const now = new Date();
+  for (const row of (data ?? []) as { id: string; content: string }[]) {
+    const session = parseSessionRow(row);
+    if (!session) continue;
+    if (session.time_off_request_id !== timeOffRequestId) continue;
+    if (new Date(session.expires_at) < now) continue;
+    return session;
+  }
+  return null;
 }
 
 export async function getActiveOutreach(
@@ -519,6 +554,9 @@ export function swapScheduleAssignment(
     ...next[idx],
     employee_id: params.coverer_employee_id,
     employee_name: params.coverer_name,
+    // W-2 — the shift now belongs to the coverer, who IS working and IS paid:
+    // the approved-call-out marker must not ride along onto them.
+    called_out: undefined,
   };
   return { assignments: next, swapped: true };
 }
@@ -590,6 +628,46 @@ async function applyCoverageToSchedule(params: {
     .eq('id', row.id);
   if (error) return { updated: false, reason: error.message };
   return { updated: true };
+}
+
+/**
+ * W-2 (Alexander, 2026-08-27) — an APPROVED call-out. The employee's
+ * assignment(s) on the date STAY on the published schedule — pulling them off
+ * would hide the very hole the manager just took on — but are marked
+ * `called_out: true`, which Homebase renders greyed out and every wage
+ * estimate excludes (computeWageEstimate filters the flag). Idempotent: an
+ * already-marked assignment is left as is. Best-effort, like
+ * applyCoverageToSchedule.
+ */
+export async function markAssignmentsCalledOut(params: {
+  company_id: string;
+  employee_id: string;
+  dates: string[];
+}): Promise<{ marked: number }> {
+  let marked = 0;
+  for (const date of [...new Set(params.dates)]) {
+    const row = await loadScheduleRow(params.company_id, date);
+    if (!row) continue;
+    const data: ScheduleData = row.data ?? { assignments: [] };
+    const assignments = (data.assignments ?? []).map(a => {
+      if (a.employee_id !== params.employee_id || a.date !== date || a.called_out) return a;
+      marked++;
+      return { ...a, called_out: true };
+    });
+    if (!assignments.some((a, i) => a !== (data.assignments ?? [])[i])) continue;
+    // Wage estimate follows the marker (D18 shape — the schedule write and the
+    // cost figure move together, or the manager's number describes a schedule
+    // that no longer exists).
+    const wages = await computeWageEstimate(params.company_id, assignments);
+    await supabase
+      .from('schedules')
+      .update({
+        data: { ...data, assignments },
+        staffing_report: { ...(row.staffing_report ?? {}), estimated_wages: wages },
+      })
+      .eq('id', row.id);
+  }
+  return { marked };
 }
 
 async function findShiftInfo(
@@ -1150,11 +1228,15 @@ export async function dispatchOutreach(params: {
 
   const dateStr = formatDisplayDate(session.shift_date);
   const si = session.shift_info;
+  // W-2 copy pass: hours through the one formatter (N2 — no "15:00:00" leaks),
+  // and a natural question instead of "Reply YES/NO" (the voice bar allows
+  // exactly one keyword prompt — the A2P opt-in). parseEmployeeResponse already
+  // accepts natural answers.
   const body =
     `${textOpener(employee.name)}this is Aegis. ` +
     `${session.callout_employee_name} is out and we need coverage for the ` +
-    `${si.shift_name} shift (${si.start_time}–${si.end_time}, ${si.role}) on ${dateStr}. ` +
-    `Can you come in?\n\nReply YES to accept or NO to decline.`;
+    `${si.shift_name} shift (${formatClockRange(si.start_time, si.end_time)}, ${si.role}) on ${dateStr}. ` +
+    `Can you come in? First to say yes gets it — just let me know either way.`;
 
   // SMS-FIRST for phone-holders (Batch-1 F2; SMS spec §3.5 — emergency coverage
   // is text-native end to end). Coverage is urgent and in-the-moment, so a
@@ -1199,7 +1281,7 @@ export async function dispatchOutreach(params: {
       `<p style="margin:0 0 4px;color:${BRAND.textPrimary};font-size:16px;line-height:1.65;">This is Aegis, and I could use your help. <strong>${escapeHtml(session.callout_employee_name)}</strong> is out and we're short on coverage for the shift below. You're qualified and open — any chance you can jump in?</p>`;
     const cardInner = `${brandCardDetailLine(
       `${escapeHtml(dateStr)} · ${escapeHtml(si.shift_name)}`,
-      `${escapeHtml(si.start_time)}–${escapeHtml(si.end_time)} · ${escapeHtml(si.role)}`,
+      `${escapeHtml(formatClockRange(si.start_time, si.end_time))} · ${escapeHtml(si.role)}`,
     )}${brandedButtonRow([
       { url: acceptUrl, label: 'Yes, I can cover', variant: 'primary' },
       { url: declineUrl, label: "Can't make it", variant: 'secondary' },
@@ -1714,6 +1796,153 @@ export async function processCoverageBatchButton(params: {
   return { outcome: 'sent', shiftName };
 }
 
+// ── W-2: "Approve & find coverage" — coverage from a call-out click ──────────
+//
+// Spec §3.5: the manager's one click approves the employee's absence AND starts
+// the manager-initiated coverage workflow with employee + shift + date already
+// filled in — no re-asking "who" or "which shift" — and blasts the WHOLE
+// qualified pool at once (an emergency is where speed beats everything; the
+// check-in fires on exhaustion, not a reserve-holding timer). Deliberately NOT
+// blasted: tier-3 candidates (already working that day — texting them means
+// asking for a double), who stay in the pool for the manager's explicit
+// "send another batch" instead.
+export type CallOutCoverageOutcome =
+  | { outcome: 'started'; contacted: string[]; shiftName: string }
+  | { outcome: 'already_open'; shiftName: string }
+  | { outcome: 'choose'; shiftName: string }   // only doubles left — manager picks
+  | { outcome: 'no_candidates'; shiftName: string }
+  | { outcome: 'no_shift' };
+
+export async function startCoverageForCallOut(params: {
+  companyId: string;
+  timeOffRequestId: string;
+  absentEmployeeId: string;
+  absentEmployeeName: string;
+  shiftDate: string;
+  shiftNameHint?: string | null;
+  manager: { userId: string | null; name: string | null; email: string | null; phone: string | null };
+}): Promise<CallOutCoverageOutcome> {
+  const { companyId, timeOffRequestId, absentEmployeeId, absentEmployeeName, shiftDate, manager } = params;
+
+  // Idempotency FIRST: a second click (or a mail client fetching the link
+  // twice — J-3's double-fetch) finds the session already open and reports
+  // that, never "nothing changed".
+  const existing = await findCoverageSessionForTimeOffRequest(companyId, timeOffRequestId);
+  if (existing) {
+    return { outcome: 'already_open', shiftName: existing.shift_info.shift_name };
+  }
+
+  const scheduleData = await findSchedule(companyId, shiftDate);
+  const shiftInfo = await findShiftInfo(companyId, shiftDate, absentEmployeeId, params.shiftNameHint ?? null, scheduleData);
+  if (!shiftInfo) return { outcome: 'no_shift' };
+
+  const { tier1, tier2, tier3 } = await buildCandidatePool({
+    company_id: companyId,
+    shift_date: shiftDate,
+    shift_info: shiftInfo,
+    called_out_employee_id: absentEmployeeId,
+    schedule_data: scheduleData,
+  });
+
+  const aegisSmsNumber = await getAegisSmsChannel(companyId);
+  // The manager's own channel for the coverage play-by-play: text when we can,
+  // else email. The synthetic message mirrors what reply() needs on each leg.
+  const viaSms = !env.EMAIL_ONLY && !!manager.phone && !!aegisSmsNumber;
+  const managerIdentifier = viaSms ? manager.phone! : manager.email ?? '';
+  const managerMessage: InboundMessage = {
+    sender: managerIdentifier,
+    recipient: viaSms ? aegisSmsNumber! : '',
+    body: '',
+    channel: viaSms ? 'sms' : 'email',
+    raw_subject: `Coverage for ${absentEmployeeName}'s ${shiftInfo.shift_name} shift`,
+    thread_id: undefined,
+  };
+  const managerContact: VerifiedContact = {
+    role: 'manager',
+    company_id: companyId,
+    employee_id: null,
+    user_id: manager.userId,
+    name: manager.name ?? 'Manager',
+    matched_identifier: managerIdentifier,
+    channel: managerMessage.channel,
+  };
+
+  const orderedPool: PoolCandidate[] = [...tier1, ...tier2, ...tier3].map(c => ({
+    employee_id: c.employee.id,
+    name: c.employee.name,
+    primary_role: c.employee.primary_role,
+    phone: c.employee.contact_phone,
+    current_weekly_hours: c.current_weekly_hours,
+    shift_hours: c.shift_hours,
+    would_exceed_max: c.would_exceed_max,
+    max_weekly_hours: c.employee.max_weekly_hours,
+    tier: c.tier,
+  }));
+
+  const session: CoverageSession = {
+    session_id: randomUUID(),
+    company_id: companyId,
+    manager_contact: managerIdentifier,
+    manager_channel: managerMessage.channel,
+    manager_sender: managerMessage.sender,
+    manager_recipient: managerMessage.recipient,
+    manager_raw_subject: managerMessage.raw_subject,
+    manager_thread_id: undefined,
+    callout_employee_id: absentEmployeeId,
+    callout_employee_name: absentEmployeeName,
+    shift_date: shiftDate,
+    shift_info: shiftInfo,
+    state: 'awaiting_names',
+    outreach_queue: [],
+    outreach_results: [],
+    coverage_filled: false,
+    covered_by_employee_id: null,
+    urgency_window_minutes: calcUrgencyWindowMinutes(shiftDate, shiftInfo.start_time),
+    candidate_pool: orderedPool,
+    shown_count: tier1.length + tier2.length,
+    time_off_request_id: timeOffRequestId,
+    expires_at: new Date(Date.now() + 4 * 60 * 60 * 1000).toISOString(),
+  };
+
+  const blastable = [...tier1, ...tier2].map(c => c.employee);
+  if (blastable.length === 0) {
+    if (tier3.length > 0) {
+      // Everyone left is already working that day — a double is the manager's
+      // call, never an auto-text. Store the session and hand them the list.
+      await storeSession(session);
+      const { text, html } = buildCandidateMessage(tier1, tier2, tier3, shiftInfo, shiftDate, absentEmployeeName, []);
+      await reply(managerContact, managerMessage, text, html);
+      return { outcome: 'choose', shiftName: shiftInfo.shift_name };
+    }
+    await reply(
+      managerContact,
+      managerMessage,
+      `I approved ${absentEmployeeName}'s call-out, but I couldn't find anyone qualified and available to cover the ` +
+        `${shiftInfo.shift_name} shift on ${formatShortDate(shiftDate)}. You'll need to handle this one directly — sorry.`,
+    );
+    return { outcome: 'no_candidates', shiftName: shiftInfo.shift_name };
+  }
+
+  await storeSession(session);
+  await logActivity({
+    company_id: companyId,
+    action: 'emergency_coverage_requested',
+    summary: `Coverage started from ${absentEmployeeName}'s call-out (Approve & find coverage) — ${shiftInfo.shift_name} on ${shiftDate}`,
+    metadata: {
+      shift_date: shiftDate,
+      shift_name: shiftInfo.shift_name,
+      time_off_request_id: timeOffRequestId,
+      via: 'call_out_button',
+      pool_blasted: blastable.length,
+      tier3_held: tier3.length,
+    },
+  });
+  // blastBatch updates the session (outreach_in_progress), texts every
+  // candidate, and sends the manager the "Reaching out to …" play-by-play.
+  await blastBatch({ message: managerMessage, contact: managerContact, session, employees: blastable });
+  return { outcome: 'started', contacted: blastable.map(e => e.name), shiftName: shiftInfo.shift_name };
+}
+
 // The contacted group is exhausted with no acceptance (everyone declined or the
 // window lapsed). Ask the manager whether to send another batch — we never
 // auto-send. Shared by the decline path and the timeout scheduler.
@@ -2093,7 +2322,7 @@ export async function handleEmployeeCoverageResponse(
     await reply(
       contact,
       message,
-      `I need a clear answer — can you cover the ${outreach.shift_info.shift_name} shift on ${formatShortDate(outreach.shift_date)}? Reply YES or NO.`
+      `Sorry — just so I don't get it wrong: can you cover the ${outreach.shift_info.shift_name} shift on ${formatShortDate(outreach.shift_date)}? A quick yes or no works.`
     );
     return;
   }

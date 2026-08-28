@@ -97,6 +97,14 @@ export interface ScheduleAssignment {
   start_time: string;
   end_time: string;
   hours: number;
+  /**
+   * W-2 (Alexander, 2026-08-27): an APPROVED call-out. The assignment stays on
+   * the published schedule — removing it would hide the very hole the manager
+   * chose to handle — but it renders greyed out in Homebase and is EXCLUDED
+   * from every wage/comp estimate (computeWageEstimate skips it). Cleared if a
+   * coverer takes the shift (the assignment then belongs to the coverer).
+   */
+  called_out?: boolean;
 }
 
 export interface ScheduleGap {

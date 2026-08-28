@@ -12,7 +12,10 @@ vi.mock('../../db/client', () => ({
   supabase: {
     from: () => {
       const chain: Record<string, unknown> = {};
-      for (const m of ['select', 'eq', 'gte', 'order']) chain[m] = () => chain;
+      // W-2 added: .in() (call-out side-row read) and .maybeSingle()
+      // (tenantTodayAndZone — the status query is tenant-local now).
+      for (const m of ['select', 'eq', 'gte', 'order', 'in']) chain[m] = () => chain;
+      (chain as { maybeSingle: unknown }).maybeSingle = () => Promise.resolve({ data: { timezone: 'America/Detroit' }, error: null });
       // The query is awaited after .order(); make the chain thenable.
       (chain as { then: unknown }).then = (onF: (v: { data: unknown[] }) => unknown) => Promise.resolve({ data: h.rows }).then(onF);
       return chain;

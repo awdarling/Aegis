@@ -39,6 +39,8 @@ import {
   getPendingSwap,
   getActiveSwapOutreach,
 } from '../workflows/shift-swap';
+// W-2 branch 5 — the manager's text answer to a call-out nudge.
+import { handleCallOutDecisionReply } from '../workflows/callout-decision';
 import {
   handleEmergencyCoverage,
   routeManagerCoverageReply,
@@ -372,6 +374,18 @@ async function routeIntentInner(
     if (pendingEdit) {
       await handleEditConfirmation(message, contact, pendingEdit);
       console.log('[router] EARLY RETURN', { reason: 'pending_homebase_edit' });
+      return;
+    }
+
+    // W-2 branch 5 (Alexander, 2026-08-28): a manager can answer a CALL-OUT
+    // nudge right in the text — "find coverage" / "approve — I've got it" /
+    // "deny" — running the exact same decision core as the email buttons.
+    // Deliberately conservative: with no clarifier open, only an explicit
+    // phrase acts; anything else falls through untouched, so this can never
+    // swallow an unrelated manager message.
+    const handledCallOut = await handleCallOutDecisionReply(message, contact);
+    if (handledCallOut) {
+      console.log('[router] EARLY RETURN', { reason: 'callout_decision_reply' });
       return;
     }
 

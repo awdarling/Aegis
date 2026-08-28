@@ -160,8 +160,8 @@ describe('buildAvailabilityManagerEmail', () => {
 
     // Requirement 4: the reply-YES/NO fallback instruction is present alongside
     // the buttons (text + HTML), so a manager is never stranded.
-    expect(text).toMatch(/reply YES/i);
-    expect(html).toMatch(/reply <strong>YES<\/strong>/i);
+    expect(text).toMatch(/replying to this email with a quick yes or no works too/i); // W-2 copy pass
+    expect(html).toMatch(/quick yes or no works too/i);
   });
 });
 

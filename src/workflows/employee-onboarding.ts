@@ -3081,7 +3081,7 @@ export async function handleInitiateOnboarding(
         overflow +
         skipNote +
         unmatchedNote +
-        `\n\nReply YES to begin or NO to cancel.`
+        `\n\nShall I get them started? A quick yes kicks it off — or tell me no and I'll hold.`
     );
     return;
   }
@@ -3279,7 +3279,7 @@ export async function handleOnboardingFanoutConfirm(
       await routeIntent(message, contact);
       return;
     }
-    await reply(contact, message, `Reply YES to start onboarding or NO to cancel.`);
+    await reply(contact, message, `Just let me know — should I start the onboarding? A quick yes or no works.`);
     return;
   }
 
@@ -3422,6 +3422,25 @@ export function classifyAvailTarget(body: string): 'normal' | 'temporary' | 'unc
 // the season" is a bounded change if the classifier resolved a date for it, and
 // a permanent one if it didn't — either way the employee's own words decide, and
 // a stored override's end date is never substituted for them.
+// W-2 (§N10) — what the F7 "normal or temporary?" REPLAY passes down. The
+// question is only ever asked when the message carried no date of its own
+// (W-1), but this closes the latent shape for good: if the original words said
+// "going forward"/"permanently", THAT wins even over a "temporary" answer —
+// the stored override's end date can never replace what the employee said
+// (Jenna's Aug 24–30 became "through July 16" this way, six times over).
+// Pure + deterministic; no model call.
+export function resolveAvailTargetReplay(
+  choice: 'normal' | 'temporary',
+  originalBody: string,
+  storedOverrideEndDate: string | null,
+): Record<string, unknown> {
+  if (choice === 'normal') return { avail_target: 'normal' };
+  if (readAvailTargetFromMessage(originalBody, {}) === 'normal') {
+    return { avail_target: 'normal' };
+  }
+  return { avail_target: 'temporary', end_date: storedOverrideEndDate ?? '' };
+}
+
 export function readAvailTargetFromMessage(
   body: string,
   extracted: Record<string, unknown>,
@@ -4103,10 +4122,12 @@ export async function handleAvailabilityConfirmResponse(
   const proposedBlock = rotation
     ? `PROPOSED ROTATION:\n${formatRotationWeeks(rotation)}`
     : `CURRENT:\n${currentDisplay}\n\nPROPOSED:\n${proposedDisplay}`;
+  // W-2 copy pass (N9, Alexander 2026-08-27): a natural question — the yes/no
+  // parser accepts natural answers, so the robotic instruction bought nothing.
   const managerBody =
     `${headline}\n\n` +
     `${proposedBlock}\n\n` +
-    `Reply YES to approve or NO to deny.`;
+    `Good to approve? A quick yes or no from you settles it either way.`;
 
   // Email-first per manager; SMS only when a manager has no email but has a
   // phone and an outbound SMS channel exists.
@@ -4295,7 +4316,7 @@ export async function buildAvailabilityManagerEmail(params: {
     `${intro} I wanted to get it in front of you — the details are below, and either link records your decision right away. I'll let ${employeeFirst} know which way it went, so there's nothing else you'll need to do.\n\n` +
     `CURRENT:\n${currentDisplay}\n\n${proposedHeading}:\n${proposedDisplay}\n\n` +
     `Approve: ${approveTok.url}\n\nDeny: ${denyTok.url}\n\n` +
-    `(You can also just reply YES to approve or NO to deny.)`;
+    `(Replying to this email with a quick yes or no works too.)`;
 
   // Conclusion-first: greeting + the whole ask (what it is, what to do, that I'll
   // handle the notification) sit ABOVE the action card, so the manager never has
@@ -4323,7 +4344,7 @@ ${brandedButtonRow([
   { url: approveTok.url, label: 'Approve', variant: 'primary' },
   { url: denyTok.url, label: 'Deny', variant: 'secondary' },
 ])}
-  <p style="margin:2px 0 6px;font-size:13px;color:${BRAND.textSecondary};">You can also just reply <strong>YES</strong> to approve or <strong>NO</strong> to deny.</p>
+  <p style="margin:2px 0 6px;font-size:13px;color:${BRAND.textSecondary};">Replying to this email with a quick yes or no works too.</p>
 </div>`;
 
   const card = brandActionCard(
@@ -4735,7 +4756,7 @@ export async function handleManagerAvailabilityApproval(
     await reply(
       contact,
       message,
-      `Please reply YES to approve or NO to deny ${pending.employee_name}'s availability update.`
+      `Just to be sure — should I approve ${pending.employee_name}'s availability update? A quick yes or no works.`
     );
     return;
   }

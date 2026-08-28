@@ -3303,7 +3303,7 @@ export async function handleTimeOffCancelConfirmation(
     }
     await reply(contact, message,
       `Just to be sure before I cancel anything — should I cancel your time off on ${pending.display_range}? ` +
-      `Reply YES or NO.`);
+      `A quick yes or no works.`);
     return;
   }
 

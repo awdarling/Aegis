@@ -38,7 +38,9 @@ export function managerAlertSms(params: {
   summary: string;
   // 'decide' — the email offers MORE than approve/deny (W-2 call-outs carry
   // three choices), so the 'approve' tail's "approve/deny link" would be a lie.
-  inbox?: 'approve' | 'action' | 'details' | 'decide' | null;
+  // 'decide_reply' — W-2 branch 5 (Alexander, 2026-08-28): the manager can
+  // answer the call-out RIGHT HERE by text; the tail teaches the three answers.
+  inbox?: 'approve' | 'action' | 'details' | 'decide' | 'decide_reply' | null;
 }): string {
   const { managerName, summary, inbox } = params;
   const tail =
@@ -50,6 +52,8 @@ export function managerAlertSms(params: {
       ? " Full details are in your email if you want them."
       : inbox === 'decide'
       ? " The details and your options are in your email — take a look when you can."
+      : inbox === 'decide_reply'
+      ? ' You can answer right here — "find coverage", "approve — I\'ve got it", or "deny" — or use the buttons in your email.'
       : '';
   return `${textOpener(managerName)}${summary}${tail}`;
 }

@@ -204,94 +204,13 @@ function errorPage(message: string): string {
 }
 
 // ── Time-off notification ─────────────────────────────────────────────────────
-
-// Decision notices are the single most important message in a flow, so they must
-// never be silently dropped. Send over the employee's channel, but ALWAYS fall
-// back to email if the SMS send fails or returns false (a transient Telnyx error
-// or an unreachable/invalid number must not lose a decision). Mirrors the
-// submission-confirmation path. (DRIFT_REGISTER H2 / batch 2a)
-export async function notifyEmployeeDecision(opts: {
-  company_id: string;
-  smsChannel: string | null;
-  phone: string | null;
-  email: string | null;
-  body: string;
-  subject: string;
-  thread_id?: string | null;
-  // The recipient employee — REQUIRED for the SMS leg (N3 consent gate). Blocked
-  // → email fallback, which is the correct legal behavior for a decision notice.
-  employee_id?: string | null;
-}): Promise<boolean> {
-  if (!env.EMAIL_ONLY && opts.phone && opts.smsChannel) {
-    const ok = await sendSms({
-      to: opts.phone,
-      from: opts.smsChannel,
-      body: opts.body,
-      company_id: opts.company_id,
-      employee_id: opts.employee_id ?? undefined,
-    });
-    if (ok) return true;
-    console.warn(`[decision-notify] SMS send failed for company ${opts.company_id}; falling back to email`);
-  }
-  if (opts.email) {
-    await sendEmail({ to: opts.email, subject: opts.subject, text: opts.body, company_id: opts.company_id, thread_id: opts.thread_id ?? undefined });
-    return true;
-  }
-  console.error(`[decision-notify] no channel available to deliver decision notice for company ${opts.company_id}`);
-  return false;
-}
-
-async function notifyEmployee(
-  token: TimeOffDecisionToken,
-  employee: Employee,
-  action: 'approve' | 'deny' | 'approve_and_cover'
-): Promise<void> {
-  const verb = action === 'deny' ? 'denied' : 'approved';
-  // Name the date(s) so an employee with several requests in flight knows exactly
-  // which one this decision covers.
-  const { data: torDates } = await supabase
-    .from('time_off_requests')
-    .select('start_date, end_date')
-    .eq('id', token.request_id)
-    .maybeSingle();
-  const tr = torDates as { start_date: string; end_date: string } | null;
-  const forDates = tr ? ` for ${formatDateRange(tr.start_date, tr.end_date)}` : '';
-  // W-2 — a call-out's outcome names the shift and closes the "still on the
-  // schedule" loop the confirmation opened. Approved = you're off, definitively.
-  const callOut = token.call_out ?? null;
-  let callOutLine: string | null = null;
-  if (callOut?.length) {
-    const { today } = await tenantTodayAndZone(token.company_id);
-    callOutLine = describeCallOutShifts(callOut, today);
-  }
-  const messageText = callOutLine
-    ? action === 'deny'
-      ? `Your manager wasn't able to approve your call-out for ${callOutLine} — you're still expected for that shift. If that's a real problem, reach out to them directly.`
-      : action === 'approve_and_cover'
-      ? `Your manager approved your call-out for ${callOutLine} — you're off, and I'm already reaching out to teammates to cover the shift.`
-      : `Your manager approved your call-out for ${callOutLine} — you're off. They're handling coverage from here.`
-    : action === 'deny'
-      ? `Your time-off request${forDates} has been denied. Please contact your manager if you have questions or would like to discuss alternatives.`
-      : `Great news! Your time-off request${forDates} has been approved. Enjoy your time off!`;
-
-  const subject = token.raw_subject
-    ? normalizeReSubject(token.raw_subject)
-    : `Your time-off request has been ${verb}`;
-  // SMS only when that's the employee's channel; the email fallback uses their
-  // address on file (or the email-channel contact).
-  const phone = token.employee_channel === 'sms' ? token.employee_contact : null;
-  const email = employee.contact_email ?? (token.employee_channel === 'email' ? token.employee_contact : null);
-  await notifyEmployeeDecision({
-    company_id: token.company_id,
-    smsChannel: token.aegis_sms_channel,
-    phone,
-    email,
-    body: messageText,
-    subject,
-    thread_id: token.thread_id,
-    employee_id: employee.id,
-  });
-}
+// W-2 branch 5: the decision CORE (status write, token retirement, schedule
+// marking, coverage start, employee notice, audit) moved to
+// workflows/callout-decision.ts so the email buttons and the manager's TEXT
+// replies run the exact same code (Rule 0b). notifyEmployeeDecision is
+// re-exported unchanged for its existing callers and tests.
+export { notifyEmployeeDecision } from '../workflows/callout-decision';
+import { notifyEmployeeDecision, applyTimeOffDecision } from '../workflows/callout-decision';
 
 // ── Swap decision handler ─────────────────────────────────────────────────────
 
@@ -708,197 +627,58 @@ decisionWebhook.get('/', async (req, res) => {
     return;
   }
 
-  // Look up the time-off request
-  const { data: torData, error: torError } = await supabase
-    .from('time_off_requests')
-    .select('*')
-    .eq('id', requestId)
-    .eq('company_id', decisionToken.company_id)
-    .single();
+  // ── Time-off / call-out decision — ONE core, shared with the text-reply
+  // door (workflows/callout-decision.ts applyTimeOffDecision). This route only
+  // validates the token (above) and renders the landing pages.
+  const t = decisionToken as TimeOffDecisionToken;
+  const tokenCallOut = t.call_out ?? null;
+  const isCallOut = Array.isArray(tokenCallOut) && tokenCallOut.length > 0;
+  const result = await applyTimeOffDecision(
+    {
+      request_id: t.request_id,
+      company_id: t.company_id,
+      employee_id: t.employee_id,
+      employee_name: t.employee_name,
+      employee_channel: t.employee_channel,
+      employee_contact: t.employee_contact,
+      aegis_sms_channel: t.aegis_sms_channel,
+      thread_id: t.thread_id,
+      raw_subject: t.raw_subject,
+      manager_user_id: t.manager_user_id,
+      manager_name: t.manager_name,
+      call_out: tokenCallOut,
+    },
+    action as 'approve' | 'deny' | 'approve_and_cover',
+    'email_link',
+  );
 
-  if (torError || !torData) {
+  if (result.outcome === 'not_found') {
     res.status(404).send(errorPage('Time-off request not found. It may have already been processed.'));
     return;
   }
 
-  const tor = torData as { id: string; status: string; employee_id: string; start_date: string; end_date: string; reason: string | null };
-
-  if (tor.status !== 'pending') {
+  if (result.outcome === 'already_decided') {
     // W-2 idempotency: a second "Approve & find coverage" click that somehow
     // still holds a live token (e.g. a different manager's copy) reports the
     // open coverage session instead of a bare conflict.
-    if (action === 'approve_and_cover' && tor.status === 'approved') {
-      const openSession = await findCoverageSessionForTimeOffRequest(decisionToken.company_id, requestId);
-      if (openSession) {
-        res.send(alreadyCoveringPage(openSession.shift_info.shift_name, openSession.coverage_filled));
-        return;
-      }
+    if (result.coverageOpen && action === 'approve_and_cover') {
+      res.send(alreadyCoveringPage(result.coverageOpen.shiftName, result.coverageOpen.filled));
+      return;
     }
     res
       .status(409)
       .send(
         errorPage(
-          `This request has already been ${tor.status}. No further action is needed.`
+          `This request has already been ${result.status}. No further action is needed.`
         )
       );
     return;
   }
 
-  // Load employee record for notification
-  const { data: empData } = await supabase
-    .from('employees')
-    .select('*')
-    .eq('id', decisionToken.employee_id)
-    .eq('company_id', decisionToken.company_id)
-    .single();
-
-  const employee = empData as Employee | null;
-
-  // Update time_off_requests status. Attribute the decision to the manager the
-  // approve/deny link was sent to, so the record credits the person who acted.
-  // W-2: 'approve_and_cover' approves the absence exactly like 'approve' — the
-  // coverage blast is additive, after the write.
-  const approves = action !== 'deny';
-  await supabase
-    .from('time_off_requests')
-    .update({
-      status: approves ? 'approved' : 'denied',
-      decided_at: new Date().toISOString(),
-      decided_by: decisionToken.manager_user_id ?? null,
-    })
-    .eq('id', requestId);
-
-  // Consume the token — delete both approve and deny tokens for this request
-  await supabase
-    .from('aegis_memory')
-    .delete()
-    .like('source', 'decision_token:%')
-    .eq('content', JSON.stringify({ ...decisionToken }));
-
-  // Also clean up the sibling token by querying for the same request_id
-  const { data: siblingTokens } = await supabase
-    .from('aegis_memory')
-    .select('id, content')
-    .like('source', 'decision_token:%')
-    .eq('company_id', decisionToken.company_id);
-
-  if (siblingTokens) {
-    const siblings = (siblingTokens as { id: string; content: string }[]).filter(row => {
-      try {
-        const parsed = JSON.parse(row.content) as { request_id?: string };
-        return parsed.request_id === requestId;
-      } catch {
-        return false;
-      }
-    });
-    if (siblings.length > 0) {
-      await supabase
-        .from('aegis_memory')
-        .delete()
-        .in('id', siblings.map(s => s.id));
-    }
-  }
-
-  // Log the decision
-  const decisionPast = approves ? 'approved' : 'denied';
-  const deciderName = decisionToken.manager_name ?? null;
-  const tokenCallOut = (decisionToken as TimeOffDecisionToken).call_out ?? null;
-  const isCallOut = Array.isArray(tokenCallOut) && tokenCallOut.length > 0;
-  await logActivity({
-    company_id: decisionToken.company_id,
-    // A manager clicked the approve/deny link — credit the manager, not the
-    // 'aegis' default (which read on the feed as the assistant deciding itself).
-    actor: 'manager',
-    actor_name: deciderName,
-    action: `time_off_${decisionPast}`,
-    entity_type: 'time_off_request',
-    entity_id: requestId,
-    summary: `${isCallOut ? 'Call-out' : 'Time-off request'} for ${decisionToken.employee_name} ${decisionPast}${deciderName ? ` by ${deciderName}` : ''} via email link`,
-    metadata: {
-      employee_id: decisionToken.employee_id,
-      start_date: tor.start_date,
-      end_date: tor.end_date,
-      reason: tor.reason,
-      decided_by: decisionToken.manager_user_id ?? null,
-      ...(isCallOut ? { call_out: true, via: action } : {}),
-    },
-  });
-
-  // W-2 — an APPROVED call-out marks the shift on the published schedule
-  // (Alexander, 2026-08-27): it STAYS on, greyed out, excluded from the wage
-  // estimate. Both approve paths do this; a coverer later replacing the
-  // assignment clears the marker.
-  if (isCallOut && approves) {
-    try {
-      await markAssignmentsCalledOut({
-        company_id: decisionToken.company_id,
-        employee_id: decisionToken.employee_id,
-        dates: tokenCallOut!.map(s => s.date),
-      });
-    } catch (err) {
-      console.error('[decision] failed to mark call-out on schedule:', err);
-    }
-  }
-
-  // Record a pattern in aegis_memory for future reference
-  await supabase.from('aegis_memory').insert({
-    company_id: decisionToken.company_id,
-    memory_type: 'pattern',
-    source: 'time_off_decision_history',
-    content: JSON.stringify({
-      employee_id: decisionToken.employee_id,
-      employee_name: decisionToken.employee_name,
-      action,
-      start_date: tor.start_date,
-      end_date: tor.end_date,
-      reason: tor.reason,
-      decided_at: new Date().toISOString(),
-    }),
-  });
-
-  // W-2 — "Approve & find coverage": absence is approved above; now start the
-  // manager-initiated coverage workflow with employee + shift + date already
-  // filled in (spec §3.5 — no re-asking "who" or "which shift"), blasting the
-  // whole qualified pool. The clicking manager gets the coverage play-by-play
-  // on their own channel from here.
-  let coverOutcome: Awaited<ReturnType<typeof startCoverageForCallOut>> | null = null;
-  if (action === 'approve_and_cover' && isCallOut) {
-    try {
-      const directory = await resolveManagers(decisionToken.company_id);
-      const clicker = directory.managers.find(m => m.userId === decisionToken.manager_user_id) ?? null;
-      const soonest = [...tokenCallOut!].sort((a, b) =>
-        `${a.date}T${a.start_time}`.localeCompare(`${b.date}T${b.start_time}`))[0];
-      coverOutcome = await startCoverageForCallOut({
-        companyId: decisionToken.company_id,
-        timeOffRequestId: requestId,
-        absentEmployeeId: decisionToken.employee_id,
-        absentEmployeeName: decisionToken.employee_name,
-        shiftDate: soonest.date,
-        shiftNameHint: soonest.shift_name,
-        manager: {
-          userId: decisionToken.manager_user_id ?? null,
-          name: decisionToken.manager_name ?? clicker?.name ?? null,
-          email: clicker?.email ?? null,
-          phone: clicker?.phone ?? null,
-        },
-      });
-    } catch (err) {
-      console.error('[decision] failed to start call-out coverage:', err);
-    }
-  }
-
-  // Notify employee
-  if (employee) {
-    try {
-      await notifyEmployee(decisionToken, employee, action);
-    } catch (err) {
-      console.error('[decision] employee notification failed:', err);
-    }
-  }
-
-  // Return HTML confirmation page to the manager's browser
-  const employeeName = decisionToken.employee_name;
+  // Applied — render the outcome page.
+  const employeeName = t.employee_name;
   if (action === 'approve_and_cover') {
+    const coverOutcome = result.coverage;
     const first = tokenCallOut?.[0]?.shift_name ?? 'shift';
     if (coverOutcome?.outcome === 'started') {
       res.send(

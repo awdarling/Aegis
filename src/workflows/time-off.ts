@@ -1643,6 +1643,28 @@ export async function notifyManager(
           : []),
       ]);
 
+      // W-2 branch 5 (Alexander, 2026-08-28): the manager can ANSWER the
+      // call-out by text — park the decision context per manager so their
+      // reply resolves without re-asking anything. Retired the moment either
+      // door (text or button) decides.
+      if (isCallOut && manager.userId) {
+        const { storeCallOutDecisionPending } = await import('./callout-decision');
+        await storeCallOutDecisionPending(manager.userId, {
+          request_id: requestId,
+          company_id: companyId,
+          employee_id: employee.id,
+          employee_name: employee.name,
+          employee_channel: pending.channel,
+          employee_contact: pending.sender,
+          aegis_sms_channel: aegisSmsNumber,
+          thread_id: pending.thread_id ?? null,
+          raw_subject: pending.raw_subject ?? null,
+          manager_user_id: manager.userId,
+          manager_name: manager.name,
+          call_out: pending.call_out ?? null,
+        });
+      }
+
       const approveUrl = `${baseUrl}/webhooks/decision?action=approve&requestId=${requestId}&token=${approveToken}`;
       const denyUrl = `${baseUrl}/webhooks/decision?action=deny&requestId=${requestId}&token=${denyToken}`;
       const approveAndCoverUrl = approveAndCoverToken
@@ -1702,7 +1724,7 @@ export async function notifyManager(
             summary: isCallOut
               ? `${employee.name} just called out of ${callOutLine}${pending.reason ? ` — ${pending.reason}` : ''}.${nearShiftLine}`
               : `${employee.name} wants ${dateDisplay} off${pending.reason ? ` for ${pending.reason}` : ` (${NO_REASON_GIVEN})`}.`,
-            inbox: isCallOut ? 'decide' : 'approve',
+            inbox: isCallOut ? 'decide_reply' : 'approve',
           }),
           company_id: companyId,
         });

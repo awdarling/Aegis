@@ -312,7 +312,9 @@ describe('Mia, Aug 21 — "I\'m sick and I can\'t make it tonight" WITH an After
     expect(managerText).toBeDefined();
     expect(managerText!.body).toMatch(/Mia Shaffer just called out of Mia's Afternoon shift/);
     expect(managerText!.body).toMatch(/the coverage window is real/);
-    expect(managerText!.body).toMatch(/options are in your email/);
+    // Branch 5: the nudge invites answering right in the text.
+    expect(managerText!.body).toMatch(/answer right here/i);
+    expect(managerText!.body).toMatch(/find coverage/);
   });
 
   it('a far-off shift gets NO near-shift escalation line', async () => {

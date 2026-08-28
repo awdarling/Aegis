@@ -1200,7 +1200,10 @@ export async function reviewAvailabilityConfirmation(
         `Times HH:MM 24h, clamped to ${bounds.earliest_start}–${bounds.latest_end}. day_of_week 0=Sunday..6=Saturday. ` +
         `Named periods (no explicit times): morning = ${bounds.earliest_start}–12:00, afternoon = 12:00–17:00, evening = 17:00–${bounds.latest_end}.\n` +
         `Respond ONLY with JSON (no markdown): ` +
-        `{ "action": "confirm" } | { "action": "revise", "slots": [{ "day_of_week": 0, "start_time": "HH:MM", "end_time": "HH:MM" }] } | { "action": "restart" } | { "action": "unclear" }.`,
+        // W-2 — different_intent was described above but MISSING from this
+        // menu, so the model could never actually answer it (the parser has
+        // handled it all along).
+        `{ "action": "confirm" } | { "action": "revise", "slots": [{ "day_of_week": 0, "start_time": "HH:MM", "end_time": "HH:MM" }] } | { "action": "restart" } | { "action": "different_intent", "intent": "<label>" } | { "action": "unclear" }.`,
       messages: [{ role: 'user', content: reply }],
     })
   );

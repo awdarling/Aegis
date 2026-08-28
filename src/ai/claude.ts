@@ -76,6 +76,10 @@ export const EMPLOYEE_INTENTS = [
   // backing out of an unsent request mid-confirmation, which stays
   // general_question and is handled by the pending-time-off gate.
   'cancel_time_off',
+  // W-2 (C-2) — calling off a swap/trade/cover ask THEY started. Distinct from
+  // cancel_time_off: "i don't need it covered anymore" once cancelled a
+  // time-off draft while the swap outreach stayed live.
+  'cancel_swap',
   'query_my_time_off',
   'query_my_shifts',
   'query_my_availability',
@@ -149,7 +153,10 @@ export async function classifyIntent(
     applyDepartureBackstop(
       applyReasonEditBackstop(
         applyCancelTimeOffBackstop(
-          applyBareTimeOffBackstop(applyAvailabilityBackstop(parsed, message), message),
+          applyCancelSwapBackstop(
+            applyBareTimeOffBackstop(applyAvailabilityBackstop(parsed, message), message),
+            message
+          ),
           message
         ),
         message,
@@ -300,6 +307,43 @@ export function applyBareTimeOffBackstop(result: ClassifyResult, message: string
 // workflow behind it). Deterministic; fires only from the general buckets, so a
 // confident specific intent is never overridden. Requires BOTH a cancel verb and
 // a time-off referent so "cancel that" mid-flow (case (a) above) stays put.
+// W-2 (C-2) — deterministic backstop for calling off a swap/cover ask. Needs a
+// backing-out shape (a cancel verb, or "don't/no longer need") AND a swap
+// referent (swap/trade/cover words) — so "cancel my time off" and a bare
+// "never mind" never match. Runs BEFORE the time-off cancel backstop: "cancel
+// the swap request" contains "request", which the time-off referent list would
+// otherwise claim (C-2 step 3 cancelled the wrong thing exactly this way).
+export function looksLikeSwapCancel(body: string): boolean {
+  const t = (body || '').toLowerCase();
+  const backingOut =
+    /\b(cancel|call off|scrap|undo|withdraw|retract|drop|take back|pull(?:ed)? back)\b/.test(t) ||
+    /\b(?:don'?t|do not|no longer)\s+(?:need|want)\b/.test(t) ||
+    /\bnever ?mind\b/.test(t);
+  if (!backingOut) return false;
+  // Explicit time-off wording wins: "cancel my time off since my shift got
+  // covered" is a time-off cancel, not a swap one.
+  if (/\b(time ?off|vacation|pto|day off|days off)\b/.test(t)) return false;
+  return /\b(swap|trade|swapped|traded|cover(?:ed|age)?|covering|take (?:my|the) shift|taking (?:my|the) shift|broadcast|shift ask)\b/.test(t);
+}
+
+export function applyCancelSwapBackstop(result: ClassifyResult, message: string): ClassifyResult {
+  if (
+    result.intent !== 'general_question' &&
+    result.intent !== 'operational_query' &&
+    result.intent !== 'cancel_time_off' &&
+    result.intent !== 'unknown'
+  ) {
+    return result;
+  }
+  // "undo all of my requests" (no swap word) stays with the time-off sweep.
+  if (!looksLikeSwapCancel(message)) return result;
+  return {
+    intent: 'cancel_swap',
+    confidence: result.confidence === 'low' ? 'medium' : result.confidence,
+    extracted: {},
+  };
+}
+
 export function looksLikeTimeOffCancel(body: string): boolean {
   const t = (body || '').toLowerCase();
   const verb = /\b(cancel|pull(?:ed)? back|rescind|undo|withdraw|retract|scrap|take back|remove|delete|drop)\b/.test(t);
@@ -681,6 +725,14 @@ today", "withdraw that one", "you said you would pull back the approved time off
 Classify cancel_time_off; extract the date when one is named, else date null. The workflow
 resolves "the pending one" / "all of them" / "today" itself. Never general_question for these —
 the free-form answer cannot act, and it must not promise to.
+
+  (c) CANCELLING A SWAP OR SHIFT-COVER ASK THEY STARTED — the message calls off a shift
+      swap, trade, or "can anyone take my shift" ask: "cancel the swap", "i don't need to
+      swap it anymore", "i don't need it covered anymore", "scrap the swap", "nobody needs
+      to take my shift now", "call off the trade". Classify cancel_swap — NEVER
+      cancel_time_off (their time off is a different thing and must not be touched) and
+      never submit_time_off. "undo all of my requests" stays cancel_time_off (that
+      workflow sweeps the swaps in too).
 
 ## Off-topic / unrelated messages → general_question
 

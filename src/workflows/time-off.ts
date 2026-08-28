@@ -6,7 +6,7 @@ import { reply, normalizeReSubject } from '../messaging/reply';
 import { sendEmail } from '../messaging/email';
 import { sendSms } from '../messaging/sms';
 import { greeting } from '../messaging/greeting';
-import { classifyIntent, generateReply } from '../ai/claude';
+import { classifyIntent, generateReply, looksLikeSwapCancel } from '../ai/claude';
 import { runSimulation, getWeekBounds, loadTimeOffPolicies as loadAllTimeOffPolicies } from '../lib/schedule-simulator';
 import { computeTimeOffViolations } from '../lib/time-off-policies';
 import { env } from '../config/env';
@@ -2172,6 +2172,20 @@ export async function handlePendingTimeOffConfirmation(
     return;
   }
 
+  // W-2 (C-2): "i don't need it covered anymore" said at THIS gate is about a
+  // SWAP, not the unsent time-off draft — Maisey's said exactly that and Aegis
+  // "scrapped that time-off request" while her broadcast stayed live. When the
+  // words point at a swap AND a swap of theirs is actually in flight, the swap
+  // is what gets called off; the time-off draft stays open.
+  if (looksLikeSwapCancel(trimmed) && contact.employee_id) {
+    const { listWithdrawableSwaps, handleCancelSwap } = await import('./shift-swap');
+    const live = await listWithdrawableSwaps(contact.company_id, contact.employee_id);
+    if (live.length > 0) {
+      await handleCancelSwap(message, contact, {});
+      return;
+    }
+  }
+
   // Natural mid-flow cancellation ("changed my mind, I don't need it", "never mind",
   // "don't want time off", "forget it") — clear the pending cleanly instead of
   // re-asking or treating it as a correction. Runs BEFORE the classifier (no LLM
@@ -2288,6 +2302,8 @@ export async function handlePendingTimeOffConfirmation(
       // the nag, or worse is caught by isTimeOffCancellation above and scraps
       // the wrong request.
       'cancel_time_off',
+      // W-2 (C-2) — likewise a swap cancel raised at this gate.
+      'cancel_swap',
       'initiate_swap',
       'update_availability',
       'capabilities',
@@ -2935,6 +2951,8 @@ interface PendingTimeOffCancel {
   display_range: string;
   /** W-1 branch 4: EVERY row this cancellation targets ("all of them"). */
   targets?: CancelTarget[];
+  /** W-2 (C-2): "undo all of my requests" also withdraws the swaps on a yes. */
+  swap_sweep?: { createdOnOrAfter?: string };
   /** Where the question was asked from, so the answer can be threaded back. */
   channel: 'sms' | 'email';
   sender: string;
@@ -3040,32 +3058,35 @@ function joinNatural(parts: string[]): string {
 export async function askToCancelTimeOff(opts: {
   message: InboundMessage;
   contact: VerifiedContact;
-  /** One row (the reactive swap path) or several ("all of them"). */
+  /** One row (the reactive swap path) or several ("all of them"). May be empty when a swap sweep alone is confirmed. */
   request: { id: string; start_date: string; end_date: string; status?: 'approved' | 'pending' } | CancelTarget[];
   /** Extra sentence explaining WHY we're offering, for the reactive path. */
   lead?: string;
+  /** W-2 (C-2): swap items withdrawn by the SAME yes ("undo all of my requests"). */
+  swapSweep?: { labels: string[]; createdOnOrAfter?: string };
 }): Promise<void> {
   const { message, contact, lead } = opts;
   const targets: CancelTarget[] = (Array.isArray(opts.request) ? opts.request : [opts.request])
     .map(r => ({ id: r.id, start_date: r.start_date, end_date: r.end_date, status: r.status ?? 'approved' }));
-  const first = targets[0];
+  const first = targets[0] ?? null;
   // The FULL range of each request — never the single date the employee happened
   // to name. formatDateRange renders a multi-day request as e.g. "Aug 1-5, 2026".
   const displayRange = joinNatural(targets.map(describeCancelTarget));
-  const dayCount = targets.length === 1 ? countDaysInclusive(first.start_date, first.end_date) : 0;
+  const dayCount = targets.length === 1 && first ? countDaysInclusive(first.start_date, first.end_date) : 0;
   // Spell the span out. A range buried in a date string is easy to skim past,
   // and this is a destructive, whole-request action.
-  const spanNote = dayCount > 1
+  const spanNote = dayCount > 1 && first
     ? ` That's all ${dayCount} days — ${formatDateRange(first.start_date, first.end_date)} — not just the one day.`
     : '';
 
   await storePendingTimeOffCancel(contact.company_id, {
     employee_id: contact.employee_id!,
-    request_id: first.id,
-    start_date: first.start_date,
-    end_date: first.end_date,
+    request_id: first?.id ?? '',
+    start_date: first?.start_date ?? '',
+    end_date: first?.end_date ?? '',
     display_range: displayRange,
     targets,
+    swap_sweep: opts.swapSweep ? { createdOnOrAfter: opts.swapSweep.createdOnOrAfter } : undefined,
     channel: message.channel,
     sender: message.sender,
     recipient: message.recipient,
@@ -3076,17 +3097,22 @@ export async function askToCancelTimeOff(opts: {
 
   // A natural yes/no question — and never "reply CANCEL", which is a carrier
   // opt-out keyword (see the header).
-  const what = targets.length === 1
+  const swapLabels = opts.swapSweep?.labels ?? [];
+  const allLabels = [...targets.map(describeCancelTarget), ...swapLabels];
+  const what = targets.length === 1 && swapLabels.length === 0 && first
     ? (first.status === 'pending'
         ? `withdraw your time-off request for ${formatDateRange(first.start_date, first.end_date)} (it's still waiting on your manager)`
         : `cancel your approved time off on ${formatDateRange(first.start_date, first.end_date)}`)
-    : `cancel all ${targets.length} of these: ${displayRange}`;
+    : allLabels.length === 1
+    ? `call off ${allLabels[0]}`
+    : `cancel all ${allLabels.length} of these: ${joinNatural(allLabels)}`;
+  const many = allLabels.length > 1;
   await reply(
     contact,
     message,
     `${lead ? `${lead} ` : `${textOpener(contact.name)}`}` +
       `Just checking — are you sure you want me to ${what}?${spanNote} ` +
-      `Say yes and I'll take care of it, or no to leave ${targets.length === 1 ? 'it' : 'them'} as ${targets.length === 1 ? 'it is' : 'they are'}.`
+      `Say yes and I'll take care of it, or no to leave ${many ? 'them' : 'it'} as ${many ? 'they are' : 'it is'}.`
   );
 }
 
@@ -3196,7 +3222,21 @@ export async function handleCancelTimeOff(
   const referent = parseCancelReferent(message.body);
   const resolved = resolveCancelTargets({ candidates, date, referent, today, timezone });
 
-  if (resolved.kind === 'none') {
+  // ── W-2 (C-2): "undo ALL of my REQUESTS" sweeps the swaps in too ───────────
+  //
+  // Maisey's 15:54 "undo all of my requests for today" had two pending
+  // time-offs AND a pending swap. "Requests" (not "time off") + "all" means
+  // everything — one confirm, one yes, one manager notice.
+  const sweepSwaps = referent.all && /\brequests?\b|\beverything\b/i.test(message.body);
+  let swapItems: Array<{ kind: string; label: string }> = [];
+  if (sweepSwaps) {
+    const { listWithdrawableSwaps } = await import('./shift-swap');
+    swapItems = await listWithdrawableSwaps(contact.company_id, contact.employee_id, {
+      createdOnOrAfter: referent.madeToday ? today : undefined,
+    });
+  }
+
+  if (resolved.kind === 'none' && swapItems.length === 0) {
     if (date && candidates.length > 0) {
       const list = joinNatural(candidates.map(describeCancelTarget));
       await reply(contact, message,
@@ -3211,7 +3251,7 @@ export async function handleCancelTimeOff(
     return;
   }
 
-  if (resolved.kind === 'ask') {
+  if (resolved.kind === 'ask' && swapItems.length === 0) {
     const list = joinNatural(resolved.rows.map(describeCancelTarget));
     await reply(contact, message,
       `${textOpener(contact.name)}Which one did you want to cancel? You have ${list}. ` +
@@ -3219,7 +3259,15 @@ export async function handleCancelTimeOff(
     return;
   }
 
-  await askToCancelTimeOff({ message, contact, request: resolved.rows });
+  const timeOffTargets = resolved.kind === 'targets' ? resolved.rows : resolved.kind === 'ask' && sweepSwaps ? resolved.rows : [];
+  await askToCancelTimeOff({
+    message,
+    contact,
+    request: timeOffTargets,
+    swapSweep: swapItems.length > 0
+      ? { labels: swapItems.map(i => i.label), createdOnOrAfter: referent.madeToday ? today : undefined }
+      : undefined,
+  });
 }
 
 /**
@@ -3266,7 +3314,9 @@ export async function handleTimeOffCancelConfirmation(
   // no longer approved/pending would be acting on a stale premise.
   const targets: CancelTarget[] = pending.targets?.length
     ? pending.targets
-    : [{ id: pending.request_id, start_date: pending.start_date, end_date: pending.end_date, status: 'approved' }];
+    : pending.request_id
+    ? [{ id: pending.request_id, start_date: pending.start_date, end_date: pending.end_date, status: 'approved' }]
+    : []; // W-2: a swap-only sweep confirms with no time-off rows at all
 
   const done: CancelTarget[] = [];
   const changed: CancelTarget[] = [];
@@ -3280,13 +3330,15 @@ export async function handleTimeOffCancelConfirmation(
       .maybeSingle();
     const row = current as { id: string; status: string; start_date: string; end_date: string } | null;
     if (!row || (row.status !== 'approved' && row.status !== 'pending')) { changed.push(t); continue; }
+    // Captured BEFORE the write — a status read back after an update is not a receipt.
+    const prevStatus = row.status as 'approved' | 'pending';
 
     const { error: cancelErr } = await supabase
       .from('time_off_requests')
       .update({ status: 'cancelled', decided_at: new Date().toISOString() })
       .eq('id', t.id)
       .eq('company_id', contact.company_id)
-      .eq('status', row.status); // optimistic guard — never clobber a concurrent decision
+      .eq('status', prevStatus); // optimistic guard — never clobber a concurrent decision
 
     if (cancelErr) {
       // FAIL CLOSED AND SAY SO. The single most likely cause is migration 022 not
@@ -3318,7 +3370,7 @@ export async function handleTimeOffCancelConfirmation(
       action: 'time_off_cancelled_by_employee',
       entity_type: 'time_off_request',
       entity_id: t.id,
-      summary: row.status === 'pending'
+      summary: prevStatus === 'pending'
         ? `${contact.name} withdrew their own pending time-off request (${formatDateRange(row.start_date, row.end_date)}).`
         : `${contact.name} cancelled their own approved time off (${formatDateRange(row.start_date, row.end_date)}).`,
       metadata: {
@@ -3326,14 +3378,14 @@ export async function handleTimeOffCancelConfirmation(
         request_id: t.id,
         start_date: row.start_date,
         end_date: row.end_date,
-        previous_status: row.status,
+        previous_status: prevStatus,
         channel: message.channel,
       },
     });
-    done.push({ ...t, status: row.status as 'approved' | 'pending' });
+    done.push({ ...t, status: prevStatus });
   }
 
-  if (failed.length > 0 && done.length === 0) {
+  if (failed.length > 0 && done.length === 0 && !pending.swap_sweep) {
     // Leave the pending in place so a retry after the migration still works.
     await reply(contact, message,
       `I wasn't able to cancel that just now — something went wrong on my end, so your time off on ` +
@@ -3343,7 +3395,25 @@ export async function handleTimeOffCancelConfirmation(
 
   await clearPendingTimeOffCancel(contact.company_id, contact.employee_id!);
 
-  if (done.length === 0) {
+  // ── W-2 (C-2): the same yes also withdraws the swaps ("undo all of my
+  // requests") — outreach closed, teammates told, pending rows cancelled,
+  // tokens retired. Its manager summary merges into the ONE notice below.
+  let swapDescriptions: string[] = [];
+  let swapManagerSummary: string | null = null;
+  if (pending.swap_sweep) {
+    const { withdrawSwap } = await import('./shift-swap');
+    const result = await withdrawSwap({
+      companyId: contact.company_id,
+      requesterId: contact.employee_id!,
+      requesterName: contact.name,
+      createdOnOrAfter: pending.swap_sweep.createdOnOrAfter,
+      notifyManagers: false,
+    });
+    swapDescriptions = result.items.map(i => i.label);
+    swapManagerSummary = result.managerSummary;
+  }
+
+  if (done.length === 0 && swapDescriptions.length === 0) {
     await reply(contact, message,
       `Something changed with ${targets.length === 1 ? 'that request' : 'those requests'} since I asked — ` +
       `${targets.length === 1 ? "it's" : "they're"} no longer showing as approved or pending, so I haven't touched anything. ` +
@@ -3351,16 +3421,17 @@ export async function handleTimeOffCancelConfirmation(
     return;
   }
 
-  const doneText = joinNatural(done.map(describeCancelTarget));
+  const doneText = joinNatural([...done.map(describeCancelTarget), ...swapDescriptions]);
+  const doneCount = done.length + swapDescriptions.length;
   const backOn = done.some(d => d.status === 'approved') ? ` and you're back on the schedule for those days` : '';
   const leftover = [...changed, ...failed];
   const leftoverNote = leftover.length > 0
     ? ` I couldn't touch ${joinNatural(leftover.map(describeCancelTarget))} — ask me "what time off do I have?" to see where ${leftover.length === 1 ? 'it stands' : 'they stand'}.`
     : '';
   await reply(contact, message,
-    `Done — ${doneText} ${done.length === 1 ? 'is' : 'are'} cancelled${backOn}. I've let your manager know.${leftoverNote}`);
+    `Done — ${doneText} ${doneCount === 1 ? 'is' : 'are'} cancelled${backOn}. I've let your manager know.${leftoverNote}`);
 
-  await notifyManagersOfTimeOffCancellation(contact, done);
+  await notifyManagersOfTimeOffCancellation(contact, done, swapManagerSummary);
 }
 
 /**
@@ -3372,15 +3443,30 @@ export async function handleTimeOffCancelConfirmation(
 async function notifyManagersOfTimeOffCancellation(
   contact: VerifiedContact,
   done: CancelTarget[],
+  // W-2 (C-2): the swap half of an "undo all of my requests" — merged in so the
+  // manager hears about the whole sweep ONCE, never twice.
+  swapSummary?: string | null,
 ): Promise<void> {
   try {
+    if (done.length === 0 && !swapSummary) return;
     const approved = done.filter(d => d.status === 'approved');
     const pendingOnes = done.filter(d => d.status === 'pending');
     const what = [
       approved.length ? `cancelled their approved time off for ${joinNatural(approved.map(d => formatDateRange(d.start_date, d.end_date)))}` : '',
       pendingOnes.length ? `withdrew their pending request for ${joinNatural(pendingOnes.map(d => formatDateRange(d.start_date, d.end_date)))}` : '',
     ].filter(Boolean).join(' and ');
-    const summary = `${contact.name} ${what}`;
+    if (done.length === 0 && swapSummary) {
+      await sendManagerResolutionNotice({
+        companyId: contact.company_id,
+        decidedByUserId: null,
+        decidedByName: contact.name,
+        summary: swapSummary,
+        subject: swapSummary,
+        body: `${swapSummary}\n\nNo action is needed.`,
+      });
+      return;
+    }
+    const summary = `${contact.name} ${what}${swapSummary ? `. Also: ${swapSummary}` : ''}`;
     await sendManagerResolutionNotice({
       companyId: contact.company_id,
       decidedByUserId: null,

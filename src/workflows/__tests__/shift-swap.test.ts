@@ -14,7 +14,23 @@ vi.mock('../../config/env', () => ({
     SENDGRID_FROM_EMAIL: 'a@test.local',
   },
 }));
-vi.mock('../../db/client', () => ({ supabase: { from: () => ({}) } }));
+// W-2: handleRespondSwap now checks for a live broadcast/pending row first, so
+// the mock must be a chainable empty-result builder rather than a bare {}.
+vi.mock('../../db/client', () => ({
+  supabase: {
+    from: () => {
+      const b: Record<string, unknown> = {};
+      for (const m of ['select', 'eq', 'neq', 'like', 'ilike', 'in', 'is', 'lte', 'gte', 'lt', 'gt', 'order', 'limit', 'or', 'insert', 'update', 'delete']) {
+        b[m] = () => b;
+      }
+      (b as { maybeSingle: unknown }).maybeSingle = () => Promise.resolve({ data: null, error: null });
+      (b as { single: unknown }).single = () => Promise.resolve({ data: null, error: null });
+      (b as { then: unknown }).then = (onF: (v: unknown) => unknown, onR?: (e: unknown) => unknown) =>
+        Promise.resolve({ data: [], error: null }).then(onF, onR);
+      return b;
+    },
+  },
+}));
 vi.mock('../../ai/claude', () => ({
   generateReply: vi.fn(),
   classifyIntent: vi.fn(),

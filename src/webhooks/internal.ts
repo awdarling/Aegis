@@ -12,6 +12,10 @@ import { loadAvailabilityChangeRow } from '../workflows/availability-change-requ
 import { notifyDayClosureCore } from '../workflows/day-closure';
 import { commitSwapPickup, proposeSwapTrade, resolveSwapProposal } from '../workflows/shift-swap';
 import { sendSwapDecisionNotification } from './decision';
+import { applyTimeOffDecision, describeDecisionResultForManager } from '../workflows/callout-decision';
+import { managerStillActive } from '../security/manager-active';
+import { getAegisSmsChannel } from '../messaging/notify';
+import type { CallOutShift } from '../workflows/time-off';
 import { supabase } from '../db/client';
 import { sendEmail } from '../messaging/email';
 import { brandedEmailShell, BRAND } from '../messaging/brand';
@@ -55,6 +59,138 @@ internalRouter.post('/notify-to-decision', async (req: Request, res: Response) =
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[internal] notify-to-decision failed:', msg);
+    serverError(res, msg);
+  }
+});
+
+// POST /internal/apply-time-off-decision
+//
+// N-3 (2026-08-28): THE server-side landing for a time-off / call-out decision
+// made through a Homebase aegis_action_tokens magic link (the confirm page).
+// Homebase consumes the token and POSTs here; this endpoint:
+//   1. refuses a revoked manager (S-3 actor half — the OLD Homebase magic-link
+//      path never checked this; now every emailed decision door does),
+//   2. rebuilds the decision context from the live rows (never trusting the
+//      payload for anything the database knows better), and
+//   3. hands the decision to applyTimeOffDecision — the ONE core shared with
+//      the manager's texted replies (F13). Whichever door decides first, the
+//      other reports "already decided" truthfully.
+// The response carries a ready-made manager-facing message (one voice —
+// describeDecisionResultForManager) so Homebase renders exactly what the text
+// door would have said.
+internalRouter.post('/apply-time-off-decision', async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const requestId = body.time_off_request_id;
+  const action = body.action;
+  const companyId = body.company_id;
+  const managerUserId = typeof body.manager_user_id === 'string' && body.manager_user_id.length > 0 ? body.manager_user_id : null;
+
+  if (typeof requestId !== 'string' || requestId.length === 0) {
+    badRequest(res, 'time_off_request_id is required');
+    return;
+  }
+  if (typeof companyId !== 'string' || companyId.length === 0) {
+    badRequest(res, 'company_id is required');
+    return;
+  }
+  if (action !== 'approve' && action !== 'deny' && action !== 'approve_and_cover') {
+    badRequest(res, 'action must be "approve", "deny" or "approve_and_cover"');
+    return;
+  }
+
+  try {
+    // S-3 (actor half): the link was minted for a specific manager; if that
+    // login has been revoked since, the link is dead regardless of expiry.
+    if (!(await managerStillActive(managerUserId))) {
+      console.log('[internal] apply-time-off-decision refused — manager login revoked or unknown', { managerUserId, requestId });
+      res.status(403).json({
+        ok: false,
+        outcome: 'revoked',
+        message: 'This link belongs to a login that no longer has manager access. Please ask a current manager to review the request in Homebase.',
+      });
+      return;
+    }
+
+    // Rebuild the decision context from the live rows. The token payload only
+    // supplies what the database cannot know: the call-out snapshot and the
+    // origin-thread metadata (also recoverable from the to_thread side row).
+    const { data: torData } = await supabase
+      .from('time_off_requests')
+      .select('id, company_id, employee_id')
+      .eq('id', requestId)
+      .eq('company_id', companyId)
+      .maybeSingle();
+    const tor = torData as { id: string; company_id: string; employee_id: string } | null;
+    if (!tor) {
+      res.json({ ok: true, outcome: 'not_found', message: "I couldn't find that request anymore — check the Time Off tab in Homebase for where it stands." });
+      return;
+    }
+
+    const { data: empData } = await supabase
+      .from('employees')
+      .select('id, name, contact_email, contact_phone')
+      .eq('id', tor.employee_id)
+      .eq('company_id', companyId)
+      .maybeSingle();
+    const employee = empData as { id: string; name: string; contact_email: string | null; contact_phone: string | null } | null;
+
+    // Origin channel + email-thread metadata from the to_thread side row
+    // (written at submission for both channels) — same read
+    // sendDecisionNotification has always used.
+    let originChannel: 'sms' | 'email' | null = null;
+    let threadId: string | null = typeof body.thread_id === 'string' ? body.thread_id : null;
+    let rawSubject: string | null = typeof body.raw_subject === 'string' ? body.raw_subject : null;
+    const { data: metaRow } = await supabase
+      .from('aegis_memory')
+      .select('content')
+      .eq('source', `to_thread:${requestId}`)
+      .maybeSingle();
+    if (metaRow) {
+      try {
+        const meta = JSON.parse((metaRow as { content: string }).content) as { channel?: 'sms' | 'email' | null; thread_id?: string | null; raw_subject?: string | null };
+        originChannel = meta.channel ?? null;
+        threadId = threadId ?? meta.thread_id ?? null;
+        rawSubject = rawSubject ?? meta.raw_subject ?? null;
+      } catch { /* corrupted side row — proceed without threading */ }
+    }
+
+    let managerName: string | null = typeof body.manager_name === 'string' ? body.manager_name : null;
+    if (!managerName && managerUserId) {
+      const { data: mgrRow } = await supabase.from('users').select('name').eq('id', managerUserId).maybeSingle();
+      managerName = (mgrRow as { name: string | null } | null)?.name ?? null;
+    }
+
+    const callOut = Array.isArray(body.call_out) && body.call_out.length > 0 ? (body.call_out as CallOutShift[]) : null;
+    const smsChannel = await getAegisSmsChannel(companyId);
+    const phone = employee?.contact_phone ?? null;
+    const email = employee?.contact_email ?? null;
+    const channel: 'sms' | 'email' = originChannel ?? (phone ? 'sms' : 'email');
+
+    const ctx = {
+      request_id: requestId,
+      company_id: companyId,
+      employee_id: tor.employee_id,
+      employee_name: employee?.name ?? 'the employee',
+      employee_channel: channel,
+      employee_contact: (channel === 'sms' ? phone : email) ?? email ?? phone ?? '',
+      aegis_sms_channel: smsChannel,
+      thread_id: threadId,
+      raw_subject: rawSubject,
+      manager_user_id: managerUserId,
+      manager_name: managerName,
+      call_out: callOut,
+    };
+
+    const result = await applyTimeOffDecision(ctx, action, 'email_link');
+    res.json({
+      ok: true,
+      outcome: result.outcome,
+      ...(result.outcome === 'already_decided' ? { status: result.status } : {}),
+      message: describeDecisionResultForManager(ctx, action, result),
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[internal] apply-time-off-decision failed:', msg);
     serverError(res, msg);
   }
 });

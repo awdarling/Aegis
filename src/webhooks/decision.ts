@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { supabase } from '../db/client';
 import { formatDateRange } from '../workflows/time-off-manager-email';
 import { managerStillActive } from '../security/manager-active';
+import { findTokenRow, deleteTokenRowBySource } from '../security/decision-token-store';
 import { logActivity } from '../logger/activity-log';
 import { sendEmail } from '../messaging/email';
 import { sendSms } from '../messaging/sms';
@@ -503,27 +504,42 @@ async function handleCoverageBatchDecision(
 }
 
 // ── Route handler ─────────────────────────────────────────────────────────────
+//
+// N-3 (2026-08-28): these links used to ACT on the bare GET — and mail
+// scanners, link previewers and antivirus proxies fetch links without a human
+// click (Outlook SafeLinks, Gmail, Slack unfurls). That is how a manager's
+// approve link executed on a double-fetch and then told him nothing had
+// happened (J-3). Now:
+//   GET  → validates the token and renders a CONFIRM page (read-only).
+//   POST → (the confirm button) validates again and executes.
+// A scanner can only ever see the confirm page; only a human press changes
+// state. Homebase's /api/aegis-action has worked this way all along — this
+// brings the Aegis-hosted links to the same standard. NEW time-off links are
+// minted as Homebase aegis_action_tokens and never land here; this route keeps
+// serving the families that remain (swap, coverage, coverage_batch) plus any
+// time-off token minted before the switch (≤7-day tail).
 
-decisionWebhook.get('/', async (req, res) => {
-  const { action, requestId, token } = req.query as Record<string, string>;
+type ResolvedDecision =
+  | { kind: 'respond'; status: number; html: string }
+  | { kind: 'ok'; decisionToken: DecisionToken; tokenSource: string };
 
+async function resolveDecisionToken(
+  action: string | undefined,
+  requestId: string | undefined,
+  token: string | undefined,
+): Promise<ResolvedDecision> {
   // Validate required params
   if (!action || !requestId || !token) {
-    res.status(400).send(errorPage('Invalid or missing parameters. This link may be malformed.'));
-    return;
+    return { kind: 'respond', status: 400, html: errorPage('Invalid or missing parameters. This link may be malformed.') };
   }
 
   if (action !== 'approve' && action !== 'deny' && action !== 'approve_and_cover') {
-    res.status(400).send(errorPage('Unknown action. Please use the links from your Aegis email.'));
-    return;
+    return { kind: 'respond', status: 400, html: errorPage('Unknown action. Please use the links from your Aegis email.') };
   }
 
-  // Look up the decision token in aegis_memory
-  const { data: tokenData } = await supabase
-    .from('aegis_memory')
-    .select('id, content')
-    .eq('source', `decision_token:${token}`)
-    .maybeSingle();
+  // Look up the decision token (hashed-at-rest, with a legacy plaintext
+  // fallback for tokens minted before the N-2 fix — see decision-token-store).
+  const tokenData = await findTokenRow('decision_token', token);
 
   if (!tokenData) {
     // W-2 — say what actually happened, never a generic "used or expired" that
@@ -543,12 +559,13 @@ decisionWebhook.get('/', async (req, res) => {
         // session. Find it and say so — idempotent, never "nothing changed".
         const openSession = await findCoverageSessionForTimeOffRequest(prior.company_id, prior.id);
         if (openSession) {
-          res.send(alreadyCoveringPage(openSession.shift_info.shift_name, openSession.coverage_filled));
-          return;
+          return { kind: 'respond', status: 200, html: alreadyCoveringPage(openSession.shift_info.shift_name, openSession.coverage_filled) };
         }
       }
-      res.send(
-        brandedPage({
+      return {
+        kind: 'respond',
+        status: 200,
+        html: brandedPage({
           title: 'Already Decided',
           heading: prior.status === 'approved' ? 'Already Approved' : 'Already Denied',
           headingColor: prior.status === 'approved' ? BRAND.goodText : BRAND.badText,
@@ -556,50 +573,40 @@ decisionWebhook.get('/', async (req, res) => {
           iconColor: prior.status === 'approved' ? BRAND.goodText : BRAND.badText,
           body: `This request was already ${prior.status} — that decision stands and the employee has been told. Nothing further is needed.`,
         }),
-      );
-      return;
+      };
     }
-    res
-      .status(404)
-      .send(
-        errorPage(
-          'This link has already been used or has expired. If you need to change a decision, please contact Aegis directly.'
-        )
-      );
-    return;
+    return {
+      kind: 'respond',
+      status: 404,
+      html: errorPage(
+        'This link has already been used or has expired. If you need to change a decision, please contact Aegis directly.'
+      ),
+    };
   }
 
   let decisionToken: DecisionToken;
   try {
-    const row = tokenData as { id: string; content: string };
     // Normalise: tokens stored before swap support have no decision_type — default to 'time_off'
-    const raw = JSON.parse(row.content) as Record<string, unknown>;
+    const raw = JSON.parse(tokenData.content) as Record<string, unknown>;
     decisionToken = { decision_type: 'time_off', ...raw } as DecisionToken;
   } catch {
-    res.status(500).send(errorPage('An internal error occurred. Please try again.'));
-    return;
+    return { kind: 'respond', status: 500, html: errorPage('An internal error occurred. Please try again.') };
   }
 
   // Check expiry
   if (new Date(decisionToken.expires_at) < new Date()) {
-    await supabase
-      .from('aegis_memory')
-      .delete()
-      .eq('source', `decision_token:${token}`);
-    res.status(410).send(errorPage('This link has expired. Please ask the employee to resubmit their request.'));
-    return;
+    await deleteTokenRowBySource(tokenData.source);
+    return { kind: 'respond', status: 410, html: errorPage('This link has expired. Please ask the employee to resubmit their request.') };
   }
 
   // Verify requestId matches token
   if (decisionToken.request_id !== requestId) {
-    res.status(400).send(errorPage('This link does not match the request. Please use the links from your Aegis email.'));
-    return;
+    return { kind: 'respond', status: 400, html: errorPage('This link does not match the request. Please use the links from your Aegis email.') };
   }
 
   // Verify action matches token (each token has a fixed action)
   if (decisionToken.action !== action) {
-    res.status(400).send(errorPage('Action mismatch. Please use the correct Approve or Deny button from your email.'));
-    return;
+    return { kind: 'respond', status: 400, html: errorPage('Action mismatch. Please use the correct Approve or Deny button from your email.') };
   }
 
   // S-3 (actor half): the link was minted for a specific manager. If that
@@ -607,9 +614,112 @@ decisionWebhook.get('/', async (req, res) => {
   const actorId = 'manager_user_id' in decisionToken ? decisionToken.manager_user_id : null;
   if (!(await managerStillActive(actorId))) {
     console.log('[decision] refused — manager login revoked or unknown', { actorId, requestId });
-    res.status(403).send(errorPage('This link belongs to a login that no longer has manager access. Please ask a current manager to review the request in Homebase.'));
+    return { kind: 'respond', status: 403, html: errorPage('This link belongs to a login that no longer has manager access. Please ask a current manager to review the request in Homebase.') };
+  }
+
+  return { kind: 'ok', decisionToken, tokenSource: tokenData.source };
+}
+
+// ── The N-3 confirm page (what a GET now renders) ─────────────────────────────
+//
+// Read-only: describes exactly what the button will do, in the same voice as
+// the Homebase confirm page, and only the POST acts. The form posts back to
+// this same URL with the same query string.
+export function confirmDecisionPage(
+  decisionToken: DecisionToken,
+  action: 'approve' | 'deny' | 'approve_and_cover',
+  requestId: string,
+  token: string,
+): string {
+  let heading = 'Confirm';
+  let description = 'Confirm this action?';
+  let buttonLabel = 'Confirm';
+
+  if (decisionToken.decision_type === 'swap') {
+    const t = decisionToken;
+    const isTrade = !!(t.target_shift_name && t.target_shift_date);
+    const noun = isTrade ? 'trade' : 'swap';
+    const dateShort = new Date(t.shift_date + 'T12:00:00Z').toLocaleDateString('en-US', { month: 'long', day: 'numeric' });
+    heading = action === 'approve' ? `Approve this ${noun}?` : `Deny this ${noun}?`;
+    description = isTrade
+      ? `${escapeHtml(t.requester_name)} ↔ ${escapeHtml(t.receiver_name)} — ${escapeHtml(t.shift_name)} on ${escapeHtml(dateShort)} for ${escapeHtml(t.target_shift_name!)}. Press the button to ${action === 'approve' ? 'approve the trade and update the schedule' : 'deny it'}; I'll let both of them know.`
+      : `${escapeHtml(t.receiver_name)} would cover ${escapeHtml(t.requester_name)}'s ${escapeHtml(t.shift_name)} shift on ${escapeHtml(dateShort)}. Press the button to ${action === 'approve' ? 'approve it and update the schedule' : 'deny it'}; I'll let both of them know.`;
+    buttonLabel = action === 'approve' ? `Approve ${noun}` : `Deny ${noun}`;
+  } else if (decisionToken.decision_type === 'coverage') {
+    heading = action === 'approve' ? 'Take this shift?' : 'Pass on this shift?';
+    description = action === 'approve'
+      ? `Press the button and the shift is yours — I'll confirm with your manager right away.`
+      : `Press the button and I'll let your manager know you can't make it — no problem at all.`;
+    buttonLabel = action === 'approve' ? 'Yes, I’ll take it' : 'I can’t make it';
+  } else if (decisionToken.decision_type === 'coverage_batch') {
+    heading = action === 'approve' ? 'Ask more teammates?' : 'Stop the search?';
+    description = action === 'approve'
+      ? `Press the button and I'll text the next batch of qualified teammates about the shift.`
+      : `Press the button and I'll stop reaching out — the shift stays with you to handle directly.`;
+    buttonLabel = action === 'approve' ? 'Send the next batch' : 'Stop the search';
+  } else {
+    // time_off — only pre-switch tokens land here now (new links go through
+    // Homebase), but they must confirm just as safely for their 7-day tail.
+    const t = decisionToken as TimeOffDecisionToken;
+    const first = t.employee_name;
+    const callOut = Array.isArray(t.call_out) && t.call_out.length > 0 ? t.call_out[0] : null;
+    if (action === 'approve_and_cover') {
+      heading = 'Approve & find coverage?';
+      description = `Press the button to approve ${escapeHtml(first)}'s call-out and have me text qualified teammates to cover the ${escapeHtml(callOut?.shift_name ?? '')} shift.`;
+      buttonLabel = 'Approve & find coverage';
+    } else if (action === 'approve') {
+      heading = callOut ? 'Approve this call-out?' : 'Approve this time off?';
+      description = callOut
+        ? `Press the button to approve ${escapeHtml(first)}'s call-out — you'll handle coverage yourself. I'll let ${escapeHtml(first)} know.`
+        : `Press the button to approve ${escapeHtml(first)}'s time-off request. I'll let ${escapeHtml(first)} know.`;
+      buttonLabel = 'Approve';
+    } else {
+      heading = callOut ? 'Deny this call-out?' : 'Deny this time off?';
+      description = callOut
+        ? `Press the button to deny ${escapeHtml(first)}'s call-out — they'd still be expected for the shift. I'll let ${escapeHtml(first)} know.`
+        : `Press the button to deny ${escapeHtml(first)}'s time-off request. I'll let ${escapeHtml(first)} know.`;
+      buttonLabel = 'Deny';
+    }
+  }
+
+  const postUrl = `/webhooks/decision?action=${encodeURIComponent(action)}&requestId=${encodeURIComponent(requestId)}&token=${encodeURIComponent(token)}`;
+  const body = `${description}
+      <form method="POST" action="${escapeHtml(postUrl)}" style="margin:24px 0 0;">
+        <button type="submit" style="background:${BRAND.accent};color:${BRAND.bgBase};border:none;padding:13px 30px;border-radius:9px;font-size:15px;font-weight:700;cursor:pointer;font-family:inherit;">${escapeHtml(buttonLabel)}</button>
+      </form>
+      <div style="margin-top:18px;font-size:13px;color:${BRAND.textSecondary};">Nothing happens until you press the button — you can close this tab to change your mind.</div>`;
+
+  return brandedPage({
+    title: heading,
+    heading,
+    headingColor: BRAND.textPrimary,
+    icon: '👋',
+    iconColor: BRAND.accent,
+    body,
+  });
+}
+
+// GET — validate and render the confirm page. Never changes state (N-3).
+decisionWebhook.get('/', async (req, res) => {
+  const { action, requestId, token } = req.query as Record<string, string>;
+  const resolved = await resolveDecisionToken(action, requestId, token);
+  if (resolved.kind === 'respond') {
+    res.status(resolved.status).send(resolved.html);
     return;
   }
+  res.send(confirmDecisionPage(resolved.decisionToken, action as 'approve' | 'deny' | 'approve_and_cover', requestId, token));
+});
+
+// POST — the confirm button. Validates again (the state may have moved since
+// the page rendered) and executes.
+decisionWebhook.post('/', async (req, res) => {
+  const { action, requestId, token } = req.query as Record<string, string>;
+  const resolved = await resolveDecisionToken(action, requestId, token);
+  if (resolved.kind === 'respond') {
+    res.status(resolved.status).send(resolved.html);
+    return;
+  }
+  const decisionToken = resolved.decisionToken;
 
   // Branch: swap vs coverage vs time-off
   if (decisionToken.decision_type === 'swap') {

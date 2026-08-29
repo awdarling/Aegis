@@ -34,6 +34,7 @@ import { resolveManagers, primaryRecipient } from '../messaging/manager-director
 import { brandedEmailShell, brandedButtonRow, BRAND } from '../messaging/brand';
 import { logActivity } from '../logger/activity-log';
 import { formatDateRange } from './time-off';
+import { mintTokenSource } from '../security/decision-token-store';
 import type { InboundMessage, VerifiedContact } from '../security/types';
 
 // The persisted magic-link payload the manager's Acknowledge / Follow-up buttons
@@ -139,7 +140,7 @@ export async function handleReportDeparture(
   await supabase.from('aegis_memory').insert({
     company_id: companyId,
     memory_type: 'observation',
-    source: `departure_token:${token}`,
+    source: mintTokenSource('departure_token', token),
     content: JSON.stringify(tokenPayload),
   });
 

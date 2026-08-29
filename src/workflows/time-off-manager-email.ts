@@ -10,6 +10,8 @@ import {
 import type { Employee, PartialDayDetail, TimeOffRequest } from '../db/types';
 import type { SimulationResult } from '../lib/schedule-simulator';
 import type { TimeOffViolations } from '../lib/time-off-policies';
+// Type-only — erased at compile time, so no runtime cycle with time-off.ts.
+import type { CallOutShift } from './time-off';
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -32,6 +34,15 @@ export interface BuildTimeOffManagerEmailParams {
   simulation?: SimulationResult;
   recommendation?: TimeOffRecommendation;
   violations?: TimeOffViolations | null;
+  // ── §O3 / N-3 (2026-08-28) — the decision context ──────────────────────────
+  // Carried in the token payload so the Homebase dispatcher can hand the
+  // decision to Aegis's shared core (/internal/apply-time-off-decision →
+  // applyTimeOffDecision) with everything it needs. call_out present ⇒ the
+  // email renders THREE actions (Approve & find coverage / Approve only /
+  // Deny) — closing §O3: an email-origin call-out used to get only two.
+  call_out?: CallOutShift[] | null;
+  thread_id?: string | null;
+  raw_subject?: string | null;
 }
 
 export interface BuildTimeOffManagerEmail {
@@ -291,14 +302,25 @@ function ctaButtonsHtml(
   approveUrl: string,
   denyUrl: string,
   homebaseUrl: string,
-  recheckUrl: string
+  recheckUrl: string,
+  // §O3 — a call-out's third action. Present ⇒ three buttons, with "find
+  // coverage" leading (it's the action a call-out usually needs) and "Approve
+  // only" meaning the manager handles coverage themselves.
+  approveAndCoverUrl?: string | null,
 ): string {
+  const buttons = approveAndCoverUrl
+    ? [
+        { url: approveAndCoverUrl, label: 'Approve & find coverage', variant: 'primary' as const },
+        { url: approveUrl, label: 'Approve only', variant: 'secondary' as const },
+        { url: denyUrl, label: 'Deny', variant: 'secondary' as const },
+      ]
+    : [
+        { url: approveUrl, label: 'Approve', variant: 'primary' as const },
+        { url: denyUrl, label: 'Deny', variant: 'secondary' as const },
+      ];
   return `
 <div style="border-top:1px solid ${BRAND.borderDefault};margin:6px 0 0;padding-top:18px;">
-${brandedButtonRow([
-  { url: approveUrl, label: 'Approve', variant: 'primary' },
-  { url: denyUrl, label: 'Deny', variant: 'secondary' },
-])}
+${brandedButtonRow(buttons)}
   <div style="margin:0 0 12px;">
     <a href="${escapeHtml(recheckUrl)}"
        style="font-size:14px;font-weight:600;color:${BRAND.accent};text-decoration:underline;">Re-run check</a>
@@ -326,23 +348,29 @@ export function renderTimeOffManagerBodyHtml(args: {
   policyLines: string[];
   simulation?: SimulationResult;
   recommendation?: TimeOffRecommendation;
+  // §O3 — present when the request is a call-out: the third button's URL.
+  approveAndCoverUrl?: string | null;
 }): string {
   const employeeFirst = firstName(args.employeeName);
+  const isCallOut = !!args.approveAndCoverUrl;
   // Conclusion-first: the greeting + the whole ask (what it is, what to do, that
   // I'll handle the notification) all sit ABOVE the card, so the manager never
   // has to read anything below the action card to know what's going on.
+  const askLine = isCallOut
+    ? `${escapeHtml(employeeFirst)} just called out of a scheduled shift, and I wanted to get it in front of you right away. Everything's in the card below — you've got three choices: approve and have me find coverage, approve and handle coverage yourself, or deny. Whichever you press records your decision right away, and I'll let ${escapeHtml(employeeFirst)} know which way it went.`
+    : `${escapeHtml(employeeFirst)} just put in a time-off request, and I wanted to get it in front of you. Everything's in the card below — either button records your decision right away, and I'll let ${escapeHtml(employeeFirst)} know which way it went, so there's nothing else you'll need to do.`;
   const introHtml = `
 <p style="margin:0 0 12px;font-size:16px;color:${BRAND.textPrimary};">${escapeHtml(greeting(args.managerName))}</p>
-<p style="margin:0;font-size:16px;color:${BRAND.textPrimary};line-height:1.65;">${escapeHtml(employeeFirst)} just put in a time-off request, and I wanted to get it in front of you. Everything's in the card below — either button records your decision right away, and I'll let ${escapeHtml(employeeFirst)} know which way it went, so there's nothing else you'll need to do.</p>`;
+<p style="margin:0;font-size:16px;color:${BRAND.textPrimary};line-height:1.65;">${askLine}</p>`;
 
   const cardInner = `${headerSectionHtml(args.employeeName, args.dateRange)}
 ${policyConsiderationsHtml(args.policyLines)}
 ${requestDetailsHtml(args.tor, args.dateRange)}
 ${args.simulation ? coverageImpactHtml(args.simulation) : ''}
 ${args.recommendation ? recommendationHtml(args.recommendation) : ''}
-${ctaButtonsHtml(args.approveUrl, args.denyUrl, args.homebaseUrl, args.recheckUrl)}`;
+${ctaButtonsHtml(args.approveUrl, args.denyUrl, args.homebaseUrl, args.recheckUrl, args.approveAndCoverUrl)}`;
 
-  const card = brandActionCard('Action needed · Time off', cardInner);
+  const card = brandActionCard(isCallOut ? 'Action needed · Call-out' : 'Action needed · Time off', cardInner);
 
   return `${introHtml}
 ${card}`;
@@ -362,6 +390,7 @@ function buildPlainText(params: {
   denyUrl: string;
   recheckUrl: string;
   homebaseUrl: string;
+  approveAndCoverUrl?: string | null;
 }): string {
   const lines: string[] = [];
 
@@ -418,8 +447,16 @@ function buildPlainText(params: {
     lines.push('');
   }
 
-  lines.push('Approve this request:');
-  lines.push(params.approveUrl);
+  if (params.approveAndCoverUrl) {
+    lines.push('Approve and have me find coverage:');
+    lines.push(params.approveAndCoverUrl);
+    lines.push('');
+    lines.push('Approve only (you handle coverage):');
+    lines.push(params.approveUrl);
+  } else {
+    lines.push('Approve this request:');
+    lines.push(params.approveUrl);
+  }
   lines.push('');
   lines.push('Deny this request:');
   lines.push(params.denyUrl);
@@ -442,21 +479,31 @@ export async function buildTimeOffManagerEmail(
   const isPartial = tor.time_off_type === 'partial' && tor.partial_days && tor.partial_days.length > 0;
   const partialSummary = isPartial && tor.partial_days ? buildPartialSummaryText(tor.partial_days) : undefined;
 
+  const isCallOut = !!(params.call_out && params.call_out.length > 0);
   const sharedPayload = {
     time_off_request_id: tor.id,
     employee_id: employee.id,
     employee_name: employee.name,
     start_date: tor.start_date,
     end_date: tor.end_date,
+    date_range: formatDateRange(tor.start_date, tor.end_date),
     time_off_type: tor.time_off_type ?? 'full_day',
     ...(partialSummary ? { partial_summary: partialSummary } : {}),
     company_name: params.company_name,
+    // §O3 / N-3 — the decision context the shared core needs (see
+    // BuildTimeOffManagerEmailParams). manager identity attributes decided_by
+    // (D17); call_out present makes this a three-action email.
+    manager_user_id: params.manager_user_id ?? null,
+    manager_name: params.manager_name ?? null,
+    thread_id: params.thread_id ?? null,
+    raw_subject: params.raw_subject ?? null,
+    call_out: params.call_out ?? null,
   };
 
   // The recheck token is single-use (like the approve/deny tokens), so the email
   // button re-checks once; the Homebase tab button and the conversational command
   // allow repeated re-checks. That's acceptable for v1 (TO-RERUN-1).
-  const [approveTok, denyTok, recheckTok] = await Promise.all([
+  const [approveTok, denyTok, coverTok, recheckTok] = await Promise.all([
     generateActionToken({
       action_type: 'approve_to',
       payload: sharedPayload,
@@ -473,6 +520,17 @@ export async function buildTimeOffManagerEmail(
       issued_to_user_id: params.manager_user_id,
       ttl_minutes: 4320,
     }),
+    // §O3 — a call-out mints the third choice; a plain request mints null.
+    isCallOut
+      ? generateActionToken({
+          action_type: 'approve_and_cover_to',
+          payload: sharedPayload,
+          company_id: params.company_id,
+          issued_to_email: params.manager_email,
+          issued_to_user_id: params.manager_user_id,
+          ttl_minutes: 4320,
+        })
+      : Promise.resolve(null),
     generateActionToken({
       action_type: 'recheck_to',
       // manager_email/_user_id ride in the payload so the dispatcher can reply
@@ -492,7 +550,9 @@ export async function buildTimeOffManagerEmail(
   const dateRange = formatDateRange(tor.start_date, tor.end_date);
   const homebaseUrl = getHomebaseUrl();
 
-  const subject = `Time-off request from ${employee.name} — ${dateRange}`;
+  const subject = isCallOut
+    ? `Call-Out — ${employee.name} (${dateRange})`
+    : `Time-off request from ${employee.name} — ${dateRange}`;
 
   const policyLines = violationLines(params.violations);
 
@@ -508,6 +568,7 @@ export async function buildTimeOffManagerEmail(
     policyLines,
     simulation: params.simulation,
     recommendation: params.recommendation,
+    approveAndCoverUrl: coverTok?.url ?? null,
   });
 
   const html = brandedEmailShell({
@@ -531,6 +592,7 @@ export async function buildTimeOffManagerEmail(
     denyUrl: denyTok.url,
     recheckUrl: recheckTok.url,
     homebaseUrl,
+    approveAndCoverUrl: coverTok?.url ?? null,
   });
 
   return { subject, html, text };

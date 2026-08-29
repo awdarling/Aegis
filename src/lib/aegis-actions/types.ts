@@ -1,6 +1,10 @@
 export type ActionType =
   | 'approve_to'
   | 'deny_to'
+  // W-2 / N-3 — the call-out's third choice: approve the absence AND blast the
+  // qualified pool (spec §3.5). Minted only when the token payload carries
+  // call_out; dispatched through the same shared decision core as the other two.
+  | 'approve_and_cover_to'
   | 'approve_availability'
   | 'deny_availability'
   | 'approve_custom_availability'

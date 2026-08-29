@@ -120,9 +120,17 @@ function seedManagers(n: number, withPhones = false) {
   h.reads['company_channels'] = [{ channel_value: '+15559999999' }];
 }
 
-const memoryTokens = () =>
-  h.writes.filter(w => w.table === 'aegis_memory' && w.op === 'insert')
-    .map(w => JSON.parse(String(w.payload!.content)) as { manager_user_id: string; action: string });
+// N-3 (2026-08-28): decision links are Homebase aegis_action_tokens now —
+// hashed at rest, confirm-on-GET, decide-on-POST. The per-manager attribution
+// (D17) rides on issued_to_user_id + the payload manager identity.
+const actionTokens = () =>
+  h.writes.filter(w => w.table === 'aegis_action_tokens' && w.op === 'insert')
+    .map(w => w.payload as {
+      action_type: string;
+      token_hash: string;
+      issued_to_user_id: string | null;
+      payload: { manager_user_id: string | null };
+    });
 
 beforeEach(() => {
   h.reads = {};
@@ -147,43 +155,47 @@ describe('time-off request → manager notification fan-out', () => {
     seedManagers(3);
     await notifyManager('co-1', EMPLOYEE, PENDING, 'req-1', null, null, null);
 
-    const tokens = memoryTokens();
-    // 3 managers × (approve + deny)
+    const tokens = actionTokens();
+    // 3 managers × (approve_to + deny_to); no plaintext decision_token rows.
     expect(tokens).toHaveLength(6);
+    expect(h.writes.filter(w => w.table === 'aegis_memory' && w.op === 'insert'
+      && String((w.payload as { source?: unknown }).source ?? '').startsWith('decision_token:'))).toHaveLength(0);
     for (const id of ['mgr-1', 'mgr-2', 'mgr-3']) {
-      const mine = tokens.filter(t => t.manager_user_id === id);
-      expect(mine.map(t => t.action).sort()).toEqual(['approve', 'deny']);
+      const mine = tokens.filter(t => t.issued_to_user_id === id);
+      expect(mine.map(t => t.action_type).sort()).toEqual(['approve_to', 'deny_to']);
+      // The payload carries the same manager identity (decided_by attribution, D17).
+      expect(mine.every(t => t.payload.manager_user_id === id)).toBe(true);
     }
   });
 
-  it('every token value is distinct, so a click identifies ONE manager', async () => {
+  it('every token hash is distinct, so a click identifies ONE manager', async () => {
     seedManagers(3);
     await notifyManager('co-1', EMPLOYEE, PENDING, 'req-1', null, null, null);
 
-    const sources = h.writes
-      .filter(w => w.table === 'aegis_memory' && w.op === 'insert')
-      .map(w => String(w.payload!.source));
-    expect(new Set(sources).size).toBe(sources.length);
+    const hashes = actionTokens().map(t => t.token_hash);
+    expect(hashes).toHaveLength(6);
+    expect(new Set(hashes).size).toBe(hashes.length);
+    // Hashed at rest — 64 hex chars, never a raw token value.
+    for (const hsh of hashes) expect(hsh).toMatch(/^[0-9a-f]{64}$/);
   });
 
   it("the magic links in a manager's email carry that manager's own tokens", async () => {
     seedManagers(2);
     await notifyManager('co-1', EMPLOYEE, PENDING, 'req-1', null, null, null);
 
-    // `&` may be rendered as `&amp;` in the HTML, so don't pin the separator.
-    const tokenOf = (html: string, action: string) =>
-      new RegExp(`action=${action}[^"'\\s]*?token=([0-9a-f-]+)`).exec(html)?.[1];
+    // N-3: the links are Homebase confirm-page magic links now — one token per
+    // button, raw value only in the URL.
+    const tokensOf = (html: string) =>
+      [...html.matchAll(/api\/aegis-action\?token=([^"&]+)/g)].map(m => m[1]);
 
-    const first = h.emails.find(e => e.to === 'mgr1@club.test')!;
-    const second = h.emails.find(e => e.to === 'mgr2@club.test')!;
+    const first = tokensOf(h.emails.find(e => e.to === 'mgr1@club.test')!.html);
+    const second = tokensOf(h.emails.find(e => e.to === 'mgr2@club.test')!.html);
 
-    const firstApprove = tokenOf(first.html, 'approve');
-    const secondApprove = tokenOf(second.html, 'approve');
-    expect(firstApprove).toBeTruthy();
-    expect(secondApprove).toBeTruthy();
-    // Two managers, two different links. Same link in both = attribution is a lie.
-    expect(firstApprove).not.toBe(secondApprove);
-    expect(tokenOf(first.html, 'deny')).not.toBe(firstApprove);
+    // Approve + deny per email, all distinct within the email.
+    expect(first.length).toBeGreaterThanOrEqual(2);
+    expect(new Set(first).size).toBe(first.length);
+    // Two managers share NO token. Same link in both = attribution is a lie.
+    expect(first.some(t => second.includes(t))).toBe(false);
   });
 
   it('texts every manager who has a phone on file', async () => {

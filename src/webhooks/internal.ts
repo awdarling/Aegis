@@ -14,11 +14,14 @@ import { commitSwapPickup, proposeSwapTrade, resolveSwapProposal } from '../work
 import { sendSwapDecisionNotification } from './decision';
 import { applyTimeOffDecision, describeDecisionResultForManager } from '../workflows/callout-decision';
 import { managerStillActive } from '../security/manager-active';
-import { getAegisSmsChannel } from '../messaging/notify';
+import { getAegisSmsChannel, notifyEmployeeSmsFirst } from '../messaging/notify';
 import type { CallOutShift } from '../workflows/time-off';
 import { supabase } from '../db/client';
 import { sendEmail } from '../messaging/email';
 import { brandedEmailShell, BRAND } from '../messaging/brand';
+import { formatClockRange } from '../lib/shift-hours';
+import { firstName } from '../messaging/greeting';
+import { logActivity } from '../logger/activity-log';
 
 // Bearer-auth-gated endpoints called by Homebase /api/aegis-action after a
 // manager clicks an aegis_action_tokens magic-link. Homebase consumes the
@@ -191,6 +194,108 @@ internalRouter.post('/apply-time-off-decision', async (req: Request, res: Respon
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[internal] apply-time-off-decision failed:', msg);
+    serverError(res, msg);
+  }
+});
+
+// POST /internal/notify-assignment
+//
+// S-4 (2026-08-28): the shift-assignment notification, moved behind Aegis's
+// consent gate. Homebase's /api/notify-assignment used to send the SMS itself
+// through its own Telnyx client — the ONE door in the whole system that could
+// text an employee without asking "may we text this person?" (dormant, held
+// closed only by EMAIL_ONLY on Vercel, but compliance-relevant). Homebase is
+// now a thin proxy to this endpoint, and the send goes through
+// notifyEmployeeSmsFirst → sendSms, where the N3 consent gate lives — so after
+// this, exactly ONE function in the system decides whether an employee may be
+// texted (Rule 0b). A non-consented employee falls back to email (legal), and
+// an unreachable one is reported honestly.
+//
+// The employee lookup is BOUND to company_id: a caller naming another
+// company's employee gets a 404 and nothing is sent.
+internalRouter.post('/notify-assignment', async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const companyId = body.company_id;
+  const employeeId = body.employee_id;
+  const shiftName = body.shift_name;
+  const role = body.role;
+  const date = body.date;
+  const startTime = typeof body.start_time === 'string' ? body.start_time : null;
+  const endTime = typeof body.end_time === 'string' ? body.end_time : null;
+  const approvedBy = typeof body.approved_by === 'string' ? body.approved_by : null;
+  const approvedByEmail = typeof body.approved_by_email === 'string' ? body.approved_by_email : null;
+
+  if (typeof companyId !== 'string' || companyId.length === 0) { badRequest(res, 'company_id is required'); return; }
+  if (typeof employeeId !== 'string' || employeeId.length === 0) { badRequest(res, 'employee_id is required'); return; }
+  if (typeof shiftName !== 'string' || shiftName.length === 0) { badRequest(res, 'shift_name is required'); return; }
+  if (typeof role !== 'string' || role.length === 0) { badRequest(res, 'role is required'); return; }
+  if (typeof date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(date)) { badRequest(res, 'date must be YYYY-MM-DD'); return; }
+
+  try {
+    // Company-bound lookup — refuse a foreign employee_id.
+    const { data: empData } = await supabase
+      .from('employees')
+      .select('id, name, contact_phone, contact_email')
+      .eq('id', employeeId)
+      .eq('company_id', companyId)
+      .maybeSingle();
+    const employee = empData as { id: string; name: string; contact_phone: string | null; contact_email: string | null } | null;
+    if (!employee) {
+      res.status(404).json({ ok: false, error: 'employee not found for this company' });
+      return;
+    }
+
+    // YYYY-MM-DD parsed component-wise (never new Date('YYYY-MM-DD'), which
+    // shifts the day at UTC midnight), and times through the one employee-
+    // facing clock formatter — never a raw HH:MM:SS interpolation (§N2).
+    const [y, mo, da] = date.split('-').map(Number);
+    const dateStr = new Date(y, mo - 1, da).toLocaleDateString('en-US', {
+      weekday: 'long', month: 'long', day: 'numeric',
+    });
+    const hours = startTime && endTime ? ` (${role}, ${formatClockRange(startTime, endTime)})` : ` (${role})`;
+    const messageBody =
+      `Hi ${firstName(employee.name)} — you've been added to the ${shiftName} shift${hours} on ${dateStr} by your manager. See you then!`;
+
+    const smsChannel = await getAegisSmsChannel(companyId);
+    const channel = await notifyEmployeeSmsFirst({
+      company_id: companyId,
+      smsChannel,
+      phone: employee.contact_phone,
+      email: employee.contact_email,
+      body: messageBody,
+      subject: `You've been added to the ${shiftName} shift on ${dateStr}`,
+      employee_id: employee.id,
+    });
+
+    const summary = channel === 'none'
+      ? `Assignment notification for ${employee.name} could not be delivered — no reachable channel (${shiftName}, ${date})`
+      : `Assignment notification sent to ${employee.name} by ${channel}: ${shiftName} (${role}) on ${date}`;
+    await logActivity({
+      company_id: companyId,
+      actor: 'manager',
+      action: channel === 'none' ? 'assignment_notification_failed' : 'assignment_notification_sent',
+      entity_type: 'employee',
+      entity_id: employee.id,
+      summary,
+      metadata: {
+        shift_name: shiftName, role, date, channel,
+        approved_by: approvedBy, approved_by_email: approvedByEmail,
+        via: 'internal_notify_assignment',
+      },
+    });
+
+    res.json({
+      ok: channel !== 'none',
+      channel,
+      message: channel === 'sms'
+        ? `${firstName(employee.name)} has been texted about the shift.`
+        : channel === 'email'
+          ? `${firstName(employee.name)} couldn't be texted (no number or no text permission), so they've been emailed instead.`
+          : `${employee.name} has no phone or email on file — please let them know directly.`,
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[internal] notify-assignment failed:', msg);
     serverError(res, msg);
   }
 });

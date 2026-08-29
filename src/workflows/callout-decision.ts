@@ -518,6 +518,16 @@ export function describeDecisionResultForManager(
     }
     return `Already handled — that one was ${result.status} earlier. Nothing changed just now.`
   }
+  // Plain (non-call-out) time off — the email-link door now lands here too
+  // (N-3: the Homebase confirm page dispatches through the same core), so the
+  // receipt must speak time-off, not call-out, when there is no shift at stake.
+  const isCallOut = !!ctx.call_out?.length
+  if (!isCallOut && result.outcome === 'applied') {
+    const dates = formatDateRange(result.startDate, result.endDate)
+    return action === 'deny'
+      ? `Done — I've told ${empFirst} their time off for ${dates} is denied.`
+      : `Done — ${empFirst}'s time off for ${dates} is approved and they've been told.`
+  }
   if (action === 'deny') {
     return `Done — I've told ${empFirst} the call-out is denied and they're still expected for the ${shiftWord}.`
   }

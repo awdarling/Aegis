@@ -27,6 +27,7 @@ import { resolveAvailabilityForWeek } from '../lib/custom-availability';
 // L4 — RULE 0b: one question ("what kind of swap is this?"), one function.
 import { withSwapKind } from '../lib/swap-kind';
 import { resolveManagers, primaryRecipient } from '../messaging/manager-directory';
+import { mintTokenSource } from '../security/decision-token-store';
 // W-2 (C-2) — withdrawals notify managers through the one shared resolver.
 import { sendManagerResolutionNotice } from '../messaging/manager-resolution-notice';
 import type { InboundMessage, VerifiedContact } from '../security/types';
@@ -2285,13 +2286,13 @@ export async function sendManagerSwapApprovalRequest(params: {
     supabase.from('aegis_memory').insert({
       company_id,
       memory_type: 'observation',
-      source: `decision_token:${approveToken}`,
+      source: mintTokenSource('decision_token', approveToken),
       content: JSON.stringify({ ...sharedPayload, action: 'approve' }),
     }),
     supabase.from('aegis_memory').insert({
       company_id,
       memory_type: 'observation',
-      source: `decision_token:${denyToken}`,
+      source: mintTokenSource('decision_token', denyToken),
       content: JSON.stringify({ ...sharedPayload, action: 'deny' }),
     }),
   ]);

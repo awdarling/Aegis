@@ -269,12 +269,19 @@ describe('Mia, Aug 21 — "I\'m sick and I can\'t make it tonight" WITH an After
     const pending = memory('pending_to:')[0] as Record<string, unknown>;
     await handlePendingTimeOffConfirmation(msg('yes'), contactFor('mia', 'Mia Shaffer'), pending as never);
 
-    const tokens = memory('decision_token:');
-    const actions = tokens.map(t => t.action).sort();
-    expect(actions).toEqual(['approve', 'approve_and_cover', 'deny']);
+    // N-3: decision links are Homebase aegis_action_tokens now — hashed at
+    // rest, confirm-on-GET, decide-on-POST. No plaintext decision_token rows.
+    expect(memory('decision_token:')).toHaveLength(0);
+    const tokens = h.inserts
+      .filter(i => i.table === 'aegis_action_tokens')
+      .map(i => i.rows as { action_type: string; token_hash: string; payload: Record<string, unknown> });
+    const actions = tokens.map(t => t.action_type).sort();
+    expect(actions).toEqual(['approve_and_cover_to', 'approve_to', 'deny_to']);
     for (const t of tokens) {
-      expect(Array.isArray(t.call_out)).toBe(true);
-      expect((t.call_out as CallOutShift[])[0].shift_name).toBe('Afternoon');
+      // Hashed at rest: 64 hex chars, never the raw token value.
+      expect(t.token_hash).toMatch(/^[0-9a-f]{64}$/);
+      expect(Array.isArray(t.payload.call_out)).toBe(true);
+      expect((t.payload.call_out as CallOutShift[])[0].shift_name).toBe('Afternoon');
     }
 
     expect(h.sendEmailMock).toHaveBeenCalled();
@@ -283,7 +290,9 @@ describe('Mia, Aug 21 — "I\'m sick and I can\'t make it tonight" WITH an After
     expect(email.html).toMatch(/Approve &amp; find coverage/);
     expect(email.html).toMatch(/Approve only/);
     expect(email.html).toMatch(/Deny/);
-    expect(email.html).toMatch(/action=approve_and_cover/);
+    // All three buttons point at the Homebase confirm page, each with its own token.
+    const linkTokens = [...email.html.matchAll(/api\/aegis-action\?token=([^"&]+)/g)].map(m => m[1]);
+    expect(new Set(linkTokens).size).toBeGreaterThanOrEqual(3);
     expect(email.html).toMatch(/sick and I can/); // her actual wording, forwarded
     expect(email.text).toMatch(/called out of Mia's Afternoon shift \(3pm–8:15pm\) tonight/);
 

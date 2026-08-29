@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { managerStillActive } from '../security/manager-active';
+import { findTokenRow, deleteTokenRowBySource } from '../security/decision-token-store';
 import { supabase } from '../db/client';
 import { logActivity } from '../logger/activity-log';
 import { getAegisSmsChannel, notifyEmployeeSmsFirst } from '../messaging/notify';
@@ -34,51 +35,93 @@ export interface DepartureDecisionResult {
   html: string;
 }
 
+type ResolvedDeparture =
+  | { kind: 'respond'; status: number; html: string }
+  | { kind: 'ok'; payload: DepartureDecisionToken; tokenSource: string };
+
+// Validation only — reads nothing but the token row and changes NOTHING (N-3:
+// the GET renders a confirm page from this; only the POST executes).
+async function resolveDepartureToken(params: {
+  action?: string;
+  departureId?: string;
+  token?: string;
+}): Promise<ResolvedDeparture> {
+  const { action, departureId, token } = params;
+
+  if (!action || !departureId || !token) {
+    return { kind: 'respond', status: 400, html: errorPage('This link is missing information. Please use the buttons from your Aegis email.') };
+  }
+  if (action !== 'acknowledge' && action !== 'followup') {
+    return { kind: 'respond', status: 400, html: errorPage('Unknown action. Please use the Acknowledge or follow-up button from your email.') };
+  }
+
+  const tokenData = await findTokenRow('departure_token', token);
+  if (!tokenData) {
+    return { kind: 'respond', status: 404, html: errorPage('This link has already been used or has expired. You can set or change a last day anytime in Homebase.') };
+  }
+
+  let payload: DepartureDecisionToken;
+  try {
+    payload = JSON.parse(tokenData.content) as DepartureDecisionToken;
+  } catch {
+    return { kind: 'respond', status: 500, html: errorPage('An internal error occurred. Please try again.') };
+  }
+
+  if (new Date(payload.expires_at) < new Date()) {
+    await deleteTokenRowBySource(tokenData.source);
+    return { kind: 'respond', status: 410, html: errorPage('This link has expired. You can set the last day directly in Homebase.') };
+  }
+  if (payload.departure_id !== departureId) {
+    return { kind: 'respond', status: 400, html: errorPage('This link does not match the request. Please use the buttons from your Aegis email.') };
+  }
+  // S-3 (actor half): a revoked manager's link is dead.
+  if (!(await managerStillActive(payload.manager_user_id))) {
+    return { kind: 'respond', status: 403, html: errorPage('This link belongs to a login that no longer has manager access. Please ask a current manager to handle this in Homebase.') };
+  }
+
+  return { kind: 'ok', payload, tokenSource: tokenData.source };
+}
+
+// The N-3 confirm page — read-only description of what the button will do.
+export function confirmDeparturePage(
+  payload: DepartureDecisionToken,
+  action: 'acknowledge' | 'followup',
+  departureId: string,
+  token: string,
+): string {
+  const employeeName = payload.employee_name;
+  const lastDayDisplay = payload.last_day_date ? formatDateRange(payload.last_day_date, payload.last_day_date) : null;
+  const heading = action === 'acknowledge' ? 'Acknowledge this departure?' : 'Follow up personally?';
+  const description = action === 'acknowledge'
+    ? lastDayDisplay
+      ? `Press the button to record ${escapeText(employeeName)}'s last day as ${escapeText(lastDayDisplay)} and let them know you've got it.`
+      : `Press the button to let ${escapeText(employeeName)} know you've got it — you'll set the exact last day in Homebase afterward.`
+    : `Press the button and I'll tell ${escapeText(employeeName)} you'll reach out personally. Nothing gets recorded yet.`;
+  const buttonLabel = action === 'acknowledge' ? 'Acknowledge' : "I'll follow up";
+  const postUrl = `/webhooks/departure?action=${encodeURIComponent(action)}&departureId=${encodeURIComponent(departureId)}&token=${encodeURIComponent(token)}`;
+  const body = `${description}
+      <form method="POST" action="${postUrl.replace(/&/g, '&amp;')}" style="margin:24px 0 0;">
+        <button type="submit" style="background:${BRAND.accent};color:${BRAND.bgBase};border:none;padding:13px 30px;border-radius:9px;font-size:15px;font-weight:700;cursor:pointer;font-family:inherit;">${escapeText(buttonLabel)}</button>
+      </form>
+      <div style="margin-top:18px;font-size:13px;color:${BRAND.textSecondary};">Nothing happens until you press the button — you can close this tab to change your mind.</div>`;
+  return brandedPage({ title: heading, heading, headingColor: BRAND.textPrimary, icon: '👋', iconColor: BRAND.accent, body });
+}
+
 // Core logic, extracted so it's unit-testable without an HTTP layer. Consumes the
 // one-time token, performs the acknowledge/followup effect, notifies the employee,
-// and returns the branded result page + status.
+// and returns the branded result page + status. This is the POST (confirm-button)
+// path — the GET renders confirmDeparturePage and never lands here.
 export async function processDepartureDecision(params: {
   action?: string;
   departureId?: string;
   token?: string;
 }): Promise<DepartureDecisionResult> {
-  const { action, departureId, token } = params;
-
-  if (!action || !departureId || !token) {
-    return { status: 400, html: errorPage('This link is missing information. Please use the buttons from your Aegis email.') };
+  const resolved = await resolveDepartureToken(params);
+  if (resolved.kind === 'respond') {
+    return { status: resolved.status, html: resolved.html };
   }
-  if (action !== 'acknowledge' && action !== 'followup') {
-    return { status: 400, html: errorPage('Unknown action. Please use the Acknowledge or follow-up button from your email.') };
-  }
-
-  const { data: tokenData } = await supabase
-    .from('aegis_memory')
-    .select('id, content')
-    .eq('source', `departure_token:${token}`)
-    .maybeSingle();
-
-  if (!tokenData) {
-    return { status: 404, html: errorPage('This link has already been used or has expired. You can set or change a last day anytime in Homebase.') };
-  }
-
-  let payload: DepartureDecisionToken;
-  try {
-    payload = JSON.parse((tokenData as { content: string }).content) as DepartureDecisionToken;
-  } catch {
-    return { status: 500, html: errorPage('An internal error occurred. Please try again.') };
-  }
-
-  if (new Date(payload.expires_at) < new Date()) {
-    await supabase.from('aegis_memory').delete().eq('source', `departure_token:${token}`);
-    return { status: 410, html: errorPage('This link has expired. You can set the last day directly in Homebase.') };
-  }
-  if (payload.departure_id !== departureId) {
-    return { status: 400, html: errorPage('This link does not match the request. Please use the buttons from your Aegis email.') };
-  }
-  // S-3 (actor half): a revoked manager's link is dead.
-  if (!(await managerStillActive(payload.manager_user_id))) {
-    return { status: 403, html: errorPage('This link belongs to a login that no longer has manager access. Please ask a current manager to handle this in Homebase.') };
-  }
+  const { payload, tokenSource } = resolved;
+  const action = params.action as 'acknowledge' | 'followup';
 
   const companyId = payload.company_id;
   const employeeName = payload.employee_name;
@@ -139,7 +182,7 @@ export async function processDepartureDecision(params: {
         employee_id: payload.employee_id ?? undefined,
       });
 
-      await supabase.from('aegis_memory').delete().eq('source', `departure_token:${token}`);
+      await deleteTokenRowBySource(tokenSource);
       return {
         status: 200,
         html: brandedPage({
@@ -178,7 +221,7 @@ export async function processDepartureDecision(params: {
       employee_id: payload.employee_id ?? undefined,
     });
 
-    await supabase.from('aegis_memory').delete().eq('source', `departure_token:${token}`);
+    await deleteTokenRowBySource(tokenSource);
     return {
       status: 200,
       html: brandedPage({
@@ -197,7 +240,19 @@ export async function processDepartureDecision(params: {
   }
 }
 
+// GET — validate and render the confirm page. Never changes state (N-3).
 departureDecisionWebhook.get('/', async (req, res) => {
+  const { action, departureId, token } = req.query as Record<string, string>;
+  const resolved = await resolveDepartureToken({ action, departureId, token });
+  if (resolved.kind === 'respond') {
+    res.status(resolved.status).send(resolved.html);
+    return;
+  }
+  res.send(confirmDeparturePage(resolved.payload, action as 'acknowledge' | 'followup', departureId, token));
+});
+
+// POST — the confirm button executes.
+departureDecisionWebhook.post('/', async (req, res) => {
   const { action, departureId, token } = req.query as Record<string, string>;
   const { status, html } = await processDepartureDecision({ action, departureId, token });
   res.status(status).send(html);

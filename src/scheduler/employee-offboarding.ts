@@ -18,6 +18,7 @@
 
 import { supabase } from '../db/client';
 import { logActivity } from '../logger/activity-log';
+import { purgeExpiredDecisionTokens } from '../security/decision-token-store';
 
 const CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
 const STARTUP_DELAY_MS = 2 * 60 * 60 * 1000;   // 2h offset — avoid colliding with coverage (starts at 0)
@@ -97,6 +98,17 @@ export async function runDailySweep(): Promise<number> {
     await retireExpiredOverrides();
   } catch (err) {
     console.error('[offboarding-scheduler] retireExpiredOverrides failed:', err);
+  }
+
+  // N-4 (2026-08-28): housekeeping ride-along — sweep out expired one-time
+  // tokens (approve/deny links, departure buttons, parked text-reply states)
+  // from both token stores. Expired rows can never act (every consumer checks
+  // expiry), but they used to accumulate forever; the audit found 112 expired
+  // decision tokens and 976 expired action tokens sitting in the live tables.
+  try {
+    await purgeExpiredDecisionTokens();
+  } catch (err) {
+    console.error('[offboarding-scheduler] purgeExpiredDecisionTokens failed:', err);
   }
 
   return flipped;

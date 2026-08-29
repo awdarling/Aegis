@@ -27,6 +27,7 @@ import { computeWageEstimate } from '../lib/schedule-simulator';
 // N2 — never interpolate a raw `time` column into copy (seconds leak).
 import { formatClockRange } from '../lib/shift-hours';
 import { coerceJsonObject } from '../utils/coerce-json';
+import { mintTokenSource } from '../security/decision-token-store';
 
 // Re-exported so existing tests importing it from this module keep working.
 export { coerceJsonObject };
@@ -1269,8 +1270,8 @@ export async function dispatchOutreach(params: {
       expires_at: tokenExpiry,
     };
     await Promise.all([
-      supabase.from('aegis_memory').insert({ company_id: session.company_id, memory_type: 'observation', source: `decision_token:${acceptToken}`, content: JSON.stringify({ ...sharedTok, action: 'approve' }) }),
-      supabase.from('aegis_memory').insert({ company_id: session.company_id, memory_type: 'observation', source: `decision_token:${declineToken}`, content: JSON.stringify({ ...sharedTok, action: 'deny' }) }),
+      supabase.from('aegis_memory').insert({ company_id: session.company_id, memory_type: 'observation', source: mintTokenSource('decision_token', acceptToken), content: JSON.stringify({ ...sharedTok, action: 'approve' }) }),
+      supabase.from('aegis_memory').insert({ company_id: session.company_id, memory_type: 'observation', source: mintTokenSource('decision_token', declineToken), content: JSON.stringify({ ...sharedTok, action: 'deny' }) }),
     ]);
     const acceptUrl = `${env.BASE_URL}/webhooks/decision?action=approve&requestId=${requestId}&token=${acceptToken}`;
     const declineUrl = `${env.BASE_URL}/webhooks/decision?action=deny&requestId=${requestId}&token=${declineToken}`;
@@ -1983,8 +1984,8 @@ export async function promptForNextBatchOrExhaust(params: {
         expires_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
       };
       await Promise.all([
-        supabase.from('aegis_memory').insert({ company_id: session.company_id, memory_type: 'observation', source: `decision_token:${sendToken}`, content: JSON.stringify({ ...sharedTok, action: 'approve' }) }),
-        supabase.from('aegis_memory').insert({ company_id: session.company_id, memory_type: 'observation', source: `decision_token:${stopToken}`, content: JSON.stringify({ ...sharedTok, action: 'deny' }) }),
+        supabase.from('aegis_memory').insert({ company_id: session.company_id, memory_type: 'observation', source: mintTokenSource('decision_token', sendToken), content: JSON.stringify({ ...sharedTok, action: 'approve' }) }),
+        supabase.from('aegis_memory').insert({ company_id: session.company_id, memory_type: 'observation', source: mintTokenSource('decision_token', stopToken), content: JSON.stringify({ ...sharedTok, action: 'deny' }) }),
       ]);
       const sendUrl = `${env.BASE_URL}/webhooks/decision?action=approve&requestId=${requestId}&token=${sendToken}`;
       const stopUrl = `${env.BASE_URL}/webhooks/decision?action=deny&requestId=${requestId}&token=${stopToken}`;

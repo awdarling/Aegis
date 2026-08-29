@@ -1,4 +1,3 @@
-import { randomUUID } from 'crypto';
 import { supabase } from '../db/client';
 import { coerceJsonObject } from '../utils/coerce-json';
 import { logActivity } from '../logger/activity-log';
@@ -21,6 +20,7 @@ import {
 } from '../messaging/brand';
 import { buildTimeOffManagerEmail, buildTimeOffResolutionEmail, describePartialDay, buildPartialSummaryText, type TimeOffRecommendation } from './time-off-manager-email';
 import { resolveManagers, recipientsFor } from '../messaging/manager-directory';
+import { generateActionToken } from '../lib/aegis-actions/tokens';
 import { sendManagerResolutionNotice } from '../messaging/manager-resolution-notice';
 import { tenantTodayAndZone, addDays, minutesUntilTenantTime } from '../lib/tenant-date';
 import type { InboundMessage, VerifiedContact } from '../security/types';
@@ -1560,8 +1560,6 @@ export async function notifyManager(
       .eq('id', requestId);
   }
 
-  const baseUrl = env.BASE_URL;
-  const tokenExpiry = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
   const dateDisplay = formatDateRange(pending.start_date, pending.end_date);
 
   // W-2 — call-out extras, computed ONCE for every manager (spec §3.5):
@@ -1591,20 +1589,23 @@ export async function notifyManager(
   let emailed = 0;
   for (const manager of managers) {
     try {
-      // Separate approve/deny tokens PER MANAGER. The payload carries the
-      // manager identity, which is what attributes the decision on
+      // ── N-3 (2026-08-28): links are Homebase confirm-page magic links ──────
+      //
+      // These used to be plaintext aegis_memory `decision_token:` rows whose
+      // /webhooks/decision links ACTED on a bare GET — the exact shape that let
+      // a mail scanner approve time off (J-3). They are now Homebase
+      // aegis_action_tokens: hashed at rest, single-use, expiring, and the link
+      // renders a confirm page — only the button press (POST) decides, and the
+      // decision lands back in applyTimeOffDecision through
+      // /internal/apply-time-off-decision (one core, both doors — F13).
+      //
+      // Still one token PER MANAGER PER ACTION: issued_to_user_id + the payload
+      // manager identity are what attribute the decision on
       // time_off_requests.decided_by and in the activity feed rather than
       // falling back to 'aegis' (Data Contract D17). A shared token would
       // credit whoever we minted it for, not whoever clicked.
-      const approveToken = randomUUID();
-      const denyToken = randomUUID();
-      // W-2 — a CALL-OUT mints a third choice: Approve & find coverage (spec
-      // §3.5). Same token family; the action string is what the click carries.
-      const approveAndCoverToken = isCallOut ? randomUUID() : null;
-
       const sharedPayload = {
-        request_id: requestId,
-        company_id: companyId,
+        time_off_request_id: requestId,
         employee_id: employee.id,
         employee_name: employee.name,
         employee_channel: pending.channel,
@@ -1614,33 +1615,24 @@ export async function notifyManager(
         raw_subject: pending.raw_subject ?? null,
         manager_user_id: manager.userId,
         manager_name: manager.name,
-        expires_at: tokenExpiry,
+        start_date: pending.start_date,
+        end_date: pending.end_date,
+        date_range: dateDisplay,
         call_out: pending.call_out ?? null,
       };
-
-      await Promise.all([
-        supabase.from('aegis_memory').insert({
-          company_id: companyId,
-          memory_type: 'observation',
-          source: `decision_token:${approveToken}`,
-          content: JSON.stringify({ ...sharedPayload, action: 'approve' }),
-        }),
-        supabase.from('aegis_memory').insert({
-          company_id: companyId,
-          memory_type: 'observation',
-          source: `decision_token:${denyToken}`,
-          content: JSON.stringify({ ...sharedPayload, action: 'deny' }),
-        }),
-        ...(approveAndCoverToken
-          ? [
-              supabase.from('aegis_memory').insert({
-                company_id: companyId,
-                memory_type: 'observation',
-                source: `decision_token:${approveAndCoverToken}`,
-                content: JSON.stringify({ ...sharedPayload, action: 'approve_and_cover' }),
-              }),
-            ]
-          : []),
+      const tokenCommon = {
+        payload: sharedPayload,
+        company_id: companyId,
+        issued_to_email: manager.email,
+        issued_to_user_id: manager.userId ?? undefined,
+        ttl_minutes: 7 * 24 * 60,
+      };
+      const [approveTok, denyTok, ...coverToks] = await Promise.all([
+        generateActionToken({ action_type: 'approve_to', ...tokenCommon }),
+        generateActionToken({ action_type: 'deny_to', ...tokenCommon }),
+        // W-2 — a CALL-OUT mints a third choice: Approve & find coverage (spec
+        // §3.5). Same token family; the action type is what the click carries.
+        ...(isCallOut ? [generateActionToken({ action_type: 'approve_and_cover_to', ...tokenCommon })] : []),
       ]);
 
       // W-2 branch 5 (Alexander, 2026-08-28): the manager can ANSWER the
@@ -1665,11 +1657,9 @@ export async function notifyManager(
         });
       }
 
-      const approveUrl = `${baseUrl}/webhooks/decision?action=approve&requestId=${requestId}&token=${approveToken}`;
-      const denyUrl = `${baseUrl}/webhooks/decision?action=deny&requestId=${requestId}&token=${denyToken}`;
-      const approveAndCoverUrl = approveAndCoverToken
-        ? `${baseUrl}/webhooks/decision?action=approve_and_cover&requestId=${requestId}&token=${approveAndCoverToken}`
-        : null;
+      const approveUrl = approveTok.url;
+      const denyUrl = denyTok.url;
+      const approveAndCoverUrl = coverToks[0]?.url ?? null;
 
       const { subject, text, html } = buildManagerEmail({
         employeeName: employee.name,
@@ -1827,6 +1817,13 @@ async function notifyManagersByEmail(
         simulation: simulation ?? undefined,
         recommendation,
         violations,
+        // §O3 — an email-origin CALL-OUT gets the same three actions the
+        // SMS-origin manager email has had since W-2, routed through the same
+        // decision core; thread context rides so the employee's decision
+        // notice threads into their original conversation.
+        call_out: pending.call_out ?? null,
+        thread_id: pending.thread_id ?? null,
+        raw_subject: pending.raw_subject ?? null,
       });
       await sendEmail({
         to: manager.email!,

@@ -56,6 +56,7 @@ export interface TimeOffDecisionContext {
   raw_subject?: string | null
   manager_user_id?: string | null
   manager_name?: string | null
+  manager_avatar_url?: string | null
   call_out?: CallOutShift[] | null
 }
 
@@ -148,7 +149,7 @@ async function notifyEmployeeOfDecision(
 export async function applyTimeOffDecision(
   ctx: TimeOffDecisionContext,
   action: TimeOffDecisionAction,
-  via: 'email_link' | 'text_reply',
+  via: 'email_link' | 'text_reply' | 'in_tab',
 ): Promise<TimeOffDecisionResult> {
   const { data: torData } = await supabase
     .from('time_off_requests')
@@ -202,14 +203,16 @@ export async function applyTimeOffDecision(
   await clearCallOutDecisionPendingForRequest(ctx.company_id, ctx.request_id)
 
   const decisionPast = approves ? 'approved' : 'denied'
+  const viaWord = via === 'text_reply' ? 'text reply' : via === 'in_tab' ? 'the Time Off tab' : 'email link'
   await logActivity({
     company_id: ctx.company_id,
     actor: 'manager',
     actor_name: ctx.manager_name ?? null,
+    actor_avatar_url: ctx.manager_avatar_url ?? null,
     action: `time_off_${decisionPast}`,
     entity_type: 'time_off_request',
     entity_id: ctx.request_id,
-    summary: `${isCallOut ? 'Call-out' : 'Time-off request'} for ${ctx.employee_name} ${decisionPast}${ctx.manager_name ? ` by ${ctx.manager_name}` : ''} via ${via === 'text_reply' ? 'text reply' : 'email link'}`,
+    summary: `${isCallOut ? 'Call-out' : 'Time-off request'} for ${ctx.employee_name} ${decisionPast}${ctx.manager_name ? ` by ${ctx.manager_name}` : ''} via ${viaWord}`,
     metadata: {
       employee_id: ctx.employee_id,
       start_date: tor.start_date,

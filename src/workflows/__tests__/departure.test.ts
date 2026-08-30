@@ -27,6 +27,7 @@ const h = vi.hoisted(() => {
       update(rows: unknown) { state.op = 'update'; state.rows = rows; return builder; },
       select() { return builder; },
       eq(col: string, val: unknown) { state.filters[col] = val; return builder; },
+      like(col: string, val: unknown) { state.filters[`like:${col}`] = val; return builder; },
       in() { return builder; },
       is() { return builder; },
       not(col: string, _op: string, val: unknown) { state.filters[`not:${col}`] = val; return builder; },
@@ -205,5 +206,21 @@ describe('runDailySweep (offboarding)', () => {
     const flipped = await runDailySweep();
     expect(flipped).toBe(0);
     expect(h.recorded.some(r => r.table === 'employees' && r.op === 'update')).toBe(false);
+  });
+
+  // Regression, 2026-08-30: the housekeeping ride-alongs (retire expired
+  // availability overrides, N-4's token purge) used to sit AFTER a `return 0`
+  // that fired on this exact "nobody departed today" branch — which is nearly
+  // every night for a roster this size. Verified live 2026-08-30: the purge
+  // had never actually run since it shipped, and 112+1,009 expired tokens sat
+  // untouched. Housekeeping must run every night regardless of whether anyone
+  // was deactivated.
+  it('runs both housekeeping ride-alongs even on a night nobody was deactivated', async () => {
+    h.config['employees:select'] = [];
+    const flipped = await runDailySweep();
+    expect(flipped).toBe(0);
+    expect(h.recorded.some(r => r.table === 'custom_availability' && r.op === 'update')).toBe(true);
+    expect(h.recorded.filter(r => r.table === 'aegis_memory' && r.op === 'select').length).toBeGreaterThanOrEqual(3);
+    expect(h.recorded.some(r => r.table === 'aegis_action_tokens' && r.op === 'delete')).toBe(true);
   });
 });

@@ -81,12 +81,24 @@ internalRouter.post('/notify-to-decision', async (req: Request, res: Response) =
 // The response carries a ready-made manager-facing message (one voice —
 // describeDecisionResultForManager) so Homebase renders exactly what the text
 // door would have said.
+//
+// P2 (2026-08-30, DRIFT §P2): the in-tab Homebase button now lands here too,
+// via 'source: "in_tab"'. Two things a browser click can't supply that an
+// emailed link's token payload used to carry:
+//   - call_out — resolved server-side from the same to_thread:<id> side row
+//     already being read for threading, when the caller doesn't send one.
+//     The browser should not have to know whether a request is a call-out.
+//   - manager_avatar_url — looked up alongside manager_name when missing.
+// 'source' also picks the activity-log voice ("the Time Off tab" vs. "email
+// link"); the magic-link dispatcher never sends it, so its behavior — and
+// every existing caller's — is unchanged.
 internalRouter.post('/apply-time-off-decision', async (req: Request, res: Response) => {
   const body = (req.body ?? {}) as Record<string, unknown>;
   const requestId = body.time_off_request_id;
   const action = body.action;
   const companyId = body.company_id;
   const managerUserId = typeof body.manager_user_id === 'string' && body.manager_user_id.length > 0 ? body.manager_user_id : null;
+  const via: 'email_link' | 'in_tab' = body.source === 'in_tab' ? 'in_tab' : 'email_link';
 
   if (typeof requestId !== 'string' || requestId.length === 0) {
     badRequest(res, 'time_off_request_id is required');
@@ -148,22 +160,33 @@ internalRouter.post('/apply-time-off-decision', async (req: Request, res: Respon
       .select('content')
       .eq('source', `to_thread:${requestId}`)
       .maybeSingle();
+    // P2: resolve call_out from the body first (magic-link payload); when the
+    // caller doesn't send one (the in-tab button), fall back to the SAME
+    // to_thread:<id> row's own call_out field — written for both channels at
+    // submission time (workflows/time-off.ts), so it's already sitting in
+    // `meta` below whenever it exists. No caller-side lookup required.
+    let metaCallOut: CallOutShift[] | null = null;
     if (metaRow) {
       try {
-        const meta = JSON.parse((metaRow as { content: string }).content) as { channel?: 'sms' | 'email' | null; thread_id?: string | null; raw_subject?: string | null };
+        const meta = JSON.parse((metaRow as { content: string }).content) as { channel?: 'sms' | 'email' | null; thread_id?: string | null; raw_subject?: string | null; call_out?: CallOutShift[] | null };
         originChannel = meta.channel ?? null;
         threadId = threadId ?? meta.thread_id ?? null;
         rawSubject = rawSubject ?? meta.raw_subject ?? null;
+        metaCallOut = Array.isArray(meta.call_out) && meta.call_out.length > 0 ? meta.call_out : null;
       } catch { /* corrupted side row — proceed without threading */ }
     }
 
     let managerName: string | null = typeof body.manager_name === 'string' ? body.manager_name : null;
-    if (!managerName && managerUserId) {
-      const { data: mgrRow } = await supabase.from('users').select('name').eq('id', managerUserId).maybeSingle();
-      managerName = (mgrRow as { name: string | null } | null)?.name ?? null;
+    let managerAvatarUrl: string | null = typeof body.manager_avatar_url === 'string' ? body.manager_avatar_url : null;
+    if ((!managerName || !managerAvatarUrl) && managerUserId) {
+      const { data: mgrRow } = await supabase.from('users').select('name, avatar_url').eq('id', managerUserId).maybeSingle();
+      const mgr = mgrRow as { name: string | null; avatar_url: string | null } | null;
+      managerName = managerName ?? mgr?.name ?? null;
+      managerAvatarUrl = managerAvatarUrl ?? mgr?.avatar_url ?? null;
     }
 
-    const callOut = Array.isArray(body.call_out) && body.call_out.length > 0 ? (body.call_out as CallOutShift[]) : null;
+    const bodyCallOut = Array.isArray(body.call_out) && body.call_out.length > 0 ? (body.call_out as CallOutShift[]) : null;
+    const callOut = bodyCallOut ?? metaCallOut;
     const smsChannel = await getAegisSmsChannel(companyId);
     const phone = employee?.contact_phone ?? null;
     const email = employee?.contact_email ?? null;
@@ -181,10 +204,11 @@ internalRouter.post('/apply-time-off-decision', async (req: Request, res: Respon
       raw_subject: rawSubject,
       manager_user_id: managerUserId,
       manager_name: managerName,
+      manager_avatar_url: managerAvatarUrl,
       call_out: callOut,
     };
 
-    const result = await applyTimeOffDecision(ctx, action, 'email_link');
+    const result = await applyTimeOffDecision(ctx, action, via);
     res.json({
       ok: true,
       outcome: result.outcome,
